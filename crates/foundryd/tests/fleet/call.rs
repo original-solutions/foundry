@@ -49,6 +49,7 @@ fn built(name: &str) -> PathBuf {
 /// left under its data directory.
 struct Served {
     addr: SocketAddr,
+    api: Api,
     data: TempDir,
     servers: Vec<JoinHandle<()>>,
     _home: TempDir,
@@ -156,6 +157,7 @@ impl Served {
         });
         let hook_router = sessions.router();
         let api = Api::new(store, peers, terminals, workspaces, sessions, Vec::new());
+        let kept = api.clone();
         let placing = api.clone();
         let listener = api::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -175,6 +177,7 @@ impl Served {
         ];
         Self {
             addr,
+            api: kept,
             data,
             servers,
             _home: home,
@@ -193,14 +196,28 @@ impl Served {
 
     /// `POST path` with `body` as JSON, or with no body: the status and the text answered.
     async fn post_text(&self, path: &str, body: Option<Value>) -> (u16, String) {
+        self.post_with(path, body, &[]).await
+    }
+
+    /// [`Served::post_text`] with `headers` added.
+    async fn post_with(
+        &self,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&'static str, String)],
+    ) -> (u16, String) {
         let url = format!("http://{}{path}", self.addr);
+        let headers = headers.to_vec();
         tokio::task::spawn_blocking(move || {
             let agent: ureq::Agent = ureq::Agent::config_builder()
                 .http_status_as_error(false)
                 .timeout_global(Some(WAIT))
                 .build()
                 .into();
-            let request = agent.post(&url);
+            let mut request = agent.post(&url);
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
             let mut response = match body {
                 Some(body) => request.send_json(&body),
                 None => request.send_empty(),
@@ -1084,8 +1101,10 @@ impl Secrets for Held {
     }
 }
 
-/// The factory session's script on B: two turns, the first of which quotes the token.
+/// The factory session's script on B: the token on its terminal, then two turns, the first of
+/// which quotes the token.
 const SESSION_SCRIPT: &str = "- hook: {event: SessionStart}
+- print_env: GH_TOKEN
 - wait_prompt
 - stop: {last_assistant_message: \"pushed with ghp_FactoryRouteToken0123456789abcdef\"}
 - wait_prompt
@@ -1093,19 +1112,116 @@ const SESSION_SCRIPT: &str = "- hook: {event: SessionStart}
 - wait_input
 ";
 
-/// Asks `on` for `path` with `body` until it answers other than `404`, and gives that answer.
-async fn once_found(on: &Served, path: &str, body: Value) -> (u16, String) {
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        let (status, text) = on.post_text(path, Some(body.clone())).await;
-        if status != 404 {
-            return (status, text);
+/// A project's remote on two machines that serve their APIs, B with the token and the
+/// factory session's script, A hearing B.
+struct Pair {
+    fleet: Fleet,
+    _remotes: TempDir,
+    project: ProjectId,
+    on_a: Served,
+    on_b: Served,
+}
+
+impl Pair {
+    async fn start() -> Pair {
+        let fleet = Fleet::start(2);
+        let remotes = tempfile::tempdir().unwrap();
+        let project = project(&fleet, remotes.path());
+        let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+        let on_a = Served::of(a).await;
+        let factory = Factory {
+            script: SESSION_SCRIPT,
+            secrets: Held::with_token(),
+        };
+        let on_b = Served::start_with(b.id, b.store.clone(), b.peers.clone(), Some(factory)).await;
+        b.peers.serve_calls(on_b.addr);
+        hears(&a.peers, b.id).await;
+        Pair {
+            fleet,
+            _remotes: remotes,
+            project,
+            on_a,
+            on_b,
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{path} still answers 404: {text}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    fn a(&self) -> &Daemon {
+        &self.fleet.daemons[0]
+    }
+
+    fn b(&self) -> &Daemon {
+        &self.fleet.daemons[1]
+    }
+
+    /// The run's call for `path` with `body`, made on A, which carries it to B: B's status and
+    /// the text it answered.
+    async fn call(&self, path: &str, body: Option<Value>) -> (u16, String) {
+        let body = body.map(|body| body.to_string()).unwrap_or_default();
+        let answer = api::factory::call(&self.on_a.api, path, body.as_bytes())
+            .await
+            .unwrap_or_else(|e| panic!("{path} not carried: {e}"))
+            .unwrap_or_else(|| panic!("{path} found no owner other than A"));
+        (
+            answer.status,
+            String::from_utf8(answer.body.to_vec()).unwrap(),
+        )
+    }
+
+    /// Asks B for `path` with `body` until it answers other than `404`, and gives that answer.
+    async fn once_found(&self, path: &str, body: Value) -> (u16, String) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let (status, text) = self.call(path, Some(body.clone())).await;
+            if status != 404 {
+                return (status, text);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{path} still answers 404: {text}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn create(&self, name: &str, setup: Value) -> Value {
+        json!({
+            "machine": self.b().id,
+            "project": self.project,
+            "name": name,
+            "checkout": {"kind": "new_branch", "base": "main", "branch": name},
+            "setup": setup,
+            "tag": {"project": self.project, "run": "run-12"},
+        })
+    }
+
+    fn start_body(&self, login: &str, model: &str, effort: &str, line: &str) -> Value {
+        json!({
+            "project": self.project,
+            "login": login,
+            "model": model,
+            "effort": effort,
+            "message": {"line": line, "body": null},
+        })
+    }
+
+    /// The factory sessions B holds for `workspace`.
+    fn sessions_in(&self, workspace: WorkspaceId) -> usize {
+        self.b()
+            .all()
+            .iter()
+            .filter(|r| {
+                r.owner() == self.b().id
+                    && matches!(r, AnyRecord::Session(s) if s.body.workspace == workspace)
+            })
+            .count()
+    }
+
+    /// Whether A shows `session` as running.
+    async fn runs(&self, session: SessionId) -> bool {
+        self.on_a.state().await.iter().any(|r| {
+            matches!(r, AnyRecord::Session(s) if s.body.id == session && !s.deleted
+                && !matches!(s.body.state, SessionState::Finished | SessionState::Failed))
+        })
     }
 }
 
@@ -1123,38 +1239,30 @@ async fn terminals_of(on: &Served, workspace: WorkspaceId) -> Vec<TerminalId> {
         .collect()
 }
 
+fn workspace_of(text: &str) -> WorkspaceId {
+    WorkspaceId(id_of(&serde_json::from_str(text).unwrap()).parse().unwrap())
+}
+
+fn session_of(text: &str) -> SessionId {
+    SessionId(id_of(&serde_json::from_str(text).unwrap()).parse().unwrap())
+}
+
 #[tokio::test]
 async fn every_factory_route_called_on_a_for_what_b_owns_reaches_b_and_no_answer_holds_a_token() {
-    let fleet = Fleet::start(2);
-    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
-    let remotes = tempfile::tempdir().unwrap();
-    let project = project(&fleet, remotes.path());
-    let on_a = Served::of(a).await;
-    let factory = Factory {
-        script: SESSION_SCRIPT,
-        secrets: Held::with_token(),
-    };
-    let on_b = Served::start_with(b.id, b.store.clone(), b.peers.clone(), Some(factory)).await;
-    b.peers.serve_calls(on_b.addr);
-    hears(&a.peers, b.id).await;
+    let pair = Pair::start().await;
+    let (a, b) = (pair.a(), pair.b());
     let mut answers: Vec<String> = Vec::new();
 
     // A factory create naming B is made on B, with the setup and branch it names.
-    let setup = "yes 0123456789abcdef | head -n 20000; echo last-line";
-    let create = json!({
-        "machine": b.id,
-        "project": project,
-        "name": "fac/12-1",
-        "checkout": {"kind": "new_branch", "base": "main", "branch": "fac/12-1"},
-        "setup": {"kind": "commands", "commands": [setup], "limit_secs": 60},
-        "tag": {"project": project, "run": "run-12"},
-    });
-    let (status, text) = on_a
-        .post_text("/api/factory/workspaces", Some(create.clone()))
+    let setup = "yes 0123456789abcdef | head -n 20000; \
+                 echo fetching https://u:s3cretpass@example.com/r; echo last-line";
+    let setup = json!({"kind": "commands", "commands": [setup], "limit_secs": 60});
+    let create = pair.create("fac/12-1", setup);
+    let (status, text) = pair
+        .call("/api/factory/workspaces", Some(create.clone()))
         .await;
     assert_eq!(status, 201, "{text}");
-    let answer: Value = serde_json::from_str(&text).unwrap();
-    let workspace = WorkspaceId(id_of(&answer).parse().unwrap());
+    let workspace = workspace_of(&text);
     answers.push(text);
     let made_on_b = b.held(|r| {
         matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace && w.body.branch == "fac/12-1")
@@ -1165,27 +1273,25 @@ async fn every_factory_route_called_on_a_for_what_b_owns_reaches_b_and_no_answer
             .is_none(),
         "nothing was made on A"
     );
-    let (status, text) = on_a
-        .post_text("/api/factory/workspaces", Some(create))
-        .await;
+    let (status, text) = pair.call("/api/factory/workspaces", Some(create)).await;
     assert_eq!(status, 201, "{text}");
-    let again: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
-        id_of(&again),
-        workspace.to_string(),
+        workspace_of(&text),
+        workspace,
         "the same tag is one workspace"
     );
     answers.push(text);
 
-    // The setup terminal's tail, read from A: at most 64 KB, ending with the setup's last line.
-    let setup_terminal = terminals_of(&on_a, workspace).await;
+    // The setup terminal's tail, read from A: at most 64 KB, ending with the setup's last
+    // line, with the URL's password hidden.
+    let setup_terminal = terminals_of(&pair.on_a, workspace).await;
     let [setup_terminal] = setup_terminal[..] else {
         panic!("one setup terminal: {setup_terminal:?}");
     };
     let tail_path = format!("/api/terminals/{setup_terminal}/tail");
     let deadline = tokio::time::Instant::now() + WAIT;
     let tail = loop {
-        let (status, text) = on_a.post_text(&tail_path, None).await;
+        let (status, text) = pair.call(&tail_path, None).await;
         assert_eq!(status, 200, "{text}");
         // The setup terminal says how the setup ended after its last command's output.
         if text.lines().rev().take(3).any(|line| line == "last-line") {
@@ -1197,34 +1303,55 @@ async fn every_factory_route_called_on_a_for_what_b_owns_reaches_b_and_no_answer
     assert!(tail.len() <= 64 * 1024, "{} bytes", tail.len());
     assert!(tail.contains("0123456789abcdef\n"), "the setup's output");
     assert!(!tail.contains('\u{1b}'), "no escape is left");
+    assert!(
+        tail.contains("https://***@example.com/r"),
+        "the URL is shown"
+    );
+    assert!(!tail.contains("s3cretpass"), "its password is not");
     answers.push(tail);
 
-    // A factory session started from A runs on B, on the first message.
-    let start = json!({
-        "project": project,
-        "login": LOGIN,
-        "model": "test-model",
-        "effort": "high",
-        "message": {"line": "/factory-build demo#12", "body": null},
-    });
+    // A start the route refuses makes no session on B.
     let path = format!("/api/workspaces/{workspace}/factory/session");
-    let (status, text) = on_a.post_text(&path, Some(start)).await;
+    for (refused, why) in [
+        (
+            pair.start_body(LOGIN, "-x", "high", "/go"),
+            "a model like an option",
+        ),
+        (
+            pair.start_body(LOGIN, "m", "two words", "/go"),
+            "an effort of two words",
+        ),
+        (
+            pair.start_body(LOGIN, "m", "high", "one\ntwo"),
+            "a line of two lines",
+        ),
+        (
+            pair.start_body("nobody", "m", "high", "/go"),
+            "a login B holds no token for",
+        ),
+    ] {
+        let (status, text) = pair.call(&path, Some(refused)).await;
+        assert_eq!(status, 422, "{why}: {text}");
+        answers.push(text);
+    }
+    assert_eq!(pair.sessions_in(workspace), 0, "no session was made");
+
+    // A factory session started from A runs on B, on the first message. The same start again
+    // answers with it, and starts no second one.
+    let start = pair.start_body(LOGIN, "test-model", "high", "/factory-build demo#12");
+    let (status, text) = pair.call(&path, Some(start.clone())).await;
     assert_eq!(status, 201, "{text}");
-    let session = SessionId(
-        id_of(&serde_json::from_str(&text).unwrap())
-            .parse()
-            .unwrap(),
-    );
+    let session = session_of(&text);
     answers.push(text);
-    assert!(
-        b.held(|r| r.owner() == b.id && matches!(r, AnyRecord::Session(s) if s.body.id == session))
-            .is_some(),
-        "the session runs on B"
-    );
+    let (status, text) = pair.call(&path, Some(start)).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(session_of(&text), session, "the running session");
+    answers.push(text);
+    assert_eq!(pair.sessions_in(workspace), 1, "one session runs on B");
 
     // Its first turn, read from A, with the token it quoted hidden.
     let turn = format!("/api/sessions/{session}/factory/turn");
-    let (status, text) = once_found(&on_a, &turn, json!({"turn": 1})).await;
+    let (status, text) = pair.once_found(&turn, json!({"turn": 1})).await;
     assert_eq!(status, 200, "{text}");
     let first: Value = serde_json::from_str(&text).unwrap();
     assert!(
@@ -1237,93 +1364,55 @@ async fn every_factory_route_called_on_a_for_what_b_owns_reaches_b_and_no_answer
     assert_eq!(first["question"], Value::Null, "{first}");
     answers.push(text);
 
-    // A message sent from A is typed on B, and answers the count of prompts before it.
+    // A message sent from A is typed on B, and answers the count of prompts before it. A line
+    // of two lines is refused and typed nowhere.
     let message = format!("/api/sessions/{session}/factory/message");
+    let two_lines = json!({"message": {"line": "a\nb", "body": null}, "only_if_prompts": 1});
+    let (status, text) = pair.call(&message, Some(two_lines)).await;
+    assert_eq!(status, 422, "{text}");
+    answers.push(text);
     let send = json!({"message": {"line": "carry on", "body": null}, "only_if_prompts": 1});
-    let (status, text) = on_a.post_text(&message, Some(send.clone())).await;
+    let (status, text) = pair.call(&message, Some(send.clone())).await;
     assert_eq!(status, 200, "{text}");
     assert_eq!(
         serde_json::from_str::<Value>(&text).unwrap(),
         json!({"prompts": 1})
     );
     answers.push(text);
-    let (status, text) = once_found(&on_a, &turn, json!({"turn": 2})).await;
+    let (status, text) = pair.once_found(&turn, json!({"turn": 2})).await;
     assert_eq!(status, 200, "{text}");
     let second: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(second["message"], "second turn", "{second}");
     answers.push(text);
 
     // The same send again finds the count risen, and is refused with the reason.
-    let (status, text) = on_a.post_text(&message, Some(send)).await;
+    let (status, text) = pair.call(&message, Some(send)).await;
     assert_eq!(status, 409, "{text}");
     let refused: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(refused["reason"], "count_rose", "{refused}");
     assert_eq!(refused["now"], 2, "{refused}");
     answers.push(text);
 
-    // The session's own terminal reads from A too.
-    let session_terminal = terminals_of(&on_a, workspace)
+    // The session's own terminal, whose child holds the token and printed it, has no tail.
+    let session_terminal = terminals_of(&pair.on_a, workspace)
         .await
         .into_iter()
         .find(|t| *t != setup_terminal)
         .expect("the session's terminal");
-    let (status, text) = on_a
-        .post_text(&format!("/api/terminals/{session_terminal}/tail"), None)
+    let (status, text) = pair
+        .call(&format!("/api/terminals/{session_terminal}/tail"), None)
         .await;
-    assert_eq!(status, 200, "{text}");
+    assert_eq!(status, 404, "{text}");
     answers.push(text);
 
-    // Called on B with no carried mark, each route is 404, and changes nothing.
-    let direct = [
-        (
-            "/api/factory/workspaces".to_owned(),
-            Some(json!({"machine": b.id, "project": project, "name": "x",
-                "checkout": {"kind": "new_branch", "base": "main", "branch": null},
-                "setup": {"kind": "none"}, "tag": null})),
-        ),
-        (
-            format!("/api/workspaces/{workspace}/factory/session"),
-            Some(
-                json!({"project": project, "login": LOGIN, "model": "m", "effort": "high",
-                "message": {"line": "hi", "body": null}}),
-            ),
-        ),
-        (format!("/api/workspaces/{workspace}/factory/end"), None),
-        (
-            message.clone(),
-            Some(json!({"message": {"line": "hi", "body": null}, "only_if_prompts": null})),
-        ),
-        (turn.clone(), Some(json!({"turn": 1}))),
-        (tail_path.clone(), None),
-    ];
-    for (path, body) in direct {
-        let (status, text) = on_b.post_text(&path, body).await;
-        assert_eq!(status, 404, "{path}: {text}");
-        answers.push(text);
-    }
-    let (status, _) = on_b.post_text(&turn, Some(json!("not a turn"))).await;
-    assert_eq!(status, 404, "a body the route cannot take is still 404");
-    assert!(
-        b.held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.name == "x"))
-            .is_none(),
-        "the uncarried create made nothing"
-    );
-    let live = |records: &[AnyRecord]| {
-        records.iter().any(|r| {
-            matches!(r, AnyRecord::Session(s) if s.body.id == session && !s.deleted
-                && !matches!(s.body.state, SessionState::Finished | SessionState::Failed))
-        })
-    };
-    assert!(live(&on_a.state().await), "the uncarried end ended nothing");
-
     // Ending the workspace's factory sessions from A ends the one on B.
-    let (status, text) = on_a
-        .post_text(&format!("/api/workspaces/{workspace}/factory/end"), None)
+    let (status, text) = pair
+        .call(&format!("/api/workspaces/{workspace}/factory/end"), None)
         .await;
     assert_eq!(status, 204, "{text}");
     answers.push(text);
     let deadline = tokio::time::Instant::now() + WAIT;
-    while live(&on_a.state().await) {
+    while pair.runs(session).await {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the session still runs"
@@ -1334,4 +1423,80 @@ async fn every_factory_route_called_on_a_for_what_b_owns_reaches_b_and_no_answer
     for text in &answers {
         assert!(!text.contains(TOKEN), "an answer holds the token: {text}");
     }
+}
+
+#[tokio::test]
+async fn a_worker_route_without_the_carried_mark_or_with_a_browsers_headers_is_404_on_every_machine()
+ {
+    let pair = Pair::start().await;
+    let b = pair.b();
+    let setup = json!({"kind": "commands", "commands": ["echo ready"], "limit_secs": 60});
+    let (status, text) = pair
+        .call(
+            "/api/factory/workspaces",
+            Some(pair.create("fac/12-1", setup)),
+        )
+        .await;
+    assert_eq!(status, 201, "{text}");
+    let workspace = workspace_of(&text);
+    let start = pair.start_body(LOGIN, "test-model", "high", "/factory-build demo#12");
+    let path = format!("/api/workspaces/{workspace}/factory/session");
+    let (status, text) = pair.call(&path, Some(start.clone())).await;
+    assert_eq!(status, 201, "{text}");
+    let session = session_of(&text);
+    let turn = format!("/api/sessions/{session}/factory/turn");
+    let (status, text) = pair.once_found(&turn, json!({"turn": 1})).await;
+    assert_eq!(status, 200, "{text}");
+    let terminal = terminals_of(&pair.on_a, workspace).await[0];
+
+    let routes = [
+        (
+            "/api/factory/workspaces".to_owned(),
+            Some(
+                json!({"machine": b.id, "project": pair.project, "name": "x",
+                "checkout": {"kind": "new_branch", "base": "main", "branch": null},
+                "setup": {"kind": "none"}, "tag": null}),
+            ),
+        ),
+        (path.clone(), Some(start)),
+        (format!("/api/workspaces/{workspace}/factory/end"), None),
+        (
+            format!("/api/sessions/{session}/factory/message"),
+            Some(json!({"message": {"line": "hi", "body": null}, "only_if_prompts": null})),
+        ),
+        (turn.clone(), Some(json!({"turn": 1}))),
+        (format!("/api/terminals/{terminal}/tail"), None),
+    ];
+    let origin = format!("http://{}", pair.on_b.addr);
+    let browser_marks: [&[(&'static str, String)]; 2] = [
+        &[("x-foundry-carried", "1".into()), ("origin", origin)],
+        &[
+            ("x-foundry-carried", "1".into()),
+            ("sec-fetch-mode", "cors".into()),
+        ],
+    ];
+    for (path, body) in routes {
+        // Called with no mark on A, which does not own it, and on B, which does.
+        for (on, machine) in [(&pair.on_a, "A"), (&pair.on_b, "B")] {
+            let (status, text) = on.post_text(&path, body.clone()).await;
+            assert_eq!(status, 404, "{path} on {machine}: {text}");
+            assert_eq!(text, r#"{"error":"no such route"}"#, "{path} on {machine}");
+        }
+        // Marked, from a browser on B.
+        for headers in browser_marks {
+            let (status, text) = pair.on_b.post_with(&path, body.clone(), headers).await;
+            assert_eq!(status, 404, "{path} with {headers:?}: {text}");
+        }
+    }
+    for on in [&pair.on_a, &pair.on_b] {
+        let (status, _) = on.post_text(&turn, Some(json!("not a turn"))).await;
+        assert_eq!(status, 404, "a body the route cannot take is still 404");
+    }
+    assert!(
+        b.held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.name == "x"))
+            .is_none(),
+        "no uncarried create made anything"
+    );
+    assert_eq!(pair.sessions_in(workspace), 1, "no second session");
+    assert!(pair.runs(session).await, "no uncarried end ended it");
 }

@@ -449,6 +449,23 @@ mod tests {
     }
 
     #[test]
+    fn a_url_whose_scheme_falls_just_before_the_cut_keeps_its_password_hidden() {
+        // The URL's `https://` ends right where a cut to the last TAIL_LIMIT bytes would
+        // start, so a tail cut first and hidden after would begin `u:s3cret@...`.
+        let after = "u:s3cret@example.com/r.git\n";
+        let end = "more output\n";
+        let padding = "y".repeat(TAIL_LIMIT - after.len() - end.len());
+        let filler = "x".repeat(TAIL_LIMIT);
+        let fetched = format!("{filler}\nfatal: https://{after}{padding}{end}");
+        assert_eq!(&fetched[fetched.len() - TAIL_LIMIT..][..after.len()], after);
+        let shown = shown_tail(&fetched);
+        assert!(!shown.contains("s3cret"), "{}", &shown[..80]);
+        assert!(shown.len() <= TAIL_LIMIT);
+        assert!(shown.ends_with("more output\n"));
+        assert_eq!(shown_tail("short\n"), "short\n");
+    }
+
+    #[test]
     fn a_tail_is_cut_to_its_last_bytes_on_a_character_boundary() {
         let text = format!("é{}", "x".repeat(10));
         assert_eq!(last_bytes(&text, 11), "x".repeat(10));

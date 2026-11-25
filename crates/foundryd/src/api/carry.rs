@@ -237,14 +237,14 @@ mod tests {
         ));
         for action in ["session", "end"] {
             let path = format!("/api/workspaces/{id}/factory/{action}");
-            assert!(matches!(target(&path), Some(Target::Workspace(w)) if w.0 == id));
+            assert!(matches!(target(&path), Some(Target::FactoryWorkspace(w)) if w.0 == id));
         }
         for action in ["message", "turn"] {
             let path = format!("/api/sessions/{id}/factory/{action}");
             assert!(matches!(target(&path), Some(Target::Session(s)) if s.0 == id));
         }
         let path = format!("/api/terminals/{id}/tail");
-        assert!(matches!(target(&path), Some(Target::Terminal(t)) if t.0 == id));
+        assert!(matches!(target(&path), Some(Target::Tail(t)) if t.0 == id));
         for other in [
             "/api/state".to_owned(),
             format!("/api/workspaces/{id}/changes"),
@@ -262,6 +262,32 @@ mod tests {
             format!("/api/terminals/{id}/tail/more"),
         ] {
             assert!(target(&other).is_none(), "{other}");
+        }
+    }
+
+    #[test]
+    fn the_worker_routes_are_carried_only_by_a_run_and_p1_routes_by_this_layer() {
+        let id = uuid::Uuid::new_v4();
+        let workers = [
+            "/api/factory/workspaces".to_owned(),
+            format!("/api/workspaces/{id}/factory/session"),
+            format!("/api/workspaces/{id}/factory/end"),
+            format!("/api/sessions/{id}/factory/message"),
+            format!("/api/sessions/{id}/factory/turn"),
+            format!("/api/terminals/{id}/tail"),
+        ];
+        for path in &workers {
+            assert!(carries(path), "{path} is taken from a peer");
+            assert!(target(path).unwrap().is_worker(), "{path}");
+        }
+        for path in [
+            "/api/workspaces".to_owned(),
+            format!("/api/workspaces/{id}/sessions"),
+            format!("/api/workspaces/{id}/shells"),
+            format!("/api/workspaces/{id}/archive"),
+            format!("/api/terminals/{id}/close"),
+        ] {
+            assert!(!target(&path).unwrap().is_worker(), "{path}");
         }
     }
 }
