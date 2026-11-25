@@ -2838,6 +2838,8 @@ async fn a_factory_edit_is_refused_with_the_reason_while_the_acting_machine_spea
     // still acting, and its first copy there holds an edit it numbered. Once that copy is
     // taken, a factory edit goes to it. Until then the daemon still reads protocol 4 for it
     // and refuses the edit (`Coordinator::uncarried`), so the test waits for the copy.
+    // `take_settings` records the protocol before it stores the copy, so holding project 9
+    // means the daemon reads protocol 5 for it.
     beat.abort();
     drop(conn);
     let (conn, said) = recorded(raw_link(daemon, older).await);
