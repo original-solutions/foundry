@@ -375,6 +375,36 @@ pub(super) fn live_workspaces(ctx: &RunContext<'_>, run: &RunId, events: &[RunEv
     found
 }
 
+/// The public reason of a run a person took `factory:building` off.
+pub const LABEL_REMOVED: &str = "a person removed factory:building from the issue";
+
+/// The public reason of a run a person assigned someone else on.
+pub const ASSIGNEE_CHANGED: &str = "a person assigned someone else to the issue";
+
+/// What one pass of [`reconcile`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconcileStep {
+    /// Nothing to do, nothing written.
+    Unchanged,
+    /// Not a run this step judges: nothing written.
+    Skipped { why: &'static str },
+    /// The run went stuck; `reason` is the public reason.
+    Stopped { reason: String },
+    /// The run's pull request was merged or closed, or its own merge closed its issue.
+    Ended,
+    /// A person closed the issue.
+    Abandoned,
+    /// Workspaces of a finished run were archived by force.
+    Archived { workspaces: Vec<WorkspaceId> },
+    /// A machine does not answer yet: nothing is finished, and the next pass asks again.
+    Waiting { workspaces: Vec<WorkspaceId> },
+}
+
+/// What a person's move and the end of a run mean for it: see the module's words.
+pub fn reconcile(_ctx: &RunContext<'_>, _run: &RunId) -> Result<ReconcileStep, RunError> {
+    todo!()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1042,6 +1072,1119 @@ mod tests {
             assert!(matches!(error, RunError::LeaseLost(_)), "{error}");
             assert_eq!(rig.events(&run).len(), events);
             assert!(calls(&rig).is_empty());
+        }
+    }
+
+    // ----- the runner's `watch`, and what a person's move and the end of a run mean -----
+
+    mod reconcile_a_run {
+        use super::*;
+        use crate::factory::messages::{
+            CANNOT_CONFIRM, CANNOT_VERIFY_DURING_BUILD, CHANGED_DURING_BUILD,
+        };
+        use crate::factory::runs::testing::approval_answer;
+
+        const URL12: &str = "https://github.com/rawphp/softfac/pull/12";
+        const FEEDBACK_WS: &str = "00000000-0000-0000-0000-000000000f11";
+
+        fn pass(rig: &Rig, run: &RunId) -> ReconcileStep {
+            reconcile(&rig.ctx(), run).unwrap()
+        }
+
+        fn building_run() -> (Rig, RunId) {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            built(&mut rig, &run);
+            (rig, run)
+        }
+
+        fn pr_opened() -> Event {
+            Event::PrOpened {
+                pr: 12,
+                url: URL12.into(),
+            }
+        }
+
+        fn pull(state: &'static str) -> SimPull {
+            SimPull {
+                state,
+                draft: true,
+                head: BRANCH.into(),
+                base: "main".into(),
+                cross: false,
+            }
+        }
+
+        fn fws() -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(0xf11))
+        }
+
+        /// A run the gate passed: `pr-open`, its pull request open, its build workspace archived.
+        fn pr_open_run() -> (Rig, RunId) {
+            let (mut rig, run) = building_run();
+            rig.write(&run, pr_opened());
+            rig.moved(&run, State::Building, State::PrOpen);
+            rig.sim.set_labels(&["factory:pr-open"]);
+            rig.sim.set_assignees(&[]);
+            rig.sim.set_pull(12, pull("OPEN"));
+            rig.view = FleetView::builder().online(rig.machine).build();
+            (rig, run)
+        }
+
+        /// A `pr-open` run whose pull request GitHub does not have.
+        fn pr_open_run_without_its_pull_request() -> (Rig, RunId) {
+            let (mut rig, run) = (Rig::new(), run_id(1));
+            built(&mut rig, &run);
+            rig.write(&run, pr_opened());
+            rig.moved(&run, State::Building, State::PrOpen);
+            rig.sim.set_labels(&["factory:pr-open"]);
+            rig.sim.set_assignees(&[]);
+            rig.view = FleetView::builder().online(rig.machine).build();
+            (rig, run)
+        }
+
+        /// The fleet shows a feedback round's workspace, which that round's session is in.
+        fn with_feedback_workspace(rig: &mut Rig, span: Option<Duration>) {
+            let builder =
+                FleetView::builder().workspace(workspace_record(rig.machine, fws(), "fac/8-1-f1"));
+            rig.view = match span {
+                Some(span) => builder.unreachable(rig.machine, span).build(),
+                None => builder.online(rig.machine).build(),
+            };
+        }
+
+        fn stranger_edited() -> String {
+            approval_answer(
+                "2026-10-04T12:00:00Z",
+                "tom",
+                &[("2026-10-04T10:30:00Z", "mallory")],
+            )
+        }
+
+        fn history_that_cannot_be_judged() -> String {
+            let times: Vec<String> = (0..100)
+                .map(|i| format!("2026-10-04T10:{:02}:{:02}Z", 1 + i / 60, i % 60))
+                .collect();
+            let edits: Vec<(&str, &str)> = times.iter().map(|t| (t.as_str(), "tom")).collect();
+            approval_answer(LABELED_AT, "tom", &edits)
+        }
+
+        fn text_reads(rig: &Rig) -> usize {
+            rig.sim
+                .calls()
+                .iter()
+                .filter(|call| {
+                    call.first().is_some_and(|a| a == "api")
+                        && call.get(1).is_some_and(|a| a == "graphql")
+                })
+                .count()
+        }
+
+        fn issue_reads(rig: &Rig) -> usize {
+            rig.sim
+                .calls()
+                .iter()
+                .filter(|call| {
+                    call.first().is_some_and(|a| a == "issue")
+                        && call.get(1).is_some_and(|a| a == "view")
+                        && call.iter().any(|a| a.contains("title"))
+                })
+                .count()
+        }
+
+        fn steps_starting(rig: &Rig, run: &RunId, prefix: &str) -> Vec<String> {
+            rig.steps(run)
+                .into_iter()
+                .filter(|step| step.starts_with(prefix))
+                .collect()
+        }
+
+        fn nothing_asked(rig: &Rig) {
+            assert!(calls(rig).is_empty(), "{:?}", calls(rig));
+            assert!(rig.sim.writes().is_empty(), "{:?}", rig.sim.writes());
+        }
+
+        // ----- the runner's `watch` -----
+
+        mod watch {
+            use super::*;
+
+            #[test]
+            fn leaves_a_run_alone_when_the_text_is_unchanged_since_the_approval() {
+                let (rig, run) = building_run();
+                let events = rig.events(&run).len();
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                assert_eq!(text_reads(&rig), 1);
+                nothing_asked(&rig);
+                assert_eq!(rig.events(&run).len(), events);
+                // And again: the same read each pass, never a step that says it passed.
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                assert_eq!(text_reads(&rig), 2);
+                assert_eq!(rig.events(&run).len(), events);
+            }
+
+            #[test]
+            fn checks_since_the_approval_the_ledger_records() {
+                // An edit by a stranger at 13:00 is after an approval at 12:34 and before none.
+                let (rig, run) = building_run_approved_at("2026-10-04T12:34:56Z");
+                rig.sim.set_approval(approval_answer(
+                    LABELED_AT,
+                    "tom",
+                    &[("2026-10-04T10:30:00Z", "mallory")],
+                ));
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                rig.sim.set_approval(approval_answer(
+                    LABELED_AT,
+                    "tom",
+                    &[("2026-10-04T13:00:00Z", "mallory")],
+                ));
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Stopped {
+                        reason: CHANGED_DURING_BUILD.into()
+                    }
+                );
+            }
+
+            fn building_run_approved_at(at: &str) -> (Rig, RunId) {
+                let (mut rig, run) = (Rig::new(), run_id(1));
+                rig.step(&run, &format!("approved {at}"));
+                rig.write(
+                    &run,
+                    Event::Claimed {
+                        machine: rig.machine.to_string(),
+                        github_user: LOGIN.into(),
+                    },
+                );
+                rig.moved(&run, State::Ready, State::Triage);
+                rig.step(&run, &format!("workspace-created {WS}"));
+                rig.step(&run, "approval-rechecked");
+                rig.write(&run, launched());
+                rig.moved(&run, State::Triage, State::Building);
+                rig.sim.set_labels(&["factory:building"]);
+                rig.sim.set_assignees(&[LOGIN]);
+                rig.view = fleet(&rig);
+                (rig, run)
+            }
+
+            fn launched() -> Event {
+                Event::SessionLaunched {
+                    thread_id: SESSION.into(),
+                    worktree: Some(WS.into()),
+                    branch: Some(BRANCH.into()),
+                    model_instance: None,
+                    model: Some("opus".into()),
+                    model_options: None,
+                    resumed_from: None,
+                    base: Some("main".into()),
+                    title: Some("Make it faster".into()),
+                }
+            }
+
+            fn assert_stopped_for(rig: &Rig, run: &RunId, code: &str, reason: &str) {
+                assert_eq!(
+                    pass(rig, run),
+                    ReconcileStep::Stopped {
+                        reason: reason.into()
+                    }
+                );
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                assert_eq!(rig.sim.assignees(), Vec::<String>::new());
+                assert_eq!(stuck_comments(rig), 1);
+                assert!(rig.sim.comments().iter().any(|c| c.contains(reason)));
+                // The session is ended and the workspace kept.
+                assert_eq!(calls(rig), vec![Call::EndSessions { workspace: ws() }]);
+                assert!(rig.finished(run));
+                let causes: Vec<_> = rig
+                    .events(run)
+                    .into_iter()
+                    .filter(|e| ["stuck", "state_changed", "finished"].contains(&e.event.as_str()))
+                    .skip(2)
+                    .map(|e| e.cause.unwrap())
+                    .collect();
+                assert_eq!(causes.len(), 3);
+                assert!(causes.iter().all(
+                    |cause| cause == &serde_json::json!({"step": "watch", "reason": code})
+                ));
+            }
+
+            #[test]
+            fn stops_a_run_whose_text_someone_else_changed() {
+                let (rig, run) = building_run();
+                rig.sim.set_approval(stranger_edited());
+                assert_stopped_for(
+                    &rig,
+                    &run,
+                    "text-changed-during-build",
+                    CHANGED_DURING_BUILD,
+                );
+            }
+
+            #[test]
+            fn stops_a_run_whose_history_cannot_be_judged_without_blaming_anyone() {
+                let (rig, run) = building_run();
+                rig.sim.set_approval(history_that_cannot_be_judged());
+                assert_stopped_for(&rig, &run, "edits-unverifiable", CANNOT_VERIFY_DURING_BUILD);
+                assert!(!rig.sim.comments().iter().any(|c| c.contains("mallory")));
+            }
+
+            #[test]
+            fn finishes_a_stopped_run_and_nothing_polls_it_again() {
+                let (rig, run) = building_run();
+                rig.sim.set_approval(stranger_edited());
+                pass(&rig, &run);
+                let reads = text_reads(&rig);
+                let asked = calls(&rig).len();
+                // The workspace is kept while the issue is `factory:stuck`: the issue is read, the
+                // text is not, and nothing is asked of the worker.
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                assert_eq!(text_reads(&rig), reads);
+                assert_eq!(calls(&rig).len(), asked);
+                assert_eq!(
+                    advance(&rig.ctx(), &run).unwrap(),
+                    StopStep::Skipped { why: "finished" }
+                );
+            }
+
+            #[test]
+            fn leaves_the_draft_pull_request_open_and_does_not_mark_it_ready() {
+                let (rig, run) = building_run();
+                rig.write(&run, pr_opened());
+                rig.sim.set_pull(12, pull("OPEN"));
+                rig.sim.set_approval(stranger_edited());
+                assert!(matches!(pass(&rig, &run), ReconcileStep::Stopped { .. }));
+                assert!(
+                    !rig.sim
+                        .calls()
+                        .iter()
+                        .any(|call| call.first().is_some_and(|a| a == "pr")
+                            && call.get(1).is_some_and(|a| a == "ready"))
+                );
+            }
+
+            #[test]
+            fn does_nothing_for_a_run_that_has_no_session_or_is_not_building() {
+                let questions = Event::QuestionsPosted {
+                    questions: "1. Which?".into(),
+                };
+                let stuck = Event::Stuck {
+                    reason: "gave up".into(),
+                    branch: None,
+                    commits_ahead: None,
+                };
+                let cases = [
+                    ("no session", "no-session"),
+                    ("triage", "not-building"),
+                    ("needs-info", "not-building"),
+                    ("stuck", "not-building"),
+                    ("half stuck", "not-building"),
+                    ("half needs-info", "not-building"),
+                ];
+                for (name, why) in cases {
+                    let rig = Rig::new();
+                    let run = run_id(1);
+                    let claim = Event::Claimed {
+                        machine: rig.machine.to_string(),
+                        github_user: LOGIN.into(),
+                    };
+                    rig.step(&run, &format!("approved {LABELED_AT}"));
+                    rig.write(&run, claim);
+                    rig.moved(&run, State::Ready, State::Triage);
+                    match name {
+                        "no session" => rig.moved(&run, State::Triage, State::Building),
+                        "triage" => {}
+                        _ => {
+                            rig.write(&run, launched());
+                            rig.moved(&run, State::Triage, State::Building);
+                            match name {
+                                "needs-info" => {
+                                    rig.write(&run, questions.clone());
+                                    rig.moved(&run, State::Building, State::NeedsInfo);
+                                }
+                                "stuck" => {
+                                    rig.write(&run, stuck.clone());
+                                    rig.moved(&run, State::Building, State::Stuck);
+                                }
+                                "half stuck" => rig.write(&run, stuck.clone()),
+                                _ => rig.write(&run, questions.clone()),
+                            }
+                        }
+                    }
+                    rig.sim.set_approval(stranger_edited());
+                    let events = rig.events(&run).len();
+                    assert_eq!(pass(&rig, &run), ReconcileStep::Skipped { why }, "{name}");
+                    assert!(rig.sim.calls().is_empty(), "{name}");
+                    assert!(calls(&rig).is_empty(), "{name}");
+                    assert_eq!(rig.events(&run).len(), events, "{name}");
+                }
+            }
+
+            #[test]
+            fn does_nothing_for_a_run_that_is_finished_and_holds_no_workspace() {
+                let (mut rig, run) = building_run();
+                rig.sim.set_approval(stranger_edited());
+                finish(&rig, &run);
+                rig.view = FleetView::builder().online(rig.machine).build();
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                assert!(rig.sim.calls().is_empty());
+                assert!(calls(&rig).is_empty());
+            }
+
+            #[test]
+            fn is_an_error_never_a_stop_or_a_pass_when_the_text_cannot_be_read() {
+                let (rig, run) = building_run();
+                rig.sim.set_approval(stranger_edited());
+                rig.sim.fail("graphql", 1);
+                let events = rig.events(&run).len();
+                let error = reconcile(&rig.ctx(), &run).unwrap_err();
+                assert!(matches!(error, RunError::Tracker(_)), "{error}");
+                assert!(calls(&rig).is_empty(), "nothing ended");
+                assert_eq!(rig.events(&run).len(), events, "nothing written");
+                assert_eq!(rig.sim.labels(), vec!["factory:building"]);
+                // The next pass reads again and, the text being changed, stops the run.
+                assert!(matches!(pass(&rig, &run), ReconcileStep::Stopped { .. }));
+            }
+
+            #[test]
+            fn is_an_error_with_nothing_written_when_the_archive_fails_and_the_next_pass_retries() {
+                let (rig, run) = building_run();
+                rig.sim.set_approval(stranger_edited());
+                for _ in 0..2 {
+                    rig.worker
+                        .on_end_sessions(Err(crate::factory::worker::WorkerError::Failed(
+                            "refused".into(),
+                        )));
+                }
+                let events = rig.events(&run).len();
+                for pass_number in 1..=2 {
+                    let error = reconcile(&rig.ctx(), &run).unwrap_err();
+                    assert!(matches!(error, RunError::Worker(_)), "{error}");
+                    assert_eq!(rig.events(&run).len(), events, "pass {pass_number}");
+                    assert_eq!(rig.sim.labels(), vec!["factory:building"]);
+                    assert!(rig.sim.writes().is_empty());
+                }
+                assert!(matches!(pass(&rig, &run), ReconcileStep::Stopped { .. }));
+                assert_eq!(stuck_comments(&rig), 1);
+            }
+
+            #[test]
+            fn fails_closed_for_a_run_with_no_approval_step() {
+                let (mut rig, run) = (Rig::new(), run_id(1));
+                rig.write(
+                    &run,
+                    Event::Claimed {
+                        machine: rig.machine.to_string(),
+                        github_user: LOGIN.into(),
+                    },
+                );
+                rig.moved(&run, State::Ready, State::Triage);
+                rig.step(&run, &format!("workspace-created {WS}"));
+                rig.write(&run, launched());
+                rig.moved(&run, State::Triage, State::Building);
+                rig.sim.set_labels(&["factory:building"]);
+                rig.sim.set_assignees(&[LOGIN]);
+                rig.view = fleet(&rig);
+                assert_stopped_for(&rig, &run, "approval-unconfirmed", CANNOT_CONFIRM);
+                // No read: there is no moment to read since.
+                assert_eq!(text_reads(&rig), 0);
+            }
+
+            #[test]
+            fn is_an_error_with_nothing_written_for_a_run_with_no_approval_step_and_a_failing_archive()
+             {
+                let (mut rig, run) = (Rig::new(), run_id(1));
+                rig.write(
+                    &run,
+                    Event::Claimed {
+                        machine: rig.machine.to_string(),
+                        github_user: LOGIN.into(),
+                    },
+                );
+                rig.moved(&run, State::Ready, State::Triage);
+                rig.write(&run, launched());
+                rig.moved(&run, State::Triage, State::Building);
+                rig.view = fleet(&rig);
+                rig.worker
+                    .on_end_sessions(Err(crate::factory::worker::WorkerError::Failed(
+                        "refused".into(),
+                    )));
+                let events = rig.events(&run).len();
+                assert!(reconcile(&rig.ctx(), &run).is_err());
+                assert_eq!(rig.events(&run).len(), events);
+                assert!(rig.sim.calls().is_empty());
+            }
+
+            #[test]
+            fn leaves_a_stopped_run_to_advance() {
+                let (rig, run) = building_run();
+                rig.write(&run, stop_line());
+                rig.sim.set_approval(stranger_edited());
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Skipped {
+                        why: "not-building"
+                    }
+                );
+                assert!(rig.sim.calls().is_empty());
+                assert!(calls(&rig).is_empty());
+            }
+
+            #[test]
+            fn skips_a_run_whose_own_merged_pull_request_closed_the_issue() {
+                let (rig, run) = building_run();
+                rig.write(&run, pr_opened());
+                rig.sim.set_approval(stranger_edited());
+                rig.sim.set_closed(true);
+                rig.sim.set_pull(12, pull("MERGED"));
+                let events = rig.events(&run).len();
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Skipped { why: "pr-merged" }
+                );
+                assert_eq!(rig.events(&run).len(), events);
+                assert!(calls(&rig).is_empty());
+                assert!(rig.sim.writes().is_empty());
+            }
+
+            #[test]
+            fn goes_on_to_stop_a_run_whose_issue_a_person_closed() {
+                let (rig, run) = building_run();
+                rig.write(&run, pr_opened());
+                rig.sim.set_approval(stranger_edited());
+                rig.sim.set_closed(true);
+                rig.sim.set_pull(12, pull("CLOSED"));
+                assert!(matches!(pass(&rig, &run), ReconcileStep::Stopped { .. }));
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+            }
+
+            #[test]
+            fn asks_about_the_issue_only_for_a_run_that_reported_a_pull_request() {
+                let (rig, run) = building_run();
+                rig.sim.set_approval(stranger_edited());
+                rig.sim.set_closed(true);
+                assert!(matches!(pass(&rig, &run), ReconcileStep::Stopped { .. }));
+                assert_eq!(issue_reads(&rig), 0);
+            }
+        }
+
+        // ----- a merged or closed pull request, a closed issue -----
+
+        mod the_end_of_a_run {
+            use super::*;
+
+            fn archive_calls(rig: &Rig) -> Vec<WorkspaceId> {
+                calls(rig)
+                    .into_iter()
+                    .filter_map(|call| match call {
+                        Call::Archive { workspace } => Some(workspace),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            fn outcome(rig: &Rig, run: &RunId) -> serde_json::Value {
+                rig.events(run)
+                    .into_iter()
+                    .find(|e| e.event == "finished")
+                    .unwrap()
+                    .data
+            }
+
+            #[test]
+            fn an_open_pull_request_and_an_open_issue_leave_a_pr_open_run_alone() {
+                let (rig, run) = pr_open_run();
+                let events = rig.events(&run).len();
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                assert_eq!(rig.events(&run).len(), events);
+                assert!(calls(&rig).is_empty());
+                // Not the text, the label or the assignee: only a building run is judged for them.
+                rig.sim.set_labels(&[]);
+                rig.sim.set_assignees(&["mallory"]);
+                rig.sim.set_approval(stranger_edited());
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                assert_eq!(text_reads(&rig), 0);
+            }
+
+            #[test]
+            fn a_merged_pull_request_ends_a_pr_open_run_and_archives_a_feedback_workspace() {
+                let (mut rig, run) = pr_open_run();
+                with_feedback_workspace(&mut rig, None);
+                rig.sim.set_pull(12, pull("MERGED"));
+                assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
+                assert_eq!(archive_calls(&rig), vec![fws()]);
+                assert!(rig.finished(&run));
+                let finished = outcome(&rig, &run);
+                assert_eq!(finished["outcome"], "pr-open");
+                assert_eq!(finished["pr_end"], "merged");
+                assert_eq!(finished["pr_url"], URL12);
+                // Recorded before it was asked, once.
+                assert_eq!(
+                    steps_starting(&rig, &run, "reconcile-"),
+                    vec![
+                        "reconcile-session-ended".to_owned(),
+                        format!("reconcile-archiving {FEEDBACK_WS}"),
+                        format!("reconcile-archived {FEEDBACK_WS}"),
+                    ]
+                );
+                // Nothing is posted: the pull request's merge is the end.
+                assert!(rig.sim.writes().is_empty());
+                // The fleet no longer shows it: nothing more is asked.
+                rig.view = FleetView::builder().online(rig.machine).build();
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                assert_eq!(archive_calls(&rig), vec![fws()]);
+            }
+
+            #[test]
+            fn a_closed_pull_request_ends_a_pr_open_run_as_closed() {
+                let (mut rig, run) = pr_open_run();
+                with_feedback_workspace(&mut rig, None);
+                rig.sim.set_pull(12, pull("CLOSED"));
+                assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
+                assert_eq!(outcome(&rig, &run)["pr_end"], "closed");
+                assert_eq!(archive_calls(&rig), vec![fws()]);
+            }
+
+            #[test]
+            fn a_pull_request_that_is_gone_ends_a_pr_open_run_as_closed() {
+                let (rig, run) = pr_open_run_without_its_pull_request();
+                assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
+                assert_eq!(outcome(&rig, &run)["pr_end"], "closed");
+            }
+
+            #[test]
+            fn a_closed_issue_ends_a_pr_open_run_that_nobody_merged() {
+                let (mut rig, run) = pr_open_run();
+                with_feedback_workspace(&mut rig, None);
+                rig.sim.set_closed(true);
+                assert_eq!(pass(&rig, &run), ReconcileStep::Abandoned);
+                assert_eq!(archive_calls(&rig), vec![fws()]);
+                assert!(rig.finished(&run));
+                assert!(rig.sim.writes().is_empty());
+            }
+
+            #[test]
+            fn a_closed_issue_abandons_a_building_run_and_archives_every_workspace_of_it() {
+                let (mut rig, run) = building_run();
+                let gate = WorkspaceId(uuid::Uuid::from_u128(0x911));
+                let resume = WorkspaceId(uuid::Uuid::from_u128(0x5a1));
+                rig.step(
+                    &run,
+                    &format!("gate-requested 1 1 {SHA} {SHA} {}", rig.machine),
+                );
+                rig.view = FleetView::builder()
+                    .online(rig.machine)
+                    .workspace(workspace_record(rig.machine, ws(), BRANCH))
+                    .workspace(workspace_record(rig.machine, gate, "fac/8-1-g1"))
+                    .workspace(workspace_record(rig.machine, resume, "fac/8-1-r1"))
+                    .build();
+                rig.sim.set_closed(true);
+                // The gate holds the run while it runs: the gate's step decides.
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Skipped {
+                        why: "gate-running"
+                    }
+                );
+                rig.step(&run, "gate-archived 1");
+                assert_eq!(pass(&rig, &run), ReconcileStep::Abandoned);
+                let mut archived = archive_calls(&rig);
+                archived.sort_by_key(|id| id.0);
+                let mut expected = vec![ws(), gate, resume];
+                expected.sort_by_key(|id| id.0);
+                assert_eq!(archived, expected);
+                assert!(rig.finished(&run));
+                assert!(rig.sim.writes().is_empty());
+                // The session was ended once, before the archives.
+                assert_eq!(
+                    calls(&rig).first(),
+                    Some(&Call::EndSessions { workspace: ws() })
+                );
+            }
+
+            #[test]
+            fn the_runs_own_merged_pull_request_that_closed_its_issue_ends_a_building_run() {
+                let (rig, run) = building_run();
+                rig.write(&run, pr_opened());
+                rig.sim.set_closed(true);
+                rig.sim.set_pull(12, pull("MERGED"));
+                assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
+                assert_eq!(outcome(&rig, &run)["pr_end"], "merged");
+                assert_eq!(archive_calls(&rig), vec![ws()]);
+            }
+
+            #[test]
+            fn a_workspace_already_archived_is_not_asked_for_again() {
+                let (mut rig, run) = pr_open_run();
+                with_feedback_workspace(&mut rig, None);
+                rig.sim.set_pull(12, pull("MERGED"));
+                // The archive was asked and answered, and the pass was cut short before the end.
+                rig.step(&run, &format!("reconcile-archiving {FEEDBACK_WS}"));
+                rig.step(&run, &format!("reconcile-archived {FEEDBACK_WS}"));
+                rig.step(&run, "reconcile-session-ended");
+                assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
+                assert!(archive_calls(&rig).is_empty());
+            }
+
+            #[test]
+            fn an_archive_the_worker_calls_not_live_counts_as_done() {
+                let (mut rig, run) = pr_open_run();
+                with_feedback_workspace(&mut rig, None);
+                rig.sim.set_pull(12, pull("MERGED"));
+                rig.worker
+                    .on_archive(Err(crate::factory::worker::WorkerError::Failed(
+                        "workspace is not a live workspace of this machine".into(),
+                    )));
+                assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
+                assert_eq!(steps_starting(&rig, &run, "reconcile-archived").len(), 1);
+            }
+
+            #[test]
+            fn a_machine_unreachable_for_fifteen_minutes_is_left_with_no_call() {
+                let (mut rig, run) = pr_open_run();
+                with_feedback_workspace(
+                    &mut rig,
+                    Some(crate::factory::runs::resume::UNREACHABLE_FOR),
+                );
+                rig.sim.set_pull(12, pull("MERGED"));
+                assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
+                assert!(calls(&rig).is_empty());
+                assert_eq!(
+                    steps_starting(&rig, &run, "reconcile-left"),
+                    vec![format!("reconcile-left {FEEDBACK_WS} its machine is gone")]
+                );
+            }
+
+            #[test]
+            fn a_machine_that_does_not_answer_yet_is_waited_for_and_asked_again() {
+                let (mut rig, run) = pr_open_run();
+                with_feedback_workspace(&mut rig, Some(Duration::from_secs(60)));
+                rig.sim.set_pull(12, pull("MERGED"));
+                rig.worker
+                    .on_archive(Err(crate::factory::worker::WorkerError::Unreachable(
+                        "timed out".into(),
+                    )));
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Waiting {
+                        workspaces: vec![fws()]
+                    }
+                );
+                assert!(!rig.finished(&run));
+                // It is asked again, and the recorded intent is not written twice.
+                assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
+                assert_eq!(archive_calls(&rig), vec![fws(), fws()]);
+                assert_eq!(steps_starting(&rig, &run, "reconcile-archiving").len(), 1);
+            }
+
+            #[test]
+            fn a_lost_lease_ends_nothing_and_archives_nothing() {
+                let (mut rig, run) = pr_open_run();
+                with_feedback_workspace(&mut rig, None);
+                rig.sim.set_pull(12, pull("MERGED"));
+                rig.guard = Box::new(Lost);
+                let error = reconcile(&rig.ctx(), &run).unwrap_err();
+                assert!(matches!(error, RunError::LeaseLost(_)), "{error}");
+                assert!(!rig.finished(&run));
+                assert!(calls(&rig).is_empty());
+            }
+
+            #[test]
+            fn a_tracker_failure_leaves_nothing_half_done_and_the_next_pass_ends_the_run_once() {
+                let (mut rig, run) = pr_open_run();
+                with_feedback_workspace(&mut rig, None);
+                rig.sim.set_pull(12, pull("MERGED"));
+                rig.sim.fail("pr view 12", 1);
+                let events = rig.events(&run).len();
+                let error = reconcile(&rig.ctx(), &run).unwrap_err();
+                assert!(matches!(error, RunError::Tracker(_)), "{error}");
+                assert_eq!(rig.events(&run).len(), events);
+                assert!(calls(&rig).is_empty());
+                assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
+                assert_eq!(
+                    rig.events(&run)
+                        .iter()
+                        .filter(|e| e.event == "finished")
+                        .count(),
+                    1
+                );
+            }
+
+            #[test]
+            fn an_archive_that_fails_in_the_middle_is_carried_on_and_each_is_asked_once() {
+                let (mut rig, run) = pr_open_run();
+                let resume = WorkspaceId(uuid::Uuid::from_u128(0x5a1));
+                rig.view = FleetView::builder()
+                    .online(rig.machine)
+                    .workspace(workspace_record(rig.machine, resume, "fac/8-1-r1"))
+                    .workspace(workspace_record(rig.machine, fws(), "fac/8-1-f1"))
+                    .build();
+                rig.sim.set_pull(12, pull("MERGED"));
+                // The first archive answers, the second is refused.
+                rig.worker.on_archive(Ok(()));
+                rig.worker
+                    .on_archive(Err(crate::factory::worker::WorkerError::Failed(
+                        "busy".into(),
+                    )));
+                let error = reconcile(&rig.ctx(), &run).unwrap_err();
+                assert!(matches!(error, RunError::Worker(_)), "{error}");
+                assert!(!rig.finished(&run));
+                assert_eq!(steps_starting(&rig, &run, "reconcile-archived").len(), 1);
+                assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
+                // The one answered is not asked again; the one refused is, once more.
+                assert_eq!(archive_calls(&rig), vec![resume, fws(), fws()]);
+                assert_eq!(steps_starting(&rig, &run, "reconcile-archived").len(), 2);
+                assert_eq!(steps_starting(&rig, &run, "reconcile-archiving").len(), 2);
+            }
+        }
+
+        // ----- a person's edit, a removed label, an assignee -----
+
+        mod a_persons_move {
+            use super::*;
+
+            fn stopped(rig: &Rig, run: &RunId, reason: &str) {
+                assert_eq!(
+                    pass(rig, run),
+                    ReconcileStep::Stopped {
+                        reason: reason.into()
+                    }
+                );
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                assert!(rig.finished(run));
+                // The session is ended and the workspace kept.
+                assert_eq!(calls(rig), vec![Call::EndSessions { workspace: ws() }]);
+                assert_eq!(stuck_comments(rig), 1);
+                assert!(rig.sim.comments().iter().any(|c| c.contains(reason)));
+            }
+
+            #[test]
+            fn a_removed_label_stops_a_building_run() {
+                let (rig, run) = building_run();
+                rig.sim.set_labels(&["bug"]);
+                stopped(&rig, &run, LABEL_REMOVED);
+                assert!(!LABEL_REMOVED.contains("bug"));
+            }
+
+            #[test]
+            fn an_assignee_other_than_the_login_stops_a_building_run() {
+                let (rig, run) = building_run();
+                rig.sim.set_assignees(&[LOGIN, "mallory"]);
+                stopped(&rig, &run, ASSIGNEE_CHANGED);
+                assert!(!rig.sim.comments().iter().any(|c| c.contains("mallory")));
+            }
+
+            #[test]
+            fn the_projects_own_login_assigned_is_what_a_claim_leaves() {
+                let (rig, run) = building_run();
+                rig.sim.set_assignees(&["Softfac-Bot"]);
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                // Nobody assigned is not a person's assigning.
+                rig.sim.set_assignees(&[]);
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                assert!(rig.sim.writes().is_empty());
+            }
+
+            #[test]
+            fn a_transition_in_flight_is_not_judged() {
+                type Arrange = fn(&Rig, &RunId);
+                let cases: Vec<(&str, Arrange)> = vec![
+                    ("questions being posted", |rig, run| {
+                        rig.step(run, "questions-commenting 0")
+                    }),
+                    ("questions posted", |rig, run| {
+                        rig.write(
+                            run,
+                            Event::QuestionsPosted {
+                                questions: "1. Which?".into(),
+                            },
+                        )
+                    }),
+                    ("stuck decided by another step", |rig, run| {
+                        rig.step(
+                            run,
+                            "stuck-stop {\"code\":\"session-stuck\",\"stop\":{\"reason\":\"said so\"}}",
+                        )
+                    }),
+                    ("approval withdrawn", |rig, run| {
+                        rig.step(run, "approval-withdrawn")
+                    }),
+                    ("stop requested", |rig, run| rig.write(run, stop_line())),
+                    ("a resume owed", |rig, run| {
+                        rig.write(
+                            run,
+                            Event::SessionInterrupted {
+                                resumes: 1,
+                                relaunch: false,
+                                run_ordinal: None,
+                                branch: Some(BRANCH.into()),
+                                t3_error: None,
+                                ended_in_pass: 1,
+                            },
+                        )
+                    }),
+                    ("a gate pass recorded", |rig, run| {
+                        rig.ledger
+                            .write(
+                                run,
+                                &Event::StepChanged {
+                                    step: format!("gate-passed {SHA} 1"),
+                                },
+                                &Cause::new(CauseStep::Gate, "gate-passed").attempt(1),
+                            )
+                            .unwrap();
+                    }),
+                ];
+                for (name, arrange) in cases {
+                    let (rig, run) = building_run();
+                    arrange(&rig, &run);
+                    // The label moves as the transition does, and someone else is assigned.
+                    rig.sim.set_labels(&["factory:pr-open"]);
+                    rig.sim.set_assignees(&["mallory"]);
+                    let events = rig.events(&run).len();
+                    let step = pass(&rig, &run);
+                    assert!(
+                        matches!(
+                            step,
+                            ReconcileStep::Skipped { .. } | ReconcileStep::Unchanged
+                        ),
+                        "{name}: {step:?}"
+                    );
+                    assert!(!rig.finished(&run), "{name}");
+                    assert_eq!(rig.events(&run).len(), events, "{name}");
+                    assert!(calls(&rig).is_empty(), "{name}");
+                    assert!(rig.sim.writes().is_empty(), "{name}");
+                }
+            }
+
+            #[test]
+            fn a_run_in_triage_is_not_judged_for_its_label_or_assignee() {
+                let rig = Rig::new();
+                let run = run_id(1);
+                rig.step(&run, &format!("approved {LABELED_AT}"));
+                rig.write(
+                    &run,
+                    Event::Claimed {
+                        machine: rig.machine.to_string(),
+                        github_user: LOGIN.into(),
+                    },
+                );
+                rig.moved(&run, State::Ready, State::Triage);
+                rig.sim.set_labels(&["factory:triage"]);
+                rig.sim.set_assignees(&["mallory"]);
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Skipped {
+                        why: "not-building"
+                    }
+                );
+                assert!(rig.sim.calls().is_empty());
+            }
+
+            #[test]
+            fn a_closed_issue_is_a_closing_and_not_a_removed_label() {
+                let (rig, run) = building_run();
+                rig.sim.set_labels(&[]);
+                rig.sim.set_closed(true);
+                assert_eq!(pass(&rig, &run), ReconcileStep::Abandoned);
+                assert!(rig.sim.writes().is_empty());
+            }
+
+            #[test]
+            fn a_stop_cut_short_is_finished_once_from_the_ledger() {
+                let (rig, run) = building_run();
+                rig.sim.set_labels(&["bug"]);
+                rig.sim.fail("could not finish this issue", 1);
+                assert!(reconcile(&rig.ctx(), &run).is_err());
+                assert!(!rig.finished(&run));
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Stopped {
+                        reason: LABEL_REMOVED.into()
+                    }
+                );
+                assert_eq!(stuck_comments(&rig), 1);
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                assert_eq!(
+                    rig.events(&run)
+                        .iter()
+                        .filter(|e| e.event == "finished")
+                        .count(),
+                    1
+                );
+            }
+
+            #[test]
+            fn a_failed_read_of_the_issue_is_an_error_with_nothing_written() {
+                let (rig, run) = building_run();
+                rig.sim.set_labels(&["bug"]);
+                rig.sim.fail("title", 1);
+                let events = rig.events(&run).len();
+                assert!(reconcile(&rig.ctx(), &run).is_err());
+                assert_eq!(rig.events(&run).len(), events);
+                assert!(calls(&rig).is_empty());
+                assert!(rig.sim.writes().is_empty());
+            }
+
+            #[test]
+            fn a_lost_lease_stops_nothing() {
+                let (mut rig, run) = building_run();
+                rig.sim.set_labels(&["bug"]);
+                rig.guard = Box::new(Lost);
+                let error = reconcile(&rig.ctx(), &run).unwrap_err();
+                assert!(matches!(error, RunError::LeaseLost(_)), "{error}");
+                assert!(!rig.finished(&run));
+                assert!(calls(&rig).is_empty());
+            }
+        }
+
+        // ----- a stuck run's workspace is kept until the issue leaves `stuck` -----
+
+        mod a_stuck_runs_workspace {
+            use super::*;
+
+            fn stuck_run() -> (Rig, RunId) {
+                let (rig, run) = building_run();
+                rig.write(&run, stop_line());
+                advance(&rig.ctx(), &run).unwrap();
+                assert!(rig.finished(&run));
+                rig.worker.on_archive(Ok(()));
+                (rig, run)
+            }
+
+            fn archives(rig: &Rig) -> usize {
+                calls(rig)
+                    .iter()
+                    .filter(|call| matches!(call, Call::Archive { .. }))
+                    .count()
+            }
+
+            #[test]
+            fn is_kept_while_the_issue_is_labelled_stuck() {
+                let (rig, run) = stuck_run();
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                for _ in 0..3 {
+                    assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                }
+                assert_eq!(archives(&rig), 0);
+            }
+
+            #[test]
+            fn is_archived_by_force_once_the_label_leaves() {
+                let (mut rig, run) = stuck_run();
+                let events = rig.events(&run).len();
+                rig.sim.set_labels(&["factory:ready"]);
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Archived {
+                        workspaces: vec![ws()]
+                    }
+                );
+                assert_eq!(archives(&rig), 1);
+                // The ledger of a finished run takes no line.
+                assert_eq!(rig.events(&run).len(), events);
+                // The fleet no longer shows it: nothing is asked and the issue is not read.
+                rig.view = FleetView::builder().online(rig.machine).build();
+                let reads = issue_reads(&rig);
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                assert_eq!(archives(&rig), 1);
+                assert_eq!(issue_reads(&rig), reads);
+            }
+
+            #[test]
+            fn is_archived_once_the_issue_is_closed() {
+                let (rig, run) = stuck_run();
+                rig.sim.set_closed(true);
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Archived {
+                        workspaces: vec![ws()]
+                    }
+                );
+            }
+
+            #[test]
+            fn is_archived_when_the_issue_is_gone() {
+                use crate::factory::github::{Answer, FakeTracker, Hiding};
+                let (rig, run) = stuck_run();
+                let gone = Hiding::new(
+                    std::sync::Arc::new(FakeTracker::answering([Answer::fail(
+                        1,
+                        "HTTP 404: Not Found",
+                    )])),
+                    std::sync::Arc::new(|text: &str| text.to_owned()),
+                );
+                let ctx = RunContext {
+                    tracker: &gone,
+                    ..rig.ctx()
+                };
+                assert_eq!(
+                    reconcile(&ctx, &run).unwrap(),
+                    ReconcileStep::Archived {
+                        workspaces: vec![ws()]
+                    }
+                );
+            }
+
+            #[test]
+            fn a_refused_read_of_the_issue_is_an_error_and_keeps_it() {
+                let (rig, run) = stuck_run();
+                rig.sim.refuse("issue view");
+                assert!(reconcile(&rig.ctx(), &run).is_err());
+                assert_eq!(archives(&rig), 0);
+            }
+
+            #[test]
+            fn a_failed_read_of_the_issue_keeps_it() {
+                let (rig, run) = stuck_run();
+                rig.sim.set_labels(&["factory:ready"]);
+                rig.sim.fail("title", 1);
+                assert!(reconcile(&rig.ctx(), &run).is_err());
+                assert_eq!(archives(&rig), 0);
+                assert!(matches!(pass(&rig, &run), ReconcileStep::Archived { .. }));
+            }
+
+            #[test]
+            fn is_not_asked_of_a_machine_given_up_on_and_waits_for_one_that_does_not_answer() {
+                let (mut rig, run) = stuck_run();
+                rig.sim.set_labels(&["factory:ready"]);
+                rig.view = cut_off(&rig, crate::factory::runs::resume::UNREACHABLE_FOR);
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                assert_eq!(archives(&rig), 0);
+                rig.view = cut_off(&rig, Duration::from_secs(60));
+                rig.worker
+                    .on_archive(Err(crate::factory::worker::WorkerError::Unreachable(
+                        "timed out".into(),
+                    )));
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Waiting {
+                        workspaces: vec![ws()]
+                    }
+                );
+            }
+
+            #[test]
+            fn a_run_ended_by_closing_its_issue_is_not_a_kept_stuck_run() {
+                let (rig, run) = building_run();
+                rig.sim.set_closed(true);
+                assert_eq!(pass(&rig, &run), ReconcileStep::Abandoned);
+                // The workspace is archived with the run, and nothing is left to sweep.
+                assert_eq!(archives(&rig), 1);
+            }
+
+            #[test]
+            fn a_finished_run_that_did_not_go_stuck_has_its_leftovers_archived() {
+                let (mut rig, run) = pr_open_run();
+                with_feedback_workspace(&mut rig, None);
+                finish(&rig, &run);
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Archived {
+                        workspaces: vec![fws()]
+                    }
+                );
+                assert_eq!(rig.sim.calls().len(), 0, "no read of GitHub for it");
+            }
         }
     }
 }
