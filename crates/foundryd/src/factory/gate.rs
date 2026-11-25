@@ -866,6 +866,70 @@ mod tests {
             let exited = Some((TerminalState::Exited, Some(1)));
             assert_eq!(could_not_run(None, Duration::ZERO, exited), None);
         }
+
+        /// What the real setup script, `SETUP_LIMITED` in `workspaces/mod.rs`, prints when
+        /// `/bin/sh` runs `commands` with it, each stopped past [`COMMAND_LIMIT`] as a gate's
+        /// are, with its error output folded in as in a terminal, and the code it exits with.
+        /// `stub` is shell code run before the script, in the script's own shell.
+        fn run_setup(stub: &str, commands: &[&str]) -> (String, i32) {
+            let script = format!("exec 2>&1\n{stub}\n{}", crate::workspaces::setup_limited());
+            let ran = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .arg("setup")
+                .arg(COMMAND_LIMIT.as_secs().to_string())
+                .args(commands)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let tail = String::from_utf8(ran.stdout).unwrap();
+            let code = ran.status.code().unwrap();
+            (tail, code)
+        }
+
+        #[test]
+        fn the_real_setup_s_line_for_a_command_that_exits_non_zero_names_it_and_its_code() {
+            let commands = ["echo fine", "echo boom; exit 3", "echo never"];
+            let (tail, code) = run_setup("", &commands);
+            assert_eq!(code, 3, "{tail:?}");
+            let GateResult::Failed {
+                command,
+                how,
+                output,
+            } = result(TerminalState::Exited, Some(code), &tail, &strs(&commands))
+            else {
+                panic!("not a failure: {tail:?}");
+            };
+            assert_eq!(
+                (command.as_deref(), how.as_str()),
+                (Some("echo boom; exit 3"), "exit code 3"),
+                "{tail:?}"
+            );
+            // The command's own output comes first. Some shells, such as macOS's `/bin/sh`, add
+            // a line of their own when the stopped watcher is reaped, so the rest is not asserted.
+            assert!(output.starts_with("boom\n"), "{tail:?}");
+        }
+
+        #[test]
+        fn the_real_setup_s_line_for_a_command_past_its_limit_names_it_and_the_limit() {
+            // `sleep` in the script's own shell returns at once, so its watcher stops the command
+            // now, not 30 minutes from now. The command runs in a shell of its own, with the
+            // real `sleep`.
+            let commands = ["sleep 3187"];
+            let (tail, code) = run_setup("sleep() { :; }", &commands);
+            assert_eq!(code, TIMED_OUT, "{tail:?}");
+            // Its output is not asserted: some shells print a line of their own for the kill.
+            let GateResult::Failed { command, how, .. } =
+                result(TerminalState::Exited, Some(code), &tail, &strs(&commands))
+            else {
+                panic!("not a failure: {tail:?}");
+            };
+            assert_eq!(
+                (command.as_deref(), how.as_str()),
+                (Some("sleep 3187"), RAN_TOO_LONG),
+                "{tail:?}"
+            );
+        }
     }
 
     mod could_not_run {
