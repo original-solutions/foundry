@@ -1582,6 +1582,114 @@ mod tests {
     mod going_stuck {
         use super::*;
 
+        /// The stuck comment is posted after its intent is recorded: a post whose answer was
+        /// lost (the comment may be on the issue) is not posted twice.
+        #[test]
+        fn the_stuck_comment_is_recorded_as_intended_before_it_is_posted() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            let steps = rig.steps(&run);
+            assert!(steps.contains(&"stuck-commenting".to_string()), "{steps:?}");
+            let names = rig.names(&run);
+            let intent = names.iter().rposition(|n| n == "step_changed").unwrap();
+            let stuck = names.iter().position(|n| n == "stuck").unwrap();
+            assert!(intent < stuck);
+        }
+
+        #[test]
+        fn a_stuck_comment_intended_and_already_the_newest_is_not_posted_again() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.step(&run, "stuck-commenting");
+            let said = messages::stuck(&stuck_stop().reason, None, None);
+            rig.tracker.post_comment(REPO, ISSUE, &said).unwrap();
+            let before = rig.sim.comments().len();
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            let posted = rig
+                .sim
+                .comments()
+                .iter()
+                .filter(|c| c.contains("Reason: the session said stuck"))
+                .count();
+            assert_eq!(posted, 1);
+            assert!(rig.sim.comments().len() <= before + 1, "only the status comment");
+            assert!(rig.names(&run).contains(&"stuck".to_string()));
+            assert!(rig.finished(&run));
+        }
+
+        #[test]
+        fn a_stuck_comment_intended_and_not_on_the_issue_is_posted() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.step(&run, "stuck-commenting");
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            let posted = rig
+                .sim
+                .comments()
+                .iter()
+                .filter(|c| c.contains("Reason: the session said stuck"))
+                .count();
+            assert_eq!(posted, 1);
+        }
+
+        #[test]
+        fn the_questions_comment_intended_and_already_the_newest_is_not_posted_again() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.step(&run, "questions-commenting");
+            rig.tracker
+                .post_comment(REPO, ISSUE, &messages::questions("which one?"))
+                .unwrap();
+            let mut at = progress(&rig, &run, State::Building);
+            apply_actions(
+                &rig.ctx(),
+                ISSUE,
+                &mut at,
+                &[Action::PostQuestions {
+                    questions: "which one?".into(),
+                }],
+                &Cause::new(CauseStep::Start, "t"),
+                &ActionPayload::default(),
+            )
+            .unwrap();
+            let posted = rig
+                .sim
+                .comments()
+                .iter()
+                .filter(|c| c.contains("which one?"))
+                .count();
+            assert_eq!(posted, 1);
+            assert!(rig.names(&run).contains(&"questions_posted".to_string()));
+        }
+
+        #[test]
+        fn the_questions_comment_is_recorded_as_intended_before_it_is_posted() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            apply_actions(
+                &rig.ctx(),
+                ISSUE,
+                &mut at,
+                &[Action::PostQuestions {
+                    questions: "which one?".into(),
+                }],
+                &Cause::new(CauseStep::Start, "t"),
+                &ActionPayload::default(),
+            )
+            .unwrap();
+            assert!(rig.steps(&run).contains(&"questions-commenting".to_string()));
+        }
+
         #[test]
         fn ends_the_session_posts_the_reason_labels_releases_and_finishes() {
             let rig = Rig::new();
