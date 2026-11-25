@@ -2026,6 +2026,37 @@ mod tests {
             assert!(rig.steps(&run).contains(&GATE_RESULTS_POSTED.to_string()));
         }
 
+        /// A lookalike of the gate results by another login on the pull request, posted after
+        /// the intent, does not stand in for the factory's own.
+        #[test]
+        fn gate_results_pasted_by_another_login_are_still_posted() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let payload = ActionPayload {
+                comment: Some("gate passed".into()),
+                ..ActionPayload::default()
+            };
+            let actions = [Action::PostGateResults { pr: 12 }];
+            rig.sim.fail("pr comment", 1);
+            let mut at = progress(&rig, &run, State::Building);
+            assert!(
+                apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).is_err()
+            );
+            rig.sim
+                .comment_as("mallory", &as_posted(&rig.ctx(), "gate passed"));
+            let mut at = progress(&rig, &run, State::Building);
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            let posted = rig
+                .sim
+                .writes()
+                .into_iter()
+                .filter(|w| w.starts_with("pr comment 12"))
+                .count();
+            assert_eq!(posted, 2, "the failed post and the one after it");
+            assert!(rig.steps(&run).contains(&GATE_RESULTS_POSTED.to_string()));
+        }
+
         /// The intent names the newest marked comment of the login on the pull request, so a
         /// later pass looks only at comments newer than it.
         #[test]
@@ -2898,6 +2929,43 @@ mod tests {
                 .count();
             assert_eq!(posted, 2);
             assert!(rig.names(&run).contains(&"questions_posted".to_string()));
+        }
+
+        /// Anyone can paste the factory's marker: a lookalike of the stuck or questions comment
+        /// by another login, posted after the intent, does not stand in for the factory's own.
+        #[test]
+        fn a_lookalike_by_another_login_does_not_stand_in_for_the_factorys_comment() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let questions = messages::questions("which one?");
+            rig.sim.fail("issue comment", 1);
+            assert!(ask(&rig, &run).is_err());
+            rig.sim
+                .comment_as("mallory", &as_posted(&rig.ctx(), &questions));
+            ask(&rig, &run).unwrap();
+            let asked = rig
+                .sim
+                .comments()
+                .iter()
+                .filter(|c| c.contains("which one?"))
+                .count();
+            assert_eq!(asked, 2, "mallory's and the factory's");
+            let stuck = messages::stuck(&stuck_stop().reason, None, None);
+            rig.sim.fail("issue comment", 1);
+            let mut at = progress(&rig, &run, State::Building);
+            assert!(go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).is_err());
+            rig.sim
+                .comment_as("mallory", &as_posted(&rig.ctx(), &stuck));
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            let posted = rig
+                .sim
+                .comments()
+                .iter()
+                .filter(|c| c.contains("Reason: the session said stuck"))
+                .count();
+            assert_eq!(posted, 2, "mallory's and the factory's");
         }
 
         /// The stuck and questions intents name the newest marked comment of the login on the

@@ -1983,6 +1983,31 @@ mod tests {
             assert_eq!(rig.sim.comments().len(), 1);
         }
 
+        /// Anyone can paste the factory's marker: the refusal's words posted by another login
+        /// do not stand in for the factory's explanation.
+        #[test]
+        fn a_refusal_pasted_by_another_login_is_still_explained() {
+            let posted = {
+                let rig = Rig::new();
+                rig.sim
+                    .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
+                claim_it(&rig).unwrap();
+                rig.sim.comments().remove(0)
+            };
+            let rig = Rig::new();
+            rig.sim
+                .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
+            rig.sim.comment_as("mallory", &posted);
+            claim_it(&rig).unwrap();
+            let explained = rig
+                .sim
+                .comments()
+                .iter()
+                .filter(|c| c.contains("did not start on this issue"))
+                .count();
+            assert_eq!(explained, 2, "mallory's and the factory's");
+        }
+
         /// A refusal that is explained again after the instructor applied the label again: the
         /// label event is newer than the comment.
         #[test]
