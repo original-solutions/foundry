@@ -4,11 +4,13 @@
 //! head commit with no branch. Its setup is the default branch's `provision` and then `gate`,
 //! each command stopped after 30 minutes, so a pull request cannot change what gates it: the
 //! commands come from the config the caller gives, never from the worktree. The setup
-//! terminal's exit code is the gate's result, and its tail says which command failed.
+//! terminal's exit code is the gate's result. Its tail, which the pull request's code writes,
+//! only says which of the gate's commands failed and what it printed.
 //!
 //! A gate that could not run (its create failed, its machine was gone for 5 minutes, or its
-//! setup ended without saying which command failed) is not a gate failure. It is tried again after 1 pass, then 2, 4 and 8; the fifth failure has no
-//! retry. A `provision` that fails in the gate is a gate failure.
+//! setup terminal ended with no exit code) is not a gate failure. It is tried again after 1
+//! pass, then 2, 4 and 8; the fifth failure has no retry. A `provision` that fails in the gate
+//! is a gate failure.
 //!
 //! The wording of the results comment is the runner's `src/gate.ts`, less its merge: the
 //! runner gated the head merged with the base branch's tip, and Foundry's gate checks out the
@@ -81,99 +83,96 @@ pub fn request(
 /// What a gate's setup terminal says about the gate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GateResult {
-    /// It has not exited, or its machine cannot be reached to say.
+    /// No verdict yet: the terminal has not exited, its machine cannot be reached to say, or it
+    /// exited with no exit code. [`could_not_run`] says when the gate could not run.
     Running,
-    /// Every command exited 0.
+    /// The setup exited 0: every command did.
     Passed,
-    /// A `provision` or `gate` command failed: which, how it ended in words and as
-    /// [`messages`](crate::factory::messages) takes it, and its output.
+    /// The setup exited with another code: a `provision` or `gate` command failed. `command`
+    /// is the one of the gate's commands the tail names, empty when it names none; `how` is
+    /// how it ended in words, and `output` what it printed.
     Failed {
         command: String,
         how: String,
-        ended: Ended,
         output: String,
     },
-    /// The setup ended without saying which command failed: with no exit code, as when its
-    /// terminal's holder went away, or without its own last line, as when a signal stopped it.
-    /// The gate could not run, as for [`could_not_run`], and is not a gate failure.
-    Lost { reason: String },
 }
 
-/// The gate's result from its setup terminal's state, exit code and plain-text tail.
+/// The gate's result from its setup terminal's state and exit code, with the failing command
+/// and its output read from the terminal's plain-text tail. `commands` are the ones the gate
+/// ran, the `provision` and `gate` lists [`request`] gave it.
 ///
-/// A terminal that has not exited is running, and so is one whose machine cannot be reached:
-/// [`could_not_run`] says when that has gone on too long. An exit of 0 is a pass. Any other
-/// exit is a failure, `provision` included, when the setup's own last line names the command
-/// that failed, and [`TIMED_OUT`] reads as [`RAN_TOO_LONG`]; with no such line, or no exit code,
-/// the gate is lost. The tail is read as the setups of `workspaces` (`SETUP_LIMITED` in
-/// `workspaces/mod.rs`) print it: `$ <command>` before each command, and last `setup failed:
-/// <command> exited <code>`, or `ran past <limit> s and was stopped`, after the one that failed.
-/// The verdict never depends on the tail, which the pull request's code writes; only the
-/// command named and the output shown do.
-pub fn result(state: TerminalState, exit_code: Option<i32>, tail: &str) -> GateResult {
-    match state {
-        TerminalState::Running | TerminalState::Unreachable => return GateResult::Running,
-        TerminalState::Exited => {}
-    }
-    let code = match exit_code {
-        Some(0) => return GateResult::Passed,
-        Some(code) => code,
-        None => {
-            return GateResult::Lost {
-                reason: "the gate's setup ended with no exit code".to_string(),
-            };
-        }
+/// The verdict is the exit code's alone: 0 is a pass, and any other code a failure, a failed
+/// `provision` included, with [`TIMED_OUT`] read as [`RAN_TOO_LONG`]. A terminal that has not
+/// exited, whose machine cannot be reached, or that exited with no exit code gives none.
+///
+/// The tail is read as `SETUP_LIMITED` in `workspaces/mod.rs` prints it: `$ <command>` before
+/// each command, then `setup failed: <command> exited <code>`, or `ran past <limit> s and was
+/// stopped`, after the one that failed. The pull request's code writes the same tail and can
+/// fake such lines or erase the real one, so only a line that names one of `commands` with an
+/// ending that fits the exit code counts, the last such in the tail. With none, the command is
+/// empty and the output is the whole tail.
+pub fn result(
+    state: TerminalState,
+    exit_code: Option<i32>,
+    tail: &str,
+    commands: &[String],
+) -> GateResult {
+    let code = match (state, exit_code) {
+        (TerminalState::Exited, Some(0)) => return GateResult::Passed,
+        (TerminalState::Exited, Some(code)) => code,
+        _ => return GateResult::Running,
     };
-    let Some((at, command)) = failure_line(tail, code) else {
-        return GateResult::Lost {
-            reason: format!("the gate's setup exited {code} and did not say which command failed"),
-        };
-    };
-    let output = output_of(&tail[..at], &command).to_string();
-    let (how, ended) = if code == TIMED_OUT {
-        let after_ms = u64::try_from(COMMAND_LIMIT.as_millis()).ok();
-        (RAN_TOO_LONG.to_string(), Ended::TimedOut { after_ms })
+    let how = if code == TIMED_OUT {
+        RAN_TOO_LONG.to_string()
     } else {
-        (format!("exit code {code}"), Ended::Exit(code.into()))
+        format!("exit code {code}")
+    };
+    let (command, output) = match failure_line(tail, code, commands) {
+        Some((at, command)) => (command.to_string(), output_of(&tail[..at], command)),
+        None => (String::new(), tail),
     };
     GateResult::Failed {
         command,
         how,
-        ended,
-        output,
+        output: output.to_string(),
     }
 }
 
-/// What starts the line the setup prints after the command that failed.
-const FAILED_PREFIX: &str = "setup failed: ";
-
-/// The byte offset of the setup's last line, `setup failed: <command> …`, and the command it
-/// names, when its ending fits `code`. The setup prints that line last, so only the last
-/// occurrence of its start is read: a line the output faked comes before it, and the real one
-/// may start mid-line, after output with no final newline.
-fn failure_line(tail: &str, code: i32) -> Option<(usize, String)> {
-    let at = tail.rfind(FAILED_PREFIX)?;
-    let rest = tail[at + FAILED_PREFIX.len()..].trim_end_matches('\n');
-    command_before_ending(rest, code).map(|command| (at, command.to_string()))
+/// How a failed gate's command ended, for the message that sends the failure back
+/// ([`messages::CommandFailure`](crate::factory::messages::CommandFailure)): stopped at
+/// [`COMMAND_LIMIT`] for [`TIMED_OUT`], else exited with `exit_code`.
+pub fn ended(exit_code: i32) -> Ended {
+    if exit_code == TIMED_OUT {
+        Ended::TimedOut {
+            after_ms: u64::try_from(COMMAND_LIMIT.as_millis()).ok(),
+        }
+    } else {
+        Ended::Exit(exit_code.into())
+    }
 }
 
-/// `rest` without the ending the setup prints for a command that ended with `code`.
-fn command_before_ending(rest: &str, code: i32) -> Option<&str> {
-    if let Some(command) = rest.strip_suffix(&format!(" exited {code}")) {
-        return Some(command);
-    }
-    if code != TIMED_OUT {
-        return None;
-    }
-    let before = rest.strip_suffix(" s and was stopped")?;
-    let without_limit = before.trim_end_matches(|c: char| c.is_ascii_digit());
-    if without_limit.len() == before.len() {
-        return None;
-    }
-    without_limit.strip_suffix(" ran past ")
+/// The byte offset in `tail` of the setup's line for the failed command, and that command:
+/// the last `setup failed: <command> <ending>` line whose command is one of `commands` and
+/// whose ending fits `code`. The real line may start mid-line, after output with no final
+/// newline, and anything written after the setup exited may follow it.
+fn failure_line<'a>(tail: &str, code: i32, commands: &'a [String]) -> Option<(usize, &'a str)> {
+    let limit = COMMAND_LIMIT.as_secs();
+    commands
+        .iter()
+        .flat_map(|command| {
+            let exited = format!("setup failed: {command} exited {code}\n");
+            let stopped = (code == TIMED_OUT)
+                .then(|| format!("setup failed: {command} ran past {limit} s and was stopped\n"));
+            std::iter::once(exited)
+                .chain(stopped)
+                .filter_map(|line| tail.rfind(&line))
+                .map(move |at| (at, command.as_str()))
+        })
+        .max_by_key(|&(at, _)| at)
 }
 
-/// The output of `command` in `before`, the tail up to the setup's last line: what follows the
+/// The output of `command` in `before`, the tail up to the setup's line for it: what follows the
 /// last `$ <command>` line, which may start mid-line after output with no final newline. All of
 /// `before` when the tail was cut after that line's start.
 fn output_of<'a>(before: &'a str, command: &str) -> &'a str {
@@ -185,18 +184,26 @@ fn output_of<'a>(before: &'a str, command: &str) -> &'a str {
 }
 
 /// Why a gate could not run, or `None` while it still can: `create` is the error its workspace
-/// create answered with, and `unreachable_for` how long its machine has been unreachable, on the
-/// sleep-counting clock. A failed create is named first.
-pub fn could_not_run(create: Option<&WorkerError>, unreachable_for: Duration) -> Option<String> {
+/// create answered with, `unreachable_for` how long its machine has been unreachable on the
+/// sleep-counting clock, and `terminal` its setup terminal's state and exit code when it has
+/// one. A terminal that exited with no exit code lost its holder before the setup said how it
+/// went. A failed create is named first.
+pub fn could_not_run(
+    create: Option<&WorkerError>,
+    unreachable_for: Duration,
+    terminal: Option<(TerminalState, Option<i32>)>,
+) -> Option<String> {
     if let Some(error) = create {
         return Some(format!("the gate workspace could not be made: {error}"));
     }
-    (unreachable_for >= MACHINE_GONE_AFTER).then(|| {
-        format!(
+    if unreachable_for >= MACHINE_GONE_AFTER {
+        return Some(format!(
             "the gate's machine was unreachable for {} minutes",
             MACHINE_GONE_AFTER.as_secs() / 60
-        )
-    })
+        ));
+    }
+    (terminal == Some((TerminalState::Exited, None)))
+        .then(|| "the gate's setup terminal ended with no exit code".to_string())
 }
 
 /// How many passes to wait before trying a gate again after `failures` failures to run: 1, 2, 4
