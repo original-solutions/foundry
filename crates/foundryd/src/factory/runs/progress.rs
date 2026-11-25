@@ -90,6 +90,10 @@ pub const LAUNCH_ENDING_SESSIONS: &str = "launch-ending-sessions";
 pub const APPROVAL_RECHECKED: &str = "approval-rechecked";
 /// The ledger step written before the reminder is sent: `result-line-reminding <k>`, `k` the ordinal of the run that ended.
 pub const RESULT_LINE_REMINDING: &str = "result-line-reminding";
+/// The ledger step written last when a turn was acted on and the run goes on: `turn-read <n>`.
+/// A turn number only rises, so the newest one read since the session was launched is the
+/// highest.
+pub const TURN_READ: &str = "turn-read ";
 /// The ledger step written after the reminder was sent.
 pub const RESULT_LINE_REMINDED: &str = "result-line-reminded";
 /// The ledger step written once the resume of a `session_interrupted` line was sent: `interruption-sent <resumes>`.
@@ -321,6 +325,13 @@ pub struct Seen {
     /// entered `building`: the comment may be on the issue with no line yet.
     /// The id of the newest marked comment of the login when the step was written (0 if none).
     pub questions_commenting: Option<u64>,
+    /// A `questions-commenting` step follows the newest `session_launched` line (or there is
+    /// none): the questions comment was begun by the session on record. Unlike
+    /// `questions_commenting`, posting the questions or entering `building` does not clear it.
+    pub questions_intent_since_launch: bool,
+    /// The newest turn read since the session was launched: the highest `turn-read <n>` step
+    /// after the newest `session_launched` line, `n` written as [`canonical`] reads it.
+    pub turn_read: Option<u64>,
     /// The `stuck-commenting` step: the stuck comment may be on the issue with no `stuck` line.
     /// The id of the newest marked comment of the login when the step was written (0 if none).
     pub stuck_commenting: Option<u64>,
@@ -452,7 +463,7 @@ pub struct RunNames {
 }
 
 /// `text` when it is a number without a sign or leading zero.
-fn canonical(text: &str) -> Option<u32> {
+fn canonical<T: std::str::FromStr>(text: &str) -> Option<T> {
     let plain = !text.is_empty()
         && text.bytes().all(|b| b.is_ascii_digit())
         && (text == "0" || !text.starts_with('0'));
@@ -718,6 +729,16 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 if let Some(id) = commenting_id(step, QUESTIONS_COMMENTING) {
                     seen.questions_commenting = Some(id);
                 }
+                if step == QUESTIONS_COMMENTING
+                    || step
+                        .strip_prefix(QUESTIONS_COMMENTING)
+                        .is_some_and(|rest| rest.starts_with(' '))
+                {
+                    seen.questions_intent_since_launch = true;
+                }
+                if let Some(n) = step.strip_prefix(TURN_READ).and_then(canonical::<u64>) {
+                    seen.turn_read = Some(seen.turn_read.map_or(n, |read| read.max(n)));
+                }
                 if let Some(name) = step.strip_prefix(WORKSPACE_REQUESTED) {
                     seen.workspace_requested = Some(name.to_owned());
                     seen.workspace = None;
@@ -953,6 +974,8 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                     seen.thread_id = Some(id.to_owned());
                 }
                 seen.sends.clear();
+                seen.turn_read = None;
+                seen.questions_intent_since_launch = false;
                 seen.worktree = text(data, "worktree").map(str::to_owned);
                 seen.worktree_done = false;
                 seen.launched_since_sending = true;
