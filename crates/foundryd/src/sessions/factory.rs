@@ -200,7 +200,7 @@ pub enum SendRefused {
     /// the first line's prompt has been counted: a line still on its way to the agent, or taken
     /// and not yet reported, has not raised it, so a resend that comes before then can still
     /// type the line twice.
-    #[error("the send failed, and its line may have been typed: {reason}")]
+    #[error("the send failed: {reason}")]
     Failed {
         /// What went wrong.
         reason: String,
