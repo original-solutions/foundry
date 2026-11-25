@@ -1732,6 +1732,7 @@ mod tests {
         std::fs::write(&file, "900").unwrap();
         assert_eq!(clock.now(), Duration::from_secs(900));
     }
+
     /// A release build ignores `FOUNDRY_CLOCK_AHEAD`.
     #[cfg(not(debug_assertions))]
     #[test]
