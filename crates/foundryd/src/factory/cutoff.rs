@@ -508,6 +508,31 @@ exec "$agent" "$@""#;
     }
 
     #[tokio::test]
+    async fn run_looks_again_only_30_seconds_after_its_last_look() {
+        let f = Fx::new().await;
+        let (early, late) = (ProjectId::random(), ProjectId::random());
+        let early_session = f.start_factory(WorkspaceId::random(), early).await;
+        let mut cutoff = f.cutoff();
+        assert_eq!(cutoff.tick().await, []);
+        f.clock.advance(Duration::from_secs(20));
+        let late_session = f.start_factory(WorkspaceId::random(), late).await;
+        f.holder_says(late, 1);
+        assert_eq!(cutoff.tick().await, []);
+        let running = tokio::spawn(cutoff.run());
+
+        // At 10:00 a look is due and ends the early project, 9:40 into the late one's.
+        f.clock.advance(10 * MINUTE - Duration::from_secs(20));
+        f.until_ended(early_session).await;
+        // At 10:25 the late project is 10:05 in, but the next look is not due until 10:30.
+        f.clock.advance(Duration::from_secs(25));
+        f.assert_runs(late_session).await;
+
+        f.clock.advance(Duration::from_secs(5));
+        until("the look at 10:30", || f.ended(late_session)).await;
+        running.abort();
+    }
+
+    #[tokio::test]
     async fn a_clock_that_jumps_20_minutes_ends_the_sessions_on_the_next_tick() {
         let f = Fx::new().await;
         let project = ProjectId::random();
