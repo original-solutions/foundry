@@ -283,6 +283,10 @@ pub const BUILD_ARCHIVED: &str = "build-archived";
 /// The public reason of a run whose pull request head kept moving until no retry was left.
 pub const HEAD_KEPT_MOVING: &str = "the pull request's head kept moving, so the gate could not settle on a commit within gate_retries";
 
+/// The public reason of a failure that has no session to go back to: the build session was
+/// ended at a pass that was then undone.
+pub const SESSION_ENDED: &str = "the build session was ended when the pass was begun, so a failure after it has no session to go back to";
+
 /// The sentence added to a failure sent back and to a stuck comment when the `.dw/config.yml`
 /// at the pull request's head is not the default branch's.
 pub const CONFIG_DIFFERS: &str = "This pull request changes .dw/config.yml, but the factory gates with the default branch's copy, so a change to provision or gate here has no effect until it is on the default branch.";
@@ -2727,6 +2731,20 @@ mod tests {
     /// line, the session ended and the build workspace kept.
     #[track_caller]
     fn assert_stuck(rig: &Rig, run: &RunId, step: &GateStep, code: &str, public: &str) {
+        assert_stuck_in(rig, run, step, code, public, false);
+    }
+
+    /// As `assert_stuck`; `build_archived_before` is a run whose build workspace an earlier round
+    /// archived at its pass, which is the one thing that then differs.
+    #[track_caller]
+    fn assert_stuck_in(
+        rig: &Rig,
+        run: &RunId,
+        step: &GateStep,
+        code: &str,
+        public: &str,
+        build_archived_before: bool,
+    ) {
         let GateStep::Stuck { reason } = step else {
             panic!("expected a stuck run, got {step:?}");
         };
@@ -2750,7 +2768,12 @@ mod tests {
         assert_eq!(rig.sim.labels(), ["factory:stuck"]);
         assert!(rig.sim.assignees().is_empty());
         assert!(calls(rig).contains(&end_of_build()));
-        assert!(!calls(rig).contains(&archive_of(workspace())));
+        let archives_of_build = calls(rig)
+            .iter()
+            .filter(|call| **call == archive_of(workspace()))
+            .count();
+        // Kept for a person to look at; round one's pass archived it once already.
+        assert_eq!(archives_of_build, usize::from(build_archived_before));
     }
 
     // ----- the runner's `gate: the session's PR becomes ready, or it does not` -----
@@ -2824,14 +2847,15 @@ mod tests {
         fn a_gate_pass_archives_the_session_and_removes_its_worktree_before_the_issue_is_pr_open() {
             let (mut rig, run, _hub) = built();
             place(&mut rig, &run, 1, 1);
-            // The session cannot be ended: nothing is written on GitHub, the label stays, and
-            // the next pass ends it and goes on.
+            // The session cannot be ended: the pull request was marked ready first, nothing else
+            // is written, the label stays, and the next pass ends it and goes on.
             rig.worker
                 .on_end_sessions(Err(WorkerError::Failed("the machine is busy".into())));
             show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
             rig.worker.on_tail(Ok(PASS_TAIL.into()));
             assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
-            no_writes(&rig);
+            assert_eq!(rig.sim.writes().len(), 1);
+            assert!(rig.sim.writes()[0].contains("pr ready 12"));
             assert_eq!(rig.sim.labels(), ["factory:building"]);
             assert!(!calls(&rig).contains(&archive_of(workspace())));
             assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
@@ -3359,7 +3383,7 @@ mod tests {
         }
 
         #[test]
-        fn the_second_failure_is_sent_with_its_own_key_and_the_turn_it_read() {
+        fn the_second_failure_is_sent_with_its_own_command_id_and_the_ordinal_it_read() {
             let (mut rig, run, hub) = built();
             gated(&mut rig, &run, 101, FAIL_TAIL);
             reported_again(&mut rig, &run, &hub, 2);
@@ -3452,7 +3476,7 @@ mod tests {
         }
 
         #[test]
-        fn a_send_that_fails_leaves_the_attempt_open_and_a_retry_sends_under_the_same_key() {
+        fn a_send_that_fails_leaves_the_attempt_open_and_a_retry_sends_under_the_same_command_id() {
             let (mut rig, run, _hub) = built();
             place(&mut rig, &run, 1, 1);
             rig.worker.on_send(Err(SendRefused::Failed {
@@ -3720,7 +3744,7 @@ mod tests {
         }
 
         #[test]
-        fn a_mergeable_answer_runs_the_gates_own_checkout() {
+        fn a_mergeable_answer_runs_the_gates_own_checkout_and_merge() {
             let (rig, run, _hub) = built();
             assert_eq!(go(&rig, &run), GateStep::Running);
             assert_eq!(creates(&rig), 1);
@@ -4148,7 +4172,8 @@ mod tests {
         }
 
         #[test]
-        fn a_failure_that_may_not_have_reached_the_session_is_sent_again_under_the_same_key() {
+        fn a_failure_that_may_not_have_reached_the_session_is_sent_again_under_the_same_command_id()
+        {
             let (mut rig, run, hub) = built();
             rig.config.required_checks = vec!["ci".into()];
             hub.set_checks(HEAD, RED);
@@ -4287,7 +4312,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn ends_the_run_writes_nothing_on_github_runs_no_command_and_ends_the_session_once() {
+        fn ends_the_run_writes_nothing_on_github_runs_no_command_and_archives_once() {
             let (rig, run, _hub) = built();
             rig.sim.set_closed(true);
             assert_eq!(go(&rig, &run), GateStep::Abandoned);
@@ -4300,7 +4325,7 @@ mod tests {
         }
 
         #[test]
-        fn whose_end_of_session_fails_is_an_error_with_nothing_written_and_the_next_call_ends_it() {
+        fn whose_archive_fails_is_an_error_with_nothing_written_and_the_next_call_ends_it() {
             let (rig, run, _hub) = built();
             rig.sim.set_closed(true);
             rig.worker
@@ -5289,13 +5314,14 @@ mod tests {
             hub.set_head(HEAD);
             show(&mut rig, &run, SessionState::Idle, 2, &[running(3)]);
             let step = ends(&mut rig, &run, 2, 3, 0, PASS_TAIL);
-            assert_eq!(
-                step,
-                GateStep::Stuck {
-                    reason: HEAD_KEPT_MOVING.into()
-                }
+            assert_stuck_in(
+                &rig,
+                &run,
+                &step,
+                "head-kept-moving",
+                HEAD_KEPT_MOVING,
+                true,
             );
-            assert_eq!(rig.sim.labels(), ["factory:stuck"]);
         }
 
         #[test]
@@ -5331,13 +5357,12 @@ mod tests {
             place(&mut rig, &run, 1, 1);
             show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
             rig.worker.on_tail(Ok(PASS_TAIL.into()));
-            rig.worker
-                .on_end_sessions(Err(WorkerError::Failed("the machine is busy".into())));
-            assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
+            rig.sim.fail("pr ready", 1);
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Tracker(_))));
             assert!(has_step(&rig, &run, "gate-passed "));
             hub.set_head(MOVED);
             assert_eq!(go(&rig, &run), GateStep::NotReady);
-            assert!(!rig.sim.writes().iter().any(|w| w.contains("pr ready 12")));
+            assert!(hub.lock().pulls[&12].draft);
             assert_eq!(rig.sim.labels(), ["factory:building"]);
             assert!(has_step(&rig, &run, GATE_HEAD_MOVED));
             rig.worker.on_create(Ok(gate_ws(2)));
@@ -5357,13 +5382,12 @@ mod tests {
             place(&mut rig, &run, 1, 1);
             show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
             rig.worker.on_tail(Ok(PASS_TAIL.into()));
-            rig.worker
-                .on_end_sessions(Err(WorkerError::Failed("the machine is busy".into())));
-            assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
+            rig.sim.fail("pr ready", 1);
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Tracker(_))));
             assert_eq!(event_count(&rig, &run, "checks_read"), 1);
             hub.set_head(MOVED);
             assert_eq!(go(&rig, &run), GateStep::NotReady);
-            assert!(!rig.sim.writes().iter().any(|w| w.contains("pr ready 12")));
+            assert!(hub.lock().pulls[&12].draft);
             assert_eq!(rig.sim.labels(), ["factory:building"]);
         }
 
@@ -5480,20 +5504,6 @@ mod tests {
             assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
             assert!(!gate_running(&rig.events(&run)));
             assert_eq!(sends(&rig), vec![]);
-        }
-
-        #[test]
-        fn an_archive_refused_because_the_machine_is_unreachable_does_not_block_the_verdict() {
-            let (mut rig, run, _hub) = built();
-            place(&mut rig, &run, 1, 1);
-            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 101)]);
-            rig.worker.on_tail(Ok(FAIL_TAIL.into()));
-            rig.worker
-                .on_archive(Err(WorkerError::Unreachable("no route".into())));
-            assert_eq!(go(&rig, &run), GateStep::SentBack { attempt: 1 });
-            assert!(has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
-            // Left to the orphan sweep: not asked again.
-            assert_eq!(archived(&rig), vec![gate_ws(1)]);
         }
 
         #[test]
@@ -6349,6 +6359,406 @@ mod tests {
         #[test]
         fn the_exhausted_path_after_a_sent_back_attempt_survives_a_failure_of_each_call() {
             same_for_every_cut(1, 101, FAIL_TAIL);
+        }
+    }
+
+    // ----- review cycle 2 -----
+
+    mod review2_nothing_is_finished_on_a_head_that_was_not_gated {
+        use super::*;
+
+        /// The gate passed on HEAD with the pull request out of draft (a person's mark, or this
+        /// pass's own that the answer was lost for), and the finish was cut short.
+        fn recorded_and_cut(required: bool, by_someone_else: bool) -> (Rig, RunId, Arc<Hub>) {
+            let (mut rig, run, hub) = built();
+            if required {
+                rig.config.required_checks = vec!["ci".into()];
+                hub.set_checks(HEAD, &[("ci", "completed", Some("success"))]);
+            }
+            place(&mut rig, &run, 1, 1);
+            if by_someone_else {
+                hub.set_draft(false);
+            } else {
+                rig.sim.lose("pr ready", 1);
+            }
+            // The label write is what is cut.
+            rig.sim.fail("--add-label factory:pr-open", 1);
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
+            rig.worker.on_tail(Ok(PASS_TAIL.into()));
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Tracker(_))));
+            assert!(has_step(&rig, &run, "gate-passed "));
+            assert!(!hub.lock().pulls[&12].draft);
+            (rig, run, hub)
+        }
+
+        fn moved_and_gated_again(rig: &mut Rig, run: &RunId, hub: &Hub) {
+            hub.set_head(MOVED);
+            assert_eq!(go(rig, run), GateStep::NotReady);
+            assert!(has_step(rig, run, GATE_HEAD_MOVED));
+            assert_eq!(rig.sim.labels(), ["factory:building"]);
+            assert!(hub.lock().pulls[&12].draft, "put back to draft");
+            rig.worker.on_create(Ok(gate_ws(2)));
+            assert_eq!(go(rig, run), GateStep::Running);
+            assert!(has_step(rig, run, &format!("{GATE_REQUESTED}2 2 {MOVED}")));
+        }
+
+        #[test]
+        fn a_pass_the_pr_was_marked_ready_for_by_the_pass_is_gated_again_when_the_head_moved() {
+            let (mut rig, run, hub) = recorded_and_cut(false, false);
+            moved_and_gated_again(&mut rig, &run, &hub);
+        }
+
+        #[test]
+        fn a_pass_a_person_marked_ready_is_gated_again_when_the_head_moved() {
+            let (mut rig, run, hub) = recorded_and_cut(false, true);
+            moved_and_gated_again(&mut rig, &run, &hub);
+        }
+
+        #[test]
+        fn the_same_with_required_checks_already_read_as_passed_by_the_pass() {
+            let (mut rig, run, hub) = recorded_and_cut(true, false);
+            moved_and_gated_again(&mut rig, &run, &hub);
+        }
+
+        #[test]
+        fn the_same_with_required_checks_already_read_as_passed_by_a_person() {
+            let (mut rig, run, hub) = recorded_and_cut(true, true);
+            moved_and_gated_again(&mut rig, &run, &hub);
+        }
+
+        #[test]
+        fn a_moved_head_with_no_retry_left_is_stuck_with_the_pull_request_back_in_draft() {
+            let (mut rig, run, hub) = recorded_and_cut(false, true);
+            rig.config.limits.gate_retries = 0;
+            hub.set_head(MOVED);
+            let step = go(&rig, &run);
+            assert_stuck(&rig, &run, &step, "head-kept-moving", HEAD_KEPT_MOVING);
+            assert!(hub.lock().pulls[&12].draft);
+        }
+    }
+
+    mod review2_the_build_session_is_ended_after_the_ready_mark {
+        use super::*;
+
+        #[test]
+        fn a_ready_mark_that_is_refused_leaves_the_session_alive_for_a_moved_head_and_a_failure() {
+            let (mut rig, run, hub) = built();
+            place(&mut rig, &run, 1, 1);
+            rig.sim.fail("pr ready", 1);
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
+            rig.worker.on_tail(Ok(PASS_TAIL.into()));
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Tracker(_))));
+            assert!(hub.lock().pulls[&12].draft);
+            assert!(!calls(&rig).contains(&end_of_build()), "not ended yet");
+            hub.set_head(MOVED);
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            place(&mut rig, &run, 1, 2);
+            assert_eq!(
+                ends(&mut rig, &run, 1, 2, 101, FAIL_TAIL),
+                GateStep::SentBack { attempt: 2 }
+            );
+            assert_eq!(sends(&rig).len(), 1);
+            assert!(!calls(&rig).contains(&end_of_build()));
+        }
+
+        #[test]
+        fn a_failure_with_the_session_already_ended_is_stuck_and_not_sent() {
+            let (mut rig, run, hub) = built();
+            place(&mut rig, &run, 1, 1);
+            // The mark and the end of the session went through; the label did not.
+            rig.sim.fail("--add-label factory:pr-open", 1);
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
+            rig.worker.on_tail(Ok(PASS_TAIL.into()));
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Tracker(_))));
+            assert!(calls(&rig).contains(&end_of_build()));
+            hub.set_head(MOVED);
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            place(&mut rig, &run, 1, 2);
+            let step = ends(&mut rig, &run, 1, 2, 101, FAIL_TAIL);
+            assert_stuck(&rig, &run, &step, "session-ended", SESSION_ENDED);
+            assert_eq!(sends(&rig), vec![]);
+        }
+    }
+
+    mod review2_an_archive_never_wedges_a_run_and_is_never_faked {
+        use super::*;
+
+        fn refuse_archives(rig: &Rig, times: usize) {
+            for _ in 0..times {
+                rig.worker
+                    .on_archive(Err(WorkerError::Failed("the worktree is busy".into())));
+            }
+        }
+
+        #[test]
+        fn a_stop_still_goes_stuck_while_the_gate_workspace_cannot_be_archived() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            rig.write(&run, Event::StopRequested { by: "tom".into() });
+            refuse_archives(&rig, 10);
+            let step = go(&rig, &run);
+            assert!(matches!(step, GateStep::Stuck { .. }));
+            assert!(rig.finished(&run));
+            assert!(!has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+        }
+
+        #[test]
+        fn a_closed_issue_still_abandons_while_the_gate_workspace_cannot_be_archived() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            rig.sim.set_closed(true);
+            refuse_archives(&rig, 10);
+            assert_eq!(go(&rig, &run), GateStep::Abandoned);
+            assert!(rig.finished(&run));
+            assert!(!has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+        }
+
+        #[test]
+        fn an_archive_answered_as_unknown_counts_as_done() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 101)]);
+            rig.worker.on_tail(Ok(FAIL_TAIL.into()));
+            rig.worker
+                .on_archive(Err(WorkerError::Failed("unknown workspace".into())));
+            assert_eq!(go(&rig, &run), GateStep::SentBack { attempt: 1 });
+            assert!(has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+        }
+
+        #[test]
+        fn a_gate_workspace_that_can_never_be_archived_ends_the_run_stuck_after_three_tries() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show(
+                &mut rig,
+                &run,
+                SessionState::Idle,
+                1,
+                &[G {
+                    k: 1,
+                    state: TerminalState::Exited,
+                    code: None,
+                }],
+            );
+            refuse_archives(&rig, 10);
+            // It could not run; the archive before the next gate is refused again and again.
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
+            let step = go(&rig, &run);
+            assert!(matches!(step, GateStep::Stuck { .. }), "{step:?}");
+            assert!(rig.finished(&run));
+            assert!(!has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+            assert!(
+                rig.sim
+                    .comments()
+                    .iter()
+                    .all(|comment| !comment.contains("busy"))
+            );
+        }
+
+        #[test]
+        fn an_archive_refused_as_unreachable_by_a_machine_that_is_online_is_asked_again() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 101)]);
+            rig.worker.on_tail(Ok(FAIL_TAIL.into()));
+            rig.worker
+                .on_archive(Err(WorkerError::Unreachable("no route".into())));
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
+            assert!(!has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+            assert_eq!(go(&rig, &run), GateStep::SentBack { attempt: 1 });
+            assert!(has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+            assert_eq!(archived(&rig), vec![gate_ws(1), gate_ws(1)]);
+        }
+
+        #[test]
+        fn a_gate_of_a_machine_that_is_gone_is_left_to_the_sweep_and_blocks_nothing() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show_gone(
+                &mut rig,
+                &run,
+                1,
+                &[running(1)],
+                Duration::from_secs(6 * 60),
+            );
+            rig.write(&run, Event::StopRequested { by: "tom".into() });
+            let step = go(&rig, &run);
+            assert!(matches!(step, GateStep::Stuck { .. }));
+            assert_eq!(archived(&rig), vec![]);
+            assert!(has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+        }
+
+        #[test]
+        fn a_create_that_got_no_answer_is_asked_again_to_find_and_archive_what_it_made() {
+            let (rig, run, _hub) = built();
+            rig.worker.on_create(Err(WorkerError::Unreachable(
+                "did not answer in time".into(),
+            )));
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
+            // The worker made it; its record is not in the view yet, two passes on.
+            rig.worker.on_create(Ok(gate_ws(1)));
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 0 });
+            assert_eq!(creates(&rig), 2);
+            assert_eq!(archived(&rig), vec![gate_ws(1)]);
+            assert!(has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+        }
+
+        #[test]
+        fn a_create_the_worker_refused_has_nothing_to_archive() {
+            let (rig, run, _hub) = built();
+            rig.worker
+                .on_create(Err(WorkerError::Failed("no disk".into())));
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 0 });
+            assert_eq!(creates(&rig), 1);
+            assert_eq!(archived(&rig), vec![]);
+            assert!(has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+        }
+    }
+
+    mod review2_what_was_recorded_is_written_once_and_in_full {
+        use super::*;
+
+        #[test]
+        fn a_conflict_attempt_cut_before_its_send_then_gated_records_its_own_commands() {
+            let (mut rig, run, hub) = built();
+            hub.set_mergeable("CONFLICTING");
+            // The conflict line is written, then reading the config for the note fails.
+            hub.fail("api repos/rawphp/softfac", 1);
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Tracker(_))));
+            assert_eq!(event_count(&rig, &run, "gate_command"), 1);
+            // The conflict clears; the same attempt is gated and passes.
+            hub.set_mergeable("MERGEABLE");
+            assert_eq!(
+                gated(&mut rig, &run, 0, PASS_TAIL),
+                GateStep::Passed { pr: 12 }
+            );
+            let comment = rig
+                .sim
+                .comments()
+                .into_iter()
+                .find(|comment| comment.contains("Factory gate: passed"))
+                .expect("the results");
+            assert!(comment.contains("`cargo test` | 0"), "{comment}");
+            assert!(!comment.contains("merge"), "{comment}");
+        }
+
+        #[test]
+        fn command_lines_cut_part_way_are_completed_for_the_gate() {
+            let (mut rig, run, _hub) = built();
+            rig.config.provision = vec!["npm ci".into()];
+            rig.config.gate = vec!["cargo fmt".into(), "cargo test".into()];
+            place(&mut rig, &run, 1, 1);
+            rig.write(
+                &run,
+                Event::GateCommand {
+                    attempt: 1,
+                    command: "npm ci".into(),
+                    exit_code: 0,
+                    duration_ms: 0,
+                },
+            );
+            assert_eq!(
+                ends(&mut rig, &run, 1, 1, 0, PASS_TAIL),
+                GateStep::Passed { pr: 12 }
+            );
+            let comment = rig
+                .sim
+                .comments()
+                .into_iter()
+                .find(|comment| comment.contains("Factory gate: passed"))
+                .expect("the results");
+            for command in ["npm ci", "cargo fmt", "cargo test"] {
+                assert_eq!(
+                    comment.matches(&format!("`{command}`")).count(),
+                    1,
+                    "{comment}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_failure_owed_to_a_session_whose_process_ended_is_not_sent_again_and_again() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show(&mut rig, &run, SessionState::Finished, 1, &[exited(1, 101)]);
+            rig.worker.on_tail(Ok(FAIL_TAIL.into()));
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert_eq!(sends(&rig), vec![]);
+            assert_eq!(step_count(&rig, &run, "send-intent"), 0);
+        }
+    }
+
+    mod review2_the_guards_are_reached {
+        use super::*;
+
+        #[test]
+        fn a_reported_pull_request_whose_session_has_no_turn_record_is_not_gated() {
+            let (mut rig, run, hub) = built();
+            assert_eq!(
+                gated(&mut rig, &run, 101, FAIL_TAIL),
+                GateStep::SentBack { attempt: 1 }
+            );
+            reported_again(&mut rig, &run, &hub, 2);
+            show(&mut rig, &run, SessionState::Idle, 0, &[]);
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert_eq!(creates(&rig), 1);
+        }
+
+        #[test]
+        fn a_send_owed_to_a_session_with_no_turn_record_waits() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            rig.worker.on_send(Err(SendRefused::Failed {
+                reason: "the answer was lost".into(),
+                prompts: Some(1),
+            }));
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 101)]);
+            rig.worker.on_tail(Ok(FAIL_TAIL.into()));
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Send(_))));
+            show(&mut rig, &run, SessionState::Idle, 0, &[]);
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert_eq!(sends(&rig).len(), 1);
+        }
+
+        #[test]
+        fn a_branch_a_launch_was_resumed_from_is_bound_at_gate_time() {
+            let (mut rig, run, hub) = built();
+            rig.step(&run, "launch-sending resumed-from fac/9-1");
+            hub.edit(12, |pull| pull.head_ref = "fac/9-1".into());
+            assert_eq!(
+                gated(&mut rig, &run, 0, PASS_TAIL),
+                GateStep::Passed { pr: 12 }
+            );
+        }
+
+        #[test]
+        fn a_second_rounds_budget_counts_from_the_rounds_first_attempt() {
+            let (mut rig, run, hub) = built();
+            rig.config.limits.gate_retries = 1;
+            second_round(&mut rig, &run, &hub);
+            place(&mut rig, &run, 2, 2);
+            // The round's first failure goes back: under a count from the run's first attempt
+            // it would already be the second.
+            assert_eq!(
+                ends(&mut rig, &run, 2, 2, 101, FAIL_TAIL),
+                GateStep::SentBack { attempt: 2 }
+            );
+            reported_again(&mut rig, &run, &hub, 3);
+            place(&mut rig, &run, 3, 3);
+            let step = ends(&mut rig, &run, 3, 3, 101, FAIL_TAIL);
+            let GateStep::Stuck { .. } = &step else {
+                panic!("expected stuck, got {step:?}");
+            };
+            assert!(
+                rig.sim.comments().iter().any(|comment| comment
+                    .contains("Reason: the gate failed after 2 attempts: `cargo test` failed")),
+                "{:?}",
+                rig.sim.comments()
+            );
         }
     }
 }
