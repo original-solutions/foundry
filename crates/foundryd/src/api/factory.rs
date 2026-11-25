@@ -26,7 +26,11 @@
 //!   `204`. A forced archive is P1's carried archive route.
 //! - `POST /api/sessions/{id}/factory/message` `{message, only_if_prompts}`: sends `message` to
 //!   the session, `200 {prompts}` with its count of prompts before the send, or `409 {error,
-//!   reason}` with why nothing was sent, and `now`, the count, when it rose.
+//!   reason}` with why it was not sent, and `now`, the count, when it rose. A `failed` send may
+//!   have typed its line, as a terminal error can come after the terminal took it: its answer
+//!   has `prompts`, the count the send read before it typed, which a resend names as
+//!   `only_if_prompts`, or `null` when it read none or did not finish, so no count can guard a
+//!   resend.
 //! - `POST /api/sessions/{id}/factory/turn` `{turn}`: `200 {message, question}`, the turn's
 //!   final message and the question that waits, `404` while the turn is not written and the
 //!   session runs, or `410` when it is not written and the session no longer runs here, so it
@@ -398,9 +402,10 @@ async fn message(api: &Api, id: SessionId, body: &Bytes) -> Result<Response, Api
     }
 }
 
-/// `409` with why nothing was sent: the reason as text, as a word the caller can match, the
-/// count of prompts when it rose, and, for `failed`, the count the send read before it typed
-/// (`null` when it read none), which a resend names as `only_if_prompts`.
+/// `409` with why the message was not sent: the reason as text, as a word the caller can
+/// match, the count of prompts when it rose, and, for `failed`, whose line may have been
+/// typed, the count the send read before it typed (`null` when it read none or did not
+/// finish), which a resend names as `only_if_prompts`.
 fn not_sent(refused: &SendRefused) -> Response {
     let reason = match refused {
         SendRefused::NotIdle => "not_idle",
@@ -415,7 +420,7 @@ fn not_sent(refused: &SendRefused) -> Response {
         refused,
         SendRefused::SecretsUnreadable | SendRefused::Failed { .. }
     ) {
-        tracing::warn!("api: a factory message was not sent: {text}");
+        tracing::warn!("api: a factory message was refused or failed: {text}");
     }
     let mut answer = serde_json::json!({ "error": text, "reason": reason });
     match refused {

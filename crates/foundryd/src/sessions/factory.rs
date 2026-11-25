@@ -165,7 +165,8 @@ pub(super) fn with_body_path(line: &str, path: &Path) -> String {
     line.replace(BODY_PATH, &word)
 }
 
-/// Why [`Sessions::send_factory`] sent nothing.
+/// Why [`Sessions::send_factory`] did not send a message. Every refusal but
+/// [`SendRefused::Failed`] typed nothing; a `Failed` send may have typed its line.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SendRefused {
     /// The session is not idle.
@@ -192,18 +193,22 @@ pub enum SendRefused {
     /// an error, or the send did not finish. The reason names no secret.
     ///
     /// A terminal error may come after the line was typed: the terminal takes the line, then
-    /// its answer does not come in time or the connection breaks. So the coordinator sends the
-    /// message again only with `only_if_prompts` set to `prompts`: a line that did become a
-    /// prompt is then refused with [`SendRefused::CountRose`] instead of typed twice, and one
-    /// that did not is typed once more.
-    #[error("the message was not sent: {reason}")]
+    /// its answer does not come in time or the connection breaks. So with `prompts` set, the
+    /// coordinator sends the message again only with `only_if_prompts` set to it: a line that
+    /// did become a prompt is then refused with [`SendRefused::CountRose`] instead of typed
+    /// twice, and one that did not is typed once more. The count stops a second copy only once
+    /// the first line's prompt has been counted: a line still on its way to the agent, or taken
+    /// and not yet reported, has not raised it, so a resend that comes before then can still
+    /// type the line twice.
+    #[error("the send failed, and its line may have been typed: {reason}")]
     Failed {
         /// What went wrong.
         reason: String,
         /// The session's count of submitted prompts, read before the body was written or the
         /// line typed. `None` when the send failed before it read the count, and so typed
-        /// nothing, or when its task ended before it answered, which loses what it read and
-        /// may come after the line was typed; with `None` there is no count to name.
+        /// nothing, or when its task ended before it answered (a panic), which loses what it
+        /// read and may come after the line was typed: then there is no count to guard a
+        /// resend, and one can type the line twice.
         prompts: Option<u64>,
     },
 }
@@ -799,8 +804,10 @@ impl Sessions {
     /// [`SendRefused::CountRose`], and nothing is written or typed: the line that was sent
     /// before was typed after all. Any other failure is [`SendRefused::Failed`], with the count
     /// read before the send when it got that far, since a terminal error can come after the
-    /// line was typed. The send finishes even when the caller stops waiting, and is ordered with
-    /// the session's hooks.
+    /// line was typed: a resend names that count as `only_if_prompts`, so a line that did
+    /// become a prompt is refused with [`SendRefused::CountRose`] instead of typed twice, as
+    /// [`SendRefused::Failed`] says. The send finishes even when the caller stops waiting, and
+    /// is ordered with the session's hooks.
     pub async fn send_factory(
         &self,
         session: SessionId,
