@@ -380,8 +380,17 @@ exec "$agent" "$@""#;
             )
         }
 
+        /// Waits until `id`'s record says it ended and it is no longer among the sessions that
+        /// run: the record is written before the session leaves them, and a look in between
+        /// still finds it running.
         async fn until_ended(&self, id: SessionId) {
-            until("the session to end", || self.ended(id)).await;
+            until("the session to end", || {
+                self.ended(id)
+                    && self.sessions.is_factory(id).is_none_or(|project| {
+                        !self.sessions.factory_sessions(project).contains(&id)
+                    })
+            })
+            .await;
         }
 
         /// That `id` still runs a while after everything the cut-off did.
