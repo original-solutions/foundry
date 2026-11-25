@@ -18,7 +18,7 @@
 //! - [`run_names`] does not read a branch back from a worktree path: a Foundry launch line
 //!   names its branch.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use foundry_proto::factory::{RunEvent, RunId};
 use serde_json::Value;
@@ -67,6 +67,11 @@ pub const STUCK_COMMENTING: &str = "stuck-commenting";
 /// The step written, with the stop as JSON after it, before the stuck comment: the decision to
 /// give up, which a later pass finishes with the same words.
 pub const STUCK_STOP: &str = "stuck-stop ";
+/// The step written before a send to the session, with the send's key and the session's prompt
+/// count after it: a send done again after a lost answer is sent under the same count.
+pub const SEND_INTENT: &str = "send-intent ";
+/// The step written before the gate-results comment on the pull request is posted.
+pub const GATE_RESULTS_COMMENTING: &str = "gate-results-commenting";
 /// The step written before the questions comment is posted.
 pub const QUESTIONS_COMMENTING: &str = "questions-commenting";
 /// The step written before the sessions of the build workspace are ended ahead of a second start
@@ -311,6 +316,11 @@ pub struct Seen {
     /// The text after the `stuck-stop` step: the recorded decision to go stuck, with no `stuck`
     /// line yet when `stuck` is `None`.
     pub stuck_stop: Option<String>,
+    /// The `gate-results-commenting` step since the results were last posted: the comment may be
+    /// on the pull request with no `gate-results-posted` step.
+    pub gate_commenting: bool,
+    /// The `send-intent` steps: each send's key and the prompt count it was first sent under.
+    pub send_intents: BTreeMap<String, u64>,
     /// A `pr_opened` since the run last entered `building` or had a gate sent back: the session's pull request waits for the gate.
     pub pr_reported: bool,
     /// The ordinal in the newest `result-line-reminding` step: a reminder send was started.
@@ -700,7 +710,17 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 if step == RESULT_LINE_REMINDED {
                     seen.reminded = true;
                 }
+                if step == GATE_RESULTS_COMMENTING {
+                    seen.gate_commenting = true;
+                }
+                if let Some(intent) = step.strip_prefix(SEND_INTENT)
+                    && let Some((key, count)) = intent.rsplit_once(' ')
+                    && let Ok(count) = count.parse()
+                {
+                    seen.send_intents.entry(key.to_owned()).or_insert(count);
+                }
                 if step == GATE_RESULTS_POSTED {
+                    seen.gate_commenting = false;
                     seen.results_posted = true;
                     seen.regating = false;
                     seen.regate_passed = false;

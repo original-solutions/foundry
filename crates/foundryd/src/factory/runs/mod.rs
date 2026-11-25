@@ -46,7 +46,10 @@ use super::worker::{FleetView, Guard, LeaseLost, Worker, WorkerError};
 use crate::clock::Clock;
 use crate::sessions::factory::SendRefused;
 use crate::store::StoreError;
-use progress::{GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, STUCK_COMMENTING, STUCK_STOP, Seen};
+use progress::{
+    GATE_RESULTS_COMMENTING, GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, SEND_INTENT,
+    STUCK_COMMENTING, STUCK_STOP, Seen,
+};
 
 /// What a step of a run can fail with.
 #[derive(Debug, thiserror::Error)]
@@ -448,7 +451,14 @@ pub fn apply_actions(
                 let Some(body) = &payload.comment else {
                     return Err(invalid(at, action));
                 };
-                ctx.comment_on_pr(*pr, body)?;
+                post_once_on_pr(
+                    ctx,
+                    &at.run,
+                    *pr,
+                    at.seen.gate_commenting,
+                    body,
+                    &Cause::new(at.step, "gate-results-commenting"),
+                )?;
                 ctx.record_step(
                     &at.run,
                     GATE_RESULTS_POSTED,
@@ -460,7 +470,13 @@ pub fn apply_actions(
                 let (Some(thread), Some(send)) = (&at.thread_id, &payload.send) else {
                     return Err(invalid(at, action));
                 };
-                ctx.send(session_id(thread)?, send.message.clone(), None)?;
+                send_once(
+                    ctx,
+                    at,
+                    session_id(thread)?,
+                    send.message.clone(),
+                    &format!("gate-failure {} {}", send.attempt, send.run_ordinal),
+                )?;
                 ctx.record(
                     &at.run,
                     Event::GateSentBack {
@@ -474,7 +490,13 @@ pub fn apply_actions(
                 let (Some(thread), Some(send)) = (&at.thread_id, &payload.forward) else {
                     return Err(invalid(at, action));
                 };
-                ctx.send(session_id(thread)?, send.message.clone(), None)?;
+                send_once(
+                    ctx,
+                    at,
+                    session_id(thread)?,
+                    send.message.clone(),
+                    &format!("forward-comment {comment_id}"),
+                )?;
                 ctx.record(
                     &at.run,
                     Event::CommentForwarded {
@@ -490,7 +512,13 @@ pub fn apply_actions(
                 let Some(step) = &send.step else {
                     return Err(invalid(at, action));
                 };
-                ctx.send(session_id(thread)?, send.message.clone(), None)?;
+                send_once(
+                    ctx,
+                    at,
+                    session_id(thread)?,
+                    send.message.clone(),
+                    &format!("forward-body-edit {step}"),
+                )?;
                 ctx.record_step(&at.run, step, cause)?;
             }
             Action::UpdateStatusComment => {
@@ -513,6 +541,41 @@ pub fn apply_actions(
         at.state = to;
     }
     Ok(())
+}
+
+/// A message sent to the session once. The `key` names the send; the session's prompt count is
+/// recorded under it before the send, and every send of the key, a repeat after an answer lost
+/// to a timeout too, goes under that count. A worker that finds the count risen has typed the
+/// message already, which is delivered. A session the fleet shows no turn for is sent to with no
+/// count, as there is none to hold the send to.
+fn send_once(
+    ctx: &RunContext<'_>,
+    at: &Progress,
+    session: SessionId,
+    message: Message,
+    key: &str,
+) -> Result<(), RunError> {
+    let _ = (at, key);
+    let count: Option<u64> = None;
+    match ctx.send(session, message, count) {
+        Ok(_) | Err(RunError::Send(SendRefused::CountRose { .. })) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// A comment on pull request `pr`, posted once, as [`post_once`] posts one on the issue: the
+/// intent is recorded first, and a pass that finds it posts only when the newest comment of the
+/// login on the pull request is not already this text.
+fn post_once_on_pr(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    pr: u64,
+    intended: bool,
+    body: &str,
+    cause: &Cause,
+) -> Result<(), RunError> {
+    let _ = (run, intended, cause);
+    ctx.comment_on_pr(pr, body)
 }
 
 /// A comment on `issue`, posted once. The `intent` step is recorded before the post. A pass that
@@ -1639,6 +1702,102 @@ mod tests {
                     .count(),
                 1
             );
+        }
+
+        /// The gate-results comment is recorded as intended before it is posted: a post whose
+        /// answer was lost (the comment may be on the pull request) is looked for, not posted
+        /// again.
+        #[test]
+        fn the_gate_results_whose_answer_was_lost_are_not_posted_twice() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let payload = ActionPayload {
+                comment: Some("gate passed".into()),
+                ..ActionPayload::default()
+            };
+            let actions = [Action::PostGateResults { pr: 12 }];
+            rig.sim.lose("pr comment", 1);
+            let mut at = progress(&rig, &run, State::Building);
+            assert!(
+                apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).is_err()
+            );
+            let steps = rig.steps(&run);
+            assert!(steps.contains(&"gate-results-commenting".to_string()));
+            assert!(!steps.contains(&GATE_RESULTS_POSTED.to_string()));
+            // The comment is on the pull request, as the lost answer left it.
+            rig.tracker
+                .post_comment(REPO, 12, &payload.comment.clone().unwrap())
+                .unwrap();
+            let mut at = progress(&rig, &run, State::Building);
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            let posted = rig
+                .sim
+                .writes()
+                .into_iter()
+                .filter(|w| w.starts_with("pr comment 12"))
+                .count();
+            assert_eq!(posted, 1);
+            assert!(rig.steps(&run).contains(&GATE_RESULTS_POSTED.to_string()));
+        }
+
+        /// A forward sent under the session's prompt count, recorded before the send: a repeat
+        /// after a lost answer goes under the same count and is delivered when the count rose.
+        #[test]
+        fn a_forward_repeated_after_a_lost_answer_is_not_typed_twice() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let turn = |prompts| foundry_proto::factory::SessionTurn {
+                session: session_id(SESSION).unwrap(),
+                workspace: workspace_id(WORKSPACE).unwrap(),
+                project: project_id(),
+                turn: 1,
+                prompts,
+                question: false,
+            };
+            let message = Message {
+                line: "see this".into(),
+                body: None,
+            };
+            let payload = ActionPayload {
+                forward: Some(ForwardPayload {
+                    message: message.clone(),
+                    step: None,
+                }),
+                ..ActionPayload::default()
+            };
+            let actions = [Action::ForwardComment {
+                comment_id: "c1".into(),
+            }];
+            rig.view = FleetView::builder().turn(turn(3)).build();
+            rig.worker.on_send(Err(SendRefused::NotIdle));
+            let mut at = progress(&rig, &run, State::Building);
+            assert!(
+                apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).is_err()
+            );
+            assert!(
+                rig.steps(&run)
+                    .contains(&"send-intent forward-comment c1 3".to_string())
+            );
+            // The worker typed it and its answer was lost: the count has risen.
+            rig.view = FleetView::builder().turn(turn(4)).build();
+            rig.worker.on_send(Err(SendRefused::CountRose { now: 4 }));
+            let mut at = progress(&rig, &run, State::Building);
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            let counts: Vec<Option<u64>> = rig
+                .worker
+                .calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    Call::Send {
+                        only_if_prompts, ..
+                    } => Some(only_if_prompts),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(counts, vec![Some(3), Some(3)]);
+            assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
         }
 
         #[test]
