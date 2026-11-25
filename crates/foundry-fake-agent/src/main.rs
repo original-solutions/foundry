@@ -128,13 +128,14 @@ fn run(cli: Cli) -> Result<u8, String> {
                 let extra = BTreeMap::from([("message".to_string(), message.into())]);
                 fire(&settings, "Notification", extra);
             }
-            Step::WaitLine(start) => loop {
-                let Some(line) = read_prompt() else { break };
-                say(&format!("LINE={}", serde_json::Value::from(line.as_str())));
-                if line.starts_with(&start) {
-                    break;
+            Step::WaitLine(start) => {
+                while let Some(line) = read_prompt() {
+                    say(&format!("LINE={}", serde_json::Value::from(line.as_str())));
+                    if line.starts_with(&start) {
+                        break;
+                    }
                 }
-            },
+            }
             Step::Hook { event, extra } => fire(&settings, &event, extra),
             Step::SleepMs(ms) => std::thread::sleep(Duration::from_millis(ms)),
             Step::Print(text) => say(&text),

@@ -7,24 +7,47 @@
 //! start. The token passes through the terminal's private, short-lived env file, as the
 //! gateway key does; it is in no argument, log line, error or other file.
 //!
+//! A message to a factory session is a line typed into its terminal and, when it has a body, a
+//! file in the session's folder that the line names ([`Sessions::send_factory`]). The first
+//! message of a start goes the same way. The folder is under the data dir, so a body is never in
+//! the worktree. A session's turns are written by [`turns`].
+//!
 //! A file `factory` in the session's own folder, `<data dir>/sessions/<session>/`, marks the
 //! session as a factory session and holds its project. [`Sessions::adopt`] reads the marks
 //! again, so a daemon that starts again still knows its factory sessions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
 
 use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
+use foundry_proto::state::SessionState;
 
-use super::{Inner, SessionError, Sessions, blocking, claude, lock};
+use super::{Inner, SessionError, Sessions, blocking, claude, lock, turns};
 use crate::factory::messages::Message;
 use crate::git_auth::{self, GitAuth};
 use crate::terminals::TerminalError;
 
 /// The name of the mark file in a factory session's folder.
 const MARK: &str = "factory";
+
+/// The name of the file beside the mark that holds the session's workspace.
+const WORKSPACE: &str = "workspace";
+
+/// The folder in a session's folder that holds the files of its messages' bodies.
+const MESSAGES: &str = "messages";
+
+/// What a caller of [`Sessions::send_factory`] or [`Sessions::start_factory`] gives as the
+/// `body_path` of a `messages` builder. The worker replaces every one in the line with the
+/// absolute path of the file it wrote the body to. A line with none is typed as it is, and a
+/// message with no body writes no file.
+pub const BODY_PATH: &str = "{body}";
+
+/// How often the sweeper looks for factory sessions whose workspace was archived.
+pub const SWEEP_EVERY: Duration = Duration::from_secs(2);
 
 /// What a factory session is started for. It holds no secret: the token is read from the
 /// secret store at the start.
@@ -49,6 +72,25 @@ pub(super) struct FactoryState {
     pub marks: HashMap<SessionId, ProjectId>,
     /// Per workspace, the number of `end_factory` calls so far.
     pub ended: HashMap<WorkspaceId, u64>,
+    /// The workspace of each session whose workspace is known: every session this daemon
+    /// started, and each one adopt found a `workspace` file for.
+    pub workspaces: HashMap<SessionId, WorkspaceId>,
+    /// The numbers of each session's `session_turn` record, once that record is stored.
+    pub counts: HashMap<SessionId, turns::Counts>,
+    /// The sessions whose folder the sweeper removed.
+    pub swept: HashSet<SessionId>,
+    /// The sweeper task, once started. It holds the daemon's state, so dropping the sessions
+    /// aborts it.
+    pub sweeper: Option<tokio::task::AbortHandle>,
+}
+
+impl FactoryState {
+    /// Takes a session whose start failed out of everything but the ends asked for.
+    pub fn forget(&mut self, id: SessionId) {
+        self.marks.remove(&id);
+        self.workspaces.remove(&id);
+        self.counts.remove(&id);
+    }
 }
 
 /// What [`Inner::start`] adds for a factory session. It holds the token, so it has no `Debug`.
@@ -60,6 +102,8 @@ pub(super) struct FactoryLaunch {
     /// The workspace's end generation when the start began: an `end_factory` since then means
     /// this start must not go on.
     pub generation: u64,
+    /// The body of the first message, written to a file in the session's folder.
+    pub first_body: Option<String>,
 }
 
 /// Session `id`'s own folder, in the sessions folder `dir`.
@@ -67,14 +111,53 @@ pub(super) fn folder(dir: &Path, id: SessionId) -> PathBuf {
     dir.join(id.to_string())
 }
 
-/// The mark file of session `id`.
-pub(super) fn mark_file(dir: &Path, id: SessionId) -> PathBuf {
-    folder(dir, id).join(MARK)
+/// Writes a factory session's files in its `folder`, which is made readable by this user only:
+/// the mark, the workspace, and the body of the first message when there is one, whose path is
+/// given.
+pub(super) fn write_files(
+    folder: &Path,
+    project: ProjectId,
+    workspace: WorkspaceId,
+    body: Option<&str>,
+) -> Result<Option<PathBuf>, SessionError> {
+    claude::write_new_private(&folder.join(MARK), project.to_string().as_bytes())?;
+    claude::write_new_private(&folder.join(WORKSPACE), workspace.to_string().as_bytes())?;
+    body.map(|body| write_body(folder, body)).transpose()
 }
 
-/// Writes the mark at `path`, which makes the session's folder, readable by this user only.
-pub(super) fn write_mark(path: &Path, project: ProjectId) -> Result<(), SessionError> {
-    claude::write_new_private(path, project.to_string().as_bytes())
+/// Writes `body` to a new private file in the `messages` folder of session folder `folder`, and
+/// gives its path.
+fn write_body(folder: &Path, body: &str) -> Result<PathBuf, SessionError> {
+    let path = folder
+        .join(MESSAGES)
+        .join(format!("{}.md", uuid::Uuid::new_v4()));
+    claude::write_new_private(&path, body.as_bytes())?;
+    Ok(path)
+}
+
+/// `line` with every [`BODY_PATH`] replaced by `path`.
+pub(super) fn with_body_path(line: &str, path: &Path) -> String {
+    line.replace(BODY_PATH, &path.to_string_lossy())
+}
+
+/// Why [`Sessions::send_factory`] sent nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SendRefused {
+    /// The session is not idle.
+    #[error("the session is not idle")]
+    NotIdle,
+    /// The caller named a count of prompts, and the session's count is now above it.
+    #[error("the session has had prompts since: its count is now {now}")]
+    CountRose {
+        /// The session's count of submitted prompts.
+        now: u64,
+    },
+    /// The session is not a live factory session of this daemon.
+    #[error("no such live factory session")]
+    NoSuchSession,
+    /// The body could not be written or the line not typed. The reason names no secret.
+    #[error("the message was not sent: {0}")]
+    Failed(String),
 }
 
 /// The environment a factory session's child gets for `login`: the token for `gh` and as the
@@ -556,9 +639,8 @@ impl Sessions {
     /// [`SessionError::NoToken`], and so is a machine with no secret store. A start that fails
     /// leaves no terminal, no file, no folder and no record.
     ///
-    /// A first message with a body is refused with [`SessionError::FirstMessageBody`]: writing
-    /// a body to a file in the session's folder, and typing the line with its path, is what
-    /// the turns and messages unit adds, and it fills this seam.
+    /// A first message with a body has it written to a private file in the session's folder,
+    /// and each [`BODY_PATH`] in the line is the file's path when the line is typed.
     pub async fn start_factory(
         &self,
         workspace: WorkspaceId,
@@ -566,9 +648,6 @@ impl Sessions {
         start: FactoryStart,
         first: Message,
     ) -> Result<SessionId, SessionError> {
-        if first.body.is_some() {
-            return Err(SessionError::FirstMessageBody);
-        }
         // Before anything is read or written: an `end_factory` from here on beats this start.
         let generation = lock(&self.inner.factory)
             .ended
@@ -578,6 +657,7 @@ impl Sessions {
         let inner = self.inner.clone();
         let worktree = worktree.to_path_buf();
         let prompt = super::first_prompt(&first.line);
+        let first_body = first.body;
         tokio::spawn(async move {
             let secrets = inner.secrets.get().cloned();
             let (login, data) = (start.login.clone(), inner.data.clone());
@@ -596,6 +676,7 @@ impl Sessions {
                 effort: start.effort,
                 env,
                 generation,
+                first_body,
             };
             inner
                 .start(
@@ -626,6 +707,27 @@ impl Sessions {
             .collect();
         sessions.sort();
         sessions
+    }
+
+    /// Types `message`'s line into the terminal of factory session `session`, with its body in
+    /// a private file in the session's folder when it has one, and each [`BODY_PATH`] in the
+    /// line replaced by that file's path. It answers with the session's count of submitted
+    /// prompts before the send.
+    ///
+    /// The session must be idle, or it is [`SendRefused::NotIdle`]. With `only_if_prompts`, a
+    /// count above it is [`SendRefused::CountRose`], and nothing is written or typed: the line
+    /// that was sent before was typed after all. The send finishes even when the caller stops
+    /// waiting, and is ordered with the session's hooks.
+    pub async fn send_factory(
+        &self,
+        session: SessionId,
+        message: Message,
+        only_if_prompts: Option<u64>,
+    ) -> Result<u64, SendRefused> {
+        let inner = self.inner.clone();
+        tokio::spawn(async move { inner.send(session, message, only_if_prompts).await })
+            .await
+            .map_err(|_| SendRefused::Failed("the send did not finish".into()))?
     }
 
     /// Closes the terminal of each factory session of `workspace` that still runs, and makes a
@@ -681,10 +783,121 @@ impl Inner {
         }
     }
 
+    /// [`Sessions::send_factory`].
+    async fn send(
+        &self,
+        session: SessionId,
+        message: Message,
+        only_if_prompts: Option<u64>,
+    ) -> Result<u64, SendRefused> {
+        let failed = |error: SessionError| SendRefused::Failed(error.to_string());
+        let marked = lock(&self.factory).marks.contains_key(&session);
+        let live = self.live(session).filter(|_| marked);
+        let Some(live) = live else {
+            return Err(SendRefused::NoSuchSession);
+        };
+        let body = live.body.lock().await;
+        if !self.is_live(&live) {
+            return Err(SendRefused::NoSuchSession);
+        }
+        if body.state != SessionState::Idle {
+            return Err(SendRefused::NotIdle);
+        }
+        let prompts = self.counts(session).await.map_err(failed)?.prompts;
+        if let Some(wanted) = only_if_prompts
+            && prompts > wanted
+        {
+            return Err(SendRefused::CountRose { now: prompts });
+        }
+        let folder = folder(&self.dir, session);
+        let written = match message.body {
+            Some(text) => {
+                let folder = folder.clone();
+                let path = blocking(move || write_body(&folder, &text))
+                    .await
+                    .and_then(|r| r)
+                    .map_err(failed)?;
+                Some(path)
+            }
+            None => None,
+        };
+        let line = match &written {
+            Some(path) => with_body_path(&message.line, path),
+            None => message.line,
+        };
+        let keys = bytes::Bytes::from(claude::typed_prompt(&line));
+        match self.terminals.input(body.terminal, keys).await {
+            Ok(()) => Ok(prompts),
+            Err(error) => {
+                if let Some(path) = written {
+                    let _ = blocking(move || std::fs::remove_file(path)).await;
+                }
+                Err(match error {
+                    TerminalError::Gone(_) | TerminalError::Unknown(_) => {
+                        SendRefused::NoSuchSession
+                    }
+                    other => SendRefused::Failed(other.to_string()),
+                })
+            }
+        }
+    }
+
+    /// Starts the sweeper unless it runs: a task that, every [`SWEEP_EVERY`], removes the folder
+    /// of each factory session that has ended and whose workspace was archived. Archiving
+    /// closes the terminals first, so sessions cannot be told about it and look for it.
+    pub(super) fn ensure_sweeper(self: &Arc<Self>) {
+        let mut state = lock(&self.factory);
+        if state.sweeper.is_none() {
+            let inner = self.clone();
+            state.sweeper = Some(tokio::spawn(sweep(inner)).abort_handle());
+        }
+    }
+
+    /// One look of the sweeper. A store that cannot be read is tried again next time.
+    async fn sweep_once(&self) {
+        let candidates: Vec<(SessionId, WorkspaceId)> = {
+            let state = lock(&self.factory);
+            state
+                .workspaces
+                .iter()
+                .filter(|(id, _)| state.marks.contains_key(id) && !state.swept.contains(id))
+                .filter(|(id, _)| self.live(**id).is_none())
+                .map(|(id, workspace)| (*id, *workspace))
+                .collect()
+        };
+        for (session, workspace) in candidates {
+            match self.on_store(move |store| store.workspace(workspace)).await {
+                Ok(Some(record)) if record.deleted => {
+                    let folder = folder(&self.dir, session);
+                    let removed = blocking(move || match std::fs::remove_dir_all(&folder) {
+                        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                        _ => Ok(()),
+                    })
+                    .await;
+                    match removed {
+                        Ok(Ok(())) => {
+                            lock(&self.factory).swept.insert(session);
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(session = %session, %error, "the folder of an archived workspace's session was not removed");
+                        }
+                        Err(error) => {
+                            tracing::warn!(session = %session, %error, "the folder of an archived workspace's session was not removed");
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(session = %session, %error, "the workspace of a factory session could not be read");
+                }
+            }
+        }
+    }
+
     /// Reads the marks of the factory sessions an earlier daemon started, so they are still
     /// factory sessions. A mark that cannot be read, or holds no project, is skipped with a
     /// warning that does not show its contents.
-    pub(super) async fn adopt_marks(&self) {
+    pub(super) async fn adopt_marks(&self) -> bool {
         let dir = self.dir.clone();
         let found = blocking(move || {
             let mut found = Vec::new();
@@ -715,7 +928,14 @@ impl Inner {
                     .and_then(|text| uuid::Uuid::parse_str(text.trim()).ok())
                     .map(ProjectId);
                 match (session, project) {
-                    (Ok(session), Some(project)) => found.push((session, project)),
+                    (Ok(session), Some(project)) => {
+                        // Without it the session is simply never swept.
+                        let workspace = std::fs::read_to_string(entry.path().join(WORKSPACE))
+                            .ok()
+                            .and_then(|text| uuid::Uuid::parse_str(text.trim()).ok())
+                            .map(WorkspaceId);
+                        found.push((session, project, workspace));
+                    }
                     _ => tracing::warn!(
                         folder = %name,
                         "a factory mark cannot be read, so the session is not taken as a factory session"
@@ -726,7 +946,23 @@ impl Inner {
         })
         .await
         .unwrap_or_default();
-        lock(&self.factory).marks.extend(found);
+        let any = !found.is_empty();
+        let mut state = lock(&self.factory);
+        for (session, project, workspace) in found {
+            state.marks.insert(session, project);
+            if let Some(workspace) = workspace {
+                state.workspaces.insert(session, workspace);
+            }
+        }
+        any
+    }
+}
+
+/// The sweeper: looks every [`SWEEP_EVERY`], for as long as the sessions live.
+async fn sweep(inner: Arc<Inner>) {
+    loop {
+        tokio::time::sleep(SWEEP_EVERY).await;
+        inner.sweep_once().await;
     }
 }
 
