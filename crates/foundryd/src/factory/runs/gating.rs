@@ -7361,7 +7361,8 @@ mod tests {
             show_gone(&mut rig, &run, 1, &[], Duration::from_secs(6 * 60));
             rig.worker
                 .on_archive(Err(WorkerError::Unreachable("no route".into())));
-            assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
+            // Not an error: the run stays as it is and the archive is asked again.
+            assert_eq!(try_go(&rig, &run).unwrap(), GateStep::NotReady);
             assert!(
                 !rig.steps(&run)
                     .iter()
@@ -7449,6 +7450,47 @@ mod tests {
                 assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
             }
             assert_eq!(step_count(&rig, &run, "gate-archive-waiting 1"), 1);
+        }
+    }
+
+    mod review6 {
+        use super::*;
+
+        #[test]
+        fn three_refused_archives_of_the_build_workspace_at_pr_open_end_the_run_stuck() {
+            let (mut rig, run, _hub) = built();
+            rig.moved(&run, State::Building, State::PrOpen);
+            rig.step(&run, BUILD_SESSION_ENDED);
+            show(&mut rig, &run, SessionState::Idle, 1, &[]);
+            for _ in 0..3 {
+                rig.worker
+                    .on_archive(Err(WorkerError::Failed("the worktree is busy".into())));
+            }
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
+            let step = go(&rig, &run);
+            let GateStep::Stuck { reason } = &step else {
+                panic!("expected stuck, got {step:?}");
+            };
+            assert!(
+                reason.contains("a gate workspace could not be archived"),
+                "{reason}"
+            );
+        }
+
+        #[test]
+        fn the_unseen_wait_says_the_passes_it_has_left() {
+            let (rig, run, _hub) = built();
+            rig.worker
+                .on_create(Err(WorkerError::Unreachable("no answer".into())));
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
+            // The backoff's own pass.
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 0 });
+            // Then the grace for the workspace to be shown, on top of the backoff.
+            for left in [3, 2, 1, 0] {
+                assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: left });
+            }
+            assert_eq!(go(&rig, &run), GateStep::Running);
         }
     }
 }
