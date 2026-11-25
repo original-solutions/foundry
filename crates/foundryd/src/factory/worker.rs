@@ -628,6 +628,7 @@ mod tests {
     use foundry_proto::factory::{FactoryBody, FactoryRecord};
 
     use super::*;
+    use crate::test_log::Logged;
 
     fn id(n: u128) -> uuid::Uuid {
         uuid::Uuid::from_u128(n)
@@ -1071,7 +1072,22 @@ mod tests {
             ],
         )
         .unwrap();
+        let logged = Logged::default();
+        let _capture = logged.capture();
         assert!(FleetView::read(&store, online, BTreeMap::new()).is_err());
+        // The row stays until this machine runs a build that reads it, so every pass fails
+        // until then: the warning names the owner whose records stop the pass.
+        let warnings = logged.warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(&b.to_string()) && w.contains("printer")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains(&a.to_string())),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -1097,7 +1113,14 @@ mod tests {
             ],
         )
         .unwrap();
+        let logged = Logged::default();
+        let _capture = logged.capture();
         assert!(FleetView::read(&store, BTreeSet::from([a]), BTreeMap::new()).is_err());
+        let warnings = logged.warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains(&a.to_string())),
+            "{warnings:?}"
+        );
     }
 
     #[test]
