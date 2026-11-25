@@ -562,6 +562,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_machine_that_holds_the_login_among_others_is_picked() {
+        let (mac, _, settings) = two();
+        let view = FleetView::builder()
+            .sample(sample(mac, 0, 0.1))
+            .held(mac, holds(&["someone-else", LOGIN], true))
+            .online(mac)
+            .build();
+        let mut reserved = Reserved::default();
+        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(mac));
+        assert_eq!(place_gate(&view, &settings, LOGIN), Ok(mac));
+    }
+
+    #[test]
+    fn a_login_that_only_begins_with_the_projects_is_no_token_for_it() {
+        let (mac, _, settings) = two();
+        let view = FleetView::builder()
+            .sample(sample(mac, 0, 0.1))
+            .held(mac, holds(&["rawphp-ci"], true))
+            .online(mac)
+            .build();
+        let mut reserved = Reserved::default();
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Err(vec!["mac: no token for rawphp".to_owned()])
+        );
+    }
+
+    #[test]
+    fn an_offline_machine_is_said_to_be_offline_whatever_it_last_said_it_holds() {
+        let (mac, vps, settings) = two();
+        let view = FleetView::builder()
+            .sample(sample(mac, 0, 0.1))
+            .sample(sample(vps, 0, 0.1))
+            .held(mac, holds(&["someone-else"], false))
+            .build();
+        let mut reserved = Reserved::default();
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Err(vec!["mac: offline".to_owned(), "vps: offline".to_owned()])
+        );
+    }
+
+    #[test]
+    fn the_reasons_come_in_the_order_of_the_samples() {
+        // Ids that sort the other way from the samples, so an order by id would show.
+        let mac = MachineId(uuid::Uuid::from_u128(2));
+        let vps = MachineId(uuid::Uuid::from_u128(1));
+        let settings = settings(&[(mac, "mac"), (vps, "vps")]);
+        let view = FleetView::builder()
+            .sample(sample(mac, 4, 0.1))
+            .sample(sample(vps, 0, 0.1))
+            .held(mac, holds(&[LOGIN], true))
+            .held(vps, holds(&["someone-else"], true))
+            .online(mac)
+            .online(vps)
+            .build();
+        let mut reserved = Reserved::default();
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Err(vec![
+                "mac: sessions 4 at limit 4".to_owned(),
+                "vps: no token for rawphp".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_run_held_on_a_machine_counts_it_one_session_fuller() {
+        let (mac, vps, settings) = two();
+        // A run placed on the mac in an earlier pass, or by another project's pass, whose
+        // session no sample counts yet.
+        let mut reserved = Reserved::default();
+        reserved.hold(mac);
+        let view = FleetView::builder()
+            .sample(sample(mac, 3, 0.1))
+            .sample(sample(vps, 0, 0.5))
+            .held(mac, holds(&[LOGIN], true))
+            .held(vps, holds(&[LOGIN], true))
+            .online(mac)
+            .online(vps)
+            .build();
+        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
+
+        let mut reserved = Reserved::default();
+        reserved.hold(mac);
+        let alone = FleetView::builder()
+            .sample(sample(mac, 3, 0.1))
+            .held(mac, holds(&[LOGIN], true))
+            .online(mac)
+            .build();
+        assert_eq!(
+            place_run(&alone, &settings, LOGIN, &mut reserved),
+            Err(vec!["mac: sessions 4 at limit 4".to_owned()])
+        );
+        // A gate has no session, so what is held does not keep one off the machine.
+        assert_eq!(place_gate(&alone, &settings, LOGIN), Ok(mac));
+    }
+
     fn run(issue: u64, state: Option<State>, confirmed: bool, pr_reported: bool) -> RunInfo {
         RunInfo {
             id: RunId::new("acme/app", issue, 1).expect("a legal repo"),
