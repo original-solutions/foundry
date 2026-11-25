@@ -534,7 +534,8 @@ enum Scan {
     Absent,
     /// The marker at this path cannot be parsed.
     Unparseable(PathBuf),
-    /// The marker at this path, or the first of those, cannot be read.
+    /// The marker at this path cannot be read, or this folder or entry cannot be listed: the
+    /// first of them.
     Unreadable(PathBuf),
 }
 
@@ -548,13 +549,33 @@ fn scan_marker(worktrees: &Path, workspace: WorkspaceId) -> Scan {
     struct Marker {
         project: ProjectId,
     }
-    let Ok(entries) = std::fs::read_dir(worktrees) else {
-        return Scan::Absent;
+    let entries = match std::fs::read_dir(worktrees) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Scan::Absent,
+        Err(_) => return Scan::Unreadable(worktrees.to_path_buf()),
     };
     let file = format!("{workspace}.factory");
     let mut unreadable = None;
-    for folder in entries.flatten() {
-        if !folder.file_type().is_ok_and(|kind| kind.is_dir()) {
+    for entry in entries {
+        let folder = match entry {
+            Ok(folder) => folder,
+            Err(_) => {
+                unreadable.get_or_insert_with(|| worktrees.to_path_buf());
+                continue;
+            }
+        };
+        let is_dir = match folder.file_type() {
+            Ok(kind) => kind.is_dir(),
+            // The type could not be read: ask for the path's metadata before skipping it.
+            Err(_) => match std::fs::metadata(folder.path()) {
+                Ok(meta) => meta.is_dir(),
+                Err(_) => {
+                    unreadable.get_or_insert_with(|| folder.path());
+                    continue;
+                }
+            },
+        };
+        if !is_dir {
             continue;
         }
         let path = folder.path().join(&file);
@@ -2116,7 +2137,7 @@ mod tests {
         let (_dir, file) = clock_file("600");
         let (_, dyn_base) = fake_base();
 
-        assert!(!CLOCK_AHEAD_ALLOWED);
+        const { assert!(!CLOCK_AHEAD_ALLOWED) };
         let clock = clock_for(Some(file.into_os_string()), CLOCK_AHEAD_ALLOWED, dyn_base);
         assert_eq!(clock.now(), Duration::ZERO);
     }
@@ -2128,7 +2149,7 @@ mod tests {
         let (_dir, file) = clock_file("600");
         let (_, dyn_base) = fake_base();
 
-        assert!(CLOCK_AHEAD_ALLOWED);
+        const { assert!(CLOCK_AHEAD_ALLOWED) };
         let clock = clock_for(Some(file.into_os_string()), CLOCK_AHEAD_ALLOWED, dyn_base);
         assert_eq!(clock.now(), Duration::from_secs(600));
     }
