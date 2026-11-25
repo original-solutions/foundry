@@ -1170,6 +1170,11 @@ mod tests {
             let wrapper = root.join(format!("git-{n}"));
             fs::write(&wrapper, wrapper_script(&marks)).unwrap();
             fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+            // Another test's fork may hold the script open for a moment after it is written, and
+            // an exec of it then fails with "text file busy". Run it until it starts.
+            wait_until("the fake git can be started", || {
+                Command::new(&wrapper).arg("--probe").status().is_ok()
+            });
             let dir = root.join(format!("lease-{n}"));
             let lease = Lease::new(
                 ProjectId::random(),
@@ -1198,6 +1203,7 @@ mod tests {
         format!(
             r#"#!/bin/sh
 M='{}'
+if [ "$1" = --probe ]; then exit 0; fi
 echo "$@" >> "$M/argv"
 names=$(env | cut -d= -f1 | grep -E '^(GIT_ASKPASS|FOUNDRY_GIT_TOKEN|GIT_CONFIG_GLOBAL)$' | tr '\n' ' ')
 args=$(printf '%s' "$*" | tr '\n' ' ')
