@@ -1548,7 +1548,8 @@ fn start_session(
     // A start that was sent and has no session recorded may have been taken whose answer was
     // lost, and the worker's start is not idempotent: the sessions of the workspace are ended,
     // recorded before they are, and only then is it started again.
-    if at.seen.launch_sent {
+    let earlier_sent = at.seen.launch_sent;
+    if earlier_sent {
         ctx.record_step(
             run,
             LAUNCH_ENDING_SESSIONS,
@@ -1575,7 +1576,13 @@ fn start_session(
         // The worker refused: stuck, with the detail in the ledger only. A machine that cannot
         // be reached is no refusal: the next pass starts again.
         Err(RunError::Worker(WorkerError::Failed(what))) => {
-            let note = messages::session_may_exist_note(&what, &format!("foundry:{run}:launch"));
+            // A first start the worker refused made no session; one after a start that may have
+            // been taken may have left one.
+            let note = if earlier_sent {
+                messages::session_may_exist_note(&what, &format!("foundry:{run}:launch"))
+            } else {
+                what
+            };
             let stop = Stop {
                 reason: messages::LAUNCH_FAILED.into(),
                 detail: Some(note),
