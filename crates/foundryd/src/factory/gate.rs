@@ -6,11 +6,13 @@
 //! commands come from the config the caller gives, never from the worktree. The setup
 //! terminal's exit code is the gate's result, and its tail says which command failed.
 //!
-//! A gate that could not run (its create failed, or its machine was gone for 5 minutes) is not
-//! a gate failure. It is tried again after 1 pass, then 2, 4 and 8; the fifth failure has no
+//! A gate that could not run (its create failed, its machine was gone for 5 minutes, or its
+//! setup ended without saying which command failed) is not a gate failure. It is tried again after 1 pass, then 2, 4 and 8; the fifth failure has no
 //! retry. A `provision` that fails in the gate is a gate failure.
 //!
-//! The wording of the results comment is the runner's `src/gate.ts`.
+//! The wording of the results comment is the runner's `src/gate.ts`, less its merge: the
+//! runner gated the head merged with the base branch's tip, and Foundry's gate checks out the
+//! head alone, so the comment says the base was not merged.
 
 use std::time::Duration;
 
@@ -19,6 +21,7 @@ use foundry_proto::ids::ProjectId;
 use foundry_proto::state::TerminalState;
 
 use crate::factory::config::ProjectConfig;
+use crate::factory::messages::Ended;
 use crate::factory::text::{command_line, short_sha};
 use crate::factory::worker::{CreateWorkspace, WorkerError};
 use crate::workspaces::{Checkout, FactoryTag, Setup};
@@ -82,43 +85,61 @@ pub enum GateResult {
     Running,
     /// Every command exited 0.
     Passed,
-    /// A `provision` or `gate` command failed: which, how it ended in words, and its output.
+    /// A `provision` or `gate` command failed: which, how it ended in words and as
+    /// [`messages`](crate::factory::messages) takes it, and its output.
     Failed {
         command: String,
         how: String,
+        ended: Ended,
         output: String,
     },
+    /// The setup ended without saying which command failed: with no exit code, as when its
+    /// terminal's holder went away, or without its own last line, as when a signal stopped it.
+    /// The gate could not run, as for [`could_not_run`], and is not a gate failure.
+    Lost { reason: String },
 }
 
 /// The gate's result from its setup terminal's state, exit code and plain-text tail.
 ///
 /// A terminal that has not exited is running, and so is one whose machine cannot be reached:
 /// [`could_not_run`] says when that has gone on too long. An exit of 0 is a pass. Any other
-/// exit is a failure, `provision` included, and [`TIMED_OUT`] reads as [`RAN_TOO_LONG`]. The
-/// failing command and its output are read from the tail, as `workspaces` prints them: `$
-/// <command>` before each command, and `setup failed: <command> exited <code>` (or `ran past
-/// <limit> s and was stopped`) after the one that failed.
+/// exit is a failure, `provision` included, when the setup's own last line names the command
+/// that failed, and [`TIMED_OUT`] reads as [`RAN_TOO_LONG`]; with no such line, or no exit code,
+/// the gate is lost. The tail is read as the setups of `workspaces` (`SETUP_LIMITED` in
+/// `workspaces/mod.rs`) print it: `$ <command>` before each command, and last `setup failed:
+/// <command> exited <code>`, or `ran past <limit> s and was stopped`, after the one that failed.
+/// The verdict never depends on the tail, which the pull request's code writes; only the
+/// command named and the output shown do.
 pub fn result(state: TerminalState, exit_code: Option<i32>, tail: &str) -> GateResult {
     match state {
         TerminalState::Running | TerminalState::Unreachable => return GateResult::Running,
         TerminalState::Exited => {}
     }
-    let how = match exit_code {
+    let code = match exit_code {
         Some(0) => return GateResult::Passed,
-        Some(TIMED_OUT) => RAN_TOO_LONG.to_string(),
-        Some(code) => format!("exit code {code}"),
-        None => "ended with no exit code".to_string(),
-    };
-    let (command, output) = match exit_code.and_then(|code| failure_line(tail, code)) {
-        Some((at, command)) => {
-            let output = output_of(&tail[..at], &command).to_string();
-            (command, output)
+        Some(code) => code,
+        None => {
+            return GateResult::Lost {
+                reason: "the gate's setup ended with no exit code".to_string(),
+            };
         }
-        None => last_started(tail),
+    };
+    let Some((at, command)) = failure_line(tail, code) else {
+        return GateResult::Lost {
+            reason: format!("the gate's setup exited {code} and did not say which command failed"),
+        };
+    };
+    let output = output_of(&tail[..at], &command).to_string();
+    let (how, ended) = if code == TIMED_OUT {
+        let after_ms = u64::try_from(COMMAND_LIMIT.as_millis()).ok();
+        (RAN_TOO_LONG.to_string(), Ended::TimedOut { after_ms })
+    } else {
+        (format!("exit code {code}"), Ended::Exit(code.into()))
     };
     GateResult::Failed {
         command,
         how,
+        ended,
         output,
     }
 }
@@ -127,22 +148,13 @@ pub fn result(state: TerminalState, exit_code: Option<i32>, tail: &str) -> GateR
 const FAILED_PREFIX: &str = "setup failed: ";
 
 /// The byte offset of the setup's last line, `setup failed: <command> …`, and the command it
-/// names. The line is the last thing the setup prints, so it is looked for from the end, and
-/// only one whose ending fits `code` counts: output that fakes such a line earlier is passed
-/// over.
+/// names, when its ending fits `code`. The setup prints that line last, so only the last
+/// occurrence of its start is read: a line the output faked comes before it, and the real one
+/// may start mid-line, after output with no final newline.
 fn failure_line(tail: &str, code: i32) -> Option<(usize, String)> {
-    let mut end = tail.len();
-    while let Some(at) = tail[..end].rfind(FAILED_PREFIX) {
-        end = at;
-        if at > 0 && !tail[..at].ends_with('\n') {
-            continue;
-        }
-        let rest = tail[at + FAILED_PREFIX.len()..].trim_end_matches('\n');
-        if let Some(command) = command_before_ending(rest, code) {
-            return Some((at, command.to_string()));
-        }
-    }
-    None
+    let at = tail.rfind(FAILED_PREFIX)?;
+    let rest = tail[at + FAILED_PREFIX.len()..].trim_end_matches('\n');
+    command_before_ending(rest, code).map(|command| (at, command.to_string()))
 }
 
 /// `rest` without the ending the setup prints for a command that ended with `code`.
@@ -162,33 +174,14 @@ fn command_before_ending(rest: &str, code: i32) -> Option<&str> {
 }
 
 /// The output of `command` in `before`, the tail up to the setup's last line: what follows the
-/// last `$ <command>` line. All of `before` when the tail was cut after that line's start.
+/// last `$ <command>` line, which may start mid-line after output with no final newline. All of
+/// `before` when the tail was cut after that line's start.
 fn output_of<'a>(before: &'a str, command: &str) -> &'a str {
     let started = format!("$ {command}\n");
-    let mut end = before.len();
-    while let Some(at) = before[..end].rfind(&started) {
-        if at == 0 || before[..at].ends_with('\n') {
-            return &before[at + started.len()..];
-        }
-        end = at;
+    match before.rfind(&started) {
+        Some(at) => &before[at + started.len()..],
+        None => before,
     }
-    before
-}
-
-/// The command on the last `$ ` line of `tail` and what follows it, for a setup that ended with
-/// no last line of its own; an empty command and the whole tail when no command started.
-fn last_started(tail: &str) -> (String, String) {
-    let mut end = tail.len();
-    while let Some(at) = tail[..end].rfind("$ ") {
-        end = at;
-        if at > 0 && !tail[..at].ends_with('\n') {
-            continue;
-        }
-        let line = &tail[at + 2..];
-        let (command, output) = line.split_once('\n').unwrap_or((line, ""));
-        return (command.to_string(), output.to_string());
-    }
-    (String::new(), tail.to_string())
 }
 
 /// Why a gate could not run, or `None` while it still can: `create` is the error its workspace
@@ -261,8 +254,9 @@ fn seconds(duration_ms: u64) -> String {
 }
 
 /// The comment for a pull request whose gate ended with `verdict`. `head_sha` is the commit the
-/// gate ran on and `base_sha` the tip of the base branch. The commands are config text, so each
-/// is cleaned like the gate's own command line, then put in a code span nothing can leave.
+/// gate ran on and `base_sha` the tip of the base branch when it ran, which the gate did not
+/// merge. The commands are config text, so each is cleaned like the gate's own command line,
+/// then put in a code span nothing can leave.
 fn results_comment(
     verdict: &str,
     results: &[CommandResult],
@@ -276,7 +270,7 @@ fn results_comment(
         short => short,
     };
     let mut text = format!(
-        "**Factory gate: {verdict}** (attempt {attempt}, run by the factory in a fresh checkout of the pull request's head `{head}` merged with the base branch tip `{base}`)\n\n| Command | Exit | Time |\n|---|---|---|"
+        "**Factory gate: {verdict}** (attempt {attempt}, run by the factory in a fresh checkout of the pull request's head `{head}`, not merged with the base branch, whose tip was `{base}`)\n\n| Command | Exit | Time |\n|---|---|---|"
     );
     for result in results {
         text.push_str(&format!(
@@ -299,8 +293,8 @@ pub fn gate_results_comment(
     results_comment("passed", results, attempt, head_sha, base_sha)
 }
 
-/// The comment for a pull request that was ready already and passed the gate again on a head or
-/// a base branch that had moved: the same table, headed `passed again`.
+/// The comment for a pull request that was ready already and passed the gate again on a head
+/// that had moved: the same table, headed `passed again`.
 pub fn regate_results_comment(
     results: &[CommandResult],
     attempt: u32,
