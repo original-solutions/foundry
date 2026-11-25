@@ -2660,14 +2660,14 @@ mod tests {
             let rig = Rig::new();
             let run = run_id(1);
             building(&rig, &run);
-            record_send_typed(&rig.ctx(), &run, CauseStep::Advance, "forward-comment c1").unwrap();
+            record_send_typed(&rig.ctx(), &run, CauseStep::Forward, "forward-comment c1").unwrap();
             assert_eq!(
                 rig.steps(&run).last().map(String::as_str),
                 Some("send-typed forward-comment c1")
             );
             let last = rig.events(&run).pop().unwrap();
             let cause = last.cause.unwrap();
-            assert_eq!(cause["step"], "advance");
+            assert_eq!(cause["step"], "forward");
             assert_eq!(cause["reason"], "send-typed");
             assert!(
                 rig.ctx().seen(&run).unwrap().sends.is_empty(),
