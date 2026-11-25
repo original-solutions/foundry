@@ -1123,21 +1123,29 @@ fn each_session_read_gives_a_deleted_session_and_reads_only_session_rows() {
 }
 
 /// A workspace may have had several sessions, as a start after an end makes: `session_in` gives
-/// the one with the highest version, whatever their ids or their order of arrival.
+/// the one with the highest version, whatever their ids or their order of arrival. Should two
+/// sessions name one terminal, `session_on` gives the newer too.
 #[test]
-fn session_in_gives_the_workspaces_session_with_the_highest_version() {
+fn session_in_and_session_on_give_the_session_with_the_highest_version() {
     let (_dir, mut store) = open();
     let owner = MachineId::random();
     let older = session_at(owner, 2, 90, 60, 70);
-    let newer = session_at(owner, 5, 10, 60, 71);
+    let newer = session_at(owner, 5, 10, 60, 70);
     let elsewhere = session_at(owner, 9, 11, 61, 72);
     for record in [&newer, &elsewhere, &older] {
         store
             .apply(&AnyRecord::Session(record.clone()), owner)
             .unwrap();
     }
-    assert_eq!(store.session_in(newer.body.workspace).unwrap(), Some(newer));
-    assert_eq!(store.session_on(older.body.terminal).unwrap(), Some(older));
+    assert_eq!(
+        store.session_in(newer.body.workspace).unwrap(),
+        Some(newer.clone())
+    );
+    assert_eq!(store.session_on(older.body.terminal).unwrap(), Some(newer));
+    assert_eq!(
+        store.session_on(elsewhere.body.terminal).unwrap(),
+        Some(elsewhere)
+    );
 }
 
 /// A session row this build cannot read, one a newer build left before a rollback, is left out
