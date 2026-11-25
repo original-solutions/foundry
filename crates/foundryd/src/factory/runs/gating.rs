@@ -8174,5 +8174,36 @@ mod tests {
             assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
             assert_eq!(readies(&rig), 1);
         }
+
+        #[test]
+        fn a_second_attempt_after_the_first_was_marked_ready_is_marked_ready_again() {
+            let (mut rig, run, hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
+            rig.worker.on_tail(Ok(PASS_TAIL.into()));
+            // Attempt 1 is marked ready and its label move fails.
+            rig.sim.fail("issue edit", 1);
+            assert!(try_go(&rig, &run).is_err());
+            assert!(has_step(&rig, &run, &format!("{GATE_READY_MARKED}1")));
+            assert_eq!(rig.sim.labels(), ["factory:building"]);
+            // The head moves: back to draft, and attempt 2 gates the new head and passes.
+            hub.set_head(MOVED);
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert!(hub.lock().pulls[&12].draft);
+            rig.worker.on_create(Ok(gate_ws(2)));
+            assert_eq!(go(&rig, &run), GateStep::Running);
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(2, 0)]);
+            rig.worker.on_tail(Ok(PASS_TAIL.into()));
+            assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
+            let readies = rig
+                .sim
+                .writes()
+                .iter()
+                .filter(|write| write.contains("pr ready 12") && !write.contains("--undo"))
+                .count();
+            assert_eq!(readies, 2, "each attempt's pass marks it ready");
+            assert!(!hub.lock().pulls[&12].draft);
+            assert_eq!(rig.sim.labels(), ["factory:pr-open"]);
+        }
     }
 }
