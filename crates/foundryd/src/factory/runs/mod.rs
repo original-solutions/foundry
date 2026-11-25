@@ -1829,6 +1829,36 @@ mod tests {
             assert!(rig.steps(&run).contains(&GATE_RESULTS_POSTED.to_string()));
         }
 
+        #[test]
+        fn the_gate_results_intended_and_not_on_the_pull_request_are_posted() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.step(&run, "gate-results-commenting");
+            let payload = ActionPayload {
+                comment: Some("gate passed".into()),
+                ..ActionPayload::default()
+            };
+            let mut at = progress(&rig, &run, State::Building);
+            apply_actions(
+                &rig.ctx(),
+                ISSUE,
+                &mut at,
+                &[Action::PostGateResults { pr: 12 }],
+                &cause(),
+                &payload,
+            )
+            .unwrap();
+            let posted = rig
+                .sim
+                .writes()
+                .into_iter()
+                .filter(|w| w.starts_with("pr comment 12"))
+                .count();
+            assert_eq!(posted, 1);
+            assert!(rig.steps(&run).contains(&GATE_RESULTS_POSTED.to_string()));
+        }
+
         /// A forward sent under the session's prompt count, recorded before the send: a repeat
         /// after a lost answer goes under the same count and is delivered when the count rose.
         #[test]
