@@ -52,8 +52,8 @@ pub enum WorkerError {
 
 /// What a run asks of the fleet. Every call is made after [`Guard::check`] passes.
 pub trait Worker: Send + Sync {
-    /// Makes a workspace on `machine`. A second create with the same tag and name answers with
-    /// the first workspace.
+    /// Makes a workspace on `machine`. A second create on the same machine with the same tag and
+    /// name answers with the first workspace, while it is not archived.
     fn create(
         &self,
         machine: MachineId,
@@ -129,6 +129,8 @@ impl Guard for Lost {
 }
 
 /// The fleet as one pass of the factory sees it: a snapshot, so a pass reads no store twice.
+/// Sessions and terminals are held as stored; the offline rule of [`as_seen`] is applied when
+/// one is read.
 #[derive(Clone, Debug, Default)]
 pub struct FleetView {
     workspaces: Vec<Record<Workspace>>,
@@ -210,38 +212,49 @@ impl FleetView {
             .collect()
     }
 
-    /// The session of `workspace` to read: a live one before an ended one, one with a turn
-    /// (a factory session) before one without, and among equals the highest version. An
-    /// ended session is still answered when it is the only one, so a run sees it ended.
+    /// The session of `workspace` to read, ranked on the state as stored: a factory session (one
+    /// with a turn) comes before any other, so a person's P1 session in the workspace never
+    /// hides the factory session; among those a live one before an ended one; then the highest
+    /// version. An ended session is still answered when it is the best there is.
     pub fn session_of(&self, workspace: WorkspaceId) -> Option<&Record<Session>> {
         self.sessions
             .iter()
             .filter(|r| !r.deleted && r.body.workspace == workspace)
             .max_by_key(|r| {
                 let ended = matches!(r.body.state, SessionState::Finished | SessionState::Failed);
-                (!ended, self.turns.contains_key(&r.body.id), r.version)
+                (self.turns.contains_key(&r.body.id), !ended, r.version)
             })
     }
 
     /// The state of `session`, as its owner's record shows it: [`SessionState::Unreachable`]
     /// while its owner is offline. `None` for one unknown or deleted.
     pub fn session_state(&self, session: SessionId) -> Option<SessionState> {
-        self.sessions
+        let record = self
+            .sessions
             .iter()
-            .find(|r| !r.deleted && r.body.id == session)
-            .map(|r| r.body.state)
+            .find(|r| !r.deleted && r.body.id == session)?;
+        match as_seen(AnyRecord::Session(record.clone()), &self.online) {
+            AnyRecord::Session(seen) => Some(seen.body.state),
+            _ => unreachable!("as_seen keeps the kind of a record"),
+        }
     }
 
     /// The state and exit code of `terminal`. `None` for one unknown. A terminal whose owner
     /// is offline is unreachable, and a deleted one has exited, as P1 treats it.
     pub fn terminal(&self, terminal: TerminalId) -> Option<(TerminalState, Option<i32>)> {
         let record = self.terminals.get(&terminal)?;
-        let state = if record.deleted && record.body.state != TerminalState::Unreachable {
-            TerminalState::Exited
-        } else {
-            record.body.state
+        let seen = match as_seen(AnyRecord::Terminal(record.clone()), &self.online) {
+            AnyRecord::Terminal(seen) => seen,
+            _ => unreachable!("as_seen keeps the kind of a record"),
         };
-        Some((state, record.body.exit_code))
+        let code = seen.body.exit_code;
+        if seen.body.state == TerminalState::Unreachable {
+            Some((TerminalState::Unreachable, code))
+        } else if seen.deleted {
+            Some((TerminalState::Exited, code))
+        } else {
+            Some((seen.body.state, code))
+        }
     }
 
     /// The newest turn of `session`, when it is a factory session.
@@ -329,25 +342,9 @@ impl FleetViewBuilder {
         self
     }
 
-    /// The view, with every session and terminal of an offline owner shown as unreachable.
+    /// The view. Its records are held as stored; the offline rule applies when one is read.
     pub fn build(self) -> FleetView {
-        let mut view = self.view;
-        let online = view.online.clone();
-        view.sessions = std::mem::take(&mut view.sessions)
-            .into_iter()
-            .map(|r| match as_seen(AnyRecord::Session(r), &online) {
-                AnyRecord::Session(r) => r,
-                _ => unreachable!("as_seen keeps the kind of a record"),
-            })
-            .collect();
-        view.terminals = std::mem::take(&mut view.terminals)
-            .into_iter()
-            .map(|(id, r)| match as_seen(AnyRecord::Terminal(r), &online) {
-                AnyRecord::Terminal(r) => (id, r),
-                _ => unreachable!("as_seen keeps the kind of a record"),
-            })
-            .collect();
-        view
+        self.view
     }
 }
 
@@ -407,6 +404,24 @@ struct FakeState {
     made: Vec<(MachineId, FactoryTag, String, WorkspaceId)>,
     /// How many messages each session was delivered.
     delivered: BTreeMap<SessionId, u64>,
+    /// The workspace each started session belongs to.
+    homes: BTreeMap<SessionId, WorkspaceId>,
+}
+
+impl FakeState {
+    /// Forgets the sessions started in `workspace`, as a real worker does once they are ended.
+    fn forget_sessions(&mut self, workspace: WorkspaceId) {
+        let gone: Vec<SessionId> = self
+            .homes
+            .iter()
+            .filter(|(_, home)| **home == workspace)
+            .map(|(session, _)| *session)
+            .collect();
+        for session in gone {
+            self.homes.remove(&session);
+            self.delivered.remove(&session);
+        }
+    }
 }
 
 impl FakeWorker {
@@ -514,6 +529,7 @@ impl Worker for FakeWorker {
             .unwrap_or_else(|| Ok(SessionId::random()));
         if let Ok(session) = &answer {
             state.delivered.insert(*session, 1);
+            state.homes.insert(*session, workspace);
         }
         answer
     }
@@ -567,7 +583,11 @@ impl Worker for FakeWorker {
     fn end_sessions(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
         let mut state = self.lock();
         state.calls.push(Call::EndSessions { workspace });
-        state.end_sessions.pop_front().unwrap_or(Ok(()))
+        let answer = state.end_sessions.pop_front().unwrap_or(Ok(()));
+        if answer.is_ok() {
+            state.forget_sessions(workspace);
+        }
+        answer
     }
 
     fn archive(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
@@ -576,6 +596,7 @@ impl Worker for FakeWorker {
         let answer = state.archive.pop_front().unwrap_or(Ok(()));
         if answer.is_ok() {
             state.made.retain(|(_, _, _, made)| *made != workspace);
+            state.forget_sessions(workspace);
         }
         answer
     }
@@ -727,6 +748,7 @@ mod tests {
         fake.turn(asked, 3).unwrap();
         let sess = fake.start_session(ws, start(), msg("go")).unwrap();
         fake.end_sessions(ws).unwrap();
+        fake.on_send(Ok(1));
         fake.send(sess, msg("hi"), Some(2)).unwrap();
         assert_eq!(
             fake.calls(),
