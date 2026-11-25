@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -113,6 +114,11 @@ pub enum SessionError {
     NoToken(#[from] crate::git_auth::NoToken),
     #[error("sessions: git_auth gave a factory start no askpass or token")]
     NoAskpass,
+    #[error(
+        "sessions: a message with a body must name its file: its line has no {}",
+        factory::BODY_PATH
+    )]
+    BodyWithoutPath,
     #[error("sessions: the workspace's factory sessions were ended while this one was starting")]
     Ended,
     #[error(transparent)]
@@ -188,6 +194,9 @@ struct Inner {
     /// Tests: how many of the next writes fail, as a busy store would.
     #[cfg(test)]
     fail_writes: std::sync::atomic::AtomicUsize,
+    /// Tests: how many of the next writes of a `session_turn` record fail.
+    #[cfg(test)]
+    fail_turn_writes: std::sync::atomic::AtomicUsize,
     /// Tests: how many of the next reads of a terminal's exit fail.
     #[cfg(test)]
     fail_exit_reads: std::sync::atomic::AtomicUsize,
@@ -211,6 +220,9 @@ struct Live {
     activity: watch::Sender<Instant>,
     /// When `SessionStart` first came, for typing the first prompt.
     started: watch::Sender<Option<Instant>>,
+    /// Whether the first prompt still waits to be typed. The follower clears it when it types
+    /// the keys or gives up, and until then no message is typed after it.
+    first_pending: AtomicBool,
     /// What the session is for and doing, from its hooks' payloads.
     brief: Mutex<brief::Brief>,
     tasks: Mutex<Vec<AbortHandle>>,
@@ -242,6 +254,8 @@ impl Sessions {
                 live: Mutex::default(),
                 #[cfg(test)]
                 fail_writes: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                fail_turn_writes: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 fail_exit_reads: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
@@ -377,6 +391,7 @@ impl Inner {
                     factory::folder(&self.dir, id),
                     f.project,
                     f.first_body.clone(),
+                    self.hider().also(token.clone()),
                 )
             });
             blocking(move || {
@@ -388,8 +403,8 @@ impl Inner {
                 };
                 claude::write_settings(&settings, &json)?;
                 match marked {
-                    Some((folder, project, body)) => {
-                        factory::write_files(&folder, project, workspace, body.as_deref())
+                    Some((folder, project, body, hider)) => {
+                        factory::write_files(&folder, project, workspace, body.as_deref(), &hider)
                     }
                     None => Ok(None),
                 }
@@ -436,6 +451,7 @@ impl Inner {
             }),
             activity,
             started: watch::Sender::new(None),
+            first_pending: AtomicBool::new(prompt.is_some()),
             brief: Mutex::default(),
             tasks: Mutex::default(),
         });
@@ -454,7 +470,7 @@ impl Inner {
                     state.marks.insert(id, factory.project);
                     state.workspaces.insert(id, workspace);
                     // A new session has no record yet, so its counts are zeros.
-                    state.counts.insert(id, turns::Counts::default());
+                    state.counts.insert(id, turns::Tally::default());
                 }
                 ended
             };
@@ -653,6 +669,7 @@ impl Inner {
             body: tokio::sync::Mutex::new(session),
             activity: watch::Sender::new(Instant::now()),
             started: watch::Sender::new(None),
+            first_pending: AtomicBool::new(false),
             brief: Mutex::default(),
             tasks: Mutex::default(),
         });
@@ -873,6 +890,7 @@ async fn follow(
                     let at = *started.borrow_and_update();
                     if let Some(keys) = first.ready(at, Instant::now()) {
                         type_first(&inner, terminal, keys).await;
+                        live.first_pending.store(false, Ordering::Release);
                     }
                     let grace = first.grace_ends(at);
                     let next = tokio::select! {
@@ -892,7 +910,10 @@ async fn follow(
                         }
                         // The child exited.
                         None => {
-                            first.give_up(terminal);
+                            {
+                                first.give_up(terminal);
+                                live.first_pending.store(false, Ordering::Release);
+                            }
                             return exited(&inner, &live, terminal, &mut cursor).await;
                         }
                         Some(Err(error)) => {
@@ -904,7 +925,10 @@ async fn follow(
             }
             Err(error) => {
                 if matches!(error, TerminalError::Gone(_) | TerminalError::Unknown(_)) {
-                    first.give_up(terminal);
+                    {
+                        first.give_up(terminal);
+                        live.first_pending.store(false, Ordering::Release);
+                    }
                     return exited(&inner, &live, terminal, &mut cursor).await;
                 }
                 retry(&mut backoff, terminal, error).await;
