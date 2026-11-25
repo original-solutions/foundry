@@ -26,11 +26,18 @@
 //!   over once the same commit has been seen unchanged for 180 seconds, at
 //!   `max(ref generation, highest seen) + 1`: the ref's generation raised by one unless the
 //!   caller or this lease has seen higher.
-//! - A generation or count that cannot be raised is never pushed, and a message that holds
-//!   `u64::MAX` is a commit the lease did not write.
+//! - A generation or count that cannot be raised is never pushed, and a message that holds a
+//!   count above [`MAX_COUNT`] (`i64::MAX`) is a commit the lease did not write.
+//! - A commit that is listed but could not be fetched has no known generation, so it is never
+//!   taken over; the wait counts on, and it is taken over once a fetch reads it.
 //!
-//! Every push is a compare-and-swap (`--force-with-lease`), so a race has one winner. The loser
-//! stops acting at once: its hold is dropped before it reads who won.
+//! Every push is a compare-and-swap (`--force-with-lease`), so a race has one winner. A
+//! refused push drops the hold before the ref is read again, so the loser stops acting at
+//! once. The hold is put back, to lapse by age, only when the ref is unchanged: the remote's
+//! own rules refused the push and no other machine won.
+//!
+//! The lease directory stays small: a commit that is no lease is dropped after it is read, and
+//! a tick that wrote an object ends with `git gc --auto` (see [`Lease::collect`]).
 
 use std::fmt;
 use std::io::Read;
@@ -99,9 +106,21 @@ pub enum LeaseState {
     /// The lease was made with no token, so it runs no git.
     NoToken,
     /// This machine does not hold the lease and no holder is known, so there is no honest
-    /// [`MachineId`] to name for [`LeaseState::HeldBy`]: the ref could not be read, or this
-    /// tick's push failed, or the ref is missing and could not be taken, or it holds a commit
-    /// the lease did not write. `reason` is one of a few fixed texts, never git's own words.
+    /// [`MachineId`] to name for [`LeaseState::HeldBy`]. `reason` is one of these fixed texts,
+    /// never git's own words:
+    ///
+    /// - "the lease ref could not be read": this tick's read failed.
+    /// - "the lease commit could not be fetched": the ref is listed but its commit could not
+    ///   be fetched, so nothing is known of its holder.
+    /// - "the lease ref holds a commit foundryd did not write".
+    /// - "the lease could not be pushed": a push over such a commit failed.
+    /// - "the lease ref is missing and could not be taken": no ref, and the take failed or
+    ///   could not be raised.
+    /// - "the lease ref has not been read": a released lease that never ticked.
+    ///
+    /// A push that fails over a lease commit read this tick gives
+    /// [`LeaseState::HeldBy`] with the holder and generation read, as the spec has a machine
+    /// that does not hold say who does.
     ///
     /// A pass writes it as a `FactoryStatus` with `holds: false`, `not_holding: None` and
     /// `reason` as `idle`, since `NotHolding` has only `NoToken` and `HeldBy`, and neither can
@@ -164,7 +183,7 @@ struct Seen {
     /// fetched to be read.
     lease: Option<Parsed>,
     /// Whether the commit is in the lease directory. A commit that could not be fetched is
-    /// still waited for and taken over, since the swap needs only its id.
+    /// still waited for, but never taken over: its generation is unknown.
     fetched: bool,
 }
 
@@ -173,6 +192,8 @@ struct Seen {
 struct Notes {
     read_failed: bool,
     push_failed: bool,
+    /// An object was written to the lease directory: a commit made, or a fetch run.
+    wrote: bool,
 }
 
 #[derive(Debug)]
@@ -392,7 +413,32 @@ impl Lease {
         {
             self.push(auth, generation, renewals, expect.as_deref());
         }
+        self.collect(auth);
         self.report()
+    }
+
+    /// Keeps the lease directory small after a tick that wrote an object. A holder never
+    /// fetches, so each renewal leaves one loose commit; `gc --auto` does nothing below git's
+    /// threshold of loose objects (6700 by default, about four days of renewals) and above it
+    /// packs what the ref reaches and prunes the rest at once. The directory therefore stays
+    /// within the threshold plus one pack of the current lease commit.
+    fn collect(&self, auth: &GitAuth) {
+        if !self.shared.state().note.wrote {
+            return;
+        }
+        self.git(
+            auth,
+            &[
+                "-c",
+                "gc.autoDetach=false",
+                "-c",
+                "gc.pruneExpire=now",
+                "gc",
+                "--auto",
+                "--quiet",
+            ],
+            true,
+        );
     }
 
     /// What this machine may do, from what it holds and last read.
@@ -481,7 +527,19 @@ impl Lease {
                     None => Plan::Nothing,
                 }
             }
-            Found::Present { sha, parsed, .. } => {
+            Found::Present {
+                sha,
+                parsed,
+                fetched,
+            } => {
+                // A commit that could not be fetched has a generation nobody has read, so a
+                // take at `highest + 1` could repeat or lower it. It is never taken over: the
+                // wait counts from the first time it was listed, and goes on once a fetch
+                // succeeds and it reads as another machine's or as no lease at all.
+                if !fetched {
+                    state.hold = None;
+                    return Plan::Nothing;
+                }
                 // A commit naming this machine at a generation below one seen since is an old
                 // one that the ref was put back to: it is treated as another machine's.
                 let mine = parsed.filter(|parsed| {
@@ -523,9 +581,10 @@ impl Lease {
     }
 
     /// Makes a lease commit with no parent and pushes it as the ref, expecting the ref to be
-    /// at `expect` (or missing). A landed push is the hold; a refused one drops the hold and
-    /// reads who won; one that failed or timed out changes nothing, and the hold lapses by
-    /// age.
+    /// at `expect` (or missing). A landed push is the hold. A refused one drops the hold
+    /// before it re-reads the ref, and puts the hold back, to lapse by age, only when the ref
+    /// is unchanged (the remote's rules refused it, no other machine won). One that failed or
+    /// timed out changes nothing, and the hold lapses by age.
     fn push(&self, auth: &GitAuth, generation: u64, renewals: u64, expect: Option<&str>) {
         let Some(tree) = self
             .git(auth, &["hash-object", "-t", "tree", "-w", "--stdin"], true)
@@ -547,6 +606,7 @@ impl Lease {
             self.shared.state().note.push_failed = true;
             return;
         };
+        self.shared.state().note.wrote = true;
         let lease = format!("--force-with-lease={REF}:{}", expect.unwrap_or(""));
         let target = format!("{commit}:{REF}");
         let ran = self.git(
@@ -556,6 +616,8 @@ impl Lease {
         );
         match pushed(&ran.outcome) {
             Pushed::Landed => {
+                // The local ref keeps the current lease commit reachable, so `gc` keeps it.
+                self.git(auth, &["update-ref", REF, &commit], true);
                 let now = self.shared.clock.now();
                 let mut state = self.shared.state();
                 state.highest = state.highest.max(generation);
@@ -606,7 +668,7 @@ impl Lease {
     /// a line naming exactly [`REF`] counts, so a branch or tag that ends in the same words is
     /// no lease. The commit is fetched (one commit, no history) only when the lease directory
     /// has not got it, so a holder never fetches its own commit. A commit that cannot be
-    /// fetched is still `Present`, with no message, so the wait and the swap still run.
+    /// fetched is still `Present`, with no message: the wait counts on, but it is not taken over.
     ///
     /// Before it, any lock file a killed git call left in the lease directory is removed (see
     /// [`remove_stale`]).
@@ -655,6 +717,21 @@ impl Lease {
             }
             _ => return Found::Failed,
         };
+        // A commit already fetched and found to be no lease is not fetched again: its message
+        // is known, and what it brought was dropped.
+        let known_foreign = self
+            .shared
+            .state()
+            .seen
+            .as_ref()
+            .is_some_and(|seen| seen.sha == sha && seen.fetched && seen.lease.is_none());
+        if known_foreign {
+            return Found::Present {
+                sha,
+                parsed: None,
+                fetched: true,
+            };
+        }
         let commit = format!("{sha}^{{commit}}");
         let have = self
             .git(auth, &["cat-file", "-e", &commit], true)
@@ -669,6 +746,9 @@ impl Lease {
                     .and_then(|(_, message)| Parsed::from_message(message))
             })
             .flatten();
+        if fetched && parsed.is_none() {
+            self.drop_foreign(auth);
+        }
         Found::Present {
             sha,
             parsed,
@@ -676,10 +756,23 @@ impl Lease {
         }
     }
 
+    /// Drops what a fetched commit that is no lease brought: its tree, blobs and history.
+    /// Taking it over needs only its id, which the lease keeps.
+    fn drop_foreign(&self, auth: &GitAuth) {
+        self.git(auth, &["update-ref", "-d", REF], true);
+        let _ = std::fs::remove_file(self.dir.join("shallow"));
+        self.git(
+            auth,
+            &["-c", "gc.autoDetach=false", "gc", "--prune=now", "--quiet"],
+            true,
+        );
+    }
+
     /// Fetches the lease ref, one commit deep, and says whether it is `sha`. Until the check
     /// the ref fetched could be another that the name resolved to in a race, so the check is
     /// what makes the read exact.
     fn fetch(&self, auth: &GitAuth, sha: &str) -> bool {
+        self.shared.state().note.wrote = true;
         let refspec = format!("+{REF}:{REF}");
         let fetch = self.git(
             auth,
