@@ -257,9 +257,9 @@
 //! Copied from `building.rs`, whose own are private and which this issue may not edit, so a
 //! change to one is to be made in both until they are made `pub(super)` there or move into
 //! `runs/mod.rs` (a follow-up): `check_binding` with its `Unbound`, `reported_but` and the
-//! words of `does_not_exist`; the `gh` no-answer classifier `gh_gave_no_answer` with
-//! `answered_status` and `is_url_error`; and the back-to-draft rule, which `back_to_draft`
-//! repeats around `RunContext::mark_pr_draft`.
+//! words of `does_not_exist`; and the back-to-draft rule, which `back_to_draft` repeats
+//! around `RunContext::mark_pr_draft`. Whether `gh` got no answer from GitHub is not copied:
+//! `github::gh` gives such a failure the kind `OtherKind::NoAnswer`, which both read.
 //!
 //! `start.rs` counts a gate in flight as a `gate_checkout` with no `gate_finished`, which
 //! disagrees with `gate_running` during a backoff: a gate that could not run has a checkout and
@@ -818,63 +818,6 @@ fn check_binding(
         });
     }
     None
-}
-
-/// Whether a `gh` failure (`OtherKind::Failed`) is that `gh` got no answer from GitHub about
-/// the pull request, as `building` tells it: a call a signal ended (status `-1`), an answer
-/// over the output limit, a connection that failed, Go's transport error, GitHub's 5xx, and
-/// anything a mutation (`API call failed: ...`) says that is not a GraphQL answer. Any other
-/// shape is a refusal.
-fn gh_gave_no_answer(message: &str) -> bool {
-    if message.contains("` printed more than ") {
-        return true;
-    }
-    let Some((_, after)) = message.split_once("` exited with status ") else {
-        return false;
-    };
-    let Some((status, said)) = after.split_once(": ") else {
-        return false;
-    };
-    if status == "-1" || said.starts_with("error connecting to ") {
-        return true;
-    }
-    let (mutation, error) = match said.strip_prefix("API call failed: ") {
-        Some(error) => (true, error),
-        None => (false, said),
-    };
-    if let Some(status) = answered_status(error) {
-        return status >= 500;
-    }
-    if error.starts_with("GraphQL: ") {
-        return false;
-    }
-    mutation || is_url_error(error)
-}
-
-/// The status of GitHub's answer that `error` starts with, in go-gh's words
-/// (`HTTP 502: Bad Gateway (<url>)`) or shurcooL-graphql's
-/// (`non-200 OK status code: 502 Bad Gateway body: "..."`).
-fn answered_status(error: &str) -> Option<u16> {
-    let rest = error
-        .strip_prefix("HTTP ")
-        .or_else(|| error.strip_prefix("non-200 OK status code: "))?;
-    let digits = rest.get(..3)?;
-    if rest[3..].starts_with(|c: char| c.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-/// Whether `error` is Go's `*url.Error` (`%s %q: %s`): the method, the quoted `http` or
-/// `https` URL, `": "`, the cause.
-fn is_url_error(error: &str) -> bool {
-    error.split_once(' ').is_some_and(|(method, rest)| {
-        let mut letters = method.chars();
-        letters.next().is_some_and(|c| c.is_ascii_uppercase())
-            && letters.all(|c| c.is_ascii_lowercase())
-            && (rest.starts_with("\"http://") || rest.starts_with("\"https://"))
-            && rest.contains("\": ")
-    })
 }
 
 /// Where a gate workspace is archived from: see `Gate::archive_gate`.
@@ -1851,7 +1794,7 @@ impl Gate<'_, '_> {
                 error @ RunError::Tracker(
                     TrackerError::NotFound { .. }
                     | TrackerError::Other {
-                        kind: OtherKind::Failed,
+                        kind: OtherKind::Failed | OtherKind::NoAnswer,
                         ..
                     },
                 ),
@@ -1881,8 +1824,10 @@ impl Gate<'_, '_> {
                 let no_answer = |error: &RunError| {
                     matches!(
                         error,
-                        RunError::Tracker(TrackerError::Other { message, .. })
-                            if gh_gave_no_answer(message)
+                        RunError::Tracker(TrackerError::Other {
+                            kind: OtherKind::NoAnswer,
+                            ..
+                        })
                     )
                 };
                 if let Some(error) = failed.filter(no_answer) {
