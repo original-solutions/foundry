@@ -3075,6 +3075,80 @@ exec "$agent" "$@""#;
     }
 
     #[tokio::test]
+    async fn a_body_is_not_written_or_typed_when_there_is_no_secret_store() {
+        // A start with no store is refused as having no token before its body is looked at, so
+        // only a send reaches this: a session started with a store, then taken up by a daemon
+        // that has none.
+        let mut f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
+             - wait_line: \"\"\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+        f.restart_with(false).await;
+
+        let sent = f
+            .sessions
+            .send_factory(
+                id,
+                Message::new(format!("/continue {BODY_PATH}"), "the rules".into()),
+                None,
+            )
+            .await;
+
+        assert!(matches!(sent, Err(SendRefused::Failed(_))), "{sent:?}");
+        assert!(
+            !f.sessions_dir()
+                .join(id.to_string())
+                .join("messages")
+                .exists()
+        );
+        f.sessions
+            .send_factory(id, Fx::message("probe"), None)
+            .await
+            .unwrap();
+        let seen = f.shown(id, |t| !all_values(t, "LINE=").is_empty()).await;
+        assert_eq!(all_values(&seen, "LINE="), ["\"probe\""]);
+        assert!(!seen.contains("/continue"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn the_folder_of_an_ended_session_stays_while_its_tally_is_in_memory_and_behind() {
+        let f = Fx::new(STOPS_THEN_EXITS).await;
+        let project = ProjectId::random();
+        let workspace = WorkspaceId::random();
+        let id = f.start_factory(workspace, project).await;
+        until("the session to be idle", || {
+            f.state(id) == Some(SessionState::Idle)
+        })
+        .await;
+        f.fail_turn_writes(1_000_000);
+        f.type_keys(id, b"\n".to_vec()).await;
+        until("the session to end", || {
+            matches!(
+                f.state(id),
+                Some(SessionState::Finished | SessionState::Failed)
+            )
+        })
+        .await;
+        assert_eq!(f.turn_of(id), None);
+        let folder = f.sessions_dir().join(id.to_string());
+
+        f.archive(workspace, project, true);
+
+        // Several looks pass, and the record cannot be written at any of them.
+        tokio::time::sleep(SWEEP_EVERY * 3 + Duration::from_secs(1)).await;
+        assert!(folder.exists());
+        assert_eq!(f.turn_of(id), None);
+        f.fail_turn_writes(0);
+        f.until_turn(id, 1, 0).await;
+        until("the folder to go", || !folder.exists()).await;
+    }
+
+    #[tokio::test]
     async fn a_p1_sessions_stop_writes_no_turn_file_and_no_factory_record() {
         let f = Fx::new(&format!(
             "{IDLE}- stop: {{last_assistant_message: \"p1 done\"}}\n\
