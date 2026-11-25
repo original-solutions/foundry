@@ -60,7 +60,8 @@
 //!    `gate_retries + 1` is not placed, whether the gate before it failed or the head moved.
 //!    - **Fail.** A pull request someone took out of draft goes back to draft first
 //!      (`pr_set_draft`). With a retry left the failure is sent to the session once, as the
-//!      runner sends it (`gate-sending <attempt> <turn>`, `send_once` under the key
+//!      runner sends it (`gate-failing <attempt> <kind>` so a send owed is rebuilt, then
+//!      `gate-sending <attempt> <turn>`, `send_once` under the key
 //!      `gate-failure <attempt> <turn>`, `gate_sent_back`), and the pass is
 //!      [`GateStep::SentBack`]; the session works, `building` reads its next turn and the gate
 //!      comes back with the next attempt. With none left the run is stuck
@@ -112,8 +113,12 @@
 //!   base, so a conflict is only what GitHub says (`mergeable`), with no paths.
 //! - The gate's results come from the setup terminal's exit code and tail, not from command
 //!   lines the gate wrote: a passed gate has one `gate_command` line per configured command
-//!   with exit code 0 and no duration, and a failed one a single line for the command the tail
-//!   names (the last command when it names none), with the terminal's exit code.
+//!   with exit code 0 and no duration (so the results comment's table shows exit codes only,
+//!   and no time), and a failed one a single line for the command `gate::result` names, with
+//!   the terminal's exit code. When the tail names none (the pull request's code can erase
+//!   the setup's own line), nothing is invented: the failure is the gate's commands as a
+//!   whole, written `provision and gate commands joined with " && "`, and the output is the
+//!   whole tail, as `gate::result` gives it.
 //! - A head that moved is gated again and spends a retry (spec); the runner's gate left it for
 //!   the next call under the same attempt, and its checks wait made it stuck
 //!   (`checks-head-moved`). [`HEAD_KEPT_MOVING`] is the stop when none is left.
@@ -156,11 +161,35 @@
 //!   forward is another step's, the gate only waits while the session works.
 //! - The runner's `command id` cases: `send_once`'s key and prompt count replace the id.
 
-use foundry_proto::factory::{RunEvent, RunId};
-use foundry_proto::settings::SharedSettings;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
-use super::{RunContext, RunError};
-use crate::factory::placing::Slots;
+use foundry_proto::factory::{RunEvent, RunId};
+use foundry_proto::ids::{MachineId, SessionId, WorkspaceId};
+use foundry_proto::settings::SharedSettings;
+use foundry_proto::state::{SessionState, TerminalState};
+
+use super::progress::{
+    CHECKS_TIMED_OUT, GATE_PASSED, PassRecord, Seen, attempts_since_pass, read_progress,
+};
+use super::{
+    ActionPayload, Closing, Progress, RunContext, RunError, SendPayload, Stop, StuckStop, abandon,
+    apply_actions, closed_issue, end_own_merge, end_run, go_stuck, progress_from, recorded_reason,
+    session_id, workspace_id,
+};
+use crate::factory::config;
+use crate::factory::gate::{self, CommandResult, GateResult};
+use crate::factory::github::{CheckState, CheckStatus, Mergeable, PullRequest, TrackerError};
+use crate::factory::ledger::events::{Cause, CauseStep, CheckRead, Event, names};
+use crate::factory::ledger::{OUTPUT_LIMIT, system_ms};
+use crate::factory::lifecycle::{Event as LifecycleEvent, State, transition};
+use crate::factory::messages::{
+    self, CommandFailure, FailedCheck, GateFailure, Message, SESSION_GONE, STOPPED_BY_HAND,
+    prepare_output_tail, prepare_session_text,
+};
+use crate::factory::placing::{self, Slots};
+use crate::factory::text::{elapsed_ms, is_commit_id, sanitize};
+use crate::sessions::factory::BODY_PATH;
 
 /// The step written before a gate workspace is asked for, recording the commit gated:
 /// `gate-requested <attempt> <k> <head> <base tip> <machine>`.
@@ -223,6 +252,9 @@ pub enum GateStep {
     BackingOff { passes_left: u32 },
 }
 
+/// The `merge` command line a conflict is recorded under.
+const MERGE_COMMAND: &str = "merge";
+
 /// One pass over `run`, whose session reported its pull request. See the module's words.
 /// "Now" is the system's wall clock on the ledger's stamping base.
 pub fn advance(
@@ -231,7 +263,7 @@ pub fn advance(
     shared: &SharedSettings,
     slots: &mut Slots,
 ) -> Result<GateStep, RunError> {
-    advance_at(ctx, run, shared, slots, crate::factory::ledger::system_ms())
+    advance_at(ctx, run, shared, slots, system_ms())
 }
 
 /// [`advance`] with "now" given, in Unix epoch milliseconds on the ledger's stamping base.
@@ -242,16 +274,1434 @@ pub fn advance_at(
     slots: &mut Slots,
     now_ms: u64,
 ) -> Result<GateStep, RunError> {
-    let _ = (ctx, run, shared, slots, now_ms);
-    todo!("the gating step")
+    let events = ctx.ledger.read(run)?;
+    let seen = read_progress(&events);
+    if seen.finished {
+        return Ok(GateStep::NotReady);
+    }
+    let (Some(thread), Some(last)) = (seen.thread_id.clone(), seen.last_pr.clone()) else {
+        return Ok(GateStep::NotReady);
+    };
+    // A closed issue is a person's move, or the run's own merged pull request, which ends the
+    // run here unless a recorded pass has the gate finish it.
+    let (closing, _) = closed_issue(ctx, run, &seen)?;
+    match closing {
+        Closing::PersonsMove => {
+            abandon(ctx, run, &seen, CauseStep::Gate)?;
+            return Ok(GateStep::Abandoned);
+        }
+        Closing::OwnMerge(pull) if seen.pass.is_none() => {
+            end_own_merge(ctx, run, &seen, CauseStep::Gate, &pull)?;
+            return Ok(GateStep::Ended);
+        }
+        Closing::OwnMerge(_) | Closing::Open => {}
+    }
+    let gate = Gate {
+        ctx,
+        run,
+        shared,
+        now_ms,
+        issue: run.issue(),
+        pr: last.pr,
+        url: last.url,
+        session: session_id(&thread)?,
+    };
+    gate.pass(slots)
 }
 
 /// Whether `events` show a gate in flight, which holds one of the fleet's gate slots: placed
 /// (`gate-requested`) and neither archived (`gate-archived`) nor given up on
 /// (`gate-could-not-run`) since.
 pub fn gate_running(events: &[RunEvent]) -> bool {
-    let _ = events;
-    todo!("the gate slot")
+    Log::read(events)
+        .reqs
+        .last()
+        .is_some_and(|req| !req.archived && !req.cnr)
+}
+
+// ----- what the gate's own steps say -----
+
+/// One gate placed: `gate-requested`, and what followed it.
+#[derive(Clone, Debug, Default)]
+struct Req {
+    attempt: u32,
+    k: u32,
+    sha: String,
+    base: String,
+    machine: String,
+    created: Option<String>,
+    ended: Option<(i32, String)>,
+    archiving: bool,
+    archived: bool,
+    cnr: bool,
+}
+
+/// A `gate-could-not-run` step.
+#[derive(Clone, Debug)]
+struct Cnr {
+    attempt: u32,
+    failures: u32,
+    reason: String,
+    /// How many gates had been requested when it was written.
+    reqs_at: usize,
+}
+
+/// The gate's steps of the round the run is in, read from its events.
+#[derive(Default)]
+struct Log {
+    reqs: Vec<Req>,
+    cnrs: Vec<Cnr>,
+    /// Passes spent waiting since the newest `gate-could-not-run`.
+    waited: u32,
+    /// Attempts whose head moved.
+    moved: BTreeSet<u32>,
+    /// What each failed attempt is, as `gate-failing` says.
+    failing: BTreeMap<u32, String>,
+    /// Attempts whose `gate_finished` is written.
+    finished: BTreeSet<u32>,
+    session_ended: bool,
+    build_archiving: bool,
+    build_archived: bool,
+}
+
+fn number(text: Option<&str>) -> Option<u32> {
+    text?.parse().ok()
+}
+
+impl Log {
+    fn read(events: &[RunEvent]) -> Log {
+        let mut log = Log::default();
+        for event in events {
+            match event.event.as_str() {
+                names::STATE_CHANGED => {
+                    // A round starts again when the run comes back to building.
+                    if event.data["to"] == State::Building.name() {
+                        log = Log::default();
+                    }
+                }
+                "gate_finished" => {
+                    if let Some(attempt) = event.data["attempt"].as_u64() {
+                        log.finished
+                            .insert(u32::try_from(attempt).unwrap_or(u32::MAX));
+                    }
+                }
+                names::STEP_CHANGED => {
+                    if let Some(step) = event.data["step"].as_str() {
+                        log.step(step);
+                    }
+                }
+                _ => {}
+            }
+        }
+        log
+    }
+
+    fn step(&mut self, step: &str) {
+        if let Some(rest) = step.strip_prefix(GATE_REQUESTED) {
+            let mut part = rest.split(' ');
+            if let (Some(attempt), Some(k), Some(sha), Some(base), Some(machine)) = (
+                number(part.next()),
+                number(part.next()),
+                part.next(),
+                part.next(),
+                part.next(),
+            ) {
+                self.reqs.push(Req {
+                    attempt,
+                    k,
+                    sha: sha.into(),
+                    base: base.into(),
+                    machine: machine.into(),
+                    ..Req::default()
+                });
+            }
+        } else if let Some(rest) = step.strip_prefix(GATE_CREATED) {
+            if let Some((k, id)) = rest.split_once(' ')
+                && let Some(req) = self.req(number(Some(k)))
+            {
+                req.created = Some(id.into());
+            }
+        } else if let Some(rest) = step.strip_prefix(GATE_ENDED) {
+            let (head, tail) = rest.split_once('\n').unwrap_or((rest, ""));
+            if let Some((k, code)) = head.split_once(' ')
+                && let Ok(code) = code.parse()
+                && let Some(req) = self.req(number(Some(k)))
+            {
+                req.ended = Some((code, tail.to_owned()));
+            }
+        } else if let Some(k) = step.strip_prefix(GATE_ARCHIVING) {
+            if let Some(req) = self.req(number(Some(k))) {
+                req.archiving = true;
+            }
+        } else if let Some(k) = step.strip_prefix(GATE_ARCHIVED) {
+            if let Some(req) = self.req(number(Some(k))) {
+                req.archived = true;
+            }
+        } else if let Some(rest) = step.strip_prefix(GATE_COULD_NOT_RUN) {
+            let mut part = rest.splitn(5, ' ');
+            if let (Some(attempt), Some(k), Some(failures), Some(_wait), Some(reason)) = (
+                number(part.next()),
+                number(part.next()),
+                number(part.next()),
+                part.next(),
+                part.next(),
+            ) {
+                if let Some(req) = self.req(Some(k)) {
+                    req.cnr = true;
+                }
+                self.waited = 0;
+                self.cnrs.push(Cnr {
+                    attempt,
+                    failures,
+                    reason: reason.into(),
+                    reqs_at: self.reqs.len(),
+                });
+            }
+        } else if step.starts_with(GATE_WAITING) {
+            self.waited += 1;
+        } else if let Some(rest) = step.strip_prefix(GATE_HEAD_MOVED) {
+            if let Some(attempt) = number(rest.split(' ').next()) {
+                self.moved.insert(attempt);
+            }
+        } else if let Some(rest) = step.strip_prefix(GATE_FAILING) {
+            if let Some((attempt, kind)) = rest.split_once(' ')
+                && let Some(attempt) = number(Some(attempt))
+            {
+                self.failing.insert(attempt, kind.to_owned());
+            }
+        } else if step == BUILD_SESSION_ENDED {
+            self.session_ended = true;
+        } else if step == BUILD_ARCHIVING {
+            self.build_archiving = true;
+        } else if step == BUILD_ARCHIVED {
+            self.build_archived = true;
+        }
+    }
+
+    fn req(&mut self, k: Option<u32>) -> Option<&mut Req> {
+        let k = k?;
+        self.reqs.iter_mut().find(|req| req.k == k)
+    }
+
+    /// The could-not-run no gate has been requested since: a gate waiting to be tried again.
+    fn active_cnr(&self) -> Option<&Cnr> {
+        self.cnrs
+            .last()
+            .filter(|cnr| cnr.reqs_at == self.reqs.len())
+    }
+}
+
+/// The step written before a failed attempt is sent back: `gate-failing <attempt> <kind>`.
+pub const GATE_FAILING: &str = "gate-failing ";
+
+/// What failed an attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// A command of the gate failed.
+    Command,
+    /// GitHub says the pull request conflicts with its base.
+    Conflict,
+    /// A required check failed.
+    Checks,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Command => "command",
+            Kind::Conflict => "conflict",
+            Kind::Checks => "checks",
+        }
+    }
+
+    fn of(name: &str) -> Option<Kind> {
+        [Kind::Command, Kind::Conflict, Kind::Checks]
+            .into_iter()
+            .find(|kind| kind.name() == name)
+    }
+}
+
+/// `n` attempts as the stuck comment counts them: "1 attempt", "2 attempts".
+fn attempts(n: u32) -> String {
+    format!("{n} {}", if n == 1 { "attempt" } else { "attempts" })
+}
+
+/// The last `max` bytes of `text`, cut on a character boundary.
+fn tail_within(text: &str, max: usize) -> &str {
+    let mut at = text.len().saturating_sub(max);
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    &text[at..]
+}
+
+/// Why a pull request is not the session's own, in `building`'s words.
+struct Unbound {
+    public: String,
+    detail: Option<String>,
+}
+
+fn reported_but(pr: u64, what: &str) -> String {
+    format!("the session reported PR #{pr} but {what}")
+}
+
+/// Binds a pull request to a run as `building` does: in this repo, not a fork, merging into
+/// `base`, and from one of the run's `branches`.
+fn check_binding(
+    pull: Option<&PullRequest>,
+    pr: u64,
+    base: &str,
+    branches: &[&str],
+) -> Option<Unbound> {
+    let plain = |what: &str| Unbound {
+        public: reported_but(pr, what),
+        detail: None,
+    };
+    let Some(pull) = pull else {
+        return Some(plain("it does not exist"));
+    };
+    if pull.cross_repository {
+        return Some(plain("it comes from a fork"));
+    }
+    if pull.base_ref != base {
+        let run_base = prepare_session_text(base);
+        return Some(Unbound {
+            public: reported_but(pr, &format!("its base is not the base branch {run_base}")),
+            detail: Some(reported_but(
+                pr,
+                &format!(
+                    "its base {} is not the base branch {run_base}",
+                    prepare_session_text(&pull.base_ref)
+                ),
+            )),
+        });
+    }
+    if branches.is_empty() {
+        return Some(plain("the session has no branch"));
+    }
+    if !branches.contains(&pull.head_ref.as_str()) {
+        return Some(Unbound {
+            public: reported_but(pr, "its branch is not this session's branch"),
+            detail: Some(reported_but(
+                pr,
+                &format!(
+                    "its branch {} is not this session's branch",
+                    prepare_session_text(&pull.head_ref)
+                ),
+            )),
+        });
+    }
+    None
+}
+
+/// Whether the session cannot be sent a message now.
+fn busy(state: SessionState) -> bool {
+    !matches!(
+        state,
+        SessionState::Idle | SessionState::Finished | SessionState::Failed
+    )
+}
+
+// ----- one pass -----
+
+struct Gate<'a, 'c> {
+    ctx: &'a RunContext<'c>,
+    run: &'a RunId,
+    shared: &'a SharedSettings,
+    now_ms: u64,
+    issue: u64,
+    pr: u64,
+    url: String,
+    session: SessionId,
+}
+
+impl Gate<'_, '_> {
+    fn cause(&self, reason: &str) -> Cause {
+        Cause::new(CauseStep::Gate, reason)
+    }
+
+    fn step(&self, text: &str, reason: &str, attempt: Option<u32>) -> Result<(), RunError> {
+        let cause = match attempt {
+            Some(attempt) => self.cause(reason).attempt(attempt),
+            None => self.cause(reason),
+        };
+        self.ctx.record_step(self.run, text, &cause)
+    }
+
+    fn record(&self, event: Event, reason: &str, attempt: u32) -> Result<(), RunError> {
+        self.ctx
+            .record(self.run, event, &self.cause(reason).attempt(attempt))
+    }
+
+    /// The ledger as it stands.
+    fn fresh(&self) -> Result<(Seen, Log), RunError> {
+        let events = self.ctx.ledger.read(self.run)?;
+        Ok((read_progress(&events), Log::read(&events)))
+    }
+
+    fn at(&self, seen: &Seen) -> Progress {
+        progress_from(self.run, CauseStep::Gate, seen, State::Building)
+    }
+
+    fn retries(&self) -> u64 {
+        self.ctx.config.limits.gate_retries
+    }
+
+    fn base<'s>(&'s self, seen: &'s Seen) -> &'s str {
+        seen.base.as_deref().unwrap_or(&self.ctx.config.base)
+    }
+
+    fn commands(&self) -> Vec<String> {
+        self.ctx
+            .config
+            .provision
+            .iter()
+            .chain(&self.ctx.config.gate)
+            .cloned()
+            .collect()
+    }
+
+    fn build_workspace(&self, seen: &Seen) -> Result<Option<WorkspaceId>, RunError> {
+        seen.worktree
+            .as_deref()
+            .or(seen.workspace.as_deref())
+            .map(workspace_id)
+            .transpose()
+    }
+
+    // ----- ending the run's own workspaces -----
+
+    /// The build session ended, once.
+    fn end_session(&self) -> Result<(), RunError> {
+        let (seen, log) = self.fresh()?;
+        if log.session_ended {
+            return Ok(());
+        }
+        if let Some(workspace) = self.build_workspace(&seen)? {
+            self.ctx.end_sessions(workspace)?;
+        }
+        self.step(BUILD_SESSION_ENDED, "build-session-ended", None)
+    }
+
+    /// The build workspace archived by force.
+    fn archive_build(&self) -> Result<(), RunError> {
+        let (seen, log) = self.fresh()?;
+        if log.build_archived {
+            return Ok(());
+        }
+        if let Some(workspace) = self.build_workspace(&seen)? {
+            if !log.build_archiving {
+                self.step(BUILD_ARCHIVING, "build-archiving", None)?;
+            }
+            self.ctx.archive(workspace)?;
+        }
+        self.step(BUILD_ARCHIVED, "build-archived", None)
+    }
+
+    /// The stuck path, with the build session ended first and once.
+    fn stuck(&self, code: &str, stop: Stop) -> Result<GateStep, RunError> {
+        self.end_session()?;
+        let (seen, _) = self.fresh()?;
+        let mut at = self.at(&seen);
+        // Ended above: `go_stuck` has nothing to stop.
+        at.worktree = None;
+        let reason = recorded_reason(&stop);
+        go_stuck(self.ctx, self.issue, &mut at, code, stop, None)?;
+        Ok(GateStep::Stuck { reason })
+    }
+
+    /// A stuck decision an earlier pass began, finished with the words it recorded.
+    fn resume_stuck(&self, seen: &Seen) -> Result<GateStep, RunError> {
+        let Some(raw) = &seen.stuck_stop else {
+            let Some(reason) = &seen.stuck else {
+                return Err(RunError::Invalid(format!(
+                    "run {} has no stuck path",
+                    self.run
+                )));
+            };
+            self.stuck("stuck-resumed", Stop::new(reason.clone()))?;
+            return Ok(GateStep::Stuck {
+                reason: reason.clone(),
+            });
+        };
+        let decision: StuckStop = serde_json::from_str(raw).map_err(|error| {
+            RunError::Invalid(format!("the stuck decision of {}: {error}", self.run))
+        })?;
+        let mut stop = decision.stop;
+        stop.detail = seen.stuck_detail.clone();
+        if decision.code == "checks-retries-used-up"
+            && let Some(failed) = &seen.checks_failed
+        {
+            let list = self.failed_checks(&failed.sha, &failed.failed);
+            stop.session_text = Some(prepare_output_tail(&messages::checks_failure_text(
+                &failed.sha,
+                &list,
+            )));
+        }
+        self.stuck(&decision.code, stop)
+    }
+
+    // ----- the pass -----
+
+    fn pass(&self, slots: &mut Slots) -> Result<GateStep, RunError> {
+        let events = self.ctx.ledger.read(self.run)?;
+        let seen = read_progress(&events);
+        let log = Log::read(&events);
+        if seen.stuck.is_some() || seen.stuck_stop.is_some() {
+            return self.resume_stuck(&seen);
+        }
+        if seen.stop_requested && seen.state == Some(State::Building) {
+            return self.stuck("stop-requested", Stop::new(STOPPED_BY_HAND));
+        }
+        match seen.state {
+            Some(State::PrOpen) => {
+                self.end_session()?;
+                self.archive_build()?;
+                return Ok(GateStep::Passed { pr: self.pr });
+            }
+            Some(State::Building) => {}
+            _ => return Ok(GateStep::NotReady),
+        }
+        let pass = seen
+            .pass
+            .clone()
+            .filter(|pass| !log.moved.contains(&pass.attempt));
+        let state = self.ctx.view.session_state(self.session);
+        let turn = self.ctx.view.session_turn(self.session).map(|t| t.turn);
+        // A send begun and not recorded is finished first, whatever else moved.
+        if let Some(owed) = seen
+            .sending
+            .filter(|sending| !seen.sent_back_attempts.contains(&sending.attempt))
+        {
+            let Some(state) = state else {
+                return self.stuck("session-gone", Stop::new(SESSION_GONE));
+            };
+            if busy(state) || turn.is_none() {
+                return Ok(GateStep::NotReady);
+            }
+            let kind = log
+                .failing
+                .get(&owed.attempt)
+                .and_then(|kind| Kind::of(kind))
+                .ok_or_else(|| {
+                    RunError::Invalid(format!("attempt {} has no failure on record", owed.attempt))
+                })?;
+            return self.send_back(owed.attempt, kind, turn);
+        }
+        match pass {
+            Some(pass) => self.after_pass(&seen, &log, &pass, state, turn),
+            None => {
+                let Some(state) = state else {
+                    return self.stuck("session-gone", Stop::new(SESSION_GONE));
+                };
+                if busy(state) || turn.is_none() || !seen.pr_reported {
+                    return Ok(GateStep::NotReady);
+                }
+                self.attempt(&seen, &log, slots, turn)
+            }
+        }
+    }
+
+    // ----- placing and reading a gate -----
+
+    /// No pass is recorded: the gate in flight is read, a verdict settled, or a gate placed.
+    fn attempt(
+        &self,
+        seen: &Seen,
+        log: &Log,
+        slots: &mut Slots,
+        turn: Option<u64>,
+    ) -> Result<GateStep, RunError> {
+        let closed = |attempt: u32| {
+            seen.sent_back_attempts.contains(&attempt)
+                || seen.passed_attempts.contains(&attempt)
+                || log.moved.contains(&attempt)
+        };
+        match log.reqs.last() {
+            Some(req) if !req.cnr && req.ended.is_none() => return self.read_gate(req.clone()),
+            Some(req) if req.ended.is_some() && !closed(req.attempt) => {
+                return self.settle(req.clone(), turn);
+            }
+            _ => {}
+        }
+        let latest = log
+            .reqs
+            .iter()
+            .map(|req| req.attempt)
+            .chain(seen.command_attempts.iter().copied())
+            .chain(seen.sent_back_attempts.iter().copied())
+            .max()
+            .unwrap_or(0);
+        let attempt = if latest == 0 {
+            1
+        } else if closed(latest) {
+            latest + 1
+        } else {
+            latest
+        };
+        // A gate that could not run waits its passes out.
+        if let Some(cnr) = log.active_cnr() {
+            match gate::backoff(cnr.failures) {
+                None => {
+                    return self.stuck(
+                        "gate-could-not-run",
+                        Stop::new(format!("the gate could not run: {}", cnr.reason)),
+                    );
+                }
+                Some(wait) if log.waited < wait => {
+                    self.step(
+                        &format!("{GATE_WAITING}{}", cnr.failures),
+                        "gate-waiting",
+                        Some(attempt),
+                    )?;
+                    return Ok(GateStep::BackingOff {
+                        passes_left: wait - log.waited - 1,
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        let pull = self.ctx.tracker.pull_request(self.ctx.repo(), self.pr)?;
+        if let Some(step) = self.unbound(seen, pull.as_ref())? {
+            return Ok(step);
+        }
+        let pull = pull.ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?;
+        if !pull.open {
+            let at = self.at(seen);
+            end_run(self.ctx, &at, &self.url, Some(&pull), CauseStep::Gate)?;
+            return Ok(GateStep::Ended);
+        }
+        if u64::from(attempt) > self.retries() + 1 {
+            return self.stuck("head-kept-moving", Stop::new(HEAD_KEPT_MOVING));
+        }
+        let head = pull.head_sha.to_lowercase();
+        if !is_commit_id(&head) {
+            return Err(RunError::Invalid(
+                "the pull request's head is not a commit id".into(),
+            ));
+        }
+        if self.ctx.config.gate.is_empty() {
+            return Err(RunError::Invalid(
+                "the project config names no gate command".into(),
+            ));
+        }
+        // GitHub already says the head conflicts: the attempt failed, with no gate or slot.
+        if pull.mergeable == Mergeable::Conflicting {
+            if !seen.command_attempts.contains(&attempt) {
+                self.record(
+                    Event::GateCommand {
+                        attempt,
+                        command: MERGE_COMMAND.into(),
+                        exit_code: 1,
+                        duration_ms: 0,
+                    },
+                    "gate-merge-conflict",
+                    attempt,
+                )?;
+            }
+            return self.fail_attempt(attempt, Kind::Conflict, Some(pull), turn);
+        }
+        if slots.gates_free == 0 {
+            return Ok(GateStep::Queued);
+        }
+        let base_sha = self
+            .ctx
+            .tracker
+            .branch_tip(self.ctx.repo(), self.base(seen))?
+            .to_lowercase();
+        let k = log.reqs.iter().map(|req| req.k).max().unwrap_or(0) + 1;
+        let machine = match placing::place_gate(self.ctx.view, self.shared, &self.ctx.project.login)
+        {
+            Ok(machine) => machine,
+            Err(reasons) => {
+                let reason = format!("no machine can take the gate: {}", reasons.join("; "));
+                return self.could_not_run(log, attempt, k, &reason);
+            }
+        };
+        slots.gates_free -= 1;
+        self.step(
+            &format!("{GATE_REQUESTED}{attempt} {k} {head} {base_sha} {machine}"),
+            "gate-requested",
+            Some(attempt),
+        )?;
+        let req = Req {
+            attempt,
+            k,
+            sha: head,
+            base: base_sha,
+            machine: machine.to_string(),
+            ..Req::default()
+        };
+        self.read_gate(req)
+    }
+
+    /// A gate that could not run: recorded, and waited out, or the run is stuck.
+    fn could_not_run(
+        &self,
+        log: &Log,
+        attempt: u32,
+        k: u32,
+        reason: &str,
+    ) -> Result<GateStep, RunError> {
+        let reason = reason.replace('\n', " ");
+        let failures = u32::try_from(log.cnrs.iter().filter(|c| c.attempt == attempt).count())
+            .unwrap_or(u32::MAX)
+            + 1;
+        let wait = gate::backoff(failures);
+        let shown = wait.map_or("-".to_owned(), |wait| wait.to_string());
+        self.step(
+            &format!("{GATE_COULD_NOT_RUN}{attempt} {k} {failures} {shown} {reason}"),
+            "gate-could-not-run",
+            Some(attempt),
+        )?;
+        match wait {
+            Some(passes_left) => Ok(GateStep::BackingOff { passes_left }),
+            None => self.stuck(
+                "gate-could-not-run",
+                Stop::new(format!("the gate could not run: {reason}")),
+            ),
+        }
+    }
+
+    /// The gate `req` placed: asked for if it was not, then its terminal read.
+    fn read_gate(&self, req: Req) -> Result<GateStep, RunError> {
+        let ctx = self.ctx;
+        let machine = uuid::Uuid::parse_str(&req.machine)
+            .map(MachineId)
+            .map_err(|_| RunError::Invalid(format!("the gate's machine {:?}", req.machine)))?;
+        let name = gate::name(self.run, req.k);
+        let found = ctx
+            .view
+            .workspace_named(ctx.project.id, &name)
+            .map(|record| (record.body.id, record.body.setup, record.owner));
+        let (setup, owner) = match found {
+            Some((id, setup, owner)) => {
+                if req.created.is_none() {
+                    self.created(&req, id)?;
+                }
+                (setup, owner)
+            }
+            None if req.created.is_none() => {
+                let request = gate::request(ctx.config, ctx.project.id, &req.sha, self.run, req.k);
+                return match ctx.create(machine, request) {
+                    Ok(id) => {
+                        self.created(&req, id)?;
+                        Ok(GateStep::Running)
+                    }
+                    Err(RunError::Worker(error)) => {
+                        let reason = gate::could_not_run(Some(&error), Duration::ZERO, None)
+                            .unwrap_or_else(|| error.to_string());
+                        let (_, log) = self.fresh()?;
+                        self.could_not_run(&log, req.attempt, req.k, &reason)
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+            None => {
+                // The workspace's record has not reached the view.
+                let gone = gate::could_not_run(None, ctx.view.unreachable_for(machine), None);
+                return self.running_or_gone(&req, gone);
+            }
+        };
+        let terminal = setup.and_then(|terminal| {
+            ctx.view
+                .terminal(terminal)
+                .map(|(state, code)| (terminal, state, code))
+        });
+        let gone = gate::could_not_run(
+            None,
+            ctx.view.unreachable_for(owner),
+            terminal.map(|(_, state, code)| (state, code)),
+        );
+        if gone.is_some() {
+            return self.running_or_gone(&req, gone);
+        }
+        let Some((terminal, TerminalState::Exited, Some(code))) = terminal else {
+            return Ok(GateStep::Running);
+        };
+        let tail = ctx.tail(terminal)?;
+        let header = format!("{GATE_ENDED}{} {code}\n", req.k);
+        let kept = tail_within(&tail, OUTPUT_LIMIT.saturating_sub(header.len()));
+        self.step(&format!("{header}{kept}"), "gate-ended", Some(req.attempt))?;
+        let (_, log) = self.fresh()?;
+        let Some(ended) = log.reqs.iter().find(|r| r.k == req.k).cloned() else {
+            return Err(RunError::Invalid(
+                "the gate's verdict is not on record".into(),
+            ));
+        };
+        let turn = ctx.view.session_turn(self.session).map(|t| t.turn);
+        self.settle(ended, turn)
+    }
+
+    fn running_or_gone(&self, req: &Req, gone: Option<String>) -> Result<GateStep, RunError> {
+        match gone {
+            None => Ok(GateStep::Running),
+            Some(reason) => {
+                let (_, log) = self.fresh()?;
+                self.could_not_run(&log, req.attempt, req.k, &reason)
+            }
+        }
+    }
+
+    fn created(&self, req: &Req, id: WorkspaceId) -> Result<(), RunError> {
+        self.step(
+            &format!("{GATE_CREATED}{} {}", req.k, id.0),
+            "gate-created",
+            Some(req.attempt),
+        )?;
+        self.record(
+            Event::GateCheckout {
+                attempt: req.attempt,
+                dir: gate::name(self.run, req.k),
+                sha: req.sha.clone(),
+                base_sha: req.base.clone(),
+            },
+            "gate-checkout",
+            req.attempt,
+        )
+    }
+
+    // ----- a verdict on record -----
+
+    /// The gate `req` has a verdict: its workspace archived, its commands recorded, and the
+    /// verdict acted on.
+    fn settle(&self, req: Req, turn: Option<u64>) -> Result<GateStep, RunError> {
+        let Some((code, tail)) = req.ended.clone() else {
+            return Err(RunError::Invalid("the gate has no verdict".into()));
+        };
+        if !req.archived {
+            if let Some(id) = &req.created {
+                if !req.archiving {
+                    self.step(
+                        &format!("{GATE_ARCHIVING}{}", req.k),
+                        "gate-archiving",
+                        None,
+                    )?;
+                }
+                self.ctx.archive(workspace_id(id)?)?;
+            }
+            self.step(&format!("{GATE_ARCHIVED}{}", req.k), "gate-archived", None)?;
+        }
+        let commands = self.commands();
+        let result = gate::result(TerminalState::Exited, Some(code), &tail, &commands);
+        let failing = match &result {
+            GateResult::Failed { command, .. } => {
+                command.clone().unwrap_or_else(|| commands.join(" && "))
+            }
+            _ => String::new(),
+        };
+        let (seen, log) = self.fresh()?;
+        let attempt = req.attempt;
+        if !seen.command_attempts.contains(&attempt) {
+            if code == 0 {
+                for command in &commands {
+                    self.record(
+                        Event::GateCommand {
+                            attempt,
+                            command: command.clone(),
+                            exit_code: 0,
+                            duration_ms: 0,
+                        },
+                        "gate-command",
+                        attempt,
+                    )?;
+                }
+            } else {
+                self.record(
+                    Event::GateCommand {
+                        attempt,
+                        command: failing.clone(),
+                        exit_code: code,
+                        duration_ms: 0,
+                    },
+                    "gate-command",
+                    attempt,
+                )?;
+            }
+        }
+        if !log.finished.contains(&attempt) {
+            self.record(
+                Event::GateFinished {
+                    attempt,
+                    total_ms: 0,
+                },
+                "gate-finished",
+                attempt,
+            )?;
+        }
+        // What the pull request is now decides what the verdict means.
+        let pull = self.ctx.tracker.pull_request(self.ctx.repo(), self.pr)?;
+        if let Some(step) = self.unbound(&seen, pull.as_ref())? {
+            return Ok(step);
+        }
+        let pull = pull.ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?;
+        let head = pull.head_sha.to_lowercase();
+        if log.moved.contains(&attempt) {
+            return self.after_moved(attempt);
+        }
+        if !pull.open {
+            if code == 0 && pull.merged && head == req.sha {
+                self.record_pass(&req, &commands)?;
+                let (seen, _) = self.fresh()?;
+                let pass = seen
+                    .pass
+                    .ok_or_else(|| RunError::Invalid("the pass is not on record".into()))?;
+                self.finish_pass(&pass, false)?;
+                let (seen, _) = self.fresh()?;
+                let mut at = self.at(&seen);
+                at.worktree = None;
+                end_run(self.ctx, &at, &self.url, Some(&pull), CauseStep::Gate)?;
+                return Ok(GateStep::Ended);
+            }
+            if pull.merged && head != req.sha {
+                self.moved(attempt, &head, &log)?;
+                return Ok(GateStep::NotReady);
+            }
+            let mut at = self.at(&seen);
+            at.worktree = None;
+            self.end_session()?;
+            end_run(self.ctx, &at, &self.url, Some(&pull), CauseStep::Gate)?;
+            return Ok(GateStep::Ended);
+        }
+        if head != req.sha {
+            self.moved(attempt, &head, &log)?;
+            return self.after_moved(attempt);
+        }
+        if code == 0 {
+            if !pull.is_draft && !seen.ready_outside {
+                self.record(
+                    Event::PrReadyOutside {
+                        pr: self.pr,
+                        by: None,
+                    },
+                    "pr-ready-outside",
+                    attempt,
+                )?;
+            }
+            self.record_pass(&req, &commands)?;
+            let (seen, log) = self.fresh()?;
+            let pass = seen
+                .pass
+                .clone()
+                .ok_or_else(|| RunError::Invalid("the pass is not on record".into()))?;
+            let state = self.ctx.view.session_state(self.session);
+            return self.after_pass(&seen, &log, &pass, state, turn);
+        }
+        self.fail_attempt(attempt, Kind::Command, Some(pull), turn)
+    }
+
+    fn record_pass(&self, req: &Req, commands: &[String]) -> Result<(), RunError> {
+        let (seen, _) = self.fresh()?;
+        if seen.passed_attempts.contains(&req.attempt) {
+            return Ok(());
+        }
+        self.step(
+            &format!("{GATE_PASSED} {} {}", req.sha, commands.len()),
+            GATE_PASSED,
+            Some(req.attempt),
+        )
+    }
+
+    fn moved(&self, attempt: u32, head: &str, log: &Log) -> Result<(), RunError> {
+        if log.moved.contains(&attempt) {
+            return Ok(());
+        }
+        self.step(
+            &format!("{GATE_HEAD_MOVED}{attempt} {head}"),
+            "gate-head-moved",
+            Some(attempt),
+        )
+    }
+
+    /// A head that moved is gated again as the next attempt, which spends a retry: with none
+    /// left the run is stuck.
+    fn after_moved(&self, attempt: u32) -> Result<GateStep, RunError> {
+        if u64::from(attempt) > self.retries() {
+            return self.stuck("head-kept-moving", Stop::new(HEAD_KEPT_MOVING));
+        }
+        Ok(GateStep::NotReady)
+    }
+
+    /// The pull request is not the run's own, or is gone: the stuck step, or `None`.
+    fn unbound(
+        &self,
+        seen: &Seen,
+        pull: Option<&PullRequest>,
+    ) -> Result<Option<GateStep>, RunError> {
+        let branches: Vec<&str> = seen
+            .last_branch
+            .iter()
+            .chain(&seen.resumed_from)
+            .chain(&seen.launch_resumed_from)
+            .chain(&seen.bound_branches)
+            .map(String::as_str)
+            .collect();
+        let Some(unbound) = check_binding(pull, self.pr, self.base(seen), &branches) else {
+            return Ok(None);
+        };
+        let stop = Stop {
+            reason: unbound.public,
+            detail: unbound.detail,
+            ..Stop::default()
+        };
+        Ok(Some(self.stuck("pr-not-bound", stop)?))
+    }
+
+    // ----- a failed attempt -----
+
+    /// A pull request someone took out of draft goes back to draft; `Some` is the stuck step
+    /// when that cannot be done.
+    fn back_to_draft(&self, seen: &Seen, pull: &PullRequest) -> Result<Option<GateStep>, RunError> {
+        if !pull.open || pull.is_draft {
+            return Ok(None);
+        }
+        match self.ctx.mark_pr_draft(self.pr) {
+            Ok(()) => {
+                let _ = seen;
+                self.ctx.record(
+                    self.run,
+                    Event::PrSetDraft { pr: self.pr },
+                    &self.cause("pr-set-draft"),
+                )?;
+                Ok(None)
+            }
+            Err(RunError::Tracker(TrackerError::NotFound { .. } | TrackerError::Other { .. })) => {
+                let stop = Stop::new(reported_but(self.pr, "it is not a draft"));
+                Ok(Some(self.stuck("pr-not-bound", stop)?))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Attempt `attempt` failed with `kind`: back to draft, then sent back while a retry is
+    /// left and stuck when none is.
+    fn fail_attempt(
+        &self,
+        attempt: u32,
+        kind: Kind,
+        pull: Option<PullRequest>,
+        turn: Option<u64>,
+    ) -> Result<GateStep, RunError> {
+        let (seen, log) = self.fresh()?;
+        let pull = match pull {
+            Some(pull) => pull,
+            None => self
+                .ctx
+                .tracker
+                .pull_request(self.ctx.repo(), self.pr)?
+                .ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?,
+        };
+        if let Some(step) = self.back_to_draft(&seen, &pull)? {
+            return Ok(step);
+        }
+        let since = attempts_since_pass(&seen, attempt);
+        if u64::from(since) > self.retries() {
+            let note = self.config_note(&seen, &log, attempt, kind, &pull)?;
+            let (code, mut stop) = self.used_up(&seen, &log, attempt, kind, since)?;
+            if note {
+                stop.reason = format!("{}. {CONFIG_DIFFERS}", stop.reason);
+            }
+            return self.stuck(code, stop);
+        }
+        self.send_back(attempt, kind, turn)
+    }
+
+    /// The stuck path of an attempt that failed with no retry left.
+    fn used_up(
+        &self,
+        seen: &Seen,
+        log: &Log,
+        attempt: u32,
+        kind: Kind,
+        since: u32,
+    ) -> Result<(&'static str, Stop), RunError> {
+        let failed_after = format!("the gate failed after {}", attempts(since));
+        match kind {
+            Kind::Command => {
+                let (failure, how) = self.command_failure(log, attempt)?;
+                let text = messages::failure_text(&failure);
+                Ok((
+                    "gate-retries-used-up",
+                    Stop {
+                        reason: format!(
+                            "{failed_after}: {} failed ({how})",
+                            gate::command_code(&failure.command)
+                        ),
+                        detail: Some(format!("{failed_after}\n\n{}", prepare_output_tail(&text))),
+                        ..Stop::default()
+                    },
+                ))
+            }
+            Kind::Conflict => {
+                let base = self.base(seen).to_owned();
+                let text = messages::merge_conflict_text(&base, &[]);
+                Ok((
+                    "gate-retries-used-up",
+                    Stop {
+                        reason: format!(
+                            "{failed_after}: the branch conflicts with the base branch {}",
+                            sanitize(&base, false)
+                        ),
+                        detail: Some(format!("{failed_after}\n\n{}", prepare_output_tail(&text))),
+                        ..Stop::default()
+                    },
+                ))
+            }
+            Kind::Checks => {
+                let failed = seen.checks_failed.clone().ok_or_else(|| {
+                    RunError::Invalid("the failed checks are not on record".into())
+                })?;
+                let list = self.failed_checks(&failed.sha, &failed.failed);
+                let text = messages::checks_failure_text(&failed.sha, &list);
+                let prepared = prepare_output_tail(&text);
+                Ok((
+                    "checks-retries-used-up",
+                    Stop {
+                        reason: format!("the required checks failed after {}", attempts(since)),
+                        session_text: (!prepared.is_empty()).then_some(prepared),
+                        ..Stop::default()
+                    },
+                ))
+            }
+        }
+    }
+
+    /// The failing command of `attempt`'s gate as the gate's tail names it. With the tail
+    /// naming none, the failure is the gate's commands as a whole and the output the whole tail.
+    fn command_failure(
+        &self,
+        log: &Log,
+        attempt: u32,
+    ) -> Result<(CommandFailure, String), RunError> {
+        let req = log
+            .reqs
+            .iter()
+            .rev()
+            .find(|req| req.attempt == attempt && req.ended.is_some())
+            .ok_or_else(|| RunError::Invalid("the gate's verdict is not on record".into()))?;
+        let (code, tail) = req.ended.clone().unwrap_or_default();
+        let commands = self.commands();
+        match gate::result(TerminalState::Exited, Some(code), &tail, &commands) {
+            GateResult::Failed {
+                command,
+                how,
+                output,
+            } => Ok((
+                CommandFailure {
+                    command: command.unwrap_or_else(|| commands.join(" && ")),
+                    ended: gate::ended(code),
+                    output,
+                    truncated: false,
+                },
+                how,
+            )),
+            _ => Err(RunError::Invalid("the gate did not fail".into())),
+        }
+    }
+
+    /// The failed checks as the message names them: what is on record, with the result and link
+    /// of the ones GitHub still shows failed.
+    fn failed_checks(&self, sha: &str, recorded: &[CheckStatus]) -> Vec<FailedCheck> {
+        let names: Vec<String> = recorded.iter().map(|check| check.name.clone()).collect();
+        let live = self
+            .ctx
+            .tracker
+            .checks(self.ctx.repo(), sha, &names)
+            .unwrap_or_default();
+        recorded
+            .iter()
+            .map(|check| {
+                let now = live
+                    .iter()
+                    .find(|live| live.name == check.name && live.state == CheckState::Failed);
+                let shown = now.unwrap_or(check);
+                FailedCheck {
+                    name: shown.name.clone(),
+                    conclusion: shown.conclusion.clone(),
+                    url: shown.url.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the `.dw/config.yml` at the commit the failure is about differs from the default
+    /// branch's.
+    fn config_note(
+        &self,
+        seen: &Seen,
+        log: &Log,
+        attempt: u32,
+        kind: Kind,
+        pull: &PullRequest,
+    ) -> Result<bool, RunError> {
+        let sha = match kind {
+            Kind::Command => log
+                .reqs
+                .iter()
+                .rev()
+                .find(|req| req.attempt == attempt)
+                .map(|req| req.sha.clone())
+                .unwrap_or_else(|| pull.head_sha.to_lowercase()),
+            Kind::Checks => seen
+                .checks_failed
+                .as_ref()
+                .map_or_else(|| pull.head_sha.to_lowercase(), |failed| failed.sha.clone()),
+            Kind::Conflict => pull.head_sha.to_lowercase(),
+        };
+        let tracker = self.ctx.tracker;
+        let repo = self.ctx.repo();
+        let default = tracker.default_branch(repo)?;
+        let tip = tracker.branch_tip(repo, &default)?;
+        let default_text = tracker.file_at(repo, config::PATH, &tip)?;
+        let at_head = match tracker.file_at(repo, config::PATH, &sha) {
+            Ok(text) => Some(text),
+            Err(TrackerError::NotFound { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(gate::config_differs(&default_text, at_head.as_deref()))
+    }
+
+    /// The failure sent into the session once, under the turn it was decided on.
+    fn send_back(&self, attempt: u32, kind: Kind, turn: Option<u64>) -> Result<GateStep, RunError> {
+        let (seen, log) = self.fresh()?;
+        let ordinal = match seen.sending {
+            Some(sending) if sending.attempt == attempt => sending.run_ordinal,
+            _ => {
+                let turn = turn.ok_or_else(|| {
+                    RunError::Invalid("the session has no turn to send under".into())
+                })?;
+                u32::try_from(turn).unwrap_or(u32::MAX)
+            }
+        };
+        let pull = self
+            .ctx
+            .tracker
+            .pull_request(self.ctx.repo(), self.pr)?
+            .ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?;
+        let mut message = match kind {
+            Kind::Command => {
+                let (failure, _) = self.command_failure(&log, attempt)?;
+                messages::gate_failed(&GateFailure::Command(failure), BODY_PATH)
+            }
+            Kind::Conflict => messages::gate_failed(
+                &GateFailure::Conflict {
+                    base: self.base(&seen).to_owned(),
+                    paths: vec![],
+                },
+                BODY_PATH,
+            ),
+            Kind::Checks => {
+                let failed = seen.checks_failed.clone().ok_or_else(|| {
+                    RunError::Invalid("the failed checks are not on record".into())
+                })?;
+                let list = self.failed_checks(&failed.sha, &failed.failed);
+                messages::check_failed(&failed.sha, &list, BODY_PATH)
+            }
+        };
+        if self.config_note(&seen, &log, attempt, kind, &pull)? {
+            message = Message::new(
+                message.line,
+                format!("{}\n\n{CONFIG_DIFFERS}", message.body.unwrap_or_default()),
+            );
+        }
+        let sending = seen
+            .sending
+            .is_some_and(|sending| sending.attempt == attempt && sending.run_ordinal == ordinal);
+        if !sending {
+            self.step(
+                &format!("{GATE_FAILING}{attempt} {}", kind.name()),
+                "gate-failing",
+                Some(attempt),
+            )?;
+            self.step(
+                &format!("{} {attempt} {ordinal}", super::progress::GATE_SENDING),
+                "gate-sending",
+                Some(attempt),
+            )?;
+        }
+        let (seen, _) = self.fresh()?;
+        let mut at = self.at(&seen);
+        let (_, actions) = transition(
+            State::Building,
+            &LifecycleEvent::GateFailed {
+                output: message.body.clone().unwrap_or_default(),
+            },
+        )?;
+        apply_actions(
+            self.ctx,
+            self.issue,
+            &mut at,
+            &actions,
+            &self.cause("gate-failed"),
+            &ActionPayload {
+                send: Some(SendPayload {
+                    message,
+                    attempt,
+                    run_ordinal: ordinal,
+                }),
+                ..ActionPayload::default()
+            },
+        )?;
+        Ok(GateStep::SentBack { attempt })
+    }
+
+    // ----- a pass on record -----
+
+    /// The pass is recorded: the required checks are waited for, then the pull request is made
+    /// ready.
+    fn after_pass(
+        &self,
+        seen: &Seen,
+        log: &Log,
+        pass: &PassRecord,
+        state: Option<SessionState>,
+        turn: Option<u64>,
+    ) -> Result<GateStep, RunError> {
+        let required = &self.ctx.config.required_checks;
+        let wanted = !required.is_empty() && seen.checks_passed.as_deref() != Some(&pass.sha);
+        let pull = self.ctx.tracker.pull_request(self.ctx.repo(), self.pr)?;
+        let open = pull.as_ref().is_some_and(|pull| pull.open);
+        if !wanted {
+            return self.finish_pass(pass, open);
+        }
+        let Some(pull) = pull.filter(|pull| pull.open) else {
+            return self.finish_pass(pass, false);
+        };
+        let head = pull.head_sha.to_lowercase();
+        if head != pass.sha {
+            self.moved(pass.attempt, &head, log)?;
+            return self.after_moved(pass.attempt);
+        }
+        let attempt = pass.attempt;
+        let minutes = self.ctx.config.limits.checks_minutes;
+        let timed_out = |missing: bool| {
+            if missing {
+                format!("a required check was not reported within {minutes} minutes")
+            } else {
+                format!("the required checks did not finish within {minutes} minutes")
+            }
+        };
+        // A decision on record stands.
+        if seen
+            .checks_failed
+            .as_ref()
+            .is_some_and(|failed| failed.sha == pass.sha)
+        {
+            return self.checks_failed(seen, pass, &pull, state, turn, None);
+        }
+        if let Some(timed) = seen
+            .checks_timed_out
+            .as_ref()
+            .filter(|timed| timed.sha == pass.sha)
+        {
+            return self.stuck("checks-timed-out", Stop::new(timed_out(timed.missing)));
+        }
+        let checks = self
+            .ctx
+            .tracker
+            .checks(self.ctx.repo(), &pass.sha, required)?;
+        let read = Event::ChecksRead {
+            sha: pass.sha.clone(),
+            checks: checks
+                .iter()
+                .map(|check| CheckRead {
+                    name: check.name.clone(),
+                    state: match check.state {
+                        CheckState::Passed => "passed",
+                        CheckState::Failed => "failed",
+                        CheckState::Pending => "pending",
+                        CheckState::Missing => "missing",
+                    }
+                    .to_owned(),
+                })
+                .collect(),
+        };
+        if checks.iter().any(|check| check.state == CheckState::Failed) {
+            return self.checks_failed(seen, pass, &pull, state, turn, Some(read));
+        }
+        if checks.iter().all(|check| check.state == CheckState::Passed) {
+            self.record(read, "required-checks-read", attempt)?;
+            return self.finish_pass(pass, true);
+        }
+        if elapsed_ms(pass.at_ms, self.now_ms) < minutes.saturating_mul(60_000) {
+            return Ok(GateStep::ChecksPending);
+        }
+        let missing = checks
+            .iter()
+            .any(|check| check.state == CheckState::Missing);
+        self.record(read, CHECKS_TIMED_OUT, attempt)?;
+        self.stuck("checks-timed-out", Stop::new(timed_out(missing)))
+    }
+
+    /// A required check failed on the pass: it goes back to the session once the session can
+    /// take it.
+    fn checks_failed(
+        &self,
+        seen: &Seen,
+        pass: &PassRecord,
+        pull: &PullRequest,
+        state: Option<SessionState>,
+        turn: Option<u64>,
+        read: Option<Event>,
+    ) -> Result<GateStep, RunError> {
+        let Some(state) = state else {
+            return self.stuck("session-gone", Stop::new(SESSION_GONE));
+        };
+        if busy(state) || turn.is_none() {
+            return Ok(GateStep::NotReady);
+        }
+        if let Some(read) = read {
+            self.record(read, "required-checks-failed", pass.attempt)?;
+        }
+        let _ = seen;
+        self.fail_attempt(pass.attempt, Kind::Checks, Some(pull.clone()), turn)
+    }
+
+    /// The rest of a passing gate: the build session ended, the pull request marked ready, the
+    /// results posted, the label moved, and the build workspace archived. A pull request that
+    /// is no longer open gets nothing marked or posted.
+    fn finish_pass(&self, pass: &PassRecord, still_open: bool) -> Result<GateStep, RunError> {
+        self.end_session()?;
+        let (seen, _) = self.fresh()?;
+        let mut at = self.at(&seen);
+        let (_, actions) = transition(State::Building, &LifecycleEvent::PrReady { pr: self.pr })?;
+        let actions: Vec<_> = actions
+            .into_iter()
+            .filter(|action| {
+                still_open
+                    || !matches!(
+                        action,
+                        crate::factory::lifecycle::Action::MarkPrReady { .. }
+                            | crate::factory::lifecycle::Action::PostGateResults { .. }
+                    )
+            })
+            .collect();
+        let count = usize::try_from(pass.count).unwrap_or(0);
+        let results: Vec<CommandResult> = pass
+            .lines
+            .iter()
+            .skip(pass.lines.len().saturating_sub(count))
+            .map(|line| CommandResult {
+                command: line.command.clone(),
+                exit_code: line.exit_code,
+                duration_ms: line.duration_ms,
+            })
+            .collect();
+        let comment = gate::gate_results_comment(&results, pass.attempt, &pass.sha, &pass.base_sha);
+        apply_actions(
+            self.ctx,
+            self.issue,
+            &mut at,
+            &actions,
+            &self.cause(GATE_PASSED).attempt(pass.attempt),
+            &ActionPayload {
+                comment: Some(comment),
+                ..ActionPayload::default()
+            },
+        )?;
+        self.archive_build()?;
+        Ok(GateStep::Passed { pr: self.pr })
+    }
 }
 
 #[cfg(test)]
@@ -1035,8 +2485,13 @@ mod tests {
             ));
             assert!(has_step(&rig, &run, "gate-passed "));
             assert_eq!(event_count(&rig, &run, "gate_checkout"), 1);
-            let last = rig.events(&run).pop().unwrap();
-            assert_eq!(last.data["to"], "pr-open");
+            // The label moves before the build workspace is archived, so the state change is
+            // recorded, and the archive's own steps follow it.
+            assert!(
+                rig.events(&run)
+                    .iter()
+                    .any(|event| event.event == "state_changed" && event.data["to"] == "pr-open")
+            );
         }
 
         #[test]
@@ -1632,6 +3087,28 @@ mod tests {
             assert_eq!(lines.len(), 1);
             assert_eq!(lines[0].data["command"], "cargo fmt");
             assert_eq!(lines[0].data["exit_code"], 1);
+        }
+
+        #[test]
+        fn a_failed_gate_whose_tail_names_no_command_is_sent_as_the_gates_commands_as_a_whole() {
+            let (mut rig, run, _hub) = built();
+            rig.config.gate = vec!["cargo fmt".into(), "cargo test".into()];
+            assert_eq!(
+                gated(&mut rig, &run, 2, "garbage the code printed\n"),
+                GateStep::SentBack { attempt: 1 }
+            );
+            let expected = messages::gate_failed(
+                &failure_of("cargo fmt && cargo test", 2, "garbage the code printed\n"),
+                BODY_PATH,
+            );
+            assert_eq!(sends(&rig), vec![sent(1, expected)]);
+            let line = rig
+                .events(&run)
+                .into_iter()
+                .find(|event| event.event == "gate_command")
+                .expect("a command line");
+            assert_eq!(line.data["command"], "cargo fmt && cargo test");
+            assert_eq!(line.data["exit_code"], 2);
         }
 
         #[test]
