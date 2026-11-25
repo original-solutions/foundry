@@ -328,7 +328,6 @@ pub const GATE_CREATED: &str = "gate-created ";
 pub const GATE_ENDED: &str = "gate-ended ";
 /// The step written before a failed attempt is sent back: `gate-failing <attempt> <kind>`.
 pub const GATE_FAILING: &str = "gate-failing ";
-/// The step of a forced archive that failed other than as unreachable: `gate-archive-failed <k>`.
 /// The step written when a gate's archive is first answered "unreachable" under a lease
 /// generation: `gate-archive-waiting <k> <generation> <ms>`, `ms` read on the sleep-counting
 /// clock.
@@ -362,6 +361,13 @@ pub const GATE_WAITING: &str = "gate-waiting ";
 pub const GATE_HEAD_MOVED: &str = "gate-head-moved ";
 /// The step written once the build session is ended at the pass.
 pub const BUILD_SESSION_ENDED: &str = "build-session-ended";
+/// The step written when the end of the build session is first answered "unreachable" under
+/// a lease generation: `build-session-waiting <generation> <ms>`, `ms` read on the
+/// sleep-counting clock.
+pub const BUILD_SESSION_WAITING: &str = "build-session-waiting ";
+/// The step of a build session whose end was given up on because its machine is gone or did
+/// not answer: `build-session-left <why>`, in fixed words.
+pub const BUILD_SESSION_LEFT: &str = "build-session-left ";
 /// The step written before the build workspace is archived at the pass.
 pub const BUILD_ARCHIVING: &str = "build-archiving";
 /// The step written once it was.
@@ -727,7 +733,10 @@ impl Log {
             if let Some(since) = clock_reading(rest) {
                 self.checks_wait = Some(since);
             }
-        } else if step.starts_with("gate-passed ") {
+        } else if step
+            .strip_prefix(GATE_PASSED)
+            .is_some_and(|rest| rest.starts_with(' '))
+        {
             self.checks_wait = None;
         } else if let Some(rest) = step.strip_prefix(GATE_HEAD_MOVED) {
             if let Some(attempt) = number(rest.split(' ').next()) {
@@ -2378,9 +2387,12 @@ impl Gate<'_, '_> {
         self.fail_attempt(pass.attempt, Kind::Checks, Some(pull.clone()), turn)
     }
 
-    /// The rest of a passing gate: the build session ended, the pull request marked ready, the
-    /// results posted, the label moved, and the build workspace archived. A pull request that
-    /// is no longer open gets nothing marked or posted.
+    /// The rest of a passing gate, in this order: every gate workspace archived or left, the
+    /// pull request marked ready, then the build session ended (never before the ready mark,
+    /// so a pass undone before it still has a session to go back to), the results posted, the
+    /// label moved, and the build workspace archived or left. A pull request that is no
+    /// longer open gets nothing marked or posted. `Passed` once all of it is done; otherwise
+    /// the step the pass ends with, and the next pass carries on.
     fn finish_pass(&self, pass: &PassRecord, still_open: bool) -> Result<GateStep, RunError> {
         if let Some(step) = self.sweep_for_pr_open()? {
             return Ok(step);
