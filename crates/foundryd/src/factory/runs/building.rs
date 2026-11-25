@@ -69,14 +69,16 @@
 //!   the worker refused as `NotIdle` is sent again while the session's turn is the same; a
 //!   newer turn answers a begun reminder whichever message started it, as in the runner, and
 //!   one that ends with no line is stuck with the run's own reason.
-//! - Putting the session's pull request back to draft: a rate limit, a timeout, a refused
-//!   login, `gh` not starting and an answer that cannot be read are an error with nothing more
-//!   written, and the next pass asks again. When `gh` fails (a 5xx, a killed `gh`, status 1) or
-//!   GitHub says `NotFound`, the pull request is read again: that read failing is the error
-//!   (GitHub is down), a draft now goes on, one open and not a draft is stuck in the runner's
-//!   words ("it is not a draft"), and one gone is stuck as one that does not exist. A pull
-//!   request that can never be drafted is stuck at once; one GitHub never answers is ended by
-//!   `limits.minutes`.
+//! - Putting the session's pull request back to draft: the runner decides what GitHub refusing
+//!   means, Foundry what GitHub being unreachable means. A rate limit, a timeout, a refused
+//!   login, `gh` not starting, an answer that cannot be read, and a `gh` failure that got no
+//!   answer from GitHub (a 5xx, a signal kill, an oversized answer, a failed connection) are
+//!   an error with nothing more written, and the next pass asks again; for the last, the pull
+//!   request is read again first, and a draft now goes on. `NotFound` and any other `gh`
+//!   failure (status 1 and a reason) read the pull request again: that read failing is the
+//!   error, a draft now goes on, one open and not a draft is stuck in the runner's words
+//!   ("it is not a draft"), and one gone is stuck as one that does not exist. A pull request
+//!   that can never be drafted is ended by `limits.minutes`.
 //! - The runner's case of a run with no ordinal and no result line, stuck at once, has no
 //!   counterpart: a turn always has a number. Its cases about a run a person stopped
 //!   (`stop-run.sh`), a run whose agent process died, `refused before anything is read`, the
@@ -243,7 +245,6 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
     };
     let turn = ctx.view.session_turn(session).cloned();
     let read = newest_turn_read(&events);
-    let unread = |turn: &SessionTurn| turn.turn > 0 && read.is_none_or(|read| turn.turn > read);
     let waiting = |turn: &Option<SessionTurn>| turn.as_ref().is_some_and(|turn| turn.question);
     let step = Step {
         ctx,
@@ -264,7 +265,7 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
             if waiting(&turn) {
                 return step.waiting(&mut at, turn.as_ref());
             }
-            match turn_to_act_on(ctx, &events, session) {
+            match turn_to_act_on(ctx, read, session) {
                 Some(turn) => step.act(&mut at, &turn),
                 // The newest turn was read already.
                 None if turn.as_ref().is_some_and(|turn| turn.turn > 0) => Ok(step.read_already()),
@@ -273,7 +274,7 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
             }
         }
         SessionState::Finished | SessionState::Failed => {
-            let Some(turn) = turn.filter(unread) else {
+            let Some(turn) = turn.filter(|turn| unread(turn, read)) else {
                 return Ok(step.read_already_or(BuildStep::Interrupted));
             };
             // The session's process ended, which `resume` decides, unless its last words are
@@ -511,6 +512,14 @@ struct Unbound {
     detail: Option<String>,
 }
 
+/// A pull request the session reported that is not there.
+fn does_not_exist(pr: u64) -> Unbound {
+    Unbound {
+        public: format!("the session reported PR #{pr} but it does not exist"),
+        detail: None,
+    }
+}
+
 /// Binds a pull request to a run: it is in this repo, not a fork, merges into `base`, and its
 /// head is one of the run's `branches`. The text comes from a session that issue text can steer,
 /// so it must not be able to name someone else's pull request.
@@ -526,7 +535,7 @@ fn check_binding(
         detail: None,
     };
     let Some(pull) = pull else {
-        return Some(plain(format!("{reported} it does not exist")));
+        return Some(does_not_exist(pr));
     };
     if pull.cross_repository {
         return Some(plain(format!("{reported} it comes from a fork")));
@@ -556,9 +565,50 @@ fn check_binding(
     None
 }
 
-/// Whether a failure of `gh` is that it got no answer from GitHub about the pull request.
-fn gh_gave_no_answer(_message: &str) -> bool {
-    false
+/// Whether a `gh` failure (`OtherKind::Failed`, as `github::gh::finish` words it) is that `gh`
+/// got no answer from GitHub about the pull request: an `HTTP 5xx` in its stderr, a call a
+/// signal ended (`exited with status -1`), an answer over the output limit (`printed more
+/// than`), or a failed connection (a connect, the network, TLS, a lookup, a timeout, an
+/// end of file). A refusal by GitHub (status 1 and a reason, `HTTP 4xx`) is not.
+fn gh_gave_no_answer(message: &str) -> bool {
+    if message.contains("printed more than") || message.contains("exited with status -1") {
+        return true;
+    }
+    if message.match_indices("HTTP 5").any(|(at, _)| {
+        message[at + 6..]
+            .bytes()
+            .take(2)
+            .filter(u8::is_ascii_digit)
+            .count()
+            == 2
+    }) {
+        return true;
+    }
+    let lower = message.to_ascii_lowercase();
+    [
+        "connect",
+        "network",
+        "tls",
+        "dial tcp",
+        "no such host",
+        "timeout",
+        "timed out",
+        "eof",
+        "temporary failure",
+    ]
+    .iter()
+    .any(|shape| lower.contains(shape))
+}
+
+/// The stop of a pull request that is not the run's: the factory's words, the detail the
+/// public must not read, and what the session said.
+fn unbound_stop(unbound: Unbound, message: &str) -> Stop {
+    Stop {
+        reason: unbound.public,
+        detail: unbound.detail,
+        session_text: prepared(message),
+        ..Stop::default()
+    }
 }
 
 /// What a pass over one session knows.
@@ -793,23 +843,21 @@ impl Step<'_, '_> {
             .map(String::as_str)
             .collect();
         if let Some(unbound) = check_binding(pull.as_ref(), pr, base, &branches) {
-            let stop = Stop {
-                reason: unbound.public,
-                detail: unbound.detail,
-                session_text: prepared(message),
-                ..Stop::default()
-            };
-            return self.stuck(at, NOT_BOUND_CODE, stop);
+            return self.stuck(at, NOT_BOUND_CODE, unbound_stop(unbound, message));
         }
         let pull = pull.ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?;
         // The session's pull request that is open and ready for review goes back to draft:
-        // only the gate marks it ready. A rate limit, a timeout, a refused login, `gh` not
-        // starting or an answer that cannot be read say nothing about the pull request: an
-        // error with nothing more written, asked again next pass. When `gh` fails, or GitHub
-        // says the pull request is not there, it is read again: a failed read is that error
-        // (GitHub is down), a draft now goes on, one open and not a draft is stuck in the
-        // runner's words (GitHub answered and the call was refused), and one gone is stuck as
-        // a pull request that does not exist.
+        // only the gate marks it ready. The runner decides what GitHub refusing means; Foundry
+        // what GitHub being unreachable means.
+        // - A rate limit, a timeout, a refused login, `gh` not starting, an answer that cannot
+        //   be read, and a `gh` failure that got no answer from GitHub ([`gh_gave_no_answer`])
+        //   are an error with nothing more written, asked again next pass; for the last the
+        //   pull request is read again first, and a draft now goes on (a pull request that
+        //   never drafts is ended by `limits.minutes`).
+        // - `NotFound` and any other `gh` failure ("exited with status 1: boom") read the pull
+        //   request again: a failed read is that error (GitHub is down), a draft now goes on,
+        //   one open and not a draft is stuck in the runner's words (GitHub answered and the
+        //   call was refused), and one gone is stuck as one that does not exist.
         if pull.open && !pull.is_draft {
             match ctx.mark_pr_draft(pr) {
                 Ok(()) => ctx.record(
@@ -825,32 +873,42 @@ impl Step<'_, '_> {
                             ..
                         },
                     ),
-                ) => match ctx.tracker.pull_request(ctx.repo(), pr) {
-                    Err(_) => return Err(error),
-                    Ok(Some(now)) if now.is_draft => ctx.record(
-                        self.run,
-                        Event::PrSetDraft { pr },
-                        &self.cause("pr-set-draft"),
-                    )?,
-                    Ok(Some(_)) => {
-                        let stop = Stop {
-                            reason: format!("the session reported PR #{pr} but it is not a draft"),
-                            session_text: prepared(message),
-                            ..Stop::default()
-                        };
-                        return self.stuck(at, NOT_BOUND_CODE, stop);
+                ) => {
+                    let no_answer = matches!(
+                        &error,
+                        RunError::Tracker(TrackerError::Other { message, .. })
+                            if gh_gave_no_answer(message)
+                    );
+                    match ctx.tracker.pull_request(ctx.repo(), pr) {
+                        Err(_) => return Err(error),
+                        Ok(Some(now)) if now.is_draft => ctx.record(
+                            self.run,
+                            Event::PrSetDraft { pr },
+                            &self.cause("pr-set-draft"),
+                        )?,
+                        Ok(_) if no_answer => return Err(error),
+                        Ok(Some(_)) => {
+                            let not_draft = Unbound {
+                                public: format!(
+                                    "the session reported PR #{pr} but it is not a draft"
+                                ),
+                                detail: None,
+                            };
+                            return self.stuck(
+                                at,
+                                NOT_BOUND_CODE,
+                                unbound_stop(not_draft, message),
+                            );
+                        }
+                        Ok(None) => {
+                            return self.stuck(
+                                at,
+                                NOT_BOUND_CODE,
+                                unbound_stop(does_not_exist(pr), message),
+                            );
+                        }
                     }
-                    Ok(None) => {
-                        let gone = check_binding(None, pr, base, &branches)
-                            .map_or_else(String::new, |unbound| unbound.public);
-                        let stop = Stop {
-                            reason: gone,
-                            session_text: prepared(message),
-                            ..Stop::default()
-                        };
-                        return self.stuck(at, NOT_BOUND_CODE, stop);
-                    }
-                },
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -889,33 +947,41 @@ pub fn time_limit(ctx: &RunContext<'_>, run: &RunId) -> Result<LimitStep, RunErr
     time_limit_at(ctx, run, crate::factory::ledger::system_ms())
 }
 
+/// Whether `turn` ended and was not read yet, `read` being the newest turn read since the last
+/// launch ([`newest_turn_read`]): the one rule for it.
+fn unread(turn: &SessionTurn, read: Option<u64>) -> bool {
+    turn.turn > 0 && read.is_none_or(|read| turn.turn > read)
+}
+
 /// The turn `advance` acts on for the recorded `session`: it is idle, no question waits, and
-/// its newest turn ended and is unread since the last launch.
+/// its newest turn is [`unread`].
 fn turn_to_act_on(
     ctx: &RunContext<'_>,
-    events: &[RunEvent],
+    read: Option<u64>,
     session: SessionId,
 ) -> Option<SessionTurn> {
     if ctx.view.session_state(session) != Some(SessionState::Idle) {
         return None;
     }
     let turn = ctx.view.session_turn(session)?;
-    let read = newest_turn_read(events);
-    (!turn.question && turn.turn > 0 && read.is_none_or(|read| turn.turn > read))
-        .then(|| turn.clone())
+    (!turn.question && unread(turn, read)).then(|| turn.clone())
 }
 
-/// Whether `advance` can still finish a questions comment that was begun: it acts on a turn
-/// ([`turn_to_act_on`]), and the session was not launched again after the intent. A session
-/// launched after it has turns of its own, which `advance` acts on as that session's, not as
-/// the questions of the intent; so the intent is not held for, and the limit takes the run.
+/// Whether the time limit waits for `advance` to finish a questions comment that was begun: it
+/// acts on a turn ([`turn_to_act_on`]), and the session was not launched again after the
+/// intent. The policy: a session launched after the intent has work of its own, so the limit
+/// does not wait for it, even though `advance` could still finish the old comment with the
+/// new session's questions (`progress.rs` keeps `questions_commenting` across a launch;
+/// dropping the intent at a launch belongs there, not here).
 fn advance_can_finish_questions(ctx: &RunContext<'_>, events: &[RunEvent], seen: &Seen) -> bool {
     let Some(session) = seen.thread_id.as_deref().and_then(|t| session_id(t).ok()) else {
         return false;
     };
-    if turn_to_act_on(ctx, events, session).is_none() {
+    if turn_to_act_on(ctx, newest_turn_read(events), session).is_none() {
         return false;
     }
+    // The order of the intent and the newest launch is the one thing the ledger scan answers;
+    // the intent's presence is in `seen`, matched as `progress.rs` matches it.
     let intent = events.iter().rposition(|event| {
         event.event == names::STEP_CHANGED
             && event
