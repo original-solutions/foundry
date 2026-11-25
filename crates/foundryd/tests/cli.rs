@@ -1,8 +1,7 @@
 //! The command line: `--version` works, `join` names a bad port, `secret set` stores a gateway
 //! key or a GitHub token without printing it, `github default` stores a login, and
-//! `factory export` writes the runner's own run file back byte for byte without writing the
-//! store. Every test that runs the binary uses a temporary data directory and skips the copy
-//! from the login keychain.
+//! `factory export` writes the runner's own run file back byte for byte. Every test that runs
+//! the binary uses a temporary data directory and skips the copy from the login keychain.
 
 // A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would move
 // secrets out of the login keychain.
@@ -348,44 +347,6 @@ fn factory_export_on_a_machine_with_no_store_writes_no_run_and_makes_no_store() 
     );
 }
 
-#[test]
-fn factory_export_never_writes_the_store_even_one_older_than_this_build() {
-    let home = tempfile::tempdir().unwrap();
-    let path = home.path().join("store.sqlite");
-    // A store that has had none of this build's schema steps, as one an older build left.
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute_batch("CREATE TABLE kept (x INTEGER); INSERT INTO kept VALUES (1);")
-        .unwrap();
-    let before = std::fs::read(&path).unwrap();
-    let out = tempfile::tempdir().unwrap();
-
-    let ran = isolated(&["factory", "export", out.path().to_str().unwrap()], &home)
-        .output()
-        .expect("foundryd runs");
-
-    assert!(
-        ran.status.success(),
-        "exit: {:?} stderr: {}",
-        ran.status,
-        words(&ran.stderr)
-    );
-    assert!(
-        std::fs::read(&path).unwrap() == before,
-        "the store was written"
-    );
-    assert!(
-        words(&ran.stdout).contains("0 runs"),
-        "stdout: {}",
-        words(&ran.stdout)
-    );
-    let left: Vec<_> = std::fs::read_dir(out.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect();
-    assert_eq!(left, ["runs"], "left in the export folder: {left:?}");
-}
-
 /// Runs `foundryd factory export <dir>` with the data directory `home`.
 fn export(home: &tempfile::TempDir, dir: &std::path::Path) -> Output {
     isolated(&["factory", "export"], home)
@@ -410,45 +371,68 @@ fn assert_exported_runner_run(ran: &Output, dir: &std::path::Path) {
     );
 }
 
-/// The store is copied in memory, never to a file: an export runs with neither the data
-/// directory nor the export directory open to new files, only its `runs` folder.
-#[cfg(unix)]
-#[test]
-fn factory_export_makes_no_copy_of_the_store_on_disk() {
-    use std::os::unix::fs::PermissionsExt as _;
+/// How many schema steps the store at `path` has had.
+fn schema_steps(path: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap()
+}
 
-    if nix::unistd::geteuid().is_root() {
-        // Root writes into a folder whatever its mode, so nothing here would be refused.
-        eprintln!("skipped: run as root");
-        return;
-    }
+/// The export opens the store as the daemon does, so a store an older build left is brought up
+/// to this build's schema, rows kept. The store's schema steps only add, so the older build
+/// keeps working on it.
+#[test]
+fn factory_export_opens_a_store_an_older_build_left_as_the_daemon_does_and_keeps_its_rows() {
     let home = tempfile::tempdir().unwrap();
-    store_runner_run(&home);
+    let path = home.path().join("store.sqlite");
+    // A store that has had none of this build's schema steps, as one an older build left.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE kept (x INTEGER); INSERT INTO kept VALUES (1);")
+        .unwrap();
+    let current = tempfile::tempdir().unwrap();
+    let current = current.path().join("store.sqlite");
+    drop(Store::open(&current).unwrap());
     let out = tempfile::tempdir().unwrap();
-    std::fs::create_dir(out.path().join("runs")).unwrap();
-    let mode = |path: &std::path::Path, mode| {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-    };
-    mode(home.path(), 0o500);
-    mode(out.path(), 0o500);
 
     let ran = export(&home, out.path());
 
-    mode(home.path(), 0o700);
-    mode(out.path(), 0o700);
-    assert_exported_runner_run(&ran, out.path());
+    assert!(
+        ran.status.success(),
+        "exit: {:?} stderr: {}",
+        ran.status,
+        words(&ran.stderr)
+    );
+    assert!(
+        words(&ran.stdout).contains("0 runs"),
+        "stdout: {}",
+        words(&ran.stdout)
+    );
+    assert_eq!(schema_steps(&path), schema_steps(&current));
+    let kept: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT x FROM kept", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(kept, 1);
 }
 
 /// A daemon killed in the middle of a write leaves its rollback journal beside the store. The
-/// export still reads the store as it stood before that write, as the daemon will.
+/// export rolls that write back first, as the daemon's next start would, and reads the store as
+/// it stood before it.
 #[test]
 fn factory_export_reads_a_store_a_killed_daemon_left_in_the_middle_of_a_write() {
     let home = tempfile::tempdir().unwrap();
     store_runner_run(&home);
     let live = home.path().join("store.sqlite");
     let writer = rusqlite::Connection::open(&live).unwrap();
+    // The unfinished write removes the run's own events, then writes enough beside them that
+    // SQLite moves its changes into the store file before any commit.
     writer
-        .execute_batch("CREATE TABLE scratch (x BLOB); PRAGMA cache_size = 2; BEGIN IMMEDIATE;")
+        .execute_batch(
+            "PRAGMA cache_size = 2; BEGIN IMMEDIATE; DELETE FROM factory_records;
+             CREATE TABLE scratch (x BLOB);",
+        )
         .unwrap();
     for _ in 0..200 {
         writer
@@ -457,13 +441,25 @@ fn factory_export_reads_a_store_a_killed_daemon_left_in_the_middle_of_a_write() 
     }
     // The store and its journal as a kill at this moment leaves them.
     let crashed = tempfile::tempdir().unwrap();
-    std::fs::copy(&live, crashed.path().join("store.sqlite")).unwrap();
+    let store = crashed.path().join("store.sqlite");
+    std::fs::copy(&live, &store).unwrap();
     std::fs::copy(
         home.path().join("store.sqlite-journal"),
         crashed.path().join("store.sqlite-journal"),
     )
     .unwrap();
     writer.execute_batch("ROLLBACK").unwrap();
+    // A read of the store file that skipped the journal would find none of the run's events.
+    let skipping = rusqlite::Connection::open_with_flags(
+        format!("file:{}?immutable=1", store.display()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap();
+    let held: i64 = skipping
+        .query_row("SELECT COUNT(*) FROM factory_records", [], |row| row.get(0))
+        .unwrap();
+    drop(skipping);
+    assert_eq!(held, 0, "the unfinished write never reached the store file");
     let out = tempfile::tempdir().unwrap();
 
     let ran = export(&crashed, out.path());
