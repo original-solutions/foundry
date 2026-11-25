@@ -320,18 +320,31 @@ async fn start(api: &Api, id: WorkspaceId, body: &Bytes) -> Result<Response, Api
     let started = api
         .workspaces
         .start_in(id, move |worktree| async move {
+            // Only the project's factory sessions that run here are read, each by its id, and
+            // the one with the lowest version answers.
             let running = sessions.factory_sessions(factory.project);
-            let records = on_store(&store, move |store| store.sessions_of(me)).await?;
-            let found = records.into_iter().find(|record| {
-                record.body.workspace == id
-                    && running.contains(&record.body.id)
-                    && !matches!(
-                        record.body.state,
-                        SessionState::Finished | SessionState::Failed
-                    )
-            });
-            if let Some(record) = found {
-                return Ok(Started::Running(record.body.id));
+            let found = on_store(&store, move |store| {
+                let mut found: Option<(u64, SessionId)> = None;
+                for session in running {
+                    let Some(record) = store.session(session)? else {
+                        continue;
+                    };
+                    let here = record.owner == me
+                        && !record.deleted
+                        && record.body.workspace == id
+                        && !matches!(
+                            record.body.state,
+                            SessionState::Finished | SessionState::Failed
+                        );
+                    if here && found.is_none_or(|(version, _)| record.version < version) {
+                        found = Some((record.version, record.body.id));
+                    }
+                }
+                Ok(found.map(|(_, session)| session))
+            })
+            .await?;
+            if let Some(session) = found {
+                return Ok(Started::Running(session));
             }
             sessions
                 .start_factory(id, &worktree, factory, first)
@@ -447,11 +460,10 @@ async fn turn(api: &Api, id: SessionId, body: &Bytes) -> Result<Response, ApiErr
         return Ok(answer(text));
     }
     let me = api.peers.me();
-    let runs = on_store(&api.store, move |store| store.sessions_of(me))
+    let runs = on_store(&api.store, move |store| store.session(id))
         .await?
-        .iter()
-        .any(|record| {
-            record.body.id == id
+        .is_some_and(|record| {
+            record.owner == me
                 && !record.deleted
                 && !matches!(
                     record.body.state,

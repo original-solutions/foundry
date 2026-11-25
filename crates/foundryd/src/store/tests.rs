@@ -1017,6 +1017,306 @@ fn sessions_of_gives_one_owners_sessions_not_deleted_and_leaves_out_a_row_it_can
     assert_eq!(store.sessions_of(me).unwrap(), vec![first, failed]);
 }
 
+/// A session record of `owner` with its id, workspace and terminal numbered.
+fn session_at(
+    owner: MachineId,
+    version: u64,
+    id: u128,
+    workspace: u128,
+    terminal: u128,
+) -> Record<Session> {
+    let AnyRecord::Session(mut record) = session(owner, version) else {
+        unreachable!("`session` gives a session record");
+    };
+    record.body.id = SessionId(uuid::Uuid::from_u128(id));
+    record.body.workspace = WorkspaceId(uuid::Uuid::from_u128(workspace));
+    record.body.terminal = TerminalId(uuid::Uuid::from_u128(terminal));
+    record
+}
+
+/// The three session reads find a session another machine wrote once sync has applied it here,
+/// with that machine as its owner, and answer none for an id no record here names.
+#[test]
+fn each_session_read_finds_a_session_another_machine_wrote_after_a_sync_and_none_for_an_unknown_id()
+{
+    let (_dir, mut store) = open();
+    let (me, peer) = (MachineId::random(), MachineId::random());
+    let mine = session_at(me, 1, 50, 60, 70);
+    store.apply(&AnyRecord::Session(mine.clone()), me).unwrap();
+    let theirs = session_at(peer, 7, 51, 61, 71);
+    // What a sync link does with a batch of the peer's records.
+    store
+        .apply_batch(
+            &[AnyRecord::Session(theirs.clone()), terminal(peer, 8)],
+            peer,
+            |r| panic!("{r:?} is the peer's"),
+        )
+        .unwrap();
+
+    let found = store.session(theirs.body.id).unwrap().unwrap();
+    assert_eq!(found, theirs);
+    assert_eq!(found.owner, peer);
+    let found = store.session_on(theirs.body.terminal).unwrap().unwrap();
+    assert_eq!((found.owner, &found), (peer, &theirs));
+    let found = store.session_in(theirs.body.workspace).unwrap().unwrap();
+    assert_eq!((found.owner, &found), (peer, &theirs));
+    assert_eq!(store.session(mine.body.id).unwrap(), Some(mine.clone()));
+    assert_eq!(
+        store.session_on(mine.body.terminal).unwrap(),
+        Some(mine.clone())
+    );
+    assert_eq!(store.session_in(mine.body.workspace).unwrap(), Some(mine));
+
+    let unknown = uuid::Uuid::from_u128(99);
+    assert_eq!(store.session(SessionId(unknown)).unwrap(), None);
+    assert_eq!(store.session_on(TerminalId(unknown)).unwrap(), None);
+    assert_eq!(store.session_in(WorkspaceId(unknown)).unwrap(), None);
+}
+
+/// Each session read gives a deleted record too, as `workspace` and `terminal` do, so a caller
+/// tells a gone session from one no record names. Only session rows answer: a workspace or a
+/// terminal under the same id, or a terminal in the same workspace, is another record.
+#[test]
+fn each_session_read_gives_a_deleted_session_and_reads_only_session_rows() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    // The other kinds go in first, so a read that ignored the kind would find them first.
+    let mut same_id = workspace(owner, 1);
+    if let AnyRecord::Workspace(r) = &mut same_id {
+        r.body.id = WorkspaceId(uuid::Uuid::from_u128(50));
+    }
+    store.apply(&same_id, owner).unwrap();
+    let mut in_workspace = terminal(owner, 2);
+    if let AnyRecord::Terminal(r) = &mut in_workspace {
+        r.body.id = TerminalId(uuid::Uuid::from_u128(70));
+        r.body.workspace = WorkspaceId(uuid::Uuid::from_u128(60));
+    }
+    store.apply(&in_workspace, owner).unwrap();
+    assert_eq!(
+        store.session(SessionId(uuid::Uuid::from_u128(50))).unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .session_in(WorkspaceId(uuid::Uuid::from_u128(60)))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .session_on(TerminalId(uuid::Uuid::from_u128(70)))
+            .unwrap(),
+        None
+    );
+
+    let mut gone = session_at(owner, 3, 50, 60, 70);
+    gone.deleted = true;
+    store
+        .apply(&AnyRecord::Session(gone.clone()), owner)
+        .unwrap();
+    assert_eq!(store.session(gone.body.id).unwrap(), Some(gone.clone()));
+    assert_eq!(
+        store.session_on(gone.body.terminal).unwrap(),
+        Some(gone.clone())
+    );
+    assert_eq!(store.session_in(gone.body.workspace).unwrap(), Some(gone));
+}
+
+/// A workspace may have had several sessions, as a start after an end makes: `session_in` gives
+/// the one with the highest version, whatever their ids or their order of arrival. Should two
+/// sessions name one terminal, `session_on` gives the newer too.
+#[test]
+fn session_in_and_session_on_give_the_session_with_the_highest_version() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let older = session_at(owner, 2, 90, 60, 70);
+    let newer = session_at(owner, 5, 10, 60, 70);
+    let elsewhere = session_at(owner, 9, 11, 61, 72);
+    for record in [&newer, &elsewhere, &older] {
+        store
+            .apply(&AnyRecord::Session(record.clone()), owner)
+            .unwrap();
+    }
+    assert_eq!(
+        store.session_in(newer.body.workspace).unwrap(),
+        Some(newer.clone())
+    );
+    assert_eq!(store.session_on(older.body.terminal).unwrap(), Some(newer));
+    assert_eq!(
+        store.session_on(elsewhere.body.terminal).unwrap(),
+        Some(elsewhere)
+    );
+}
+
+/// A session row this build cannot read, one a newer build left before a rollback, is left out
+/// with a warning, as `sessions_of` leaves it out: the session reads answer the routes that
+/// used `sessions_of`, and their answers stay as they were. A readable session of the same
+/// workspace still answers.
+#[test]
+fn each_session_read_leaves_out_a_session_row_it_cannot_read() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let readable = session_at(owner, 1, 50, 60, 70);
+    store
+        .apply(&AnyRecord::Session(readable.clone()), owner)
+        .unwrap();
+    let (id, workspace, terminal) = (
+        uuid::Uuid::from_u128(51),
+        uuid::Uuid::from_u128(60),
+        uuid::Uuid::from_u128(71),
+    );
+    store
+        .conn
+        .execute(
+            "INSERT INTO records (kind, id, owner, version, record) VALUES ('session', ?1, ?2, 2, ?3)",
+            params![
+                id.to_string(),
+                owner.to_string(),
+                format!(
+                    r#"{{"kind":"session","owner":"{owner}","version":2,"deleted":false,"body":{{"id":"{id}","workspace":"{workspace}","terminal":"{terminal}","model":"m","state":"from-a-newer-build"}}}}"#
+                )
+            ],
+        )
+        .unwrap();
+    assert_eq!(store.session(SessionId(id)).unwrap(), None);
+    assert_eq!(store.session_on(TerminalId(terminal)).unwrap(), None);
+    assert_eq!(
+        store.session_in(WorkspaceId(workspace)).unwrap(),
+        Some(readable)
+    );
+}
+
+/// The plan SQLite makes for `sql`, one line per step.
+fn plan(store: &Store, sql: &str) -> Vec<String> {
+    let mut query = store
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap();
+    let count = query.parameter_count();
+    let params: Vec<String> = (0..count).map(|_| String::new()).collect();
+    query
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// Each session read is answered from an index, not by reading every owner's sessions: SQLite
+/// searches `records` through the index named and never scans it or sorts in a temporary tree.
+#[test]
+fn each_session_read_searches_an_index_and_reads_no_other_session() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    for n in 0..50 {
+        let record = session_at(
+            owner,
+            n + 1,
+            1000 + u128::from(n),
+            2000,
+            3000 + u128::from(n),
+        );
+        store.apply(&AnyRecord::Session(record), owner).unwrap();
+    }
+    assert_each_session_read_searches_its_index(&store);
+}
+
+/// SQLite answers each session read by searching `records` through the index named, and never
+/// scans it or sorts in a temporary tree.
+fn assert_each_session_read_searches_its_index(store: &Store) {
+    for (sql, index) in [
+        (SESSION_BY_ID, "sqlite_autoindex_records_1"),
+        (SESSION_ON_TERMINAL, "records_session_by_terminal"),
+        (SESSION_IN_WORKSPACE, "records_session_by_workspace"),
+    ] {
+        let steps = plan(store, sql);
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.starts_with("SEARCH records USING INDEX ")
+                    && step.contains(index)),
+            "{sql}: {steps:?}"
+        );
+        for step in &steps {
+            assert!(!step.starts_with("SCAN"), "{sql}: {steps:?}");
+            assert!(!step.contains("TEMP B-TREE"), "{sql}: {steps:?}");
+        }
+    }
+}
+
+/// A file at step 2 that already holds session rows (this machine's, a peer's, a deleted one
+/// and one this build cannot read) opens at the current schema. Step 3 indexes the rows it
+/// finds, so each session read finds every row written before it through its index, leaves
+/// out the unreadable one, and finds a session written after it too.
+#[test]
+fn step_3_indexes_the_session_rows_a_step_2_file_already_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("foundry.db");
+    let (me, peer) = (MachineId::random(), MachineId::random());
+    let mine = session_at(me, 1, 50, 60, 70);
+    let theirs = session_at(peer, 4, 51, 61, 71);
+    let mut gone = session_at(me, 2, 52, 62, 72);
+    gone.deleted = true;
+    let (unreadable, its_workspace, its_terminal) = (
+        uuid::Uuid::from_u128(53),
+        uuid::Uuid::from_u128(63),
+        uuid::Uuid::from_u128(73),
+    );
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrate(&mut conn, 2).unwrap();
+        let tx = conn.transaction().unwrap();
+        for (record, owner) in [(&mine, me), (&theirs, peer), (&gone, me)] {
+            let applied = apply_in_tx(&tx, &AnyRecord::Session(record.clone()), owner).unwrap();
+            assert_eq!(applied, Applied::Stored);
+        }
+        tx.execute(
+            "INSERT INTO records (kind, id, owner, version, record) VALUES ('session', ?1, ?2, 3, ?3)",
+            params![
+                unreadable.to_string(),
+                me.to_string(),
+                format!(
+                    r#"{{"kind":"session","owner":"{me}","version":3,"deleted":false,"body":{{"id":"{unreadable}","workspace":"{its_workspace}","terminal":"{its_terminal}","model":"m","state":"from-a-newer-build"}}}}"#
+                )
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(user_version(&conn).unwrap(), 2);
+    }
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
+    assert_each_session_read_searches_its_index(&store);
+    for record in [&mine, &theirs, &gone] {
+        assert_eq!(
+            store.session(record.body.id).unwrap().as_ref(),
+            Some(record)
+        );
+        assert_eq!(
+            store.session_on(record.body.terminal).unwrap().as_ref(),
+            Some(record)
+        );
+        assert_eq!(
+            store.session_in(record.body.workspace).unwrap().as_ref(),
+            Some(record)
+        );
+    }
+    assert_eq!(store.session(SessionId(unreadable)).unwrap(), None);
+    assert_eq!(store.session_on(TerminalId(its_terminal)).unwrap(), None);
+    assert_eq!(store.session_in(WorkspaceId(its_workspace)).unwrap(), None);
+
+    let later = session_at(me, 5, 54, 64, 74);
+    store.apply(&AnyRecord::Session(later.clone()), me).unwrap();
+    assert_eq!(store.session(later.body.id).unwrap().as_ref(), Some(&later));
+    assert_eq!(
+        store.session_on(later.body.terminal).unwrap().as_ref(),
+        Some(&later)
+    );
+    assert_eq!(store.session_in(later.body.workspace).unwrap(), Some(later));
+}
+
 #[test]
 fn apply_batch_stores_valid_prefix_skips_stale_and_reports_not_owner() {
     let (_dir, mut store) = open();

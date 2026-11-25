@@ -1933,3 +1933,96 @@ async fn two_starts_sent_at_once_start_one_session_and_both_answer_with_it() {
     assert_eq!(session_of(&one_text), session_of(&two_text), "one session");
     assert_eq!(pair.sessions_in(workspace), 1, "one session runs on B");
 }
+
+/// A turn or a message that reaches A, carried, for B's running factory session is not answered
+/// as if the session ran on A: the session is B's, so A's turn is `410` and its message `409
+/// no_such_session`, and B's session still runs.
+#[tokio::test]
+async fn a_carried_turn_or_message_for_a_session_another_machine_runs_is_not_answered_as_running_here()
+ {
+    let pair = Pair::start().await;
+    let (status, text) = pair
+        .call(
+            "/api/factory/workspaces",
+            Some(pair.create("fac/12-1", json!({"kind": "none"}))),
+        )
+        .await;
+    assert_eq!(status, 201, "{text}");
+    let workspace = workspace_of(&text);
+    let start = pair.start_body(LOGIN, "test-model", "high", "/factory-build demo#12");
+    let path = format!("/api/workspaces/{workspace}/factory/session");
+    let (status, text) = pair.call(&path, Some(start)).await;
+    assert_eq!(status, 201, "{text}");
+    let session = session_of(&text);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !pair.runs(session).await {
+        assert!(tokio::time::Instant::now() < deadline, "A never shows it");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let carried = [(CARRIED, "1".to_owned())];
+
+    let turn = format!("/api/sessions/{session}/factory/turn");
+    let (status, text) = pair
+        .on_a
+        .post_with(&turn, Some(json!({"turn": 7})), &carried)
+        .await;
+    assert_eq!(status, 410, "{text}");
+    let message = format!("/api/sessions/{session}/factory/message");
+    let send = json!({"message": {"line": "hi", "body": null}, "only_if_prompts": null});
+    let (status, text) = pair.on_a.post_with(&message, Some(send), &carried).await;
+    assert_eq!(status, 409, "{text}");
+    assert!(text.contains("no_such_session"), "{text}");
+    assert!(pair.runs(session).await, "B's session still runs");
+}
+
+/// A deleted session record names no owner, as it did when only live sessions were read: a run's
+/// message or turn call for it is refused as not here yet and sent nowhere, whether B or A wrote
+/// it. A turn carried to A for A's own deleted session is `410`, as for a session that ended.
+#[tokio::test]
+async fn a_run_call_for_a_deleted_session_is_refused_as_not_here_yet_and_answered_by_no_machine() {
+    let pair = Pair::start().await;
+    let (a, b) = (pair.a(), pair.b());
+    for owner in [b.id, a.id] {
+        let session = SessionId::random();
+        let deleted = AnyRecord::Session(foundry_proto::record::Record {
+            owner,
+            version: 1 << 40,
+            deleted: true,
+            body: foundry_proto::record::Session {
+                id: session,
+                workspace: WorkspaceId::random(),
+                terminal: TerminalId::random(),
+                model: "test-model".into(),
+                state: SessionState::Working,
+            },
+        });
+        // As sync applies B's records on A, and as A keeps its own.
+        a.store.lock().unwrap().apply(&deleted, owner).unwrap();
+        let send = json!({"message": {"line": "hi", "body": null}, "only_if_prompts": null});
+        for (path, body) in [
+            (format!("/api/sessions/{session}/factory/message"), send),
+            (
+                format!("/api/sessions/{session}/factory/turn"),
+                json!({"turn": 1}),
+            ),
+        ] {
+            let body = body.to_string();
+            match api::factory::call(&pair.on_a.api, &path, body.as_bytes()).await {
+                Err(CallError::Refused(said)) => {
+                    assert!(said.contains(NOT_HERE_YET), "{path}: {said}");
+                }
+                other => panic!("{path} of {owner}'s deleted session not refused: {other:?}"),
+            }
+        }
+        if owner == a.id {
+            // Carried to A, which owns it: a deleted session runs nowhere, so its turn is gone.
+            let turn = format!("/api/sessions/{session}/factory/turn");
+            let carried = [(CARRIED, "1".to_owned())];
+            let (status, text) = pair
+                .on_a
+                .post_with(&turn, Some(json!({"turn": 1})), &carried)
+                .await;
+            assert_eq!(status, 410, "{text}");
+        }
+    }
+}
