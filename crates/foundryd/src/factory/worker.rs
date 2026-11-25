@@ -706,14 +706,14 @@ mod tests {
         let fake = FakeWorker::new();
         let m = machine(1);
         let ws = WorkspaceId(id(5));
-        let sess = SessionId(id(6));
+        let asked = SessionId(id(6));
         let term = TerminalId(id(7));
         fake.archive(ws).unwrap();
         fake.tail(term).unwrap();
         let req = request("a", "r1");
         fake.create(m, req.clone()).unwrap();
-        fake.turn(sess, 3).unwrap();
-        fake.start_session(ws, start(), msg("go")).unwrap();
+        fake.turn(asked, 3).unwrap();
+        let sess = fake.start_session(ws, start(), msg("go")).unwrap();
         fake.end_sessions(ws).unwrap();
         fake.send(sess, msg("hi"), Some(2)).unwrap();
         assert_eq!(
@@ -726,7 +726,7 @@ mod tests {
                     request: req
                 },
                 Call::Turn {
-                    session: sess,
+                    session: asked,
                     n: 3
                 },
                 Call::StartSession {
@@ -760,21 +760,24 @@ mod tests {
     }
 
     #[test]
-    fn scripted_answers_come_in_order_and_the_last_repeats() {
+    fn scripted_answers_come_in_order_then_the_default() {
         let fake = FakeWorker::new();
         let ws = WorkspaceId(id(5));
         fake.on_end_sessions(Err(WorkerError::Failed("one".into())))
-            .on_end_sessions(Ok(()));
+            .on_end_sessions(Err(WorkerError::Failed("two".into())));
         assert_eq!(
             fake.end_sessions(ws),
             Err(WorkerError::Failed("one".into()))
         );
-        assert_eq!(fake.end_sessions(ws), Ok(()));
+        assert_eq!(
+            fake.end_sessions(ws),
+            Err(WorkerError::Failed("two".into()))
+        );
         assert_eq!(fake.end_sessions(ws), Ok(()));
         let term = TerminalId(id(7));
         fake.on_tail(Ok("out".into()));
         assert_eq!(fake.tail(term), Ok("out".into()));
-        assert_eq!(fake.tail(term), Ok("out".into()));
+        assert_eq!(fake.tail(term), Ok(String::new()));
     }
 
     #[test]
@@ -812,8 +815,54 @@ mod tests {
         let scripted = WorkspaceId(id(9));
         fake.on_create(Ok(scripted));
         assert_eq!(fake.create(m, request("a", "r1")).unwrap(), scripted);
-        let queue_done = fake.create(m, request("a", "r1")).unwrap();
-        assert_eq!(queue_done, scripted, "the last scripted answer repeats");
+        let fresh = fake.create(m, request("a", "r1")).unwrap();
+        assert_ne!(fresh, scripted, "the scripted answer answered one call");
+        assert_eq!(fake.create(m, request("a", "r1")).unwrap(), fresh);
+    }
+
+    #[test]
+    fn a_default_create_is_per_machine_and_forgets_an_archived_workspace() {
+        let fake = FakeWorker::new();
+        let (a, b) = (machine(1), machine(2));
+        let first = fake.create(a, request("a", "r1")).unwrap();
+        let elsewhere = fake.create(b, request("a", "r1")).unwrap();
+        assert_ne!(elsewhere, first);
+        assert_eq!(fake.create(a, request("a", "r1")).unwrap(), first);
+        fake.archive(first).unwrap();
+        let again = fake.create(a, request("a", "r1")).unwrap();
+        assert_ne!(again, first);
+        assert_eq!(fake.create(b, request("a", "r1")).unwrap(), elsewhere);
+    }
+
+    #[test]
+    fn a_failed_archive_does_not_forget_the_workspace() {
+        let fake = FakeWorker::new();
+        let m = machine(1);
+        let first = fake.create(m, request("a", "r1")).unwrap();
+        fake.on_archive(Err(WorkerError::Failed("no".into())));
+        assert!(fake.archive(first).is_err());
+        assert_eq!(fake.create(m, request("a", "r1")).unwrap(), first);
+    }
+
+    #[test]
+    fn the_default_send_refuses_a_session_it_never_started_and_a_count_that_rose() {
+        let fake = FakeWorker::new();
+        let ws = WorkspaceId(id(5));
+        assert_eq!(
+            fake.send(SessionId(id(6)), msg("a"), None),
+            Err(SendRefused::NoSuchSession)
+        );
+        let sess = fake.start_session(ws, start(), msg("go")).unwrap();
+        assert_eq!(
+            fake.send(sess, msg("a"), Some(0)),
+            Err(SendRefused::CountRose { now: 1 })
+        );
+        assert_eq!(fake.send(sess, msg("a"), Some(1)), Ok(1));
+        assert_eq!(
+            fake.send(sess, msg("a"), Some(1)),
+            Err(SendRefused::CountRose { now: 2 })
+        );
+        assert_eq!(fake.send(sess, msg("a"), None), Ok(2));
     }
 
     #[test]
@@ -830,11 +879,11 @@ mod tests {
         let fake = FakeWorker::new();
         let ws = WorkspaceId(id(5));
         let sess = fake.start_session(ws, start(), msg("go")).unwrap();
-        fake.on_send(Err(SendRefused::NotIdle)).on_send(Ok(1));
+        fake.on_send(Err(SendRefused::NotIdle));
         assert_eq!(fake.send(sess, msg("a"), None), Err(SendRefused::NotIdle));
         // The refusal delivered nothing, so a send after it still follows the start alone.
         assert_eq!(fake.send(sess, msg("a"), None), Ok(1));
-        assert_eq!(fake.send(sess, msg("b"), None), Ok(1));
+        assert_eq!(fake.send(sess, msg("b"), None), Ok(2));
         assert_eq!(fake.calls().len(), 4);
     }
 
@@ -1053,6 +1102,127 @@ mod tests {
             SessionId(id(23))
         );
         assert!(plain.session_of(WorkspaceId(id(99))).is_none());
+    }
+
+    #[test]
+    fn session_of_ranks_a_live_session_above_an_ended_one_with_a_turn() {
+        let m = machine(1);
+        let view = FleetView::builder()
+            .online(m)
+            .session(session_record(m, 5, false, 20, 10, SessionState::Finished))
+            .session(session_record(m, 3, false, 21, 10, SessionState::Idle))
+            .turn(turn_of(20, 10))
+            .build();
+        assert_eq!(
+            view.session_of(WorkspaceId(id(10))).unwrap().body.id,
+            SessionId(id(21))
+        );
+        let failed = FleetView::builder()
+            .online(m)
+            .session(session_record(m, 5, false, 20, 10, SessionState::Failed))
+            .session(session_record(m, 3, false, 21, 10, SessionState::Working))
+            .turn(turn_of(20, 10))
+            .build();
+        assert_eq!(
+            failed.session_of(WorkspaceId(id(10))).unwrap().body.id,
+            SessionId(id(21))
+        );
+        let only_ended = FleetView::builder()
+            .online(m)
+            .session(session_record(m, 5, false, 20, 10, SessionState::Finished))
+            .build();
+        assert_eq!(
+            only_ended.session_of(WorkspaceId(id(10))).unwrap().body.id,
+            SessionId(id(20))
+        );
+    }
+
+    #[test]
+    fn workspaces_named_gives_every_live_workspace_of_the_name() {
+        let (a, b) = (machine(1), machine(2));
+        let view = FleetView::builder()
+            .workspace(workspace_record(a, 1, false, 10, 1, "run"))
+            .workspace(workspace_record(b, 1, false, 11, 1, "run"))
+            .workspace(workspace_record(b, 2, true, 12, 1, "run"))
+            .workspace(workspace_record(b, 3, false, 13, 1, "other"))
+            .workspace(workspace_record(b, 4, false, 14, 2, "run"))
+            .build();
+        let ids: Vec<WorkspaceId> = view
+            .workspaces_named(project(1), "run")
+            .iter()
+            .map(|r| r.body.id)
+            .collect();
+        assert_eq!(ids, vec![WorkspaceId(id(10)), WorkspaceId(id(11))]);
+        assert!(view.workspaces_named(project(3), "run").is_empty());
+    }
+
+    #[test]
+    fn a_machine_that_holds_only_a_factory_record_is_read() {
+        let (_dir, mut store) = open();
+        let m = machine(1);
+        let held = MachineHeld {
+            logins: vec!["bot".into()],
+            skill: false,
+        };
+        store
+            .apply_factory(
+                &FactoryRecord {
+                    owner: m,
+                    version: 1,
+                    body: FactoryBody::Held(held.clone()),
+                },
+                m,
+            )
+            .unwrap();
+        let view = FleetView::read(&store, BTreeSet::new(), BTreeMap::new()).unwrap();
+        assert_eq!(view.held(m), Some(&held));
+    }
+
+    #[test]
+    fn a_deleted_session_with_a_stored_turn_has_no_turn_in_the_view() {
+        let (_dir, mut store) = open();
+        let m = machine(1);
+        store
+            .apply(
+                &AnyRecord::Session(session_record(m, 2, true, 20, 10, SessionState::Idle)),
+                m,
+            )
+            .unwrap();
+        store
+            .apply_factory(
+                &FactoryRecord {
+                    owner: m,
+                    version: 1,
+                    body: FactoryBody::Turn(turn_of(20, 10)),
+                },
+                m,
+            )
+            .unwrap();
+        let view = FleetView::read(&store, BTreeSet::from([m]), BTreeMap::new()).unwrap();
+        assert_eq!(view.session_turn(SessionId(id(20))), None);
+    }
+
+    #[test]
+    fn online_added_after_the_records_still_applies() {
+        let (a, b) = (machine(1), machine(2));
+        let view = FleetView::builder()
+            .session(session_record(a, 1, false, 20, 10, SessionState::Idle))
+            .terminal(terminal_record(a, false, 30, TerminalState::Running, None))
+            .session(session_record(b, 1, false, 21, 10, SessionState::Idle))
+            .online(a)
+            .build();
+        assert_eq!(
+            view.session_state(SessionId(id(20))),
+            Some(SessionState::Idle)
+        );
+        assert_eq!(
+            view.session_state(SessionId(id(21))),
+            Some(SessionState::Unreachable)
+        );
+        assert_eq!(
+            view.terminal(TerminalId(id(30))),
+            Some((TerminalState::Running, None))
+        );
     }
 
     #[test]
