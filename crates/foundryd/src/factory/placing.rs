@@ -8,7 +8,8 @@
 //!
 //! [`place_run`] keeps to every limit, the session limit included, and counts each machine it
 //! picked earlier in the same pass one session fuller, as the spec's shared settings say of a
-//! pass that claims more than one issue. [`place_gate`] keeps to the load and disk limits only:
+//! pass that claims more than one issue, and so too each run the caller holds on a machine with
+//! [`Reserved::hold`]. [`place_gate`] keeps to the load and disk limits only:
 //! a gate has no session. Neither sends anything; the caller makes the workspace.
 //!
 //! [`slots`] counts what is free of the fleet's `max_runs` and `max_gates`.
@@ -24,8 +25,9 @@ use crate::factory::ledger::list::{RunInfo, holds_slot};
 use crate::factory::worker::FleetView;
 use crate::placement;
 
-/// The machines [`place_run`] picked so far in one pass, each counted one session fuller for
-/// the rest of it. A new pass starts with a new one.
+/// The runs placed or held on each machine in one pass, each counting its machine one session
+/// fuller for the rest of it: those [`place_run`] picked, and those the caller held with
+/// [`Reserved::hold`]. A new pass starts with a new one.
 ///
 /// A machine's samples count a run's session only once it has started, after its workspace's
 /// setup, which can take minutes and so outlast the pass that placed it. The caller tells the
@@ -33,19 +35,19 @@ use crate::placement;
 /// an earlier pass, or by another project's, still keeps the machine's limit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reserved {
-    picked: BTreeMap<MachineId, u32>,
+    held: BTreeMap<MachineId, u32>,
 }
 
 impl Reserved {
     /// Counts `machine` one session fuller for every later [`place_run`]: a run is placed there
     /// whose session its samples do not count yet.
     pub fn hold(&mut self, machine: MachineId) {
-        *self.picked.entry(machine).or_insert(0) += 1;
+        *self.held.entry(machine).or_insert(0) += 1;
     }
 
-    /// How many runs were placed on `machine` this pass.
+    /// How many runs are placed or held on `machine`.
     fn on(&self, machine: MachineId) -> u32 {
-        self.picked.get(&machine).copied().unwrap_or(0)
+        self.held.get(&machine).copied().unwrap_or(0)
     }
 }
 
