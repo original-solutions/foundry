@@ -829,6 +829,9 @@ pub(crate) mod testing {
         closing: Vec<Value>,
         branches: BTreeSet<String>,
         failures: Vec<(String, usize)>,
+        /// Calls containing one of these are refused as an invalid argument, as a branch name
+        /// the tracker will not take is.
+        refused: Vec<String>,
         calls: Vec<Vec<String>>,
     }
 
@@ -886,6 +889,7 @@ pub(crate) mod testing {
                     closing: vec![],
                     branches: BTreeSet::new(),
                     failures: vec![],
+                    refused: vec![],
                     calls: vec![],
                 }),
             })
@@ -951,6 +955,11 @@ pub(crate) mod testing {
         /// Makes the next `times` calls whose arguments contain `needle` fail.
         pub fn fail(&self, needle: &str, times: usize) {
             self.lock().failures.push((needle.into(), times));
+        }
+
+        /// Makes every call whose arguments contain `needle` fail as an invalid argument.
+        pub fn refuse(&self, needle: &str) {
+            self.lock().refused.push(needle.into());
         }
 
         pub fn calls(&self) -> Vec<Vec<String>> {
@@ -1024,6 +1033,16 @@ pub(crate) mod testing {
             {
                 state.failures[at].1 -= 1;
                 return Err(Self::other(args, "injected failure"));
+            }
+            if state
+                .refused
+                .iter()
+                .any(|needle| joined.contains(needle.as_str()))
+            {
+                return Err(TrackerError::Other {
+                    kind: OtherKind::InvalidArgument,
+                    message: format!("`gh {joined}` was refused: not a name"),
+                });
             }
             let word = |at: usize| args.get(at).map(String::as_str);
             match (word(0), word(1)) {

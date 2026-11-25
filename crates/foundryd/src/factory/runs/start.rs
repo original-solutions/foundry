@@ -2624,6 +2624,14 @@ mod tests {
             (rig, run)
         }
 
+        /// The run a claim made.
+        fn claim_run(rig: &Rig) -> RunId {
+            match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                ClaimOutcome::Claimed { run } => run,
+                other => panic!("{other:?}"),
+            }
+        }
+
         /// Claimed, the workspace asked for and shown, with no setup: the next pass starts.
         fn workspace_shown() -> (Rig, RunId) {
             let (mut rig, run) = claimed_rig();
@@ -3419,7 +3427,11 @@ mod tests {
         mod the_launch_asked_for_again {
             use super::*;
 
-            fn show_session(rig: &mut Rig, state: SessionState, turn: Option<(u64, u64)>) {
+            pub(super) fn show_session(
+                rig: &mut Rig,
+                state: SessionState,
+                turn: Option<(u64, u64)>,
+            ) {
                 let mut view = FleetView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, "fac/8-1", None))
@@ -3437,7 +3449,7 @@ mod tests {
                 rig.view = view.build();
             }
 
-            fn sends(rig: &Rig) -> Vec<Call> {
+            pub(super) fn sends(rig: &Rig) -> Vec<Call> {
                 calls(rig)
                     .into_iter()
                     .filter(|call| matches!(call, Call::Send { .. }))
@@ -3546,12 +3558,12 @@ mod tests {
         mod an_issue_set_ready_again {
             use super::*;
 
-            fn url(pr: u64) -> String {
+            pub(super) fn url(pr: u64) -> String {
                 format!("https://github.com/{REPO}/pull/{pr}")
             }
 
             /// A second attempt: the first ended and the issue was set `ready` again.
-            fn second_attempt(rig: &Rig) -> RunId {
+            pub(super) fn second_attempt(rig: &Rig) -> RunId {
                 let first = run_id(1);
                 rig.step(&first, &format!("approved {LABELED_AT}"));
                 rig.moved(&first, State::Ready, State::Triage);
@@ -3570,21 +3582,21 @@ mod tests {
                 }
             }
 
-            fn rig_for_second_attempt() -> Rig {
+            pub(super) fn rig_for_second_attempt() -> Rig {
                 let rig = Rig::new();
                 rig.worker.on_create(Ok(ws_id()));
                 rig.worker.on_start_session(Ok(session()));
                 rig
             }
 
-            fn first_create(rig: &Rig) -> crate::factory::worker::CreateWorkspace {
+            pub(super) fn first_create(rig: &Rig) -> crate::factory::worker::CreateWorkspace {
                 match &creates(rig)[..] {
                     [Call::Create { request, .. }] => request.clone(),
                     other => panic!("{other:?}"),
                 }
             }
 
-            fn show_second(rig: &mut Rig, name: &str) {
+            pub(super) fn show_second(rig: &mut Rig, name: &str) {
                 rig.view = FleetView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, name, None))
@@ -3885,7 +3897,7 @@ mod tests {
                 }
             }
 
-            fn time_limited_first_attempt(rig: &Rig, branch: &str) {
+            pub(super) fn time_limited_first_attempt(rig: &Rig, branch: &str) {
                 let first = run_id(1);
                 rig.step(&first, &format!("approved {LABELED_AT}"));
                 rig.moved(&first, State::Ready, State::Triage);
@@ -4210,6 +4222,662 @@ mod tests {
                     .position(|s| s.starts_with("workspace-requested"))
                     .unwrap();
                 assert!(base < requested);
+            }
+        }
+
+        /// The runner's `start.test.ts` cases for the claim and the launch that the groups above
+        /// do not carry under their own names. Where the runner's case has no counterpart in
+        /// Foundry (T3, a host or cloud launch, a model cooling down, claims of several
+        /// machines), the test keeps the runner's name and asserts what replaces it.
+        mod a_fresh_ready_issue {
+            use super::*;
+
+            /// The runner's case, where the host message names the machine's resolved login: in
+            /// Foundry there is one login for a project, and the one launch message names it,
+            /// whichever machine builds.
+            #[test]
+            fn sends_the_host_message_naming_the_machine_s_resolved_login_the_runner_s_login_for_a_machine_with_none()
+             {
+                let (rig, _run) = started();
+                match &start_sessions(&rig)[..] {
+                    [Call::StartSession { login, first, .. }] => {
+                        assert_eq!(login, LOGIN);
+                        assert_eq!(first, &launch_message());
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// The runner's case, where the cloud message names no login beside the local and
+            /// host ones: in Foundry there is no cloud launch, so a build on another machine
+            /// sends the very same message.
+            #[test]
+            fn sends_the_cloud_message_which_names_no_login_beside_the_local_and_host_ones() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.worker.on_start_session(Ok(session()));
+                let run = match claim(&rig.ctx(), ISSUE, elsewhere()).unwrap() {
+                    ClaimOutcome::Claimed { run } => run,
+                    other => panic!("{other:?}"),
+                };
+                let mut rig = rig;
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                rig.view = FleetView::builder()
+                    .online(elsewhere())
+                    .workspace(workspace_record(elsewhere(), "fac/8-1", None))
+                    .build();
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                match &start_sessions(&rig)[..] {
+                    [Call::StartSession { first, .. }] => assert_eq!(first, &launch_message()),
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// The runner's case, where `launchModel` picks a model while the project's cools
+            /// down: in Foundry there is no cooldown model, the session starts on the fleet's
+            /// model and effort, and the launch records them before the workspace is asked for.
+            #[test]
+            fn launches_on_the_model_launchmodel_picks_while_the_project_s_model_cools_down() {
+                let mut rig = Rig::new();
+                rig.settings.fleet.model = "claude-opus-4-1".into();
+                rig.settings.fleet.effort = "high".into();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.worker.on_start_session(Ok(session()));
+                let run = claim_run(&rig);
+                pass(&rig, &run);
+                assert!(
+                    rig.steps(&run)
+                        .contains(&"launch-model claude-opus-4-1".to_string())
+                );
+                show_workspace(&mut rig);
+                pass(&rig, &run);
+                match &start_sessions(&rig)[..] {
+                    [Call::StartSession { model, effort, .. }] => {
+                        assert_eq!(model, "claude-opus-4-1");
+                        assert_eq!(effort, "high");
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// The runner's case: a launch decided again writes its model over one a crash left
+            /// unsent, and the newest `launch-model` step is the one read.
+            #[test]
+            fn a_launch_decided_again_writes_its_model_over_one_a_crash_left_unsent() {
+                let (rig, run) = claimed_rig();
+                rig.step(&run, "launch-model stale-model");
+                pass(&rig, &run);
+                let fleet = rig.settings.fleet.model.clone();
+                assert_eq!(
+                    rig.steps(&run)
+                        .into_iter()
+                        .rfind(|s| s.starts_with("launch-model "))
+                        .unwrap(),
+                    format!("launch-model {fleet}")
+                );
+                assert_eq!(read_progress(&rig.events(&run)).launch_model, Some(fleet));
+            }
+
+            /// The runner's case, where the project's model carries provider options: in
+            /// Foundry the launch line records the fleet's effort as the model's one option.
+            #[test]
+            fn records_the_provider_options_the_project_s_model_carries() {
+                let (rig, run) = started();
+                let launched = rig
+                    .events(&run)
+                    .into_iter()
+                    .find(|e| e.event == "session_launched")
+                    .unwrap();
+                let options = &launched.data["model_options"];
+                assert_eq!(options[0]["id"], "effort");
+                assert_eq!(options[0]["value"], rig.settings.fleet.effort.as_str());
+                assert_eq!(launched.data["model"], rig.settings.fleet.model.as_str());
+            }
+
+            /// The runner's case, where the launch line has no worktree yet: a line that names
+            /// none is read with no worktree, and the progress takes the workspace the step
+            /// recorded.
+            #[test]
+            fn records_a_launch_that_has_no_worktree_yet() {
+                let (rig, run) = claimed_rig();
+                rig.step(&run, &format!("workspace-created {}", ws_id()));
+                rig.write(
+                    &run,
+                    Event::SessionLaunched {
+                        thread_id: session().to_string(),
+                        worktree: None,
+                        branch: None,
+                        model_instance: None,
+                        model: None,
+                        model_options: None,
+                        resumed_from: None,
+                        base: None,
+                        title: None,
+                    },
+                );
+                let seen = rig.ctx().seen(&run).unwrap();
+                assert_eq!(seen.thread_id, Some(session().to_string()));
+                assert_eq!(seen.worktree, None);
+                let at = crate::factory::runs::progress_from(
+                    &run,
+                    CauseStep::Start,
+                    &seen,
+                    State::Building,
+                );
+                assert_eq!(at.worktree, Some(ws_id().to_string()));
+            }
+        }
+
+        mod an_issue_in_triage_that_is_ours {
+            use super::*;
+
+            /// The runner's case "the new attempt comes after a finished older run, and the
+            /// older run is left alone".
+            #[test]
+            fn the_new_attempt_comes_after_a_finished_older_run_and_the_older_run_is_left_alone() {
+                let rig = Rig::new();
+                let first = run_id(1);
+                rig.step(&first, &format!("approved {LABELED_AT}"));
+                rig.moved(&first, State::Ready, State::Triage);
+                rig.ledger
+                    .finish(
+                        &first,
+                        Outcome::Stuck,
+                        None,
+                        None,
+                        &Cause::new(CauseStep::Start, "test"),
+                        None,
+                    )
+                    .unwrap();
+                let before = rig.events(&first);
+                assert_eq!(claim_run(&rig), run_id(2));
+                assert_eq!(rig.events(&first), before);
+            }
+
+            /// The runner's case "with an unfinished run that records no approval, goes stuck in
+            /// that run".
+            #[test]
+            fn with_an_unfinished_run_that_records_no_approval_goes_stuck_in_that_run() {
+                let rig = Rig::new();
+                let run = run_id(1);
+                rig.sim.set_labels(&["factory:triage"]);
+                rig.sim.set_assignees(&[LOGIN]);
+                rig.write(
+                    &run,
+                    Event::Claimed {
+                        machine: rig.machine.to_string(),
+                        github_user: LOGIN.into(),
+                    },
+                );
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: CANNOT_CONFIRM.into()
+                    }
+                );
+                assert!(rig.finished(&run));
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                assert!(calls(&rig).is_empty());
+            }
+
+            /// The runner's case "with an unfinished run in stuck, finishes it and goes stuck in
+            /// a new attempt".
+            #[test]
+            fn with_an_unfinished_run_in_stuck_finishes_it_and_goes_stuck_in_a_new_attempt() {
+                let rig = Rig::new();
+                let first = run_id(1);
+                rig.step(&first, &format!("approved {LABELED_AT}"));
+                rig.moved(&first, State::Ready, State::Triage);
+                rig.moved(&first, State::Triage, State::Stuck);
+                rig.sim.set_body("## Base\nrelease..2\n");
+                let run = claim_run(&rig);
+                assert_eq!(run, run_id(2));
+                assert!(rig.finished(&first));
+                assert_eq!(rig.events(&first).pop().unwrap().data["outcome"], "stuck");
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: messages::base_not_a_branch("release..2")
+                    }
+                );
+                assert!(rig.finished(&run));
+            }
+
+            /// The runner's case "goes on with a triage run of ours as start does".
+            #[test]
+            fn goes_on_with_a_triage_run_of_ours_as_start_does() {
+                let (rig, run) = claimed_rig();
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(creates(&rig).len(), 1);
+            }
+
+            /// The runner's case "says nothing moved for a ready issue someone is assigned to".
+            #[test]
+            fn says_nothing_moved_for_a_ready_issue_someone_is_assigned_to() {
+                let (rig, run) = claimed_rig();
+                rig.sim.set_labels(&["factory:ready"]);
+                rig.sim.set_assignees(&["someone"]);
+                let writes = rig.sim.writes();
+                assert!(matches!(pass(&rig, &run), StartStep::Skipped { .. }));
+                assert_eq!(rig.sim.writes(), writes);
+                assert!(calls(&rig).is_empty());
+            }
+
+            /// The runner's case "leaves alone a stuck issue whose run never went stuck: a
+            /// person stopped it": the issue is not in triage or building, so nothing is done.
+            #[test]
+            fn leaves_alone_a_stuck_issue_whose_run_never_went_stuck_a_person_stopped_it() {
+                let (rig, run) = claimed_rig();
+                rig.sim.set_labels(&["factory:stuck"]);
+                let before = (rig.events(&run), rig.sim.writes());
+                assert!(matches!(pass(&rig, &run), StartStep::Skipped { .. }));
+                assert_eq!((rig.events(&run), rig.sim.writes()), before);
+                assert!(calls(&rig).is_empty());
+            }
+
+            /// The runner's case "leaves a stuck issue alone when its run is finished, or it has
+            /// none".
+            #[test]
+            fn leaves_a_stuck_issue_alone_when_its_run_is_finished_or_it_has_none() {
+                let (rig, run) = claimed_rig();
+                rig.sim.set_labels(&["factory:stuck"]);
+                rig.ledger
+                    .finish(
+                        &run,
+                        Outcome::Stuck,
+                        None,
+                        None,
+                        &Cause::new(CauseStep::Start, "test"),
+                        None,
+                    )
+                    .unwrap();
+                assert!(matches!(pass(&rig, &run), StartStep::Skipped { .. }));
+                // A run with no events is looked for in the claim comments, and none names it.
+                assert!(matches!(pass(&rig, &run_id(5)), StartStep::Skipped { .. }));
+                assert!(rig.ledger.read(&run_id(5)).unwrap().is_empty());
+                assert!(calls(&rig).is_empty());
+            }
+        }
+
+        mod the_launch_decided {
+            use super::*;
+
+            /// The runner's case, where a repo with no T3 project goes stuck: in Foundry the
+            /// project is the one the run belongs to, and the workspace is asked for on it.
+            #[test]
+            fn a_repo_with_no_t3_project_goes_stuck_before_any_launch_is_sent() {
+                let (rig, run) = claimed_rig();
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                match &creates(&rig)[..] {
+                    [Call::Create { request, .. }] => {
+                        assert_eq!(request.project, project_id());
+                        assert_eq!(request.tag.project, project_id());
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// The runner's case, where a project with no default model goes stuck: in Foundry
+            /// the model is the fleet's setting, which is never empty, and the session starts
+            /// on it.
+            #[test]
+            fn a_project_with_no_default_model_goes_stuck_before_any_launch_is_sent() {
+                assert!(!fleet_default_model().is_empty());
+                let (rig, _run) = started();
+                match &start_sessions(&rig)[..] {
+                    [Call::StartSession { model, .. }] => assert!(!model.is_empty()),
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            fn fleet_default_model() -> String {
+                foundry_proto::factory::FactorySettings::default().model
+            }
+
+            /// The runner's case, where a project that is another repo's clone goes stuck: in
+            /// Foundry the workspace is tagged with the run and made on the run's own project,
+            /// by the run's name.
+            #[test]
+            fn a_project_that_is_another_repo_s_clone_or_of_none_goes_stuck_before_any_launch() {
+                let (rig, run) = claimed_rig();
+                pass(&rig, &run);
+                match &creates(&rig)[..] {
+                    [Call::Create { request, .. }] => {
+                        assert_eq!(request.name, "fac/8-1");
+                        assert_eq!(request.tag.run, run.to_string());
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// The runner's case, where a T3 that cannot be reached when the project is looked
+            /// up claims nothing: in Foundry there is no lookup, and a claim calls no worker.
+            #[test]
+            fn a_t3_that_cannot_be_reached_when_the_project_is_looked_up_claims_nothing() {
+                let rig = Rig::new();
+                rig.worker
+                    .on_create(Err(WorkerError::Unreachable("down".into())));
+                assert!(matches!(
+                    claim_it_for_the_launch(&rig),
+                    ClaimOutcome::Claimed { .. }
+                ));
+                assert!(calls(&rig).is_empty());
+            }
+
+            fn claim_it_for_the_launch(rig: &Rig) -> ClaimOutcome {
+                claim(&rig.ctx(), ISSUE, rig.machine).unwrap()
+            }
+
+            /// The runner's case "a second attempt gets the next number and its own command id":
+            /// the workspace is named for the attempt and tagged with the run.
+            #[test]
+            fn a_second_attempt_gets_the_next_number_and_its_own_command_id() {
+                let rig = super::an_issue_set_ready_again::rig_for_second_attempt();
+                let run = super::an_issue_set_ready_again::second_attempt(&rig);
+                assert_eq!(run, run_id(2));
+                pass(&rig, &run);
+                let request = super::an_issue_set_ready_again::first_create(&rig);
+                assert_eq!(request.name, "fac/8-2");
+                assert_eq!(request.tag.run, run.to_string());
+            }
+
+            /// The runner's case "a text that changed before the second look archives the
+            /// session and goes stuck": a start that may have been sent has its sessions ended.
+            #[test]
+            fn a_text_that_changed_before_the_second_look_archives_the_session_and_goes_stuck() {
+                let (rig, run) = workspace_shown();
+                rig.step(&run, "launch-sending");
+                rig.sim.set_approval(approval_answer(
+                    "2026-10-04T12:00:00Z",
+                    "tom",
+                    &[("2026-10-04T10:30:00Z", "mallory")],
+                ));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: TEXT_CHANGED.into()
+                    }
+                );
+                assert!(calls(&rig).contains(&Call::EndSessions { workspace: ws_id() }));
+                assert!(start_sessions(&rig).is_empty());
+            }
+
+            /// The runner's case "an archive that fails is an error before anything is written,
+            /// and the next start retries": the sessions that cannot be ended fail the stuck
+            /// path with nothing written, and the next pass ends them and finishes it.
+            #[test]
+            fn an_archive_that_fails_is_an_error_before_anything_is_written_and_the_next_start_retries()
+             {
+                let (rig, run) = workspace_shown();
+                rig.step(&run, "launch-sending");
+                rig.sim.set_approval(approval_answer(
+                    "2026-10-04T12:00:00Z",
+                    "tom",
+                    &[("2026-10-04T10:30:00Z", "mallory")],
+                ));
+                rig.worker
+                    .on_end_sessions(Err(WorkerError::Unreachable("down".into())));
+                let writes = rig.sim.writes();
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert_eq!(rig.sim.writes(), writes);
+                assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
+                assert!(!rig.finished(&run));
+                assert!(matches!(pass(&rig, &run), StartStep::Stuck { .. }));
+                assert!(rig.finished(&run));
+                assert_eq!(
+                    calls(&rig)
+                        .iter()
+                        .filter(|call| matches!(call, Call::EndSessions { .. }))
+                        .count(),
+                    2
+                );
+            }
+
+            /// The runner's case "the second look comes after the launch is recorded and before
+            /// the label": in Foundry the look comes before the launch is sent, and the label
+            /// moves after the launch is recorded.
+            #[test]
+            fn the_second_look_comes_after_the_launch_is_recorded_and_before_the_label() {
+                let (rig, run) = started();
+                let trail: Vec<String> = rig
+                    .events(&run)
+                    .into_iter()
+                    .map(|event| match event.data["step"].as_str() {
+                        Some(step) => step.to_owned(),
+                        None => event.event,
+                    })
+                    .collect();
+                let at = |what: &str| trail.iter().position(|t| t == what).unwrap();
+                let building = trail.iter().rposition(|t| t == "state_changed").unwrap();
+                assert!(at("approval-rechecked") < at("launch-sending"));
+                assert!(at("launch-sending") < at("session_launched"));
+                assert!(at("session_launched") < building);
+            }
+
+            /// The runner's case "a label change that fails after the launch is a runner error
+            /// with no rollback": the session stays, and the next pass moves the label.
+            #[test]
+            fn a_label_change_that_fails_after_the_launch_is_a_runner_error_with_no_rollback() {
+                let (rig, run) = workspace_shown();
+                rig.sim.fail("--add-label factory:building", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert!(rig.names(&run).contains(&"session_launched".to_string()));
+                assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
+                assert!(!rig.finished(&run));
+                assert!(
+                    !calls(&rig)
+                        .iter()
+                        .any(|call| matches!(call, Call::EndSessions { .. }))
+                );
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert_eq!(rig.sim.labels(), vec!["factory:building"]);
+                assert_eq!(start_sessions(&rig).len(), 1);
+                assert!(
+                    rig.events(&run)
+                        .iter()
+                        .any(|e| e.event == "state_changed" && e.data["to"] == "building")
+                );
+            }
+
+            /// The runner's case "an unassign that fails in the stuck path is a runner error".
+            #[test]
+            fn an_unassign_that_fails_in_the_stuck_path_is_a_runner_error() {
+                let (mut rig, run) = claimed_rig();
+                pass(&rig, &run);
+                show_setup(&mut rig, TerminalState::Exited, Some(1));
+                rig.worker.on_tail(Ok("boom".into()));
+                rig.sim.fail("--remove-assignee", 1);
+                assert!(matches!(
+                    advance(&rig.ctx(), &run),
+                    Err(RunError::Tracker(_))
+                ));
+                // Nothing is rolled back: the label stays moved, the run is not finished.
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                assert!(!rig.finished(&run));
+            }
+        }
+
+        mod a_launch_that_an_earlier_pass_may_have_sent {
+            use super::*;
+
+            /// The runner's case "writes the launch-sending step once and sends under the same
+            /// command id", for a start asked for again after it was sent: one step, and the
+            /// same launch message both times.
+            #[test]
+            fn a_start_asked_for_again_sends_the_same_launch_message() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.worker
+                    .on_start_session(Err(WorkerError::Unreachable("down".into())));
+                rig.worker.on_start_session(Ok(session()));
+                let run = claim_run(&rig);
+                let mut rig = rig;
+                pass(&rig, &run);
+                show_workspace(&mut rig);
+                let _ = advance(&rig.ctx(), &run);
+                pass(&rig, &run);
+                match &start_sessions(&rig)[..] {
+                    [
+                        Call::StartSession { first: one, .. },
+                        Call::StartSession { first: two, .. },
+                    ] => {
+                        assert_eq!(one, two)
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+
+        mod a_resume {
+            use super::*;
+
+            /// The runner's case "with no session launches and then looks at the text once".
+            #[test]
+            fn with_no_session_launches_and_then_looks_at_the_text_once() {
+                let (rig, run) = workspace_shown();
+                let graphql = |rig: &Rig| {
+                    rig.sim
+                        .calls()
+                        .iter()
+                        .filter(|call| call.iter().any(|a| a == "graphql"))
+                        .count()
+                };
+                let before = graphql(&rig);
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                let looked = graphql(&rig) - before;
+                assert!(looked >= 1);
+                pass(&rig, &run);
+                assert_eq!(graphql(&rig) - before, looked);
+                assert_eq!(
+                    rig.steps(&run)
+                        .iter()
+                        .filter(|s| *s == "approval-rechecked")
+                        .count(),
+                    1
+                );
+            }
+
+            /// The runner's case "with a session that was not looked at again does not launch
+            /// again".
+            #[test]
+            fn with_a_session_that_was_not_looked_at_again_does_not_launch_again() {
+                let (rig, run) = started();
+                let asked = rig.sim.calls().len();
+                rig.sim
+                    .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert_eq!(start_sessions(&rig).len(), 1);
+                assert!(
+                    rig.sim.calls()[asked..]
+                        .iter()
+                        .all(|call| !call.iter().any(|a| a == "graphql"))
+                );
+            }
+
+            /// The runner's case "with a second look that passed does not repeat it".
+            #[test]
+            fn with_a_second_look_that_passed_does_not_repeat_it() {
+                let (rig, run) = started();
+                let rechecked = |rig: &Rig, run: &RunId| {
+                    rig.steps(run)
+                        .iter()
+                        .filter(|s| *s == "approval-rechecked")
+                        .count()
+                };
+                assert_eq!(rechecked(&rig, &run), 1);
+                pass(&rig, &run);
+                pass(&rig, &run);
+                assert_eq!(rechecked(&rig, &run), 1);
+            }
+        }
+
+        mod stopping_a_session_that_goes_stuck {
+            use super::*;
+
+            /// The runner's case "a removal that cannot archive the threads on the worktree is
+            /// an error with nothing written, and the next start removes it": the sessions of
+            /// the workspace cannot be ended, nothing is written, and the next pass ends them.
+            #[test]
+            fn a_removal_that_cannot_archive_the_threads_on_the_worktree_is_an_error_with_nothing_written_and_the_next_start_removes_it()
+             {
+                let (rig, run) = started();
+                rig.write(
+                    &run,
+                    Event::Stuck {
+                        reason: "the earlier reason".into(),
+                        branch: None,
+                        commits_ahead: None,
+                    },
+                );
+                rig.worker
+                    .on_end_sessions(Err(WorkerError::Unreachable("down".into())));
+                let writes = rig.sim.writes();
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert_eq!(rig.sim.writes(), writes);
+                assert!(!rig.finished(&run));
+                assert!(matches!(pass(&rig, &run), StartStep::Stuck { .. }));
+                assert!(rig.finished(&run));
+                assert_eq!(
+                    calls(&rig)
+                        .iter()
+                        .filter(|call| matches!(call, Call::EndSessions { .. }))
+                        .count(),
+                    2
+                );
+            }
+
+            /// The runner's case "a thread T3 no longer knows is stopped at the worktree the
+            /// ledger records": a session the fleet does not show is ended at the workspace the
+            /// ledger names.
+            #[test]
+            fn a_thread_t3_no_longer_knows_is_stopped_at_the_worktree_the_ledger_records() {
+                let (mut rig, run) = started();
+                rig.view = FleetView::builder().online(rig.machine).build();
+                rig.write(
+                    &run,
+                    Event::Stuck {
+                        reason: "the earlier reason".into(),
+                        branch: None,
+                        commits_ahead: None,
+                    },
+                );
+                assert!(matches!(pass(&rig, &run), StartStep::Stuck { .. }));
+                assert!(calls(&rig).contains(&Call::EndSessions { workspace: ws_id() }));
+            }
+        }
+
+        mod a_closed_issue_of_a_run {
+            use super::*;
+
+            /// The runner's case "is the same for resume": a closed issue ends a run in triage
+            /// and a run that is building, with its session ended, writing nothing on GitHub.
+            #[test]
+            fn is_the_same_for_resume() {
+                let (rig, run) = claimed_rig();
+                rig.sim.set_closed(true);
+                let writes = rig.sim.writes();
+                assert_eq!(pass(&rig, &run), StartStep::Abandoned);
+                assert!(rig.finished(&run));
+                assert_eq!(rig.sim.writes(), writes);
+                let (rig, run) = started();
+                rig.sim.set_closed(true);
+                let writes = rig.sim.writes();
+                assert_eq!(pass(&rig, &run), StartStep::Abandoned);
+                assert!(calls(&rig).contains(&Call::EndSessions { workspace: ws_id() }));
+                assert_eq!(rig.sim.writes(), writes);
+            }
+
+            /// The runner's case "leaves the actor out when GitHub names none or cannot be
+            /// asked": the tracker has no `closedBy`, so a run ended for a closed issue names no
+            /// actor.
+            #[test]
+            fn leaves_the_actor_out_when_github_names_none_or_cannot_be_asked() {
+                let (rig, run) = claimed_rig();
+                rig.sim.set_closed(true);
+                pass(&rig, &run);
+                let finished = rig.events(&run).pop().unwrap();
+                assert_eq!(finished.event, "finished");
+                assert!(finished.cause.unwrap().get("actor").is_none());
             }
         }
 
