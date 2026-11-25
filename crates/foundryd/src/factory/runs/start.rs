@@ -4082,7 +4082,7 @@ mod tests {
         mod an_issue_that_names_its_base {
             use super::*;
 
-            fn claimed_with_body(body: &str) -> (Rig, RunId) {
+            pub(super) fn claimed_with_body(body: &str) -> (Rig, RunId) {
                 let rig = Rig::new();
                 rig.worker.on_create(Ok(ws_id()));
                 rig.worker.on_start_session(Ok(session()));
@@ -4878,6 +4878,856 @@ mod tests {
                 let finished = rig.events(&run).pop().unwrap();
                 assert_eq!(finished.event, "finished");
                 assert!(finished.cause.unwrap().get("actor").is_none());
+            }
+        }
+
+        /// What an earlier attempt left, written as the ledger of the attempt that ended: the
+        /// runner's `seedStuckRun`, in Foundry's lines.
+        mod the_resume_cases {
+            use super::an_issue_set_ready_again::{
+                first_create, rig_for_second_attempt, show_second, url,
+            };
+            use super::*;
+
+            #[derive(Default)]
+            struct Earlier<'a> {
+                launched: Option<&'a str>,
+                recorded: Option<&'a str>,
+                resumed_from: Option<(RunId, &'a str)>,
+                pr: Option<u64>,
+                reason: &'a str,
+                interrupted: Option<(bool, Option<&'a str>)>,
+                questions: bool,
+            }
+
+            fn earlier(rig: &Rig, attempt: u32, e: &Earlier<'_>) {
+                let run = run_id(attempt);
+                let end = Cause::new(CauseStep::Watch, e.reason);
+                rig.step(&run, &format!("approved {LABELED_AT}"));
+                rig.moved(&run, State::Ready, State::Triage);
+                rig.write(
+                    &run,
+                    Event::SessionLaunched {
+                        thread_id: session().to_string(),
+                        worktree: Some(ws_id().to_string()),
+                        branch: e.launched.map(Into::into),
+                        model_instance: None,
+                        model: None,
+                        model_options: None,
+                        resumed_from: e.resumed_from.as_ref().map(|(run, branch)| ResumedFrom {
+                            run: run.to_string(),
+                            branch: (*branch).into(),
+                        }),
+                        base: None,
+                        title: None,
+                    },
+                );
+                rig.moved(&run, State::Triage, State::Building);
+                if let Some(pr) = e.pr {
+                    rig.write(&run, Event::PrOpened { pr, url: url(pr) });
+                }
+                if let Some((relaunch, branch)) = e.interrupted {
+                    rig.write(
+                        &run,
+                        Event::SessionInterrupted {
+                            resumes: 1,
+                            relaunch,
+                            run_ordinal: if relaunch { None } else { Some(1) },
+                            branch: branch.map(Into::into),
+                            t3_error: None,
+                            ended_in_pass: 2,
+                        },
+                    );
+                }
+                if e.questions {
+                    rig.write(
+                        &run,
+                        Event::QuestionsPosted {
+                            questions: "1. Which?".into(),
+                        },
+                    );
+                    rig.moved(&run, State::Building, State::NeedsInfo);
+                    rig.ledger
+                        .finish(&run, Outcome::NeedsInfo, None, None, &end, None)
+                        .unwrap();
+                } else {
+                    rig.ledger
+                        .write(
+                            &run,
+                            &Event::Stuck {
+                                reason: "the run ended".into(),
+                                branch: e.recorded.map(Into::into),
+                                commits_ahead: Some(2),
+                            },
+                            &end,
+                        )
+                        .unwrap();
+                    rig.moved(&run, State::Building, State::Stuck);
+                    rig.ledger
+                        .finish(&run, Outcome::Stuck, None, None, &end, None)
+                        .unwrap();
+                }
+            }
+
+            fn open_pull(rig: &Rig, pr: u64, head: &str) {
+                rig.sim.set_pull(
+                    pr,
+                    SimPull {
+                        state: "OPEN",
+                        draft: true,
+                        head: head.into(),
+                        base: "main".into(),
+                        cross: false,
+                    },
+                );
+            }
+
+            /// The issue is set `ready` again and claimed: the run that follows the earlier ones.
+            fn next(rig: &Rig) -> RunId {
+                rig.sim.set_labels(&["factory:ready"]);
+                rig.sim.set_assignees(&[]);
+                claim_run(rig)
+            }
+
+            fn on_branch(name: &str) -> Checkout {
+                Checkout::Branch { name: name.into() }
+            }
+
+            fn plain(rig: &Rig) {
+                assert!(
+                    matches!(first_create(rig).checkout, Checkout::NewBranch { .. }),
+                    "{:?}",
+                    first_create(rig).checkout
+                );
+            }
+
+            fn lookups(rig: &Rig) -> Vec<String> {
+                rig.sim
+                    .calls()
+                    .iter()
+                    .map(|call| call.join(" "))
+                    .filter(|call| call.contains("git/ref/heads/"))
+                    .map(|call| call.rsplit("heads/").next().unwrap().to_owned())
+                    .collect()
+            }
+
+            fn time_limited<'a>(
+                launched: Option<&'a str>,
+                recorded: Option<&'a str>,
+            ) -> Earlier<'a> {
+                Earlier {
+                    launched,
+                    recorded,
+                    reason: TIME_LIMIT,
+                    ..Earlier::default()
+                }
+            }
+
+            /// The runner's case "starts from base after a run whose interruption was resumed in
+            /// its own thread": only a relaunch or a time limit leaves work to continue from.
+            #[test]
+            fn starts_from_base_after_a_run_whose_interruption_was_resumed_in_its_own_thread() {
+                let rig = rig_for_second_attempt();
+                earlier(
+                    &rig,
+                    1,
+                    &Earlier {
+                        launched: Some("fac/8-1"),
+                        resumed_from: Some((run_id(1), "fac/old")),
+                        interrupted: Some((false, Some("fac/8-1"))),
+                        reason: "session-ended-badly",
+                        ..Earlier::default()
+                    },
+                );
+                rig.sim.add_branch("fac/8-1");
+                rig.sim.add_branch("fac/old");
+                let run = next(&rig);
+                pass(&rig, &run);
+                plain(&rig);
+                assert!(lookups(&rig).is_empty());
+            }
+
+            /// The runner's case "of a resumed run falls back to the branch its session was told
+            /// to push to": the attempt's own recorded branch is tried first, then the one it
+            /// resumed from.
+            #[test]
+            fn of_a_resumed_run_falls_back_to_the_branch_its_session_was_told_to_push_to() {
+                let rig = rig_for_second_attempt();
+                earlier(&rig, 1, &time_limited(Some("fac/8-1"), Some("fac/8-1")));
+                earlier(
+                    &rig,
+                    2,
+                    &Earlier {
+                        resumed_from: Some((run_id(1), "fac/8-1")),
+                        ..time_limited(None, Some("fac/own"))
+                    },
+                );
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                assert_eq!(run, run_id(3));
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-1"));
+                assert_eq!(lookups(&rig), vec!["fac/own", "fac/8-1"]);
+            }
+
+            /// The runner's case "of a resumed run continues from T3's own branch when origin has
+            /// it": in Foundry, the branch the attempt recorded on its stuck line.
+            #[test]
+            fn of_a_resumed_run_continues_from_t3_s_own_branch_when_origin_has_it() {
+                let rig = rig_for_second_attempt();
+                earlier(&rig, 1, &time_limited(Some("fac/8-1"), Some("fac/8-1")));
+                earlier(
+                    &rig,
+                    2,
+                    &Earlier {
+                        resumed_from: Some((run_id(1), "fac/8-1")),
+                        ..time_limited(None, Some("fac/own"))
+                    },
+                );
+                rig.sim.add_branch("fac/own");
+                let run = next(&rig);
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/own"));
+                assert_eq!(lookups(&rig), vec!["fac/own"]);
+            }
+
+            /// The runner's case "continues from the branch a relaunch after an interruption
+            /// left".
+            #[test]
+            fn continues_from_the_branch_a_relaunch_after_an_interruption_left() {
+                let rig = rig_for_second_attempt();
+                earlier(
+                    &rig,
+                    1,
+                    &Earlier {
+                        interrupted: Some((true, Some("fac/8-1"))),
+                        reason: "session-interrupted",
+                        ..Earlier::default()
+                    },
+                );
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-1"));
+                let mut rig = rig;
+                show_second(&mut rig, "fac/8-2");
+                pass(&rig, &run);
+                match &start_sessions(&rig)[..] {
+                    [Call::StartSession { first, .. }] => assert_eq!(
+                        first,
+                        &messages::resumed(
+                            REPO,
+                            ISSUE,
+                            LOGIN,
+                            &ResumeFrom::Interrupted {
+                                run: run_id(1),
+                                branch: "fac/8-1".into()
+                            },
+                            None,
+                            BODY_PATH
+                        )
+                    ),
+                    other => panic!("{other:?}"),
+                }
+                let launched = rig
+                    .events(&run)
+                    .into_iter()
+                    .find(|e| e.event == "session_launched")
+                    .unwrap();
+                assert_eq!(launched.cause.unwrap()["reason"], "resumed-from-branch");
+            }
+
+            /// The runner's case "is not made after an interruption's relaunch that then asked
+            /// questions".
+            #[test]
+            fn is_not_made_after_an_interruption_s_relaunch_that_then_asked_questions() {
+                let rig = rig_for_second_attempt();
+                earlier(
+                    &rig,
+                    1,
+                    &Earlier {
+                        interrupted: Some((true, Some("fac/8-1"))),
+                        questions: true,
+                        reason: "session-interrupted",
+                        ..Earlier::default()
+                    },
+                );
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                pass(&rig, &run);
+                plain(&rig);
+                assert!(lookups(&rig).is_empty());
+            }
+
+            /// The runner's case "reads the branch from the stuck line when the launch line has
+            /// none".
+            #[test]
+            fn reads_the_branch_from_the_stuck_line_when_the_launch_line_has_none() {
+                let rig = rig_for_second_attempt();
+                earlier(&rig, 1, &time_limited(None, Some("fac/8-1")));
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-1"));
+            }
+
+            /// The runner's case "prefers the branch on the launch line".
+            #[test]
+            fn prefers_the_branch_on_the_launch_line() {
+                let rig = rig_for_second_attempt();
+                earlier(
+                    &rig,
+                    1,
+                    &time_limited(Some("fac/launched"), Some("fac/8-1")),
+                );
+                rig.sim.add_branch("fac/launched");
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/launched"));
+            }
+
+            /// The runner's case "writes no launch-sending step when GitHub fails while
+            /// deciding".
+            #[test]
+            fn writes_no_launch_sending_step_when_github_fails_while_deciding() {
+                let rig = rig_for_second_attempt();
+                earlier(&rig, 1, &time_limited(Some("fac/8-1"), Some("fac/8-1")));
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                rig.sim.fail("git/ref/heads", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert!(
+                    !rig.steps(&run).iter().any(
+                        |s| s.starts_with("launch-sending") || s.starts_with("launch-resuming")
+                    )
+                );
+            }
+
+            /// The runner's case "is an error that leaves the issue in triage when the issue text
+            /// cannot be read".
+            #[test]
+            fn is_an_error_that_leaves_the_issue_in_triage_when_the_issue_text_cannot_be_read() {
+                let rig = rig_for_second_attempt();
+                earlier(&rig, 1, &time_limited(Some("fac/8-1"), Some("fac/8-1")));
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                rig.sim.fail("graphql", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
+                assert!(creates(&rig).is_empty());
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-1"));
+            }
+
+            /// The runner's case "is not made when the earlier run stopped for another reason".
+            #[test]
+            fn is_not_made_when_the_earlier_run_stopped_for_another_reason() {
+                let rig = rig_for_second_attempt();
+                earlier(
+                    &rig,
+                    1,
+                    &Earlier {
+                        launched: Some("fac/8-1"),
+                        recorded: Some("fac/8-1"),
+                        reason: "session-said-stuck",
+                        ..Earlier::default()
+                    },
+                );
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                pass(&rig, &run);
+                plain(&rig);
+                assert!(lookups(&rig).is_empty());
+            }
+
+            /// The runner's case "is not made when the earlier run recorded no branch".
+            #[test]
+            fn is_not_made_when_the_earlier_run_recorded_no_branch() {
+                let rig = rig_for_second_attempt();
+                earlier(&rig, 1, &time_limited(None, None));
+                let run = next(&rig);
+                pass(&rig, &run);
+                plain(&rig);
+                assert!(lookups(&rig).is_empty());
+            }
+
+            /// The runner's case "records the decision in the launch-sending step, before the
+            /// launch is sent".
+            #[test]
+            fn records_the_decision_in_the_launch_sending_step_before_the_launch_is_sent() {
+                let mut rig = rig_for_second_attempt();
+                earlier(&rig, 1, &time_limited(Some("fac/8-1"), Some("fac/8-1")));
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                pass(&rig, &run);
+                show_second(&mut rig, "fac/8-2");
+                pass(&rig, &run);
+                let steps = rig.steps(&run);
+                let at = |step: &str| steps.iter().position(|s| s == step).unwrap();
+                assert!(at("launch-resuming fac/8-1") < at("launch-sending resumed-from fac/8-1"));
+            }
+
+            /// A rig whose first start of a session is not answered.
+            fn rig_whose_first_start_is_lost() -> Rig {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.worker
+                    .on_start_session(Err(WorkerError::Unreachable("down".into())));
+                rig.worker.on_start_session(Ok(session()));
+                rig
+            }
+
+            /// The runner's case "sent again, reuses the recorded decision and asks GitHub
+            /// nothing".
+            #[test]
+            fn sent_again_reuses_the_recorded_decision_and_asks_github_nothing() {
+                let mut rig = rig_whose_first_start_is_lost();
+                earlier(&rig, 1, &time_limited(Some("fac/8-1"), Some("fac/8-1")));
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                pass(&rig, &run);
+                show_second(&mut rig, "fac/8-2");
+                assert!(advance(&rig.ctx(), &run).is_err());
+                let asked = rig.sim.calls().len();
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert!(
+                    rig.sim.calls()[asked..]
+                        .iter()
+                        .map(|call| call.join(" "))
+                        .all(|call| !call.contains("git/ref/heads")
+                            && !call.contains("closedByPullRequestsReferences")
+                            && !call.starts_with("pr view"))
+                );
+                let resumed = messages::resumed(
+                    REPO,
+                    ISSUE,
+                    LOGIN,
+                    &ResumeFrom::TimeLimit {
+                        run: run_id(1),
+                        branch: "fac/8-1".into(),
+                    },
+                    None,
+                    BODY_PATH,
+                );
+                match &start_sessions(&rig)[..] {
+                    [
+                        Call::StartSession { first: one, .. },
+                        Call::StartSession { first: two, .. },
+                    ] => {
+                        assert_eq!(one, &resumed);
+                        assert_eq!(two, &resumed);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// The runner's case "sent again after a plain start, stays plain though a resume is
+            /// now possible".
+            #[test]
+            fn sent_again_after_a_plain_start_stays_plain_though_a_resume_is_now_possible() {
+                let mut rig = rig_whose_first_start_is_lost();
+                earlier(&rig, 1, &time_limited(Some("fac/8-1"), Some("fac/8-1")));
+                let run = next(&rig);
+                pass(&rig, &run);
+                show_second(&mut rig, "fac/8-2");
+                assert!(advance(&rig.ctx(), &run).is_err());
+                // The branch reached origin since the decision.
+                rig.sim.add_branch("fac/8-1");
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                plain(&rig);
+                assert!(
+                    !rig.steps(&run)
+                        .iter()
+                        .any(|s| s.starts_with("launch-resuming"))
+                );
+                match &start_sessions(&rig)[..] {
+                    [
+                        Call::StartSession { first: one, .. },
+                        Call::StartSession { first: two, .. },
+                    ] => {
+                        assert_eq!(one, &launch_message());
+                        assert_eq!(two, &launch_message());
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// The runner's case "after a session that said stuck, continues its pull request".
+            #[test]
+            fn after_a_session_that_said_stuck_continues_its_pull_request() {
+                let rig = rig_for_second_attempt();
+                earlier(
+                    &rig,
+                    1,
+                    &Earlier {
+                        launched: Some("fac/8-1"),
+                        pr: Some(12),
+                        reason: "session-said-stuck",
+                        ..Earlier::default()
+                    },
+                );
+                open_pull(&rig, 12, "fac/8-1");
+                let run = next(&rig);
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-1"));
+                assert!(
+                    rig.steps(&run)
+                        .contains(&format!("launch-pull-request fac/8-1 {}", url(12)))
+                );
+            }
+
+            /// The runner's case "is an error that leaves the issue in triage when GitHub cannot
+            /// read the ledger's pull request".
+            #[test]
+            fn is_an_error_that_leaves_the_issue_in_triage_when_github_cannot_read_the_ledger_s_pull_request()
+             {
+                let rig = rig_for_second_attempt();
+                earlier(
+                    &rig,
+                    1,
+                    &Earlier {
+                        launched: Some("fac/8-1"),
+                        pr: Some(12),
+                        reason: "session-said-stuck",
+                        ..Earlier::default()
+                    },
+                );
+                open_pull(&rig, 12, "fac/8-1");
+                let run = next(&rig);
+                rig.sim.fail("pr view", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
+                assert!(creates(&rig).is_empty());
+                assert!(
+                    !rig.steps(&run)
+                        .iter()
+                        .any(|s| s.starts_with("workspace-requested"))
+                );
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+            }
+
+            /// The runner's case "after a time limit, the pull request wins over the branch".
+            #[test]
+            fn after_a_time_limit_the_pull_request_wins_over_the_branch() {
+                let rig = rig_for_second_attempt();
+                earlier(
+                    &rig,
+                    1,
+                    &Earlier {
+                        pr: Some(12),
+                        ..time_limited(Some("fac/8-1"), Some("fac/8-1"))
+                    },
+                );
+                open_pull(&rig, 12, "fac/8-pr");
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-pr"));
+                assert!(
+                    rig.steps(&run)
+                        .contains(&format!("launch-pull-request fac/8-pr {}", url(12)))
+                );
+            }
+
+            /// The runner's case "is made even when the issue text changed since the earlier
+            /// approval": a pull request is continued whatever the text.
+            #[test]
+            fn is_made_even_when_the_issue_text_changed_since_the_earlier_approval() {
+                let rig = rig_for_second_attempt();
+                earlier(
+                    &rig,
+                    1,
+                    &Earlier {
+                        launched: Some("fac/8-1"),
+                        pr: Some(12),
+                        reason: "session-said-stuck",
+                        ..Earlier::default()
+                    },
+                );
+                open_pull(&rig, 12, "fac/8-1");
+                rig.sim.set_approval(approval_answer(
+                    "2026-10-04T12:00:00Z",
+                    "tom",
+                    &[("2026-10-04T11:00:00Z", "tom")],
+                ));
+                let run = next(&rig);
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-1"));
+            }
+
+            /// The runner's case "with an empty ledger, continues the open pull request GitHub
+            /// says closes the issue".
+            #[test]
+            fn with_an_empty_ledger_continues_the_open_pull_request_github_says_closes_the_issue() {
+                let rig = rig_for_second_attempt();
+                rig.sim.closing_pull(12, "fac/8-1", "main", LOGIN, false);
+                let run = claim_run(&rig);
+                assert_eq!(run, run_id(1));
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-1"));
+            }
+
+            fn plain_attempt(rig: &Rig, attempt: u32) {
+                earlier(
+                    rig,
+                    attempt,
+                    &Earlier {
+                        reason: "session-said-stuck",
+                        ..Earlier::default()
+                    },
+                );
+            }
+
+            fn with_pull(rig: &Rig, attempt: u32, pr: u64) {
+                earlier(
+                    rig,
+                    attempt,
+                    &Earlier {
+                        pr: Some(pr),
+                        reason: "session-said-stuck",
+                        ..Earlier::default()
+                    },
+                );
+            }
+
+            /// The runner's case "continues the ledger's pull request of an attempt before the
+            /// last one".
+            #[test]
+            fn continues_the_ledger_s_pull_request_of_an_attempt_before_the_last_one() {
+                let rig = rig_for_second_attempt();
+                with_pull(&rig, 1, 12);
+                plain_attempt(&rig, 2);
+                open_pull(&rig, 12, "fac/8-1");
+                let run = next(&rig);
+                assert_eq!(run, run_id(3));
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-1"));
+            }
+
+            /// The runner's case "continues the newest attempt's pull request when two attempts
+            /// recorded one each".
+            #[test]
+            fn continues_the_newest_attempt_s_pull_request_when_two_attempts_recorded_one_each() {
+                let rig = rig_for_second_attempt();
+                with_pull(&rig, 1, 12);
+                with_pull(&rig, 2, 13);
+                open_pull(&rig, 12, "fac/8-1");
+                open_pull(&rig, 13, "fac/8-2");
+                let run = next(&rig);
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-2"));
+            }
+
+            /// The runner's case "passes over the ledger's pull request when it is not on this
+            /// base, from a fork, or on a branch a command cannot be handed".
+            #[test]
+            fn passes_over_the_ledger_s_pull_request_when_it_is_not_on_this_base_from_a_fork_or_on_a_branch_a_command_cannot_be_handed()
+             {
+                let rig = rig_for_second_attempt();
+                with_pull(&rig, 1, 12);
+                with_pull(&rig, 2, 13);
+                with_pull(&rig, 3, 14);
+                rig.sim.set_pull(
+                    12,
+                    SimPull {
+                        state: "OPEN",
+                        draft: true,
+                        head: "fac/8-fork".into(),
+                        base: "main".into(),
+                        cross: true,
+                    },
+                );
+                rig.sim.set_pull(
+                    13,
+                    SimPull {
+                        state: "OPEN",
+                        draft: true,
+                        head: "fac/8-other".into(),
+                        base: "release".into(),
+                        cross: false,
+                    },
+                );
+                open_pull(&rig, 14, "-x");
+                let run = next(&rig);
+                assert_eq!(run, run_id(4));
+                pass(&rig, &run);
+                plain(&rig);
+            }
+
+            /// The runner's case "finds an open pull request by a host's login for a resume":
+            /// in Foundry there are no hosts, and the project's login is the only author whose
+            /// pull request is the run's own.
+            #[test]
+            fn finds_an_open_pull_request_by_a_host_s_login_for_a_resume() {
+                let rig = rig_for_second_attempt();
+                rig.sim.closing_pull(12, "fac/8-host", "main", LOGIN, false);
+                rig.sim
+                    .closing_pull(13, "fac/8-other", "main", "a-host-login", false);
+                let run = claim_run(&rig);
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-host"));
+            }
+
+            /// The runner's case "falls back to the branch after a time limit when the pull
+            /// request is closed".
+            #[test]
+            fn falls_back_to_the_branch_after_a_time_limit_when_the_pull_request_is_closed() {
+                let rig = rig_for_second_attempt();
+                earlier(
+                    &rig,
+                    1,
+                    &Earlier {
+                        pr: Some(12),
+                        ..time_limited(Some("fac/8-1"), Some("fac/8-1"))
+                    },
+                );
+                rig.sim.set_pull(
+                    12,
+                    SimPull {
+                        state: "CLOSED",
+                        draft: false,
+                        head: "fac/8-1".into(),
+                        base: "main".into(),
+                        cross: false,
+                    },
+                );
+                rig.sim.add_branch("fac/8-1");
+                let run = next(&rig);
+                pass(&rig, &run);
+                assert_eq!(first_create(&rig).checkout, on_branch("fac/8-1"));
+                assert!(
+                    !rig.steps(&run)
+                        .iter()
+                        .any(|s| s.starts_with("launch-pull-request"))
+                );
+            }
+
+            /// The runner's case "is an error that leaves the issue in triage when GitHub cannot
+            /// list the pull requests".
+            #[test]
+            fn is_an_error_that_leaves_the_issue_in_triage_when_github_cannot_list_the_pull_requests()
+             {
+                let rig = rig_for_second_attempt();
+                let run = claim_run(&rig);
+                rig.sim.fail("closedByPullRequestsReferences", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
+                assert!(creates(&rig).is_empty());
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+            }
+        }
+
+        mod the_base_cases {
+            use super::an_issue_that_names_its_base::claimed_with_body;
+            use super::*;
+
+            /// The runner's case "a base the tracker refuses as a name is not a branch name, not
+            /// an error".
+            #[test]
+            fn a_base_the_tracker_refuses_as_a_name_is_not_a_branch_name_not_an_error() {
+                let (rig, run) = claimed_with_body("## Base\nrelease/2\n");
+                rig.sim.refuse("git/ref/heads");
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: messages::base_not_a_branch("release/2")
+                    }
+                );
+                assert!(calls(&rig).is_empty());
+            }
+
+            /// The runner's case "a launch sent again keeps the base the first send decided and
+            /// asks GitHub nothing".
+            #[test]
+            fn a_launch_sent_again_keeps_the_base_the_first_send_decided_and_asks_github_nothing() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.worker
+                    .on_start_session(Err(WorkerError::Unreachable("down".into())));
+                rig.worker.on_start_session(Ok(session()));
+                rig.sim.set_body("Do it.\n\n## Base\nrelease/2\n");
+                rig.sim.add_branch("release/2");
+                let run = claim_run(&rig);
+                let mut rig = rig;
+                pass(&rig, &run);
+                show_workspace(&mut rig);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                rig.sim.set_body("Do it.");
+                let asked = rig.sim.calls().len();
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert!(
+                    rig.sim.calls()[asked..]
+                        .iter()
+                        .all(|call| !call.join(" ").contains("git/ref/heads"))
+                );
+                let wanted = messages::launch(REPO, ISSUE, LOGIN, Some("release/2"), BODY_PATH);
+                match &start_sessions(&rig)[..] {
+                    [
+                        Call::StartSession { first: one, .. },
+                        Call::StartSession { first: two, .. },
+                    ] => {
+                        assert_eq!(one, &wanted);
+                        assert_eq!(two, &wanted);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// A launch asked for again by count keeps the base the first send decided.
+            #[test]
+            fn a_launch_asked_for_again_keeps_the_named_base() {
+                let (mut rig, run) = claimed_with_body("Do it.\n\n## Base\nrelease/2\n");
+                rig.sim.add_branch("release/2");
+                pass(&rig, &run);
+                show_workspace(&mut rig);
+                pass(&rig, &run);
+                super::the_launch_asked_for_again::show_session(&mut rig, SessionState::Idle, None);
+                rig.worker.on_send(Ok(0));
+                assert_eq!(pass(&rig, &run), StartStep::Resent { session: session() });
+                match &super::the_launch_asked_for_again::sends(&rig)[..] {
+                    [Call::Send { message, .. }] => assert_eq!(
+                        message,
+                        &messages::launch(REPO, ISSUE, LOGIN, Some("release/2"), BODY_PATH)
+                    ),
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// A launch asked for again by count keeps the resume the first send decided.
+            #[test]
+            fn a_launch_asked_for_again_keeps_the_resume() {
+                let (mut rig, run) = {
+                    let rig = super::an_issue_set_ready_again::rig_for_second_attempt();
+                    super::an_issue_set_ready_again::time_limited_first_attempt(&rig, "fac/8-1");
+                    rig.sim.add_branch("fac/8-1");
+                    let run = claim_run(&rig);
+                    (rig, run)
+                };
+                pass(&rig, &run);
+                super::an_issue_set_ready_again::show_second(&mut rig, "fac/8-2");
+                pass(&rig, &run);
+                super::the_launch_asked_for_again::show_session(&mut rig, SessionState::Idle, None);
+                // The fleet shows the workspace under its name for the idle session.
+                rig.worker.on_send(Ok(0));
+                assert_eq!(pass(&rig, &run), StartStep::Resent { session: session() });
+                match &super::the_launch_asked_for_again::sends(&rig)[..] {
+                    [Call::Send { message, .. }] => assert_eq!(
+                        message,
+                        &messages::resumed(
+                            REPO,
+                            ISSUE,
+                            LOGIN,
+                            &ResumeFrom::TimeLimit {
+                                run: run_id(1),
+                                branch: "fac/8-1".into()
+                            },
+                            None,
+                            BODY_PATH
+                        )
+                    ),
+                    other => panic!("{other:?}"),
+                }
             }
         }
 
