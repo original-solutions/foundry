@@ -806,7 +806,28 @@ fn finish_begun_path(
         let decision: super::StuckStop = serde_json::from_str(raw)
             .map_err(|error| RunError::Invalid(format!("the stuck decision of {run}: {error}")))?;
         let reason = decision.stop.reason.clone();
-        go_stuck(ctx, issue, &mut at, &decision.code, decision.stop, None)?;
+        let mut stop = decision.stop;
+        // The decision holds no setup output; the workspace is kept, so the tail is read again
+        // as the first pass read it. A failed read posts the reason alone.
+        if decision.code == "setup-failed"
+            && let Some(machine) = seen
+                .machine
+                .as_deref()
+                .and_then(|machine| uuid::Uuid::parse_str(machine).ok())
+                .map(MachineId)
+            && let Some(record) = find_workspace(
+                ctx,
+                &workspace_name(run),
+                machine,
+                seen.workspace.as_deref().map(workspace_id).transpose()?,
+            )
+            && let Some(terminal) = record.body.setup
+            && let Ok(tail) = ctx.tail(terminal)
+        {
+            stop.session_text = Some(messages::prepare_output_tail(&tail));
+            stop.recorded_text = Some(text::sanitize(&tail, true));
+        }
+        go_stuck(ctx, issue, &mut at, &decision.code, stop, None)?;
         return Ok(Some(StartStep::Stuck { reason }));
     }
     if seen.withdrawn {
@@ -6084,6 +6105,21 @@ mod tests {
                 assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
             }
 
+            /// The resumed stuck path of a failed setup posts the comment with the tail again.
+            #[test]
+            fn a_resumed_stuck_path_posts_the_setup_tail() {
+                let (mut rig, run) = claimed_rig();
+                pass(&rig, &run);
+                show_setup(&mut rig, TerminalState::Exited, Some(2));
+                rig.worker.on_tail(Ok("setup tail words".into()));
+                rig.sim.fail("issue comment", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert_eq!(said(&rig, "could not finish this issue"), 0);
+                rig.worker.on_tail(Ok("setup tail words".into()));
+                assert!(matches!(pass(&rig, &run), StartStep::Stuck { .. }));
+                assert!(stuck_comment(&rig).contains("setup tail words"));
+            }
+
             /// The same, cut short by the status comment after the unassign.
             #[test]
             fn a_stuck_path_cut_short_after_the_unassign_is_finished_by_the_next_pass() {
@@ -6298,7 +6334,7 @@ mod tests {
                 let mut rig = rig;
                 pass(&rig, &run);
                 show_workspace(&mut rig);
-                rig.sim.lose("comment", 1);
+                rig.sim.lose("issue comment", 1);
                 assert!(advance(&rig.ctx(), &run).is_err());
                 assert_eq!(said(&rig, "could not finish this issue"), 1);
                 assert!(!rig.finished(&run));

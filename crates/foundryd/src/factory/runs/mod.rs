@@ -47,7 +47,7 @@ use crate::clock::Clock;
 use crate::sessions::factory::SendRefused;
 use crate::store::StoreError;
 use progress::{
-    GATE_RESULTS_COMMENTING, GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, SEND_INTENT, SEND_UNKNOWN,
+    GATE_RESULTS_COMMENTING, GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, SEND_INTENT, SEND_REFUSED,
     STUCK_COMMENTING, STUCK_STOP, Seen,
 };
 
@@ -429,11 +429,21 @@ pub fn apply_actions(
                     // The intent is found: the post may have landed, with text this pass no
                     // longer holds (the session's), so a newest comment of ours that opens as a
                     // stuck comment does is taken as it.
-                    if !at.seen.stuck_commenting {
-                        ctx.record_step(&at.run, STUCK_COMMENTING, cause)?;
-                        ctx.post_comment(issue, &body)?;
-                    } else if !newest_comment_starts_with(ctx, issue, STUCK_HEADER)? {
-                        ctx.post_comment(issue, &body)?;
+                    match at.seen.stuck_commenting {
+                        None => {
+                            let above = newest_own_id(ctx, issue)?;
+                            ctx.record_step(
+                                &at.run,
+                                &format!("{STUCK_COMMENTING} {above}"),
+                                cause,
+                            )?;
+                            ctx.post_comment(issue, &body)?;
+                        }
+                        Some(above) => {
+                            if !newest_comment_starts_with(ctx, issue, STUCK_HEADER, above)? {
+                                ctx.post_comment(issue, &body)?;
+                            }
+                        }
                     }
                     ctx.record(
                         &at.run,
@@ -554,10 +564,9 @@ pub fn apply_actions(
 }
 
 /// A message sent to the session once. The `key` names the send; the session's prompt count is
-/// recorded under it before the send. A try whose outcome is unknown (a failed or unreachable
-/// call) records `send-unknown`, and only a repeat of such a try goes under the same count and
-/// takes a risen count as delivered. A refusal that typed nothing leaves the next try to read
-/// the count anew. `apply_actions` makes at most one send per session per call. A session the
+/// recorded under it before the send. Every recorded intent is an outcome unknown until a
+/// definite refusal (`send-refused`) follows it; a repeat of an unknown try goes under the same
+/// count and takes a risen count as delivered. After a refusal the next try reads the count anew. `apply_actions` makes at most one send per session per call. A session the
 /// fleet shows no turn for is sent to with no count.
 fn send_once(
     ctx: &RunContext<'_>,
@@ -567,28 +576,31 @@ fn send_once(
     key: &str,
 ) -> Result<(), RunError> {
     let intent = at.seen.send_intents.get(key).copied();
-    let unknown = at.seen.send_unknown.contains(key);
-    // The count of a try whose outcome is unknown is kept: the repeat goes under it. Any other
-    // try reads the count anew (never below an intent recorded), and records it first.
-    let count = match intent {
-        Some(count) if unknown => Some(count),
-        _ => {
-            let seen = ctx.view.session_turn(session).map(|turn| turn.prompts);
-            let count = match (seen, intent) {
-                (Some(seen), Some(old)) => Some(seen.max(old)),
-                (seen, old) => seen.or(old),
-            };
-            if let Some(count) = count
-                && Some(count) != intent
-            {
-                ctx.record_step(
-                    &at.run,
-                    &format!("{SEND_INTENT}{key} {count}"),
-                    &Cause::new(at.step, "send-intent"),
-                )?;
-            }
-            count
+    // Every recorded intent is an outcome unknown until a definite refusal follows it.
+    let unknown = intent.is_some() && !at.seen.send_refused.contains(key);
+    let count = if unknown {
+        intent
+    } else {
+        let seen = ctx.view.session_turn(session).map(|turn| turn.prompts);
+        let count = match (seen, intent) {
+            (Some(seen), Some(old)) => Some(seen.max(old)),
+            (seen, old) => seen.or(old),
+        };
+        if let Some(count) = count {
+            ctx.record_step(
+                &at.run,
+                &format!("{SEND_INTENT}{key} {count}"),
+                &Cause::new(at.step, "send-intent"),
+            )?;
         }
+        count
+    };
+    let refused = || {
+        ctx.record_step(
+            &at.run,
+            &format!("{SEND_REFUSED}{key}"),
+            &Cause::new(at.step, "send-refused"),
+        )
     };
     match ctx.send(session, message, count) {
         Ok(_) => Ok(()),
@@ -602,22 +614,24 @@ fn send_once(
                 &format!("{SEND_INTENT}{key} {now}"),
                 &Cause::new(at.step, "send-intent"),
             )?;
+            refused()?;
             Err(RunError::Send(SendRefused::CountRose { now }))
         }
-        // The outcome is unknown: the message may have been typed.
+        // Definite refusals: nothing was typed.
         Err(
-            error @ (RunError::Send(SendRefused::Failed(_))
-            | RunError::Worker(WorkerError::Unreachable(_) | WorkerError::Failed(_))),
+            error @ RunError::Send(
+                SendRefused::NotIdle
+                | SendRefused::NoSuchSession
+                | SendRefused::BodyWithoutPath
+                | SendRefused::SecretsUnreadable,
+            ),
         ) => {
             if count.is_some() {
-                ctx.record_step(
-                    &at.run,
-                    &format!("{SEND_UNKNOWN}{key}"),
-                    &Cause::new(at.step, "send-unknown"),
-                )?;
+                refused()?;
             }
             Err(error)
         }
+        // A failed or unreachable call may have typed: the intent stays unknown.
         Err(error) => Err(error),
     }
 }
@@ -629,14 +643,20 @@ fn post_once_on_pr(
     ctx: &RunContext<'_>,
     run: &RunId,
     pr: u64,
-    intended: bool,
+    intended: Option<u64>,
     body: &str,
     cause: &Cause,
 ) -> Result<(), RunError> {
-    if !intended {
-        ctx.record_step(run, GATE_RESULTS_COMMENTING, cause)?;
-    } else if newest_comment_is(ctx, pr, body)? {
-        return Ok(());
+    match intended {
+        None => {
+            let above = newest_own_id(ctx, pr)?;
+            ctx.record_step(run, &format!("{GATE_RESULTS_COMMENTING} {above}"), cause)?;
+        }
+        Some(above) => {
+            if newest_comment_is(ctx, pr, body, above)? {
+                return Ok(());
+            }
+        }
     }
     ctx.comment_on_pr(pr, body)
 }
@@ -656,7 +676,7 @@ fn post_once(
 ) -> Result<(), RunError> {
     if !intended {
         ctx.record_step(run, intent, cause)?;
-    } else if newest_comment_is(ctx, issue, body)? {
+    } else if newest_comment_is(ctx, issue, body, 0)? {
         return Ok(());
     }
     ctx.post_comment(issue, body)
@@ -671,10 +691,17 @@ fn newest_comment_starts_with(
     ctx: &RunContext<'_>,
     issue: u64,
     prefix: &str,
+    above: u64,
 ) -> Result<bool, RunError> {
+    let newest = newest_own(ctx, issue)?;
+    Ok(newest.is_some_and(|(id, body)| id > above && body.starts_with(prefix)))
+}
+
+/// The id and body of the newest comment of the project's login that carries the marker.
+fn newest_own(ctx: &RunContext<'_>, issue: u64) -> Result<Option<(u64, String)>, RunError> {
     let comments = ctx.tracker.issue_comments(ctx.repo(), issue)?;
     let normal = |body: &str| body.replace("\r\n", "\n").trim_end().to_owned();
-    let newest = comments
+    Ok(comments
         .iter()
         .filter(|comment| {
             comment
@@ -683,27 +710,27 @@ fn newest_comment_starts_with(
                 .is_some_and(|author| author.eq_ignore_ascii_case(&ctx.project.login))
         })
         .filter(|comment| normal(&comment.body).ends_with(MARKER))
-        .max_by_key(|comment| comment.id);
-    Ok(newest.is_some_and(|comment| comment.body.starts_with(prefix)))
+        .max_by_key(|comment| comment.id)
+        .map(|comment| (comment.id, comment.body.clone())))
+}
+
+/// The id of the newest comment of the login with the marker, 0 when there is none.
+fn newest_own_id(ctx: &RunContext<'_>, issue: u64) -> Result<u64, RunError> {
+    Ok(newest_own(ctx, issue)?.map_or(0, |(id, _)| id))
 }
 
 /// Whether the newest comment of the project's login that carries the factory's marker is `said`
 /// as it is posted. Anyone can paste the marker, so only the login's own comment counts.
-fn newest_comment_is(ctx: &RunContext<'_>, issue: u64, said: &str) -> Result<bool, RunError> {
-    let comments = ctx.tracker.issue_comments(ctx.repo(), issue)?;
+fn newest_comment_is(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    said: &str,
+    above: u64,
+) -> Result<bool, RunError> {
     let normal = |body: &str| body.replace("\r\n", "\n").trim_end().to_owned();
-    let newest = comments
-        .iter()
-        .filter(|comment| {
-            comment
-                .author
-                .as_deref()
-                .is_some_and(|author| author.eq_ignore_ascii_case(&ctx.project.login))
-        })
-        .filter(|comment| normal(&comment.body).ends_with(MARKER))
-        .max_by_key(|comment| comment.id);
     let expected = format!("{}\n\n{MARKER}", text::for_comment(&ctx.tracker.hide(said)));
-    Ok(newest.is_some_and(|comment| normal(&comment.body) == normal(&expected)))
+    Ok(newest_own(ctx, issue)?
+        .is_some_and(|(id, body)| id > above && normal(&body) == normal(&expected)))
 }
 
 /// Stops the run's session before it goes stuck: ends the factory sessions of its build
@@ -1353,7 +1380,14 @@ pub(crate) mod testing {
                     }
                 }
                 (Some("pr"), Some("list")) => Ok(Value::Array(state.listed.clone()).to_string()),
-                (Some("pr"), Some("ready" | "comment")) => Ok(String::new()),
+                (Some("pr"), Some("comment")) => {
+                    let body = Self::flag_values(args, "--body").pop().unwrap_or_default();
+                    let id = state.next_comment;
+                    state.next_comment += 1;
+                    state.comments.push((id, LOGIN.to_string(), body));
+                    Ok(String::new())
+                }
+                (Some("pr"), Some("ready")) => Ok(String::new()),
                 _ => Err(Self::other(args, "the simulator does not know this call")),
             }
         }
@@ -1811,7 +1845,11 @@ mod tests {
                 apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).is_err()
             );
             let steps = rig.steps(&run);
-            assert!(steps.contains(&"gate-results-commenting".to_string()));
+            assert!(
+                steps
+                    .iter()
+                    .any(|s| s.starts_with("gate-results-commenting"))
+            );
             assert!(!steps.contains(&GATE_RESULTS_POSTED.to_string()));
             // The comment is on the pull request, as the lost answer left it.
             rig.tracker
@@ -1827,6 +1865,42 @@ mod tests {
                 .count();
             assert_eq!(posted, 1);
             assert!(rig.steps(&run).contains(&GATE_RESULTS_POSTED.to_string()));
+        }
+
+        /// A second round's results, intended and not landed, are posted though the first
+        /// round's identical comment is the newest on the pull request.
+        #[test]
+        fn a_second_rounds_gate_results_intended_and_not_landed_are_posted() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let payload = ActionPayload {
+                comment: Some("gate passed".into()),
+                ..ActionPayload::default()
+            };
+            let actions = [Action::PostGateResults { pr: 12 }];
+            let mut at = progress(&rig, &run, State::Building);
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            let id = rig
+                .ctx()
+                .tracker
+                .issue_comments(REPO, 12)
+                .unwrap()
+                .iter()
+                .map(|c| c.id)
+                .max()
+                .unwrap();
+            rig.step(&run, &format!("gate-results-commenting {id}"));
+            let mut at = progress(&rig, &run, State::Building);
+            at.gate_results_posted = false;
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            let posted = rig
+                .sim
+                .writes()
+                .into_iter()
+                .filter(|w| w.starts_with("pr comment 12"))
+                .count();
+            assert_eq!(posted, 2);
         }
 
         #[test]
@@ -1899,10 +1973,6 @@ mod tests {
                 rig.steps(&run)
                     .contains(&"send-intent forward-comment c1 3".to_string())
             );
-            assert!(
-                rig.steps(&run)
-                    .contains(&"send-unknown forward-comment c1".to_string())
-            );
             // The worker typed it and its answer was lost: the count has risen.
             rig.view = FleetView::builder().turn(turn(4)).build();
             rig.worker.on_send(Err(SendRefused::CountRose { now: 4 }));
@@ -1969,6 +2039,27 @@ mod tests {
                     _ => None,
                 })
                 .collect()
+        }
+
+        /// A send answered Ok whose delivery event was not written is not typed again.
+        #[test]
+        fn a_send_answered_ok_with_no_delivery_line_is_not_typed_again() {
+            let (mut rig, run, payload, actions) = forward_rig(3);
+            let at = progress(&rig, &run, State::Building);
+            rig.worker.on_send(Ok(4));
+            send_once(
+                &rig.ctx(),
+                &at,
+                session_id(SESSION).unwrap(),
+                payload.forward.clone().unwrap().message,
+                "forward-comment c1",
+            )
+            .unwrap();
+            set_prompts(&mut rig, 4);
+            rig.worker.on_send(Err(SendRefused::CountRose { now: 4 }));
+            let mut at = progress(&rig, &run, State::Building);
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
         }
 
         /// A first send refused with a count risen has no earlier try with an unknown outcome:
@@ -2171,7 +2262,10 @@ mod tests {
             let mut at = progress(&rig, &run, State::Building);
             go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
             let steps = rig.steps(&run);
-            assert!(steps.contains(&"stuck-commenting".to_string()), "{steps:?}");
+            assert!(
+                steps.iter().any(|s| s.starts_with("stuck-commenting")),
+                "{steps:?}"
+            );
             let names = rig.names(&run);
             let intent = names.iter().rposition(|n| n == "step_changed").unwrap();
             let stuck = names.iter().position(|n| n == "stuck").unwrap();
@@ -2227,6 +2321,36 @@ mod tests {
                     .all(|s| !s.contains("ghp_abc") && !s.contains("ghijkl")),
                 "{steps:?}"
             );
+        }
+
+        /// An earlier run's stuck comment is not this run's: the intent records the newest
+        /// comment's id and only a newer one counts.
+        #[test]
+        fn an_earlier_runs_stuck_comment_is_not_taken_as_this_runs() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let said = messages::stuck(&stuck_stop().reason, None, None);
+            rig.tracker.post_comment(REPO, ISSUE, &said).unwrap();
+            let id = rig
+                .ctx()
+                .tracker
+                .issue_comments(REPO, ISSUE)
+                .unwrap()
+                .iter()
+                .map(|c| c.id)
+                .max()
+                .unwrap();
+            rig.step(&run, &format!("stuck-commenting {id}"));
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            let posted = rig
+                .sim
+                .comments()
+                .iter()
+                .filter(|c| c.contains("Reason: the session said stuck"))
+                .count();
+            assert_eq!(posted, 2);
         }
 
         #[test]

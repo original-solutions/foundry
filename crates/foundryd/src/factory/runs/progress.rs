@@ -70,8 +70,9 @@ pub const STUCK_STOP: &str = "stuck-stop ";
 /// The step written before a send to the session, with the send's key and the session's prompt
 /// count after it: a send done again after a lost answer is sent under the same count.
 pub const SEND_INTENT: &str = "send-intent ";
-/// A send of the key whose outcome is unknown: its answer was lost or its transport failed.
-pub const SEND_UNKNOWN: &str = "send-unknown ";
+/// A send of the key the session definitely refused with nothing typed: the intent before it
+/// no longer stands for a possible delivery.
+pub const SEND_REFUSED: &str = "send-refused ";
 /// The step written before the gate-results comment on the pull request is posted.
 pub const GATE_RESULTS_COMMENTING: &str = "gate-results-commenting";
 /// The step written before the questions comment is posted.
@@ -314,17 +315,19 @@ pub struct Seen {
     /// entered `building`: the comment may be on the issue with no line yet.
     pub questions_commenting: bool,
     /// The `stuck-commenting` step: the stuck comment may be on the issue with no `stuck` line.
-    pub stuck_commenting: bool,
+    /// The id of the newest marked comment of the login when the step was written (0 if none).
+    pub stuck_commenting: Option<u64>,
     /// The text after the `stuck-stop` step: the recorded decision to go stuck, with no `stuck`
     /// line yet when `stuck` is `None`.
     pub stuck_stop: Option<String>,
     /// The `gate-results-commenting` step since the results were last posted: the comment may be
     /// on the pull request with no `gate-results-posted` step.
-    pub gate_commenting: bool,
+    /// The id of the newest marked comment on the pull request when the step was written.
+    pub gate_commenting: Option<u64>,
     /// The `send-intent` steps: each send's key and the prompt count it was first sent under.
     pub send_intents: BTreeMap<String, u64>,
-    /// The keys whose newest send-intent was tried with an unknown outcome.
-    pub send_unknown: std::collections::BTreeSet<String>,
+    /// The keys whose newest send-intent was followed by a definite refusal.
+    pub send_refused: std::collections::BTreeSet<String>,
     /// A `pr_opened` since the run last entered `building` or had a gate sent back: the session's pull request waits for the gate.
     pub pr_reported: bool,
     /// The ordinal in the newest `result-line-reminding` step: a reminder send was started.
@@ -695,8 +698,8 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 if step == APPROVAL_WITHDRAWN {
                     seen.withdrawn = true;
                 }
-                if step == STUCK_COMMENTING {
-                    seen.stuck_commenting = true;
+                if let Some(id) = commenting_id(step, STUCK_COMMENTING) {
+                    seen.stuck_commenting = Some(id);
                 }
                 if let Some(stop) = step.strip_prefix(STUCK_STOP) {
                     seen.stuck_stop = Some(stop.to_owned());
@@ -714,21 +717,21 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 if step == RESULT_LINE_REMINDED {
                     seen.reminded = true;
                 }
-                if step == GATE_RESULTS_COMMENTING {
-                    seen.gate_commenting = true;
+                if let Some(id) = commenting_id(step, GATE_RESULTS_COMMENTING) {
+                    seen.gate_commenting = Some(id);
                 }
                 if let Some(intent) = step.strip_prefix(SEND_INTENT)
                     && let Some((key, count)) = intent.rsplit_once(' ')
                     && let Ok(count) = count.parse()
                 {
                     seen.send_intents.insert(key.to_owned(), count);
-                    seen.send_unknown.remove(key);
+                    seen.send_refused.remove(key);
                 }
-                if let Some(key) = step.strip_prefix(SEND_UNKNOWN) {
-                    seen.send_unknown.insert(key.to_owned());
+                if let Some(key) = step.strip_prefix(SEND_REFUSED) {
+                    seen.send_refused.insert(key.to_owned());
                 }
                 if step == GATE_RESULTS_POSTED {
-                    seen.gate_commenting = false;
+                    seen.gate_commenting = None;
                     seen.results_posted = true;
                     seen.regating = false;
                     seen.regate_passed = false;
@@ -1320,6 +1323,14 @@ pub fn run_names(events: &[RunEvent], seen: &Seen) -> RunNames {
         }
     }
     names
+}
+
+/// The id after a `<name> <id>` intent step: 0 for the bare name an older ledger wrote.
+fn commenting_id(step: &str, name: &str) -> Option<u64> {
+    if step == name {
+        return Some(0);
+    }
+    step.strip_prefix(name)?.strip_prefix(' ')?.parse().ok()
 }
 
 #[cfg(test)]
