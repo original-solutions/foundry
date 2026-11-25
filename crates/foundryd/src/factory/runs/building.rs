@@ -77,7 +77,8 @@
 //!   request is read again first, and a draft now goes on. `NotFound` and any other `gh`
 //!   failure (status 1 and a reason) read the pull request again: that read failing is the
 //!   error, a draft now goes on, one open and not a draft is stuck in the runner's words
-//!   ("it is not a draft"), and one gone is stuck as one that does not exist. A pull request
+//!   ("it is not a draft"), and one gone is stuck as one that does not exist. Either way, one
+//!   merged or closed meanwhile ends the run as a first read that found it so does. A pull request
 //!   GitHub never answers about is ended by `limits.minutes`.
 //! - The runner's case of a run with no ordinal and no result line, stuck at once, has no
 //!   counterpart: a turn always has a number. Its cases about a run a person stopped
@@ -903,19 +904,22 @@ impl Step<'_, '_> {
         if let Some(unbound) = check_binding(pull.as_ref(), pr, base, &branches) {
             return self.stuck(at, NOT_BOUND_CODE, unbound_stop(unbound, message));
         }
-        let pull = pull.ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?;
+        let mut pull =
+            pull.ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?;
         // The session's pull request that is open and ready for review goes back to draft:
         // only the gate marks it ready. The runner decides what GitHub refusing means; Foundry
         // what GitHub being unreachable means.
         // - A rate limit, a timeout, a refused login, `gh` not starting, an answer that cannot
         //   be read, and a `gh` failure that got no answer from GitHub ([`gh_gave_no_answer`])
         //   are an error with nothing more written, asked again next pass; for the last the
-        //   pull request is read again first, and a draft now goes on (a pull request that
-        //   never drafts is ended by `limits.minutes`).
+        //   pull request is read again first: one merged or closed meanwhile ends the run as
+        //   below, and a draft now goes on (a pull request that never drafts is ended by
+        //   `limits.minutes`).
         // - `NotFound` and any other `gh` failure ("exited with status 1: boom") read the pull
-        //   request again: a failed read is that error (GitHub is down), a draft now goes on,
-        //   one open and not a draft is stuck in the runner's words (GitHub answered and the
-        //   call was refused), and one gone is stuck as one that does not exist.
+        //   request again: a failed read is that error (GitHub is down), one merged or closed
+        //   meanwhile ends the run as below, a draft now goes on, one open and not a draft is
+        //   stuck in the runner's words (GitHub answered and the call was refused), and one gone
+        //   is stuck as one that does not exist.
         if pull.open && !pull.is_draft {
             match ctx.mark_pr_draft(pr) {
                 Ok(()) => ctx.record(
@@ -939,6 +943,9 @@ impl Step<'_, '_> {
                     );
                     match ctx.tracker.pull_request(ctx.repo(), pr) {
                         Err(_) => return Err(error),
+                        // Merged or closed meanwhile: ended below, as a first read that found
+                        // it so would be.
+                        Ok(Some(now)) if !now.open => pull = now,
                         Ok(Some(now)) if now.is_draft => ctx.record(
                             self.run,
                             Event::PrSetDraft { pr },
@@ -2027,6 +2034,106 @@ mod tests {
                     return Err((self.1)());
                 }
                 self.0.gh(args)
+            }
+        }
+
+        /// A tracker whose call to put pull request #12 back to draft finds it ended meanwhile: a
+        /// person merged or closed it (`state`, `draft`), the call failed with `message`, and the
+        /// tracker's own read of the pull request after the failure failed too, so the error
+        /// reaches `advance`, whose second look reads the pull request ended.
+        struct EndedFirst {
+            sim: Arc<Sim>,
+            state: &'static str,
+            draft: bool,
+            message: &'static str,
+            failed: std::sync::atomic::AtomicBool,
+            read_failed: std::sync::atomic::AtomicBool,
+        }
+
+        impl Tracker for EndedFirst {
+            fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
+                use std::sync::atomic::Ordering;
+                if args.iter().any(|arg| arg == "--undo") {
+                    self.sim
+                        .set_pull(12, pull(self.state, self.draft, BRANCH, "main", false));
+                    self.failed.store(true, Ordering::SeqCst);
+                    return Err(TrackerError::Other {
+                        kind: crate::factory::github::OtherKind::Failed,
+                        message: self.message.into(),
+                    });
+                }
+                if self.failed.load(Ordering::SeqCst)
+                    && args.first().map(String::as_str) == Some("pr")
+                    && args.iter().any(|arg| arg == "view")
+                    && !self.read_failed.swap(true, Ordering::SeqCst)
+                {
+                    return Err(TrackerError::Other {
+                        kind: crate::factory::github::OtherKind::Failed,
+                        message: "`gh pr view` exited with status 1: HTTP 502: Bad Gateway".into(),
+                    });
+                }
+                self.sim.gh(args)
+            }
+        }
+
+        /// A pull request merged or closed before the draft call, which the second look reads,
+        /// ends the run as one the first read found ended does, whatever the call said: never
+        /// stuck as "not a draft", never handed to the gate.
+        #[test]
+        fn a_pull_request_ended_before_the_draft_call_ends_the_run() {
+            for (state, draft, message, end) in [
+                (
+                    "MERGED",
+                    false,
+                    "`gh pr ready` exited with status 1: API call failed: GraphQL: Pull request is already merged",
+                    "merged",
+                ),
+                (
+                    "CLOSED",
+                    false,
+                    "`gh pr ready` exited with status 1: boom",
+                    "closed",
+                ),
+                (
+                    "CLOSED",
+                    true,
+                    "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway",
+                    "closed",
+                ),
+            ] {
+                let (mut rig, run) = built();
+                rig.sim
+                    .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
+                let before = rig.events(&run).len();
+                rig.tracker = Hiding::new(
+                    Arc::new(EndedFirst {
+                        sim: rig.sim.clone(),
+                        state,
+                        draft,
+                        message,
+                        failed: std::sync::atomic::AtomicBool::new(false),
+                        read_failed: std::sync::atomic::AtomicBool::new(false),
+                    }),
+                    Arc::new(|t: &str| t.into()),
+                );
+                end_turn(&mut rig, 1, DONE_MESSAGE);
+                assert_eq!(pass(&rig, &run), BuildStep::Ended, "{state} {draft}");
+                assert_eq!(
+                    names_after(&rig, &run, before),
+                    ["pr_opened", "finished"],
+                    "{state} {draft}"
+                );
+                let finished = last_event(&rig, &run);
+                assert_eq!(finished.data["outcome"], "pr-open");
+                assert_eq!(finished.data["pr_end"], end);
+                assert_eq!(rig.sim.labels(), ["factory:building"]);
+                assert!(
+                    !rig.sim
+                        .comments()
+                        .iter()
+                        .any(|comment| comment.contains("could not finish")),
+                    "{state} {draft}"
+                );
             }
         }
 
@@ -4856,6 +4963,90 @@ mod tests {
                 None,
                 None,
             );
+        }
+
+        /// A begun stuck path that quotes the session reads the turn again for the words its
+        /// code quotes: the question for `session-waiting`, the text before the result line for
+        /// `session-stuck` and `session-wrong-account`.
+        #[test]
+        fn a_stuck_path_begun_quotes_what_its_code_quotes_when_finished() {
+            let question = "Which database should I use?";
+            let stuck = "The gate cannot run here.\nIt needs a database.";
+            let wrong = "the session's gh account is tomkaczocha, not rawphp\nIt cannot see rawphp/softfac.";
+            let cases: [(&str, &str, TurnText, &str); 3] = [
+                (
+                    "session-waiting",
+                    SESSION_WAITING,
+                    TurnText {
+                        message: "Working.".into(),
+                        question: Some(question.into()),
+                    },
+                    question,
+                ),
+                (
+                    "session-stuck",
+                    SAID_STUCK,
+                    TurnText {
+                        message: format!("{stuck}\nFACTORY-STOP: stuck"),
+                        question: None,
+                    },
+                    stuck,
+                ),
+                (
+                    "session-wrong-account",
+                    WRONG_ACCOUNT,
+                    TurnText {
+                        message: format!("{wrong}\nFACTORY-STOP: stuck"),
+                        question: None,
+                    },
+                    wrong,
+                ),
+            ];
+            for (code, public, turn, quoted) in cases {
+                let (mut rig, run) = built();
+                let waiting = code == "session-waiting";
+                let state = if waiting {
+                    SessionState::WaitingForYou
+                } else {
+                    SessionState::Idle
+                };
+                show_with(&mut rig, state, 1, 1, waiting);
+                rig.worker.on_turn(Ok(turn.clone()));
+                // The comment fails after the decision was recorded.
+                rig.sim.fail("issue comment", 1);
+                assert!(advance(&rig.ctx(), &run).is_err(), "{code}");
+                let seen = rig.ctx().seen(&run).unwrap();
+                assert!(seen.stuck_stop.is_some() && seen.stuck.is_none(), "{code}");
+                rig.worker.on_turn(Ok(turn));
+                let step = pass(&rig, &run);
+                assert_stuck(&rig, &run, &step, code, public, None, Some(quoted));
+            }
+        }
+
+        /// A run whose resume was sent is this step's again: the turn the resumed session ends
+        /// is acted on.
+        #[test]
+        fn a_run_whose_resume_was_sent_acts_on_the_next_turn() {
+            let (mut rig, run) = built();
+            rig.write(
+                &run,
+                Event::SessionInterrupted {
+                    resumes: 1,
+                    relaunch: false,
+                    run_ordinal: Some(1),
+                    branch: None,
+                    t3_error: None,
+                    ended_in_pass: 1,
+                },
+            );
+            rig.step(&run, "interruption-sent 1");
+            end_turn(&mut rig, 2, DONE_MESSAGE);
+            let before = rig.events(&run).len();
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+            assert_eq!(steps_after(&rig, &run, before), ["turn-read 2"]);
         }
 
         #[test]
