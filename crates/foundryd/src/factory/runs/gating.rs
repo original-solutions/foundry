@@ -312,6 +312,9 @@ pub const GATE_ENDED: &str = "gate-ended ";
 /// The step written before a failed attempt is sent back: `gate-failing <attempt> <kind>`.
 pub const GATE_FAILING: &str = "gate-failing ";
 /// The step of a forced archive that failed other than as unreachable: `gate-archive-failed <k>`.
+/// The step noting, once, that an archive is waiting for a machine that is online but did not
+/// answer: `gate-archive-waiting <k>`.
+pub const GATE_ARCHIVE_WAITING: &str = "gate-archive-waiting ";
 pub const GATE_ARCHIVE_FAILED: &str = "gate-archive-failed ";
 /// How many such failures make a gate workspace one that can never be archived.
 pub const ARCHIVE_TRIES: u32 = 3;
@@ -342,8 +345,6 @@ pub const GATE_HEAD_MOVED: &str = "gate-head-moved ";
 pub const BUILD_SESSION_ENDED: &str = "build-session-ended";
 /// The step written before the build workspace is archived at the pass.
 pub const BUILD_ARCHIVING: &str = "build-archiving";
-/// The step written when the build workspace's machine is gone and the workspace is left.
-pub const BUILD_LEFT: &str = "build-left";
 /// The step written once it was.
 pub const BUILD_ARCHIVED: &str = "build-archived";
 
@@ -461,6 +462,8 @@ struct Req {
     left: Option<String>,
     /// Forced archives that failed, other than as unreachable.
     archive_failed: u32,
+    /// An archive answered unreachable by an online machine was noted.
+    archive_waiting: bool,
     /// Passes that found the created gate's workspace or terminal missing from the fleet.
     unseen: u32,
 }
@@ -659,6 +662,10 @@ impl Log {
             if let Some(req) = self.req(k) {
                 req.left = Some(why);
             }
+        } else if let Some(k) = step.strip_prefix(GATE_ARCHIVE_WAITING) {
+            if let Some(req) = self.req(number(Some(k))) {
+                req.archive_waiting = true;
+            }
         } else if let Some(k) = step.strip_prefix(GATE_ARCHIVE_FAILED) {
             if let Some(req) = self.req(number(Some(k))) {
                 req.archive_failed += 1;
@@ -693,7 +700,7 @@ impl Log {
             self.session_ended = true;
         } else if step == BUILD_ARCHIVING {
             self.build_archiving = true;
-        } else if step == BUILD_ARCHIVED || step == BUILD_LEFT {
+        } else if step == BUILD_ARCHIVED {
             self.build_archived = true;
         }
     }
@@ -871,6 +878,7 @@ const LEFT_GONE: &str = "its machine is gone";
 const LEFT_UNSHOWN: &str = "no workspace was shown for it";
 const LEFT_UNREACHABLE: &str = "its archive was unreachable";
 const LEFT_REFUSED: &str = "its archive was refused";
+const LEFT_CREATE_REFUSED: &str = "its create was refused";
 
 /// A forced archive of `id`, where P1's answer that it is not a live workspace counts as done.
 fn archive_call(ctx: &RunContext<'_>, id: WorkspaceId) -> Result<(), RunError> {
@@ -1002,19 +1010,6 @@ impl Gate<'_, '_> {
             if !log.build_archiving {
                 self.step(BUILD_ARCHIVING, "build-archiving", None)?;
             }
-            let gone = seen
-                .machine
-                .as_deref()
-                .and_then(|machine| uuid::Uuid::parse_str(machine).ok())
-                .map(MachineId)
-                .is_some_and(|machine| {
-                    self.ctx.view.unreachable_for(machine) >= gate::MACHINE_GONE_AFTER
-                });
-            if gone {
-                // Left to the sweep that archives a run's workspaces when the machine is
-                // heard from again.
-                return self.step(BUILD_LEFT, "build-left", None);
-            }
             archive_call(self.ctx, workspace)?;
         }
         self.step(BUILD_ARCHIVED, "build-archived", None)
@@ -1090,9 +1085,7 @@ impl Gate<'_, '_> {
         }
         // Only the `pr-open` sweep goes back to a gate that was left, and not to one left
         // because its machine is gone or nothing was shown.
-        if let Some(why) = &req.left
-            && (mode != Mode::PrOpen || why == LEFT_GONE || why == LEFT_UNSHOWN)
-        {
+        if req.left.is_some() && mode != Mode::PrOpen {
             return Ok(None);
         }
         let ctx = self.ctx;
@@ -1100,10 +1093,13 @@ impl Gate<'_, '_> {
             .view
             .workspaces_named(ctx.project.id, &gate::name(self.run, req.k));
         let recorded = req.created.as_deref().map(workspace_id).transpose()?;
-        let ids: Vec<WorkspaceId> = match recorded {
-            Some(id) => vec![id],
-            None => live.iter().map(|record| record.body.id).collect(),
-        };
+        // What the view shows now, and the recorded id, whatever the gate was left for.
+        let mut ids: Vec<WorkspaceId> = recorded.into_iter().collect();
+        for record in &live {
+            if !ids.contains(&record.body.id) {
+                ids.push(record.body.id);
+            }
+        }
         let machine = live
             .first()
             .map(|record| record.owner)
@@ -1159,6 +1155,13 @@ impl Gate<'_, '_> {
                         });
                     }
                     if unreachable {
+                        if !req.archive_waiting {
+                            self.step(
+                                &format!("{GATE_ARCHIVE_WAITING}{}", req.k),
+                                "gate-archive-waiting",
+                                None,
+                            )?;
+                        }
                         return Err(error);
                     }
                     self.step(
@@ -1468,6 +1471,15 @@ impl Gate<'_, '_> {
                         Ok(GateStep::Running)
                     }
                     Err(RunError::Worker(error)) => {
+                        if matches!(error, WorkerError::Failed(_)) {
+                            // A refusal made nothing (P1 answers a workspace it made with
+                            // its id): nothing waits to be found.
+                            self.step(
+                                &format!("{GATE_LEFT}{} - {LEFT_CREATE_REFUSED}", req.k),
+                                "gate-left",
+                                None,
+                            )?;
+                        }
                         let reason = gate::could_not_run(Some(&error), Duration::ZERO, None)
                             .unwrap_or_else(|| error.to_string());
                         let (_, log) = self.fresh()?;
@@ -1665,7 +1677,10 @@ impl Gate<'_, '_> {
                 let pass = seen
                     .pass
                     .ok_or_else(|| RunError::Invalid("the pass is not on record".into()))?;
-                self.finish_pass(&pass, false)?;
+                let finished = self.finish_pass(&pass, false)?;
+                if matches!(finished, GateStep::Stuck { .. }) {
+                    return Ok(finished);
+                }
                 let (seen, _) = self.fresh()?;
                 let mut at = self.at(&seen);
                 at.worktree = None;
@@ -6566,11 +6581,9 @@ mod tests {
         ) -> (GateStep, Vec<Call>, Vec<String>, Vec<String>) {
             let (mut rig, run, hub) = built();
             rig.config.limits.gate_retries = retries;
-            for k in 1..=2 {
-                for _ in 0..3 {
-                    rig.worker.on_create(Ok(gate_ws(k)));
-                }
-            }
+            // The first create answers the first gate's workspace, the second the second's.
+            rig.worker.on_create(Ok(gate_ws(1)));
+            rig.worker.on_create(Ok(gate_ws(2)));
             if let Some(checks) = cut {
                 rig.guard = Box::new(HeldFor::new(checks));
             }
@@ -7275,7 +7288,9 @@ mod tests {
                 ends(&mut rig, &run, 1, 2, 0, PASS_TAIL),
                 GateStep::Passed { pr: 12 }
             );
-            assert!(!archived(&rig).contains(&gate_ws(1)));
+            // Its machine answers again by now: decided from the view now, not from why it was
+            // left, it is archived by call.
+            assert!(archived(&rig).contains(&gate_ws(1)));
         }
 
         #[test]
