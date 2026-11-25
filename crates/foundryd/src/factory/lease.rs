@@ -1382,6 +1382,23 @@ mod tests {
             clock: Arc<dyn Clock>,
             token: bool,
         ) -> Machine {
+            self.build(me, fake, clock, token, None)
+        }
+
+        /// A machine whose lease directory is `dir`, one an earlier machine used.
+        fn machine_in(&self, dir: PathBuf) -> Machine {
+            let fake = Arc::new(FakeClock::new());
+            self.build(MachineId::random(), fake.clone(), fake, true, Some(dir))
+        }
+
+        fn build(
+            &self,
+            me: MachineId,
+            fake: Arc<FakeClock>,
+            clock: Arc<dyn Clock>,
+            token: bool,
+            reuse: Option<PathBuf>,
+        ) -> Machine {
             let n = self.next.get();
             self.next.set(n + 1);
             let root = self.dir.path();
@@ -1403,7 +1420,7 @@ mod tests {
             wait_until("the fake git can be started", || {
                 Command::new(&wrapper).arg("--probe").status().is_ok()
             });
-            let dir = root.join(format!("lease-{n}"));
+            let dir = reuse.unwrap_or_else(|| root.join(format!("lease-{n}")));
             let lease = Lease::new(
                 ProjectId::random(),
                 self.remote.url(),
@@ -1424,7 +1441,7 @@ mod tests {
     }
 
     /// A `git` that logs its arguments and, for a push, does what the marker files in `marks`
-    /// ask: `needfilter` (a fetch without `--filter=tree:0` fails), `catfail` (the next `cat-file commit`
+    /// ask: `autopack` (git packs after 3 packs, not 50), `needfilter` (a fetch without `--filter=tree:0` fails), `catfail` (the next `cat-file commit`
     /// fails, once), `readfail` (a fetch or ls-remote fails), `fetchfail` (only a fetch fails), `reject` (the
     /// remote rejects the push with a `!` line, as a ruleset does), `linger` (the push leaves a child holding the
     /// pipes and exits 0), `fail` (the push fails), `hang` (it never returns), `hold` (it waits for `go`
@@ -1472,6 +1489,7 @@ if [ $push = yes ]; then
     exit $st
   fi
 fi
+if [ -e "$M/autopack" ]; then exec git -c gc.autoPackLimit=3 "$@"; fi
 exec git "$@"
 "#,
             marks.display()
@@ -1848,11 +1866,7 @@ exec git "$@"
             keys.sort_unstable();
             assert_eq!(
                 keys,
-                [
-                    "remote.lease.partialclonefilter",
-                    "remote.lease.promisor",
-                    "remote.lease.url"
-                ]
+                ["remote.lease.partialclonefilter", "remote.lease.promisor"]
             );
             let heads = git_text(&machine.dir, &["for-each-ref", "refs/heads"]);
             assert_eq!(heads, "");
@@ -2463,5 +2477,86 @@ exec git "$@"
         assert!(a.check().is_err());
         assert_eq!(b.check(), Ok(2));
         never_both(&a, &b);
+    }
+
+    #[test]
+    fn a_lease_directory_reused_for_another_repo_url_reads_the_new_repo() {
+        let old = Rig::new();
+        let holder = old.machine();
+        let watcher = old.machine();
+        assert_eq!(holder.tick(0), held(1));
+        assert_eq!(watcher.tick(0), holder.held_by(1));
+        // The project's repo URL changes: the same lease directory, another repo.
+        let new = Rig::new();
+        let other = MachineId::random();
+        new.remote.write_foreign(&lease_message(other, "3", "0"));
+        let moved = new.machine_in(watcher.dir.clone());
+        let at = LeaseState::HeldBy {
+            machine: other,
+            generation: 3,
+        };
+        assert_eq!(moved.tick(0), at);
+        moved.advance(millis(179_999));
+        assert_eq!(moved.tick(0), at);
+        moved.advance(millis(1));
+        assert_eq!(moved.tick(0), held(4));
+    }
+
+    #[test]
+    fn superseded_lease_commits_a_watcher_fetched_are_pruned() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        let b = rig.machine();
+        b.mark("autopack");
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(b.tick(0), a.held_by(1));
+        let mut seen = vec![rig.remote.sha()];
+        let packs = |machine: &Machine| {
+            fs::read_dir(machine.dir.join("objects/pack"))
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+                .count()
+        };
+        for _ in 0..14 {
+            a.advance(secs(60));
+            b.advance(secs(60));
+            assert_eq!(a.tick(0), held(1));
+            assert_eq!(b.tick(0), a.held_by(1));
+            seen.push(rig.remote.sha());
+            if packs(&b) == 1 {
+                break;
+            }
+        }
+        assert_eq!(packs(&b), 1, "the packs were never put together");
+        let current = seen.pop().unwrap();
+        for sha in &seen {
+            let has = git_out(&b.dir, &["cat-file", "-e", sha]);
+            assert!(!has.status.success(), "{sha} was kept");
+        }
+        let has = git_out(&b.dir, &["cat-file", "-e", &current]);
+        assert!(has.status.success());
+        // A dies; B still reads and takes over.
+        b.advance(secs(180));
+        assert_eq!(b.tick(0), held(2));
+    }
+
+    #[test]
+    fn a_commit_with_an_empty_message_reads_as_foreign_and_is_taken_after_180_seconds() {
+        let rig = Rig::new();
+        let b = rig.machine();
+        let tree = git_text(
+            &rig.remote.path,
+            &["hash-object", "-t", "tree", "-w", "--stdin"],
+        );
+        let commit = git_stdin(
+            &rig.remote.path,
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            &format!("tree {tree}\nauthor t <t@l> 0 +0000\ncommitter t <t@l> 0 +0000\n\n"),
+        );
+        rig.remote.set_lease(&commit);
+        assert_eq!(reason_of(&b.tick(0)), NOT_WRITTEN);
+        b.advance(secs(180));
+        assert_eq!(b.tick(0), held(1));
     }
 }
