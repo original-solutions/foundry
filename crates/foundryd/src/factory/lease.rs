@@ -9,7 +9,9 @@
 //! machines' clocks.
 //!
 //! A [`Lease`] keeps a small bare git directory of its own for the ref alone. It is no clone:
-//! it holds the empty tree and lease commits, and it fetches nothing but this ref. Every git
+//! it holds the empty tree and lease commits, and it fetches nothing but this ref, and of that
+//! the commit object alone (`--depth=1 --filter=tree:0`, from a partial clone whose one remote,
+//! `lease`, has no fetch refspec), so a commit with a big snapshot costs one object. Every git
 //! call runs with the login's token in its environment only (see [`GitAuth::apply`]), never in
 //! an argument, and ends within [`PUSH_LIMIT`] on the clock or is killed with everything it
 //! started. Nothing git says on stderr is kept, so no error or reason can quote a URL.
@@ -260,6 +262,17 @@ struct Ran {
 }
 
 impl Ran {
+    /// The stdout of a call that exited 0, as it was printed.
+    fn ok_raw(&self) -> Option<&str> {
+        match &self.outcome {
+            Outcome::Exit {
+                code: Some(0),
+                stdout,
+            } => Some(stdout),
+            _ => None,
+        }
+    }
+
     /// The trimmed stdout of a call that exited 0.
     fn ok_stdout(&self) -> Option<&str> {
         match &self.outcome {
@@ -291,6 +304,9 @@ enum Plan {
         renewals: u64,
         /// The commit the ref must be at for the push to land, or none for no ref.
         expect: Option<String>,
+        /// Whether the commit expected is another's, so what a fetch brought of it is
+        /// dropped before the push (see [`Lease::forget`]).
+        forget: bool,
     },
 }
 
@@ -409,8 +425,12 @@ impl Lease {
             generation,
             renewals,
             expect,
+            forget,
         } = self.decide(&read, now)
         {
+            if forget {
+                self.forget(auth);
+            }
             self.push(auth, generation, renewals, expect.as_deref());
         }
         self.collect(auth);
@@ -523,6 +543,7 @@ impl Lease {
                         generation,
                         renewals: 0,
                         expect: None,
+                        forget: false,
                     },
                     None => Plan::Nothing,
                 }
@@ -558,6 +579,7 @@ impl Lease {
                             generation: parsed.generation,
                             renewals,
                             expect: Some(sha.clone()),
+                            forget: false,
                         },
                         None => Plan::Nothing,
                     };
@@ -573,6 +595,7 @@ impl Lease {
                         generation,
                         renewals: 0,
                         expect: Some(sha.clone()),
+                        forget: true,
                     },
                     None => Plan::Nothing,
                 }
@@ -686,7 +709,9 @@ impl Lease {
                 ],
                 false,
             );
-            if init.ok_stdout().is_none() {
+            if init.ok_stdout().is_none() || !self.configure(auth) {
+                // Half made: made again whole by the next read.
+                let _ = std::fs::remove_dir_all(&self.dir);
                 return Found::Failed;
             }
         }
@@ -737,17 +762,24 @@ impl Lease {
             .git(auth, &["cat-file", "-e", &commit], true)
             .ok_stdout()
             .is_some();
-        let fetched = have || self.fetch(auth, &sha);
-        let parsed = fetched
-            .then(|| {
-                self.git(auth, &["cat-file", "commit", &sha], true)
-                    .ok_stdout()
-                    .and_then(|commit| commit.split_once("\n\n"))
-                    .and_then(|(_, message)| Parsed::from_message(message))
-            })
-            .flatten();
+        let mut fetched = have || self.fetch(auth, &sha);
+        let mut parsed = None;
+        if fetched {
+            // Only a commit that was read, and whose message is no lease's, is foreign. One
+            // that could not be read (git failed or was killed) is as good as not fetched:
+            // nothing is dropped or remembered, and the next tick reads it again.
+            let message = self
+                .git(auth, &["cat-file", "commit", &sha], true)
+                .ok_raw()
+                .and_then(|commit| commit.split_once("\n\n"))
+                .map(|(_, message)| message.to_owned());
+            match message {
+                Some(message) => parsed = Parsed::from_message(&message),
+                None => fetched = false,
+            }
+        }
         if fetched && parsed.is_none() {
-            self.drop_foreign(auth);
+            self.forget(auth);
         }
         Found::Present {
             sha,
@@ -756,11 +788,43 @@ impl Lease {
         }
     }
 
-    /// Drops what a fetched commit that is no lease brought: its tree, blobs and history.
-    /// Taking it over needs only its id, which the lease keeps.
-    fn drop_foreign(&self, auth: &GitAuth) {
+    /// Makes the directory a partial clone of the lease alone, so that a fetch can ask for the
+    /// commit object without its tree and blobs (`--filter=tree:0`, which git takes only from
+    /// a repository with a promisor remote). The remote, named `lease`, has no fetch refspec:
+    /// every fetch names the one ref it wants. The URL is kept on the fetch call too, so a
+    /// project whose repo URL was edited follows it. No token is in the config: it reaches
+    /// git through the environment only. `GIT_NO_LAZY_FETCH`, set by [`GitAuth::apply`],
+    /// keeps every other call from fetching a missing tree.
+    fn configure(&self, auth: &GitAuth) -> bool {
+        let settings = [
+            ("core.repositoryformatversion", "1"),
+            ("extensions.partialClone", "lease"),
+            ("remote.lease.url", self.url.as_str()),
+            ("remote.lease.promisor", "true"),
+            ("remote.lease.partialclonefilter", "tree:0"),
+        ];
+        settings.iter().all(|(key, value)| {
+            self.git(auth, &["config", key, value], true)
+                .ok_stdout()
+                .is_some()
+        })
+    }
+
+    /// Drops every object a fetch brought: the ref, the shallow file, the promisor marks of
+    /// the packs, and then, by `gc --prune=now`, the objects. It is done for a commit that
+    /// is no lease, which can bring a whole snapshot, and before a take-over push, which
+    /// would otherwise need the tree of the commit it swaps out, a tree this partial clone
+    /// never fetched. The take-over needs only the commit's id, which the lease keeps.
+    fn forget(&self, auth: &GitAuth) {
         self.git(auth, &["update-ref", "-d", REF], true);
         let _ = std::fs::remove_file(self.dir.join("shallow"));
+        if let Ok(packs) = std::fs::read_dir(self.dir.join("objects/pack")) {
+            for pack in packs.flatten() {
+                if pack.path().extension().is_some_and(|ext| ext == "promisor") {
+                    let _ = std::fs::remove_file(pack.path());
+                }
+            }
+        }
         self.git(
             auth,
             &["-c", "gc.autoDetach=false", "gc", "--prune=now", "--quiet"],
@@ -777,13 +841,16 @@ impl Lease {
         let fetch = self.git(
             auth,
             &[
+                "-c",
+                &format!("remote.lease.url={}", self.url),
                 "fetch",
                 "--no-tags",
                 "--no-auto-gc",
                 "--depth=1",
+                "--filter=tree:0",
                 "--quiet",
                 "--",
-                &self.url,
+                "lease",
                 &refspec,
             ],
             true,
@@ -1005,6 +1072,8 @@ mod tests {
             .arg("--git-dir")
             .arg(git_dir)
             .args(args)
+            // The lease directory is a partial clone: a test must not fetch what it asks for.
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@localhost")
             .env("GIT_COMMITTER_NAME", "test")
@@ -2386,7 +2455,8 @@ exec git "$@"
         let b = rig.machine();
         assert_eq!(a.tick(0), held(1));
         rig.remote.delete_lease();
-        assert_eq!(b.tick(0), held(2));
+        // The caller knows generation 1 from A's `factory_status`.
+        assert_eq!(b.tick(1), held(2));
         a.mark("fetchfail");
         a.advance(secs(30));
         assert_eq!(reason_of(&a.tick(0)), NOT_FETCHED);
