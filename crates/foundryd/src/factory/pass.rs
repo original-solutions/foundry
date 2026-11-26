@@ -484,25 +484,34 @@ fn ending(error: RunError) -> Result<String, Ended> {
 /// last good results, idle once [`IDLE_AFTER_FAILURES`] have failed in a row. The memo is kept.
 pub fn run(world: &World<'_>, memo: &mut Memo) -> PassReport {
     let pass = next_pass(world, memo);
-    let ran =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_pass(world, memo, pass)));
+    let ticket = world.book.ticket(world.project.id);
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_pass(world, memo, pass, ticket)
+    }));
     match ran {
         Ok(report) => report,
-        // The panic's own text is left out: it may quote what a call answered.
-        Err(_) => failed(
-            world,
-            memo,
-            PassReport::default(),
-            pass,
-            "the pass panicked".into(),
-        ),
+        Err(_) => {
+            // A step that ran before the panic may have recorded a run that holds a slot: the
+            // book is set from the ledger, as after any failed pass. A ledger that cannot be
+            // read leaves it to the next pass.
+            if let Ok(known) = known_of(world.ledger, &world.project.repo) {
+                world.book.finish(ticket, Pass::holding(&known));
+            }
+            // The panic's own text is left out: it may quote what a call answered.
+            failed(
+                world,
+                memo,
+                PassReport::default(),
+                pass,
+                "the pass panicked".into(),
+            )
+        }
     }
 }
 
-fn run_pass(world: &World<'_>, memo: &mut Memo, pass: u64) -> PassReport {
+fn run_pass(world: &World<'_>, memo: &mut Memo, pass: u64, ticket: Ticket) -> PassReport {
     let mut report = PassReport::default();
     let project = world.project.id;
-    let ticket = world.book.ticket(project);
     if matches!(world.lease, LeaseState::NoToken) {
         let why = NotHolding::NoToken {
             login: world.project.login.clone(),
