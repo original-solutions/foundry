@@ -2962,6 +2962,8 @@ mod tests {
                     free_disk: 100_000_000_000,
                     sessions: 0,
                     update_refused: None,
+                    version: None,
+                    update_ready: None,
                 },
             })
             .held(

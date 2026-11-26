@@ -1351,6 +1351,8 @@ mod tests {
                         free_disk: 2,
                         sessions: 1,
                         update_refused: None,
+                        version: None,
+                        update_ready: None,
                     },
                 }),
                 m,

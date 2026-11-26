@@ -723,6 +723,8 @@ fn loaded(sessions: u32, load: f64) -> impl FnOnce(MachineId, u64) -> AnyRecord 
                 free_disk: 1 << 35,
                 sessions,
                 update_refused: None,
+                version: None,
+                update_ready: None,
             },
         })
     }

@@ -165,6 +165,8 @@ fn read_with(
         free_disk: free_disk(data_dir)?,
         sessions,
         update_refused: None,
+        version: None,
+        update_ready: None,
     })
 }
 
@@ -215,6 +217,8 @@ fn store_sample(
     let body = MachineSample {
         sessions: store.live_session_count(me)?,
         update_refused,
+        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        update_ready: None,
         ..machine
     };
     let record = Record {
@@ -313,6 +317,8 @@ mod tests {
                 free_disk,
                 sessions,
                 update_refused: None,
+                version: None,
+                update_ready: None,
             },
         }
     }
@@ -581,6 +587,23 @@ mod tests {
         let again = write_sample(&store, me, dir.path()).unwrap();
         assert!(again.version > written.version);
         assert_eq!(again.body.sessions, 5);
+    }
+
+    #[test]
+    fn every_sample_this_machine_writes_carries_its_version_and_no_ready_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(Store::open(dir.path().join("foundry.db")).unwrap());
+        let me = MachineId::random();
+        let mut system = None;
+        for _ in 0..2 {
+            let written = write_sample_with(&mut system, &store, me, dir.path()).unwrap();
+            assert_eq!(
+                written.body.version.as_deref(),
+                Some(env!("CARGO_PKG_VERSION"))
+            );
+            assert_eq!(written.body.update_ready, None);
+            assert_eq!(held_sample(&store.lock().unwrap(), me), Some(written));
+        }
     }
 
     #[test]
