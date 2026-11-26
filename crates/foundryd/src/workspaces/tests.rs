@@ -1116,9 +1116,22 @@ async fn a_setup_whose_terminal_cannot_be_recorded_is_stopped_and_names_the_work
 
 #[tokio::test]
 async fn a_fetch_that_hangs_fails_in_time_and_frees_the_project() {
-    let setup = Setup::with(holder(), Duration::from_secs(1));
+    // The scene is set with the daemon's own limit, which an ordinary create meets however
+    // loaded the machine is.
+    let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
     let id = setup.create(&remote, "main", "before").await;
+    // Only the workspaces under test give git a short limit. It is still long enough for the
+    // ordinary git calls a create makes before its fetch on a loaded machine, so the fetch is
+    // the call cut off. They share the setup's store and folders, so they know "before".
+    let within = Duration::from_secs(5);
+    let workspaces = Workspaces::with_git_within(
+        setup.me,
+        setup.store.clone(),
+        setup.data.path(),
+        setup.terminals.clone(),
+        within,
+    );
     // The remote side now takes longer to answer than git is given.
     let clone = setup.clone_of(remote.project);
     git(
@@ -1126,13 +1139,12 @@ async fn a_fetch_that_hangs_fails_in_time_and_frees_the_project() {
         &[
             "config",
             "remote.origin.uploadpack",
-            "sleep 4.73; git-upload-pack",
+            "sleep 23.65; git-upload-pack",
         ],
     );
 
     let started = Instant::now();
-    let err = setup
-        .workspaces
+    let err = workspaces
         .create(remote.project, "main", "after")
         .await
         .unwrap_err();
@@ -1140,13 +1152,10 @@ async fn a_fetch_that_hangs_fails_in_time_and_frees_the_project() {
         matches!(&err, WorkspaceError::Git { command: "fetch", stderr } if stderr.contains("did not finish")),
         "{err}"
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "{:?}",
-        started.elapsed()
-    );
-    // The project's lock was let go: an archive of it goes through.
-    setup.workspaces.archive(id, false).await.unwrap();
+    // Well before the remote's sleep would end.
+    assert!(started.elapsed() < within * 4, "{:?}", started.elapsed());
+    // The project's lock was let go: an archive of it, by the same workspaces, goes through.
+    workspaces.archive(id, false).await.unwrap();
 }
 
 /// Stands in front of terminal `id`'s holder: the next request to it writes `late.txt` into
