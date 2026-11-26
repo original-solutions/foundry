@@ -26,7 +26,7 @@ const status = (project: string, generation: number): FactoryStatus => ({
 const said = (s: FactoryStatus): UiMessage => ({ type: "factory_status", protocol: 5, status: s });
 
 describe("apply and the factory", () => {
-  it("keeps each project's newest status, and a later one replaces only its own project's", () => {
+  it("keeps the last status the socket sent for each project, and a later one replaces only its own project's", () => {
     let state = apply(emptyState, said(status("p1", 1)));
     state = apply(state, said(status("p2", 4)));
     state = apply(state, said(status("p1", 2)));

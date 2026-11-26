@@ -759,6 +759,13 @@ describe("App", () => {
     expect(await screen.findByText(/Holds the lease at generation 9/)).toBeDefined();
   });
 
+  it("shows the Factory view, not the launchpad, at /factory for a fleet with no workspaces", async () => {
+    mockActions(factoryOverview());
+    await open("/factory", { type: "state", protocol: 1, records: [sample(ME, 1)], settings: settings() });
+    expect(await screen.findByRole("heading", { name: "Factory" })).toBeDefined();
+    expect(screen.queryByText("What should Claude work on?")).toBeNull();
+  });
+
   it("keeps the board working after a factory_status or a message it does not know", async () => {
     mockActions();
     await open("/", live);

@@ -1,9 +1,11 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FactoryOverview, FactorySettings, FactoryStatus, FinishedRun, ProjectFactory } from "./api";
 import { Factory } from "./Factory";
 import { fleet } from "./fleet";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import type { SharedSettings } from "./api";
 import { json, mockFetch, renderApp } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -66,7 +68,6 @@ const holding = status({
     { run: "acme__foundry__6__1", title: "Needed words", outcome: "needs-info", pr_end: null, pr_url: null },
     ...Array.from({ length: 23 }, (_, i) => finished(100 + i)),
   ],
-  foreign: [{ issue: 33, title: "Taken elsewhere", state: "claimed" }],
 });
 
 function overview(entry: { status?: FactoryStatus | null; factory?: ProjectFactory; writer?: string | null } = {}): FactoryOverview {
@@ -127,7 +128,7 @@ describe("Factory", () => {
     expect(held.textContent).toContain("the gate failed 3 times");
     expect(held.textContent).toContain("any uncommitted work there is lost then");
 
-    expect(within(p.getByRole("list", { name: "Claimed by another factory" })).getByText(/Taken elsewhere/)).toBeDefined();
+    expect(p.queryByRole("list", { name: "Claimed by another factory" })).toBeNull();
 
     const done = within(p.getByRole("list", { name: "Finished" })).getAllByRole("listitem");
     expect(done).toHaveLength(20);
@@ -156,6 +157,90 @@ describe("Factory", () => {
       expect(within(project).getByText(line), name).toBeDefined();
       document.body.innerHTML = "";
     }
+  });
+
+  it("says a needs-info run waits without the stuck workspace sentence", async () => {
+    const waiting = status({ held_up: [{ run: "acme__foundry__9__2", kind: "needs_info", reason: "which database?" }] });
+    const { project } = await show(overview({ status: waiting }), { p1: waiting });
+    const held = within(within(project).getByRole("list", { name: "Held up" })).getByRole("listitem");
+    expect(held.textContent).toContain("needs info");
+    expect(held.textContent).toContain("which database?");
+    expect(held.textContent).not.toContain("uncommitted work");
+  });
+
+  it("shows no lists for an off project, whatever status the socket holds", async () => {
+    const { project } = await show(overview({ factory: { on: false, login: "", paused: false }, status: null }), { p1: holding });
+    expect(within(project).getByText("Factory off")).toBeDefined();
+    expect(within(project).queryByRole("list", { name: "Ready" })).toBeNull();
+  });
+
+  it("shows the alert when the overview is refused", async () => {
+    mockFetch(json(500, { error: "the store cannot be read" }));
+    await renderApp(<Factory statuses={undefined} settings={shared} machines={machines} />);
+    expect((await screen.findByRole("alert")).textContent).toContain("the store cannot be read");
+  });
+
+  describe("the socket's status and the overview's", () => {
+    const at = (generation: number, extra: Partial<FactoryStatus> = {}) => status({ generation, ...extra });
+
+    it("does not name the writer when the socket's generation differs from the overview's", async () => {
+      const { project } = await show(overview({ status: at(7) }), { p1: at(8) });
+      expect(within(project).getByText(/Holds the lease at generation 8/)).toBeDefined();
+      expect(within(project).queryByText(/on studio/)).toBeNull();
+    });
+
+    it("names the writer when both are at the same generation", async () => {
+      const { project } = await show(overview({ status: at(7) }), { p1: at(7) });
+      expect(within(project).getByText(/Holds the lease at generation 7, on studio/)).toBeDefined();
+    });
+
+    it("shows the socket's content over the overview's", async () => {
+      const socket = at(7, { ready: [{ issue: 77, title: "From the socket", reason: "fresh" }] });
+      const { project } = await show(overview({ status: at(7, { ready: [{ issue: 1, title: "From the overview", reason: "old" }] }) }), { p1: socket });
+      expect(within(project).getByText(/From the socket/)).toBeDefined();
+      expect(within(project).queryByText(/From the overview/)).toBeNull();
+    });
+  });
+
+  describe("reading the overview again", () => {
+    type Props = { statuses?: Record<string, FactoryStatus>; seq: number };
+    let set: (props: Props) => void = () => {};
+    function Harness() {
+      const [props, setProps] = useState<Props>({ seq: 1 });
+      set = setProps;
+      const withSeq: SharedSettings = { ...shared, seq: props.seq };
+      return <Factory statuses={props.statuses} settings={withSeq} machines={machines} />;
+    }
+    const reads = (calls: { url: string; method: string }[]) => calls.filter((c) => c.url === "/api/factory" && c.method === "GET").length;
+    const settle = () => act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    const believed = (extra: Partial<FactoryStatus> = {}) => status({ pass: 3, generation: 7, ...extra });
+
+    async function start() {
+      const calls = mockFetch(json(200, overview({ status: believed() })), json(200, overview({ status: believed({ generation: 8 }) })), json(200, overview()));
+      await renderApp(<Harness />);
+      await screen.findByRole("region", { name: "foundry" });
+      return calls;
+    }
+
+    it("reads it again when the settings' seq changes", async () => {
+      const calls = await start();
+      expect(reads(calls)).toBe(1);
+      act(() => set({ seq: 2 }));
+      await waitFor(() => expect(reads(calls)).toBe(2));
+    });
+
+    it("reads it again when a status holds at another generation", async () => {
+      const calls = await start();
+      act(() => set({ seq: 1, statuses: { p1: believed({ generation: 8 }) } }));
+      await waitFor(() => expect(reads(calls)).toBe(2));
+    });
+
+    it("does not read it again for a status that differs only in its pass", async () => {
+      const calls = await start();
+      act(() => set({ seq: 1, statuses: { p1: believed({ pass: 4 }) } }));
+      await settle();
+      expect(reads(calls)).toBe(1);
+    });
   });
 
   it("shows an empty state for a fleet with no projects", async () => {
