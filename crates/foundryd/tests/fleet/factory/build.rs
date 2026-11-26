@@ -76,6 +76,18 @@ fn an_issue_reaches_pr_open_with_its_build_session_ended_and_its_workspace_gone(
                 "one build workspace"
             );
             gone(&h, "fac/12-1").await;
+            // The pass that moves the run to pr-open ends the build session itself, before the
+            // workspace is archived: the archive's own end of its sessions is not the step.
+            let steps: Vec<String> = named(&h, 12, "step_changed")
+                .iter()
+                .filter_map(|d| d["step"].as_str().map(str::to_owned))
+                .collect();
+            let ended = steps.iter().position(|s| s == "build-session-ended");
+            let archiving = steps.iter().position(|s| s == "build-archiving");
+            assert!(
+                matches!((ended, archiving), (Some(e), Some(a)) if e < a),
+                "the build session is ended before its workspace is archived: {steps:?}"
+            );
             let builder = h.owner_of("fac/12-1").unwrap();
             assert_ne!(
                 builder, h.fleet.daemons[0].id,
