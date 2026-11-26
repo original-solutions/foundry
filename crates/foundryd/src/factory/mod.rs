@@ -2123,4 +2123,96 @@ mod tests {
             "the failed pass wrote the last good results, which the dead pass did not drop"
         );
     }
+
+    /// Whether the caller runs on a thread that may block: a blocking thread of the runtime does,
+    /// an async worker thread panics when asked to wait on a future.
+    fn may_block() -> bool {
+        let handle = tokio::runtime::Handle::current();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.block_on(async {}))).is_ok()
+    }
+
+    /// A host that notes on which kind of thread the store and secret reads of the service run.
+    struct Probed {
+        inner: Arc<FakeHost>,
+        /// Calls of `token_mark` and `lease` that ran on an async worker thread.
+        async_calls: AtomicUsize,
+        /// Calls of `hide` that ran on a blocking thread: the seed asks for the hider there.
+        blocking_hides: AtomicUsize,
+    }
+
+    impl Host for Probed {
+        fn acting(&self) -> Answering<'_, bool> {
+            self.inner.acting()
+        }
+        fn tracker(&self, login: &str) -> Option<Arc<dyn Commenting>> {
+            self.inner.tracker(login)
+        }
+        fn token_mark(&self, login: &str) -> Result<Option<u64>, String> {
+            if !may_block() {
+                self.async_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.token_mark(login)
+        }
+        fn lease(&self, watched: &Watched) -> Arc<dyn Leasing> {
+            if !may_block() {
+                self.async_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.lease(watched)
+        }
+        fn worker(&self) -> Arc<dyn Worker> {
+            self.inner.worker()
+        }
+        fn online(&self) -> BTreeSet<MachineId> {
+            self.inner.online()
+        }
+        fn hide(&self) -> Hide {
+            if may_block() {
+                self.blocking_hides.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.hide()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_seed_and_the_secret_reads_of_a_scan_do_not_run_on_the_async_task() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN)]))
+            .unwrap();
+        let fake = fake_host();
+        fake.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        let host = Arc::new(Probed {
+            inner: fake,
+            async_calls: AtomicUsize::new(0),
+            blocking_hides: AtomicUsize::new(0),
+        });
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the lease", || host2.inner.made.lock().unwrap().len() == 1)
+        })
+        .await
+        .unwrap();
+        // A second scan reads the token mark of the running project.
+        clock.advance(SCAN);
+        a_while().await;
+        running.abort();
+        assert_eq!(
+            host.async_calls.load(Ordering::SeqCst),
+            0,
+            "token_mark and lease run on a blocking thread"
+        );
+        assert!(
+            host.blocking_hides.load(Ordering::SeqCst) >= 1,
+            "the seed runs on a blocking thread"
+        );
+    }
 }
