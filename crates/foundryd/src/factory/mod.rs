@@ -1261,4 +1261,45 @@ mod tests {
         secrets.set("github:other", "ghp_ok").unwrap();
         assert_eq!(mark("other"), mark("bot"));
     }
+
+    #[test]
+    fn projects_that_name_one_repo_are_watched_from_none_and_another_repo_still_is() {
+        let mut settings = SharedSettings::default();
+        for (n, repo) in [
+            (1, "https://github.com/o/r"),
+            (2, "git@github.com:O/R.git"),
+            (3, "https://github.com/o/other"),
+        ] {
+            settings.projects.push(Project {
+                id: project(n),
+                name: format!("p{n}"),
+                repo: repo.into(),
+            });
+            settings.project_factory.insert(
+                project(n),
+                ProjectFactory {
+                    on: true,
+                    login: "bot".into(),
+                    paused: false,
+                },
+            );
+        }
+        assert_eq!(
+            watched(&settings),
+            vec![Watched {
+                project: project(3),
+                repo: "o/other".into(),
+                login: "bot".into(),
+            }]
+        );
+        // A project that is off does not make its repo shared.
+        settings.project_factory.get_mut(&project(2)).unwrap().on = false;
+        assert_eq!(
+            watched(&settings)
+                .iter()
+                .map(|w| w.project)
+                .collect::<Vec<_>>(),
+            vec![project(1), project(3)]
+        );
+    }
 }
