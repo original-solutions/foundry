@@ -554,6 +554,7 @@ fn run_pass(world: &World<'_>, memo: &mut Memo, pass: u64) -> PassReport {
         memo,
         titles: BTreeMap::new(),
         ticket,
+        others: Vec::new(),
     };
     match one.go() {
         Ok(()) => {
@@ -577,6 +578,9 @@ fn run_pass(world: &World<'_>, memo: &mut Memo, pass: u64) -> PassReport {
             report
         }
         Err(Ended::Failed(error)) => {
+            // A step that failed may have recorded a run that holds a slot: the book is set
+            // from the ledger before the next pass, so that no other project's pass claims it.
+            let _ = one.recount(&mut Reserved::default());
             let Pass { report, memo, .. } = one;
             failed(world, memo, report, pass, error)
         }
@@ -773,6 +777,8 @@ struct Pass<'a, 'w> {
     titles: BTreeMap<u64, String>,
     /// The pass's hold on the book, taken before the lease was checked.
     ticket: Ticket,
+    /// The machines other projects placed runs on, whose sessions have not started.
+    others: Vec<MachineId>,
 }
 
 /// Whose claim an issue in `triage` or `building` carries.
@@ -791,6 +797,21 @@ struct Known {
     info: RunInfo,
     events: Vec<foundry_proto::factory::RunEvent>,
     seen: super::runs::progress::Seen,
+}
+
+/// The unfinished runs of `repo` in `ledger`, each with its events.
+fn known_of(ledger: &Ledger, repo: &str) -> Result<Vec<Known>, StoreError> {
+    let mut known = Vec::new();
+    for info in ledger.runs(repo)? {
+        let events = if info.unreadable {
+            Vec::new()
+        } else {
+            ledger.read(&info.id)?
+        };
+        let seen = read_progress(&events);
+        known.push(Known { info, events, seen });
+    }
+    Ok(known)
 }
 
 /// The context of one run's steps.
@@ -828,17 +849,22 @@ impl<'a, 'w> Pass<'a, 'w> {
 
     /// The unfinished runs of the project, each with its events.
     fn known(&self) -> Result<Vec<Known>, Ended> {
-        let mut known = Vec::new();
-        for info in self.ledger.runs(&self.world.project.repo)? {
-            let events = if info.unreadable {
-                Vec::new()
-            } else {
-                self.ledger.read(&info.id)?
-            };
-            let seen = read_progress(&events);
-            known.push(Known { info, events, seen });
+        Ok(known_of(self.ledger, &self.world.project.repo)?)
+    }
+
+    /// The book holds what the ledger now says this project's runs hold, and the machines
+    /// reserved are those of its runs and of the other projects'. Called wherever a step may
+    /// have recorded a run that holds a slot with no slot taken for it (a claim carried on, a
+    /// claim that failed after it recorded), so that the count every project's pass claims
+    /// against is the ledger's.
+    fn recount(&self, reserved: &mut Reserved) -> Result<(), Ended> {
+        let held = Self::holding(&self.known()?);
+        *reserved = Reserved::default();
+        for machine in held.placed.iter().chain(&self.others) {
+            reserved.hold(*machine);
         }
-        Ok(known)
+        self.world.book.finish(self.ticket, held);
+        Ok(())
     }
 
     /// What this project's runs hold of the fleet, by their events.
@@ -880,9 +906,10 @@ impl<'a, 'w> Pass<'a, 'w> {
         let Some(others) = world.book.begin(ticket, held) else {
             return Err(Ended::Lost);
         };
-        for machine in others {
-            reserved.hold(machine);
+        for machine in &others {
+            reserved.hold(*machine);
         }
+        self.others = others;
 
         // 3 and 4. The claims on issues in `triage` and `building` that no run of the ledger
         // holds: Foundry's are carried on, another factory's are foreign.
@@ -904,6 +931,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                 }
             }
         }
+        let carried = !carry.is_empty();
         for run in carry {
             let ctx = self.ctx(self.config);
             let said = match start::advance(&ctx, &run) {
@@ -911,6 +939,11 @@ impl<'a, 'w> Pass<'a, 'w> {
                 Err(error) => ending(error)?,
             };
             self.note(&run, said);
+        }
+        if carried {
+            // A run carried on holds a slot and its machine from here, though no slot was
+            // taken for it: the claims below must read it.
+            self.recount(&mut reserved)?;
         }
 
         // 5. Every run, then the feedback steps, before the claims as the issue orders them.
@@ -1294,6 +1327,10 @@ impl<'a, 'w> Pass<'a, 'w> {
                 Err(error) => {
                     *reserved = before;
                     give_back(book);
+                    // The claim may have recorded its run before it failed: that run holds its
+                    // slot and its machine, whatever the error. If the ledger cannot be read,
+                    // the pass ends below or the next one counts it again.
+                    let _ = self.recount(reserved);
                     let said = ending(error)?;
                     wait(self, said);
                     continue;
