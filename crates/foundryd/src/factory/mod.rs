@@ -396,11 +396,14 @@ async fn wait(clock: &dyn Clock, from: Duration, span: Duration) {
     }
 }
 
-/// The highest lease generation the run events of `repo` were written under.
-fn highest_event_generation(store: &Store, repo: &str) -> u64 {
+/// The highest lease generation the run events of `repo` were written under. The store's lock
+/// is the whole daemon's, so it is taken for one run at a time, never across the history.
+fn highest_event_generation(store: &Mutex<Store>, repo: &str) -> u64 {
+    let runs = lock(store).runs_of(repo).unwrap_or_default();
     let mut highest = 0;
-    for run in store.runs_of(repo).unwrap_or_default() {
-        for event in store.run_events(&run).unwrap_or_default() {
+    for run in runs {
+        let events = lock(store).run_events(&run).unwrap_or_default();
+        for event in events {
             highest = highest.max(event.generation);
         }
     }
@@ -423,12 +426,8 @@ async fn lease_task(
         let (store2, lease2, repo) = (store.clone(), lease.clone(), watched.repo.clone());
         let known = events;
         let ticked = tokio::task::spawn_blocking(move || {
-            let (statuses, events) = {
-                let store = lock(&store2);
-                let statuses = store.highest_generation(project).unwrap_or(0);
-                let events = known.unwrap_or_else(|| highest_event_generation(&store, &repo));
-                (statuses, events)
-            };
+            let statuses = lock(&store2).highest_generation(project).unwrap_or(0);
+            let events = known.unwrap_or_else(|| highest_event_generation(&store2, &repo));
             (lease2.tick(statuses.max(events)), events)
         })
         .await;
