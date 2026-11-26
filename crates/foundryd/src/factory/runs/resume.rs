@@ -1050,8 +1050,8 @@ fn ended(
                 // A turn record syncs apart from its session's, and can be written after the
                 // session ended: the turn after the newest read is asked of the worker. One it
                 // answers is written and not shown yet, so nothing is decided until it shows. One
-                // it says was never written means the process ended before a result line. Any other error
-                // decides nothing: the next pass asks again.
+                // it says was never written means the process ended before a result line. Any
+                // other error decides nothing: the next pass asks again.
                 None => {
                     let next = seen.turn_read.map_or(1, |read| read + 1);
                     ctx.held()?;

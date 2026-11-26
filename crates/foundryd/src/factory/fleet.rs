@@ -14,7 +14,8 @@
 //! machine that answered with a refusal is [`WorkerError::Failed`], with the reason the answer
 //! gives. A turn not written yet while its session runs (`404`) is unreachable for now; one
 //! that will never be written (`410`) is [`WorkerError::NotWritten`], which is what the resume
-//! step reads as an interruption. Any other refusal of a turn read, a `5xx` included, is failed. No answer holds a token, and every reason is passed through
+//! step reads as an interruption. Any other refusal of a turn read, a `5xx` included, is failed.
+//! No answer holds a token, and every reason is passed through
 //! [`redact`](crate::secrets::redact) before it is kept.
 
 use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
@@ -143,7 +144,8 @@ fn sent(answer: Result<Answer, CallError>) -> Result<u64, SendRefused> {
 }
 
 /// What a turn read's answer says. `404` is a turn not written yet while its session runs: asked
-/// again. `410` is a turn that will never be written. Any other refusal, a `5xx` included, is failed.
+/// again. `410` is a turn that will never be written. Any other refusal, a `5xx` included, is
+/// failed.
 fn turn_read(answer: &Answer) -> Result<TurnText, WorkerError> {
     if answer.status == 404 {
         return Err(WorkerError::Unreachable(reason(answer)));
