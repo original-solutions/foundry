@@ -1552,6 +1552,87 @@ mod tests {
             assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
         }
 
+        const RESUME_WS: &str = "00000000-0000-0000-0000-000000000b11";
+
+        fn resume_ws() -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(0xb11))
+        }
+
+        /// A building run whose session was interrupted, a resume decided (`resumes` 1), the
+        /// steps of its set-up recorded, and a stop asked for. The old workspace is archived
+        /// once the resume has one, and shows no more.
+        fn resume_being_set_up(steps: &[String]) -> (Rig, RunId) {
+            let (mut rig, run) = requested();
+            rig.write(
+                &run,
+                Event::SessionInterrupted {
+                    resumes: 1,
+                    relaunch: false,
+                    run_ordinal: None,
+                    branch: Some(BRANCH.into()),
+                    t3_error: None,
+                    ended_in_pass: 1,
+                },
+            );
+            for step in steps {
+                rig.step(&run, step);
+            }
+            if steps
+                .iter()
+                .any(|step| step.starts_with("resume-workspace"))
+            {
+                rig.view = FleetView::builder()
+                    .online(rig.machine)
+                    .workspace(workspace_record(rig.machine, resume_ws(), "fac/8-1-r1"))
+                    .build();
+            }
+            (rig, run)
+        }
+
+        #[test]
+        fn during_a_resumes_set_up_ends_the_sessions_of_the_resumes_workspace_not_the_old_one() {
+            let (rig, run) = resume_being_set_up(&[
+                "resume-requested 1 fac/8-1-r1".into(),
+                format!("resume-workspace 1 {RESUME_WS}"),
+                "resume-sending 1".into(),
+            ]);
+            assert_eq!(
+                pass(&rig, &run),
+                StopStep::Stuck {
+                    reason: STOPPED_BY_HAND.into()
+                }
+            );
+            assert_eq!(
+                calls(&rig),
+                vec![Call::EndSessions {
+                    workspace: resume_ws()
+                }]
+            );
+            assert!(rig.finished(&run));
+        }
+
+        #[test]
+        fn a_stop_after_a_resume_started_ending_its_sessions_ends_them_again() {
+            let (rig, run) = resume_being_set_up(&[
+                format!("resume-workspace 1 {RESUME_WS}"),
+                "resume-ending-sessions 1".into(),
+            ]);
+            assert!(matches!(pass(&rig, &run), StopStep::Stuck { .. }));
+            assert_eq!(
+                calls(&rig),
+                vec![Call::EndSessions {
+                    workspace: resume_ws()
+                }]
+            );
+        }
+
+        #[test]
+        fn before_a_resume_has_a_workspace_a_stop_keeps_ending_the_builds_session() {
+            let (rig, run) = resume_being_set_up(&["resume-requested 1 fac/8-1-r1".into()]);
+            assert!(matches!(pass(&rig, &run), StopStep::Stuck { .. }));
+            assert_eq!(calls(&rig), vec![Call::EndSessions { workspace: ws() }]);
+        }
+
         #[test]
         fn is_never_stuck_twice() {
             let (rig, run) = requested();
