@@ -1063,7 +1063,7 @@ pub fn advance(
     slots: &mut Slots,
     reserved: &mut Reserved,
 ) -> Result<FeedbackStep, RunError> {
-    if run.repo() != ctx.repo() {
+    if !run.repo().eq_ignore_ascii_case(ctx.repo()) {
         return Ok(FeedbackStep::None);
     }
     let events = ctx.ledger.read(run)?;
