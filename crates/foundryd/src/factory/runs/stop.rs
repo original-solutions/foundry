@@ -125,9 +125,16 @@
 //! Runner cases with no counterpart here:
 //!
 //! - `takeStopRequest`, `leaveStopRequest` and `stopRequestPath` (every case of the
-//!   `takeStopRequest` and `leaveStopRequest` groups of `stop.test.ts`): a directory of
-//!   request files per run, a file left, a race on the file, a file that cannot be written and
-//!   a file kept when the ledger cannot be read. `request` writes the ledger line itself.
+//!   `takeStopRequest` group of `stop.test.ts`, and the cases of `leaveStopRequest` that are
+//!   about a file): a directory of request files per run, a file left, a race on the file, a
+//!   file that cannot be written and a file kept when the ledger cannot be read. `request`
+//!   writes the ledger line itself. The cases of `leaveStopRequest` that are about the state
+//!   are ported: `refuses a pr-open run with a stale stop line, as not building` under its
+//!   name (`refuses_a_pr_open_run_with_a_stale_stop_line_as_not_building`), `is already-requested
+//!   when a building run's ledger has the stop line, and leaves no file` as the second ask of
+//!   `request_stop::records_a_stop_for_a_building_run_once` (there is no file to leave), and
+//!   `refuses a finished run and a run with no state yet` as `writes_nothing_to_a_run_that_finished`
+//!   and `writes_nothing_to_a_run_with_no_state_yet`.
 //! - `control.ts`'s claims pause and resume, `showRun` and `parseId` (and `stopRun`'s
 //!   `not-found` and `invalid` answers: a route has a `RunId`): settings and ledger reads, other
 //!   tasks'.
@@ -613,9 +620,7 @@ pub fn reconcile(ctx: &RunContext<'_>, run: &RunId) -> Result<ReconcileStep, Run
             .and_then(|raw| serde_json::from_str::<StuckStop>(raw).ok())
             .is_some_and(|decision| SHARED_CODES.contains(&decision.code.as_str()));
         if own && shared && feedback::round_pending(&events) {
-            return Ok(ReconcileStep::Skipped {
-                why: "relaunching",
-            });
+            return Ok(ReconcileStep::Skipped { why: "relaunching" });
         }
         if own && matches!(seen.state, Some(State::Building | State::Stuck)) {
             let mut at = progress_from(run, CauseStep::Watch, &seen, State::Building);
@@ -1237,7 +1242,7 @@ mod tests {
         // The runner's `leaveStopRequest` and `control.ts`'s `stopRun` check the state before
         // a stop already on record, so a stale line never reads as "already".
         #[test]
-        fn refuses_a_run_that_left_building_with_a_stale_stop_line_instead_of_answering_already() {
+        fn refuses_a_pr_open_run_with_a_stale_stop_line_as_not_building() {
             let rig = Rig::new();
             let run = run_id(1);
             let mut events = building();
@@ -1497,7 +1502,10 @@ mod tests {
             rig.sim.set_assignees(&[LOGIN]);
             // The build's workspace is archived; the round's shows once it was made.
             let mut view = FleetView::builder().online(rig.machine);
-            if steps.iter().any(|step| step.starts_with("feedback-workspace")) {
+            if steps
+                .iter()
+                .any(|step| step.starts_with("feedback-workspace"))
+            {
                 view = view.workspace(workspace_record(rig.machine, round_ws(), "fac/8-1-f1"));
             }
             rig.view = view.build();
@@ -2669,9 +2677,7 @@ mod tests {
                 let events = rig.events(&run).len();
                 assert_eq!(
                     pass(&rig, &run),
-                    ReconcileStep::Skipped {
-                        why: "relaunching"
-                    }
+                    ReconcileStep::Skipped { why: "relaunching" }
                 );
                 assert_eq!(rig.events(&run).len(), events);
                 assert!(calls(&rig).is_empty());

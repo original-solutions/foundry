@@ -4145,7 +4145,10 @@ mod tests {
                 }
                 assert!(cut, "the pass finished without being cut at the move");
             }
-            assert!(found, "no cut fell between the move and the second decision");
+            assert!(
+                found,
+                "no cut fell between the move and the second decision"
+            );
         }
 
         #[test]
@@ -4175,9 +4178,7 @@ mod tests {
             let world = cut_before_the_move();
             let before = world.count();
             let mut free = slots(0);
-            let step = world
-                .try_pass(&mut free, &mut Reserved::default())
-                .unwrap();
+            let step = world.try_pass(&mut free, &mut Reserved::default()).unwrap();
             assert_eq!(
                 step,
                 FeedbackStep::Waiting {
@@ -4195,10 +4196,11 @@ mod tests {
         fn a_round_carried_on_in_pr_open_takes_the_free_run_slot() {
             let world = cut_before_the_move();
             let mut free = slots(1);
-            let step = world
-                .try_pass(&mut free, &mut Reserved::default())
-                .unwrap();
-            assert!(matches!(step, FeedbackStep::Decided { round: 1, .. }), "{step:?}");
+            let step = world.try_pass(&mut free, &mut Reserved::default()).unwrap();
+            assert!(
+                matches!(step, FeedbackStep::Decided { round: 1, .. }),
+                "{step:?}"
+            );
             assert_eq!(free.runs_free, 0);
             assert_eq!(world.rig.sim.labels(), ["factory:building"]);
         }
@@ -4210,18 +4212,14 @@ mod tests {
             assert_eq!(world.seen().state, Some(State::Building));
             world.rig.worker.on_create(Ok(fresh()));
             let mut free = slots(2);
-            let step = world
-                .try_pass(&mut free, &mut Reserved::default())
-                .unwrap();
+            let step = world.try_pass(&mut free, &mut Reserved::default()).unwrap();
             assert_eq!(step, FeedbackStep::Preparing(Wait::Workspace));
             assert_eq!(free.runs_free, 2);
             // With none free it goes on all the same: the round holds the slot it took.
             world.rig.view = round_view();
             world.rig.worker.on_start_session(Ok(round_session()));
             let mut none = slots(0);
-            let step = world
-                .try_pass(&mut none, &mut Reserved::default())
-                .unwrap();
+            let step = world.try_pass(&mut none, &mut Reserved::default()).unwrap();
             assert!(matches!(step, FeedbackStep::Started { .. }), "{step:?}");
             assert_eq!(none.runs_free, 0);
         }
@@ -4609,8 +4607,7 @@ mod tests {
         }
 
         #[test]
-        fn a_new_session_is_followed_by_building_like_any_other_and_its_pull_request_is_reported_again()
-         {
+        fn a_feedback_relaunch_is_no_gate_attempt_and_the_session_is_waited_for_like_any_other() {
             use crate::factory::runs::building::{BuildStep, advance as build};
             let mut world = World::reviewed();
             world.round();
@@ -6003,7 +6000,7 @@ mod tests {
         }
 
         #[test]
-        fn a_thread_that_no_longer_exists_skips_the_call_and_reports_no_drops() {
+        fn a_thread_t3_no_longer_has_skips_the_call_and_reports_no_drops() {
             let mut world = forwarding();
             world.rig.view = fleet().build();
             world.hub.set_activity(Activity {
