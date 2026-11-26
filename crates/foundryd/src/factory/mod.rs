@@ -2262,4 +2262,138 @@ mod tests {
             "the seed runs on a blocking thread"
         );
     }
+
+    /// Turns on a second project naming project 1's repo, as `seq`.
+    fn share_repo(store: &Arc<Mutex<Store>>, seq: u64, shared: bool, logins: [&str; 2]) {
+        let mut settings = settings_with(&[(1, logins[0]), (2, logins[1])]);
+        settings.seq = seq;
+        if shared {
+            settings.projects[1].repo = settings.projects[0].repo.clone();
+        }
+        store.lock().unwrap().apply_settings(settings).unwrap();
+    }
+
+    fn says_shared(status: &Option<FactoryStatus>) -> bool {
+        status
+            .as_ref()
+            .and_then(|s| s.idle.as_deref())
+            .is_some_and(|idle| idle.contains("also named"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_project_that_was_shared_and_is_watched_again_resumes_its_pass_count() {
+        let (_dir, store) = open_store();
+        share_repo(&store, 1, false, [LOGIN, "b-bot"]);
+        let host = fake_host();
+        host.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host, freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let store2 = store.clone();
+        let reached = tokio::task::spawn_blocking(move || {
+            wait_for("a pass", || {
+                status_of(&store2, project(1)).is_some_and(|s| s.pass >= 1)
+            });
+            status_of(&store2, project(1)).unwrap().pass
+        })
+        .await
+        .unwrap();
+        share_repo(&store, 2, true, [LOGIN, "b-bot"]);
+        clock.advance(SCAN);
+        let store2 = store.clone();
+        let shared = tokio::task::spawn_blocking(move || {
+            wait_for("the shared status", || {
+                says_shared(&status_of(&store2, project(1)))
+            });
+            status_of(&store2, project(1)).unwrap()
+        })
+        .await
+        .unwrap();
+        share_repo(&store, 3, false, [LOGIN, "b-bot"]);
+        clock.advance(SCAN);
+        let store2 = store.clone();
+        let resumed = tokio::task::spawn_blocking(move || {
+            came(|| {
+                status_of(&store2, project(1))
+                    .is_some_and(|s| !says_shared(&Some(s.clone())) && s.pass > reached)
+            })
+        })
+        .await
+        .unwrap();
+        running.abort();
+        assert!(
+            shared.pass >= reached,
+            "the shared status keeps the count: {} < {reached}",
+            shared.pass
+        );
+        assert!(resumed, "the count goes on above {reached}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_in_flight_when_its_project_becomes_shared_does_not_leave_its_own_status() {
+        let (_dir, store) = open_store();
+        share_repo(&store, 1, false, ["slow-bot", "b-bot"]);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let slow = Arc::new(Slow {
+            inner: Hub::new(),
+            gate: gate.clone(),
+            entered: AtomicBool::new(false),
+        });
+        let host = fake_host();
+        host.trackers.lock().unwrap().insert(
+            "slow-bot".into(),
+            Arc::new(Hiding::new(slow.clone(), shown())),
+        );
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host, freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let slow2 = slow.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the pass in flight", || {
+                slow2.entered.load(Ordering::SeqCst)
+            })
+        })
+        .await
+        .unwrap();
+        share_repo(&store, 2, true, ["slow-bot", "b-bot"]);
+        clock.advance(SCAN);
+        let store2 = store.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the shared status", || {
+                says_shared(&status_of(&store2, project(1)))
+            })
+        })
+        .await
+        .unwrap();
+        let_go(&gate);
+        let store2 = store.clone();
+        let overwritten = tokio::task::spawn_blocking(move || {
+            came(|| !says_shared(&status_of(&store2, project(1))))
+        })
+        .await
+        .unwrap();
+        let in_flight = status_of(&store, project(1)).map_or(0, |s| s.pass);
+        clock.advance(SCAN);
+        let store2 = store.clone();
+        let again = tokio::task::spawn_blocking(move || {
+            came(|| says_shared(&status_of(&store2, project(1))))
+        })
+        .await
+        .unwrap();
+        let last = status_of(&store, project(1));
+        running.abort();
+        assert!(overwritten, "the pass in flight writes its own status");
+        assert!(
+            again,
+            "the next scan writes the shared status again: {last:?}"
+        );
+        let last = last.unwrap();
+        assert!(!last.holds, "{last:?}");
+        assert!(last.pass >= in_flight, "{} < {in_flight}", last.pass);
+    }
 }
