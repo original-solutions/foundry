@@ -77,11 +77,17 @@
 //!   letters, digits and `-`. Turning a project on with no login named takes the acting
 //!   coordinator's default login at that moment (`foundryd github default`), and is `422` when
 //!   it names none, `503` when its secret store cannot be read. Only that machine's secret
-//!   store holds it, so such a request is carried there and decided there, against its own
-//!   copy; one carried to a machine that no longer acts is `503`, never carried on. A project
-//!   that is on acts as its login, so an edit that keeps it on and names none is `422`, and
-//!   changes nothing. Any other edit goes through [`Coordinator::edit`], which sends it to
-//!   whichever machine acts.
+//!   store holds it, so such a request is carried there and decided there, against its copy as
+//!   the request reads it; one carried to a machine that no longer acts is `503`, never carried
+//!   on. A project that is on acts as its login, so an edit that keeps it on and names none is
+//!   `422`, and changes nothing: a turn-on sent again after its answer was lost gets that `422`
+//!   when the first was made, which `GET /api/factory` then shows. Any other edit goes through
+//!   [`Coordinator::edit`], which sends it to whichever machine acts.
+//!
+//!   These rules are checked when the request is read, not when the edit is numbered, which
+//!   [`Coordinator::edit`] may do a little later, once the coordinator has caught up: an edit
+//!   numbered in between, such as a turn-on naming a login, is not seen. Checking them as the
+//!   edit is numbered is the coordinator's to do.
 //!
 //! Both edits are values sent whole, as P1's edits are, so an edit never merges a field with a
 //! copy that may be older: the last one numbered wins, as with any shared setting.
@@ -1112,7 +1118,7 @@ async fn project_factory(
         None => {
             // On with no login: only a turn-on takes one, the acting coordinator's default at
             // that moment (F4), which only that machine's secret store holds. So the edit is
-            // decided there, against the copy it is numbered against.
+            // decided there, against its copy as read now.
             let path = format!("/api/projects/{project}/factory");
             if let Some(answer) = view.at_coordinator(&headers, &path, &body).await? {
                 return Ok(answer);
@@ -1120,14 +1126,16 @@ async fn project_factory(
             if held_on {
                 return Err(unprocessable(format!(
                     "the factory of {:?} is on, and acts as its login: an edit of it names the \
-                     login, as GET /api/factory gives it",
+                     login, as GET /api/factory gives it (a turn-on sent again after a lost \
+                     answer finds the first one made)",
                     held_project.name
                 )));
             }
             if !on_github(&held_project.repo) {
                 return Err(refused_url());
             }
-            view.readable().await?;
+            // Read here and not through `secrets::github_default`, which takes a store that
+            // cannot be read for one with no default.
             let secrets = view.secrets.clone();
             match blocking(move || secrets.get(secrets::GITHUB_DEFAULT)).await? {
                 Ok(Some(login)) if secrets::is_login(&login) => login,
