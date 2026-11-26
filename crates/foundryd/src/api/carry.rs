@@ -14,10 +14,10 @@
 //! machine: it runs here, where a handler refuses anything this machine does not own, and is
 //! never carried on. Every other request, and one that names nothing elsewhere, runs here.
 //!
-//! Three Factory view routes are taken from a peer too, and carried by their own handlers
+//! Two Factory view routes are taken from a peer too, and carried by their own handlers
 //! ([`super::factory::view_router`]), never by this layer: `POST /api/factory/runs/{id}/stop`,
-//! to the machine believed to hold the run's lease, and `POST /api/factory/settings` and
-//! `POST /api/projects/{id}/factory`, to the acting coordinator.
+//! to the machine believed to hold the run's lease, and `POST /api/projects/{id}/factory`, to
+//! the acting coordinator when it must fill in its default login.
 //!
 //! The factory's worker routes ([`super::factory`]) are carried too, but never by this layer: a
 //! request to one runs here, where it is `404` unless marked. A run carries its own call with
@@ -51,8 +51,9 @@ enum Target {
     Terminal(TerminalId),
     /// A factory worker route, which only a run carries.
     Worker(Worker),
-    /// A Factory view route whose handler carries it: a stop, to the lease holder, and an edit
-    /// of the fleet's or a project's factory settings, to the acting coordinator.
+    /// A Factory view route whose handler carries it: a stop, to the lease holder, and a
+    /// project's factory edit, to the acting coordinator when it must fill in its default
+    /// login.
     View,
 }
 
@@ -131,7 +132,6 @@ fn target(path: &str) -> Option<Target> {
             id.parse::<uuid::Uuid>().ok()?;
             Some(Target::View)
         }
-        ["factory", "settings"] => Some(Target::View),
         _ => None,
     }
 }

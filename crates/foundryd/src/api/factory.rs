@@ -66,23 +66,27 @@
 //!   machine carries it to the machine whose believed status holds the lease, and answers as it
 //!   answers. A stop carried here that finds no lease held, or asked where no holder is
 //!   believed, is `409` with the reason, and nothing is written.
-//! - `POST /api/factory/settings` with any of the fleet settings' fields: the held settings with
-//!   those fields changed, sent through the coordinator as every shared setting is, `200
-//!   {settings}`. A field it does not have, or a value out of range (`poll_seconds` from 10 to
-//!   60) or that Claude Code would not take as one word (`model`, `effort`), is `422`.
-//! - `POST /api/projects/{id}/factory` with any of `{on, login, paused}`: the project's factory
-//!   setting with those changed, sent through the coordinator, `200 {factory}`. Turning a
-//!   project on is `422` unless its repo URL starts `https://github.com/` and names a repo:
-//!   SSH and other hosts are out of scope. A login is letters, digits and `-`. One named is
-//!   written as named. Turning a project on with none named takes the acting coordinator's
+//! - `POST /api/factory/settings` with every field of the fleet's factory settings: sent
+//!   through the coordinator as every shared setting is, `200 {settings}`. A field left out or
+//!   one it does not have, a value out of range (`poll_seconds` from 10 to 60), or one Claude
+//!   Code would not take as one word (`model`, `effort`), is `422`.
+//! - `POST /api/projects/{id}/factory` `{on, paused, login}`: the project's factory setting,
+//!   sent through the coordinator, `200 {factory}`. `login` may be left out, `null` or blank,
+//!   which names none. Turning a project on is `422` unless its repo URL starts
+//!   `https://github.com/` and names a repo: SSH and other hosts are out of scope. A login is
+//!   letters, digits and `-`. A project on with no login named takes the acting coordinator's
 //!   default login at that moment ([`secrets::github_default`]), and is `422` when it names
-//!   none; any other edit that names none keeps the login held.
+//!   none: only the acting coordinator's secret store holds it, so such a request is carried
+//!   there and made there, and one carried to a machine that no longer acts is `503`, never
+//!   carried on. Any other edit goes through [`Coordinator::edit`], which sends it to whichever
+//!   machine acts.
 //!
-//! Both edits are checked against this machine's copy of the settings, then carried to the
-//! acting coordinator, which merges the fields with its own copy, the one it numbers the edit
-//! against, so an edit never puts back a field another edit changed that has not reached this
-//! machine yet. A request carried to a machine that no longer acts is `503`, and never carried
-//! on.
+//! Both edits are values sent whole, as P1's edits are, so an edit never merges a field with a
+//! copy that may be older: the last one numbered wins, as with any shared setting.
+//!
+//! Every answer is `503` when the secret store cannot be read, since its strings must have the
+//! known secrets hidden. A write is refused so before it is made; one made before the store
+//! stopped being readable is still `200`, with its strings given as unreadable.
 //!
 //! Every string these answers hold is passed through [`secrets::hide_known`] first, so a token
 //! a writer left unhidden in a status or a run event is not shown.
@@ -668,7 +672,8 @@ fn strings_of<'a>(value: &'a mut Value, texts: &mut Vec<&'a mut String>) {
 
 /// Every string in `value` passed through `hide`, which reads the secret store each time it is
 /// called: the strings are joined by [`JOINT`] and hidden in one call, or each in a call of its
-/// own when one of them holds the joint or the hidden text no longer splits into as many. The
+/// own when one of them holds the joint's middle character or the hidden text no longer splits
+/// into as many. The
 /// keys of its objects stay as they are. A `hide` that answers
 /// [`HIDDEN_UNREADABLE`](secrets::HIDDEN_UNREADABLE) for text that did not say so is a store
 /// that could not be read: [`Unreadable`], and `value` is left as it was, never half hidden.
@@ -685,7 +690,9 @@ pub(super) fn hide_strings(
     let unread = |text: &str, hidden: &str| {
         hidden == secrets::HIDDEN_UNREADABLE && text != secrets::HIDDEN_UNREADABLE
     };
-    if !texts.iter().any(|text| text.contains(JOINT)) {
+    // A string with the joint's middle in it is hidden on its own: one that ended with the
+    // joint's start would split back at the wrong place.
+    if !texts.iter().any(|text| text.contains('\u{E000}')) {
         let joined = texts
             .iter()
             .map(|text| text.as_str())
@@ -753,6 +760,40 @@ impl View {
         Ok(Json(self.hidden(value).await?).into_response())
     }
 
+    /// `503`, before anything is written, when the secret store cannot be read: the answer to
+    /// a write must have the known secrets hidden, and a `503` on a write route then always
+    /// means nothing was done.
+    async fn readable(&self) -> Result<(), ApiError> {
+        let probe = "the secret store is read";
+        if self.hide(probe.to_owned()).await == secrets::HIDDEN_UNREADABLE {
+            return Err(ApiError::Rejected(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the secret store could not be read, so nothing was done: the answer must have \
+                 the known secrets hidden"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The `200` answer to a write that was made: `value` hidden, or, should the secret store
+    /// stop being readable since [`View::readable`], with every string of it given as
+    /// [`HIDDEN_UNREADABLE`](secrets::HIDDEN_UNREADABLE), so it is never answered as not made.
+    async fn answer_made(&self, value: Value) -> Result<Response, ApiError> {
+        let mut shown = value.clone();
+        match self.hidden(value).await {
+            Ok(hidden) => Ok(Json(hidden).into_response()),
+            Err(_) => {
+                let mut texts = Vec::new();
+                strings_of(&mut shown, &mut texts);
+                for text in texts {
+                    *text = secrets::HIDDEN_UNREADABLE.to_owned();
+                }
+                Ok(Json(shown).into_response())
+            }
+        }
+    }
+
     /// `text` with the known secrets hidden.
     async fn hide(&self, text: String) -> String {
         let secrets = self.secrets.clone();
@@ -761,9 +802,8 @@ impl View {
             .unwrap_or_else(|_| secrets::HIDDEN_UNREADABLE.to_owned())
     }
 
-    /// Where an edit of the shared factory settings is made: on the acting coordinator, so it
-    /// is merged with the copy it is numbered against, not with a copy here that may be older.
-    /// `None` on that machine. On any other, the acting coordinator's answer to the request,
+    /// Where an edit that needs the acting coordinator's own secret store is made: on that
+    /// machine. `None` there. On any other, the acting coordinator's answer to the request,
     /// `path` with `body`, carried there; a request carried here is `503`, never carried on.
     async fn at_coordinator(
         &self,
@@ -880,6 +920,7 @@ async fn stop_run(
         .of_repo(run.repo())
         .and_then(|(_, leased): (ProjectId, Leased)| leased.holding());
     if let Some((guard, generation)) = held {
+        view.readable().await?;
         return stop_here(&view, run, guard, generation).await;
     }
     let repo = run.repo().to_owned();
@@ -943,7 +984,7 @@ async fn stop_here(
     match asked {
         Ok(request) => match request.answer(&id) {
             StopAnswer::Stopped { already, message } => {
-                view.answer(serde_json::json!({
+                view.answer_made(serde_json::json!({
                     "stopped": true,
                     "already": already,
                     "message": message,
@@ -967,52 +1008,42 @@ async fn stop_here(
     }
 }
 
-/// `held` as JSON, with the fields of `changes` put over it: `422` for a field `held` does not
-/// have.
-fn changed(held: Value, changes: Map<String, Value>, what: &str) -> Result<Value, ApiError> {
-    let Value::Object(mut fields) = held else {
+async fn fleet_settings(State(view): State<Arc<View>>, body: Bytes) -> Result<Response, ApiError> {
+    let sent: Map<String, Value> = read(&body)?;
+    // The value is sent whole, as every shared setting is: a field left out is not taken for
+    // its default, nor for the held one.
+    let Value::Object(fields) = to_json(&FactorySettings::default())? else {
         return Err(ApiError::Rejected(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("the held {what} are not an object"),
+            "the factory settings are not an object".to_owned(),
         ));
     };
-    for (name, value) in changes {
-        if !fields.contains_key(&name) {
-            return Err(unprocessable(format!("{what} have no field {name:?}")));
-        }
-        fields.insert(name, value);
+    if let Some(name) = sent.keys().find(|name| !fields.contains_key(*name)) {
+        return Err(unprocessable(format!(
+            "the factory settings have no field {name:?}"
+        )));
     }
-    Ok(Value::Object(fields))
-}
-
-async fn fleet_settings(
-    State(view): State<Arc<View>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    let changes: Map<String, Value> = read(&body)?;
-    let held = on_store(&view.store, |store| store.settings())
-        .await?
-        .factory
-        .unwrap_or_default();
-    let merged = changed(to_json(&held)?, changes, "the factory settings")?;
-    let settings: FactorySettings = serde_json::from_value(merged)
+    let missing: Vec<&str> = fields
+        .keys()
+        .filter(|name| !sent.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(unprocessable(format!(
+            "the factory settings are sent whole; this edit leaves out {}",
+            missing.join(", ")
+        )));
+    }
+    let settings: FactorySettings = serde_json::from_value(Value::Object(sent))
         .map_err(|e| unprocessable(format!("the factory settings are not taken: {e}")))?;
     one_word("a model", &settings.model)?;
     one_word("an effort", &settings.effort)?;
-    // Checked against this machine's copy, so a refusal costs no call; made on the
-    // coordinator's.
-    if let Some(answer) = view
-        .at_coordinator(&headers, "/api/factory/settings", &body)
-        .await?
-    {
-        return Ok(answer);
-    }
+    view.readable().await?;
     view.edit(Edit::SetFactory {
         settings: settings.clone(),
     })
     .await?;
-    view.answer(serde_json::json!({ "settings": to_json(&settings)? }))
+    view.answer_made(serde_json::json!({ "settings": to_json(&settings)? }))
         .await
 }
 
@@ -1022,6 +1053,17 @@ fn on_github(repo: &str) -> bool {
     repo.starts_with(GITHUB_HTTPS) && github_repo(repo).is_some()
 }
 
+/// A project's factory setting as an edit sends it: whole, but for a login it may leave out.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectEdit {
+    on: bool,
+    paused: bool,
+    /// Absent, `null` or blank names none.
+    #[serde(default)]
+    login: Option<String>,
+}
+
 async fn project_factory(
     State(view): State<Arc<View>>,
     headers: HeaderMap,
@@ -1029,12 +1071,11 @@ async fn project_factory(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let project = parse_id(&id, "project", ProjectId)?;
-    let mut changes: Map<String, Value> = read(&body)?;
-    let named = match changes.remove("login") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(login)) => Some(login.trim().to_owned()).filter(|l| !l.is_empty()),
-        Some(_) => return Err(unprocessable("a login is text".to_owned())),
-    };
+    let edit: ProjectEdit = read(&body)?;
+    let named = edit
+        .login
+        .map(|login| login.trim().to_owned())
+        .filter(|login| !login.is_empty());
     if let Some(login) = &named
         && !secrets::is_login(login)
     {
@@ -1044,35 +1085,29 @@ async fn project_factory(
     let Some(held_project) = settings.projects.iter().find(|p| p.id == project) else {
         return Err(ApiError::NotFound(format!("no project {project} here")));
     };
-    let held = settings
+    let held_on = settings
         .project_factory
         .get(&project)
-        .cloned()
-        .unwrap_or_default();
-    let merged = changed(to_json(&held)?, changes, "a project's factory settings")?;
-    let mut factory: ProjectFactory = serde_json::from_value(merged)
-        .map_err(|e| unprocessable(format!("the project's factory setting is not taken: {e}")))?;
-    let turning_on = factory.on && !held.on;
-    match named {
-        Some(login) => factory.login = login,
-        // Turned on with no login named: the coordinator's default at this moment, below.
-        None if turning_on => factory.login.clear(),
-        None => {}
-    }
-    if turning_on && !on_github(&held_project.repo) {
+        .is_some_and(|factory| factory.on);
+    if edit.on && !held_on && !on_github(&held_project.repo) {
         return Err(unprocessable(format!(
             "the factory of {:?} cannot be turned on: its repo URL does not start \
              {GITHUB_HTTPS} and name a repo there, and a factory reaches GitHub only over HTTPS",
             held_project.name
         )));
     }
-    // Checked against this machine's copy, so a refusal costs no call; made on the
-    // coordinator's, which also fills in its own default login.
-    let path = format!("/api/projects/{project}/factory");
-    if let Some(answer) = view.at_coordinator(&headers, &path, &body).await? {
-        return Ok(answer);
-    }
+    let mut factory = ProjectFactory {
+        on: edit.on,
+        login: named.unwrap_or_default(),
+        paused: edit.paused,
+    };
     if factory.on && factory.login.is_empty() {
+        // The login is the acting coordinator's default at this moment (F4), which only that
+        // machine's secret store holds: the edit is made there.
+        let path = format!("/api/projects/{project}/factory");
+        if let Some(answer) = view.at_coordinator(&headers, &path, &body).await? {
+            return Ok(answer);
+        }
         let secrets = view.secrets.clone();
         match blocking(move || secrets::github_default(&*secrets)).await? {
             Some(login) => factory.login = login,
@@ -1086,12 +1121,13 @@ async fn project_factory(
             }
         }
     }
+    view.readable().await?;
     view.edit(Edit::SetProjectFactory {
         project,
         factory: factory.clone(),
     })
     .await?;
-    view.answer(serde_json::json!({ "factory": to_json(&factory)? }))
+    view.answer_made(serde_json::json!({ "factory": to_json(&factory)? }))
         .await
 }
 

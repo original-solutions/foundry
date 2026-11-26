@@ -17,7 +17,8 @@
 //!   the statuses again. When a project that had a status has none believed any more, the
 //!   whole state is sent again, then the statuses still believed, so the UI drops what it
 //!   held. Its strings have the known secrets hidden ([`Api::secrets`]); a status is not sent
-//!   while the secret store cannot be read, and is tried again. No run event is ever sent, on
+//!   while the secret store cannot be read, and is tried again after a wait that doubles from
+//!   a second to half a minute, with one warning when it starts. No run event is ever sent, on
 //!   this socket or in `GET /api/state`: those are P1's records.
 //! - `GET /api/terminals/{id}`, a WebSocket: see [`terminals`].
 //! - `GET /api/machine`: `{id}`, the machine that serves the UI, see [`machine`].
@@ -607,7 +608,16 @@ struct Believed {
     /// the statuses were last read: `None` before the first read.
     read_at: Option<(BTreeMap<MachineId, u64>, u64, BTreeSet<MachineId>)>,
     statuses: BTreeMap<ProjectId, foundry_proto::factory::FactoryStatus>,
+    /// While the secret store cannot be read: when to try again, and how long the last wait
+    /// was, doubled each time up to [`UNREADABLE_WAIT_MOST`].
+    unreadable: Option<(tokio::time::Instant, Duration)>,
 }
+
+/// The first wait before a status the secret store could not hide is tried again.
+const UNREADABLE_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest wait before a status the secret store could not hide is tried again.
+const UNREADABLE_WAIT_MOST: Duration = Duration::from_secs(30);
 
 /// What [`send_factory`] did.
 #[derive(Debug, PartialEq, Eq)]
@@ -632,6 +642,12 @@ async fn send_factory(
     seq: u64,
     online: &BTreeSet<MachineId>,
 ) -> Result<Factory, StoreError> {
+    if believed
+        .unreadable
+        .is_some_and(|(again, _)| tokio::time::Instant::now() < again)
+    {
+        return Ok(Factory::Sent);
+    }
     let versions = on_store(&api.store, |store| store.factory_versions()).await?;
     let now = (versions, seq, online.clone());
     if believed.read_at.as_ref() == Some(&now) {
@@ -650,8 +666,9 @@ async fn send_factory(
     {
         return Ok(Factory::Gone);
     }
-    // A status that could not be written leaves the read to be made again on the next tick.
+    // A status that could not be hidden leaves the read to be made again, after a wait.
     believed.read_at = Some(now);
+    let mut hidden_all = true;
     for (project, (_, status)) in read {
         if believed.statuses.get(&project) == Some(&status) {
             continue;
@@ -660,27 +677,56 @@ async fn send_factory(
             protocol: PROTOCOL,
             status: status.clone(),
         };
-        let Some(text) = hidden_text(api, &message).await else {
-            believed.read_at = None;
-            continue;
+        let text = match hidden_text(api, &message).await {
+            Ok(text) => text,
+            Err(Unsent::Unreadable) => {
+                hidden_all = false;
+                continue;
+            }
+            // Logged; a status that cannot be written is not tried again until it changes.
+            Err(Unsent::Unwritable) => continue,
         };
         if socket.send(ws::Message::Text(text.into())).await.is_err() {
             return Ok(Factory::Closed);
         }
         believed.statuses.insert(project, status);
     }
+    if hidden_all {
+        if believed.unreadable.take().is_some() {
+            tracing::info!("api: the factory statuses are sent again: the secret store reads");
+        }
+    } else {
+        believed.read_at = None;
+        let wait = match believed.unreadable {
+            None => {
+                tracing::warn!(
+                    "api: factory statuses are not sent while the secret store cannot be read"
+                );
+                UNREADABLE_WAIT
+            }
+            Some((_, wait)) => (wait * 2).min(UNREADABLE_WAIT_MOST),
+        };
+        believed.unreadable = Some((tokio::time::Instant::now() + wait, wait));
+    }
     Ok(Factory::Sent)
 }
 
+/// Why [`hidden_text`] gave no text.
+enum Unsent {
+    /// The secret store could not be read: tried again later.
+    Unreadable,
+    /// The message could not be written as JSON, which is logged.
+    Unwritable,
+}
+
 /// `message` as JSON text, every string in it hidden with the known secrets of
-/// [`Api::secrets`], or only the passwords of URLs without one. `None`, logged, when it cannot
-/// be written, or the secret store cannot be read.
-async fn hidden_text(api: &Api, message: &UiMessage) -> Option<String> {
+/// [`Api::secrets`], or only the passwords of URLs without one; or why there is none.
+async fn hidden_text(api: &Api, message: &UiMessage) -> Result<String, Unsent> {
     let mut value = match serde_json::to_value(message) {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!("api: an event cannot be sent: {error}");
-            return None;
+            return Err(Unsent::Unwritable);
         }
     };
     let secrets = api.secrets.clone();
@@ -695,14 +741,11 @@ async fn hidden_text(api: &Api, message: &UiMessage) -> Option<String> {
     })
     .await;
     match hidden {
-        Ok(Ok(text)) => Some(text),
-        Ok(Err(factory::Unreadable)) => {
-            tracing::warn!("api: a factory status is not sent: the secret store could not be read");
-            None
-        }
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(factory::Unreadable)) => Err(Unsent::Unreadable),
         Err(error) => {
             tracing::warn!("api: an event cannot be sent: {error}");
-            None
+            Err(Unsent::Unwritable)
         }
     }
 }
