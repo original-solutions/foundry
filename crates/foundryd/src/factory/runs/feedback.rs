@@ -1416,9 +1416,6 @@ fn finish_stuck(
     let Some(raw) = &seen.stuck_stop else {
         return Ok(None);
     };
-    if seen.state == Some(State::Stuck) {
-        return Ok(None);
-    }
     let decision: StuckStop = serde_json::from_str(raw)
         .map_err(|error| RunError::Invalid(format!("the stuck decision of {run}: {error}")))?;
     let owned = round.is_some_and(|round| !round.launched())
@@ -1435,8 +1432,12 @@ fn finish_stuck(
         &round_seen(seen, round),
         State::Building,
     );
-    if seen.state == Some(State::PrOpen) {
-        at.state = State::PrOpen;
+    // A path cut after its move to `stuck` is finished with the one line it lacks: `go_stuck`
+    // writes only `finished` for a run already there.
+    match seen.state {
+        Some(State::PrOpen) => at.state = State::PrOpen,
+        Some(State::Stuck) => at.state = State::Stuck,
+        _ => {}
     }
     let reason = recorded_reason(&stop);
     go_stuck(ctx, run.issue(), &mut at, &decision.code, stop, None)?;
