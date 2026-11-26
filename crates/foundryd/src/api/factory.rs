@@ -1775,6 +1775,20 @@ mod view_tests {
             .count()
     }
 
+    /// The `stop_requested` events of the run in `machine`'s store that `writer` wrote, so a
+    /// copy that sync brought from another writer is never counted.
+    fn stops_written_by(machine: &Served, writer: MachineId) -> usize {
+        machine
+            .store
+            .lock()
+            .unwrap()
+            .run_events_by(&run_id(), writer, None)
+            .unwrap()
+            .iter()
+            .filter(|(_, event)| event.event == "stop_requested")
+            .count()
+    }
+
     // ----- GET /api/factory -----
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1904,7 +1918,7 @@ mod view_tests {
         assert_eq!(stop.event, "stop_requested");
         assert_eq!(stop.generation, 3, "written at the holder's generation");
         assert_eq!(
-            stops_held(other),
+            stops_written_by(other, other.me),
             0,
             "the machine asked writes nothing itself"
         );
