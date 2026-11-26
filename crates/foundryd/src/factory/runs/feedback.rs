@@ -3997,6 +3997,74 @@ mod tests {
             assert!(!round_pending(&world.events()));
         }
 
+        /// A world whose first pass was cut right after the decision was recorded: the run is
+        /// still `pr-open`, its label not moved.
+        fn cut_before_the_move() -> World {
+            let mut world = healthy();
+            world.rig.guard = Box::new(HeldFor::new(3));
+            assert!(world.try_go().is_err(), "the cut pass fails");
+            world.rig.guard = Box::new(crate::factory::worker::AlwaysHeld(1));
+            assert_eq!(world.decisions().len(), 1);
+            assert_eq!(world.seen().state, Some(State::PrOpen));
+            world
+        }
+
+        #[test]
+        fn a_round_carried_on_in_pr_open_waits_when_no_run_slot_is_free_and_writes_nothing() {
+            let world = cut_before_the_move();
+            let before = world.count();
+            let mut free = slots(0);
+            let step = world
+                .try_pass(&mut free, &mut Reserved::default())
+                .unwrap();
+            assert_eq!(
+                step,
+                FeedbackStep::Waiting {
+                    reason: NO_SLOT.into()
+                }
+            );
+            assert_eq!(world.count(), before);
+            assert_eq!(free.runs_free, 0);
+            assert_eq!(world.rig.sim.labels(), ["factory:pr-open"]);
+            assert!(world.writes().is_empty());
+            assert!(world.rig.worker.calls().is_empty());
+        }
+
+        #[test]
+        fn a_round_carried_on_in_pr_open_takes_the_free_run_slot() {
+            let world = cut_before_the_move();
+            let mut free = slots(1);
+            let step = world
+                .try_pass(&mut free, &mut Reserved::default())
+                .unwrap();
+            assert!(matches!(step, FeedbackStep::Decided { round: 1, .. }), "{step:?}");
+            assert_eq!(free.runs_free, 0);
+            assert_eq!(world.rig.sim.labels(), ["factory:building"]);
+        }
+
+        #[test]
+        fn a_round_carried_on_in_building_has_its_slot_already_and_takes_none() {
+            let mut world = healthy();
+            assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+            assert_eq!(world.seen().state, Some(State::Building));
+            world.rig.worker.on_create(Ok(fresh()));
+            let mut free = slots(2);
+            let step = world
+                .try_pass(&mut free, &mut Reserved::default())
+                .unwrap();
+            assert_eq!(step, FeedbackStep::Preparing(Wait::Workspace));
+            assert_eq!(free.runs_free, 2);
+            // With none free it goes on all the same: the round holds the slot it took.
+            world.rig.view = round_view();
+            world.rig.worker.on_start_session(Ok(round_session()));
+            let mut none = slots(0);
+            let step = world
+                .try_pass(&mut none, &mut Reserved::default())
+                .unwrap();
+            assert!(matches!(step, FeedbackStep::Started { .. }), "{step:?}");
+            assert_eq!(none.runs_free, 0);
+        }
+
         #[test]
         fn a_launch_that_is_cut_short_after_the_session_is_recorded_is_finished_without_a_second_launch()
          {
