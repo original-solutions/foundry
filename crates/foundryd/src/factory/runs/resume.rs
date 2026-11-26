@@ -67,8 +67,9 @@
 //!   same thread a message. Foundry resumes in a new workspace of the same run, so the runner's
 //!   attempt+1 mechanics (`carryOutRelaunch`, `endUnbegunRelaunch`, `carryStopToNext`, a worktree
 //!   removed with `worktree_removed`, the next attempt's approval) have no counterpart. The
-//!   counter is the newest `session_interrupted` line's `resumes`; the feedback round's reset is
-//!   task 28's.
+//!   count on a `session_interrupted` line (`resumes`, which names `-r<k>`) is the run's whole
+//!   count, while the cap counts only the lines after the newest `feedback_relaunching`: a
+//!   feedback round starts `interruption_resumes` again (task 28), and no name is reused.
 //! - A session is read by the fleet, not by a thread's status: there is no T3 evidence (a T3
 //!   error in the machine log, `endedInPass`, T3 starts and stops), so a session that ended is
 //!   resumed up to the cap with none, where the runner needed evidence or a second end in one
@@ -1276,6 +1277,20 @@ fn choose_branch(ctx: &RunContext<'_>, issue: u64, seen: &Seen) -> Result<Branch
     Ok(Branch::Use(None))
 }
 
+/// How many resumes count against `limits.interruption_resumes`: the `session_interrupted`
+/// lines after the newest `feedback_relaunching`, since a feedback round starts the cap again.
+/// The `-r<k>` names keep the run's whole count, so no name is reused.
+fn resumes_this_round(events: &[RunEvent]) -> u64 {
+    let round = events
+        .iter()
+        .rposition(|event| event.event == "feedback_relaunching")
+        .map_or(0, |at| at + 1);
+    events[round..]
+        .iter()
+        .filter(|event| event.event == "session_interrupted")
+        .count() as u64
+}
+
 /// The first pass: the cap, the branch, the decision, and the archive of the earlier workspace.
 fn decide(
     ctx: &RunContext<'_>,
@@ -1291,16 +1306,18 @@ fn decide(
         return Ok(step);
     }
     ensure_building(ctx, issue, at)?;
-    let used = seen
+    // The names count across the whole run; the cap counts this round's resumes only.
+    let resumes = seen
         .interruption
         .as_ref()
         .map_or(0, |interruption| interruption.resumes);
+    let used = resumes_this_round(events);
     let (code, stop) = ended.stop();
     // The machine is gone: nothing can be asked of it, and it ends its own sessions.
     if *ended == Ended::Unreachable {
         at.worktree = None;
     }
-    if u64::from(used) >= ctx.config.limits.interruption_resumes {
+    if used >= ctx.config.limits.interruption_resumes {
         return stuck(ctx, run, at, code, stop);
     }
     // A resume starts a session, which the approval must stand behind.
@@ -1323,7 +1340,7 @@ fn decide(
             return stuck(ctx, run, at, STUCK_LAUNCH, stop);
         }
     };
-    let k = used + 1;
+    let k = resumes + 1;
     ctx.held()?;
     ctx.record(
         run,
