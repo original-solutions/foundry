@@ -4867,4 +4867,106 @@ mod tests {
             assert_eq!(book.runs_free(3), 3);
         }
     }
+
+    mod a_failed_claim_keeps_what_the_pass_reserved {
+        use super::*;
+
+        /// Every write of a run event of `issue` that names a state change fails from now on, as
+        /// a store that fails after the claim recorded its run does.
+        fn fail_state_change_of(rig: &Rig, issue: u64) {
+            let conn = rusqlite::Connection::open(rig._dir.path().join("foundry.db")).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER fail_issue_{issue} BEFORE INSERT ON factory_records \
+                 WHEN NEW.kind = 'run_event' AND NEW.id LIKE 'rawphp__softfac__{issue}__%' \
+                 AND NEW.record LIKE '%state_changed%' \
+                 BEGIN SELECT RAISE(ABORT, 'the write failed'); END;"
+            ))
+            .unwrap();
+        }
+
+        #[test]
+        fn a_claim_placed_and_started_earlier_still_holds_its_machine_after_a_later_claim_fails() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 5);
+            // Only the builder takes a session, and it takes two.
+            rig.shared.limits.insert(builder_machine(), limits(2));
+            for issue in [5, 6, 7] {
+                rig.hub.ready(issue);
+            }
+            // The fleet shows the workspace of 5 ready, so its session starts in the claim's own
+            // advance: the run holds no machine reservation in the ledger from then on.
+            let terminal = TerminalId(uuid::Uuid::from_u128(0x78));
+            rig.view = FleetView::builder()
+                .online(me())
+                .online(builder_machine())
+                .sample(sample(builder_machine(), 0))
+                .held(
+                    builder_machine(),
+                    MachineHeld {
+                        logins: vec![LOGIN.into()],
+                        skill: true,
+                    },
+                )
+                .workspace(Record {
+                    owner: builder_machine(),
+                    version: 1,
+                    deleted: false,
+                    body: Workspace {
+                        id: WorkspaceId(uuid::Uuid::from_u128(0x77)),
+                        project: project_id(),
+                        name: "fac/5-1".into(),
+                        branch: "fac/5-1".into(),
+                        base: "main".into(),
+                        setup: Some(terminal),
+                    },
+                })
+                .terminal(Record {
+                    owner: builder_machine(),
+                    version: 1,
+                    deleted: false,
+                    body: foundry_proto::record::Terminal {
+                        id: terminal,
+                        workspace: WorkspaceId(uuid::Uuid::from_u128(0x77)),
+                        state: foundry_proto::state::TerminalState::Exited,
+                        exit_code: Some(0),
+                    },
+                })
+                .build();
+            fail_state_change_of(&rig, 6);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert!(
+                rig.ledger
+                    .read(&RunId::new(REPO, 6, 1).unwrap())
+                    .is_ok_and(|events| !events.is_empty()),
+                "the claim of 6 recorded its run before it failed: {report:?}"
+            );
+            assert!(
+                report
+                    .runs
+                    .iter()
+                    .any(|(run, said)| run.issue() == 5 && said.contains("session started")),
+                "the session of 5 started: {report:?}"
+            );
+            assert!(
+                !rig.claimed_issues().contains(&7),
+                "5 and 6 hold the builder's two sessions: {report:?}"
+            );
+            let reason = waiting_reason(&report, 7).unwrap_or_default();
+            assert!(reason.contains("no machine"), "{reason}");
+        }
+
+        #[test]
+        fn a_claim_that_fails_after_it_recorded_keeps_its_slot_against_the_next_ready_issue() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            rig.hub.ready(5);
+            rig.hub.ready(6);
+            fail_state_change_of(&rig, 5);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(rig.claimed_issues(), vec![5], "{report:?}");
+            assert_eq!(waiting_reason(&report, 6).as_deref(), Some(NO_SLOT));
+        }
+    }
 }
