@@ -2128,6 +2128,8 @@ mod tests {
         inner: FakeWorker,
         lost: Arc<AtomicBool>,
         late: Mutex<Vec<String>>,
+        /// Run after each archive call, with the workspace archived.
+        after_archive: Mutex<Option<Box<dyn Fn(WorkspaceId) + Send + Sync>>>,
     }
 
     impl Watched {
@@ -2168,7 +2170,11 @@ mod tests {
         }
         fn archive(&self, w: WorkspaceId) -> Result<(), WorkerError> {
             self.note("archive");
-            self.inner.archive(w)
+            let archived = self.inner.archive(w);
+            if let Some(hook) = self.after_archive.lock().unwrap().as_ref() {
+                hook(w);
+            }
+            archived
         }
     }
 
@@ -2277,6 +2283,7 @@ mod tests {
                     inner: FakeWorker::new(),
                     lost,
                     late: Mutex::new(vec![]),
+                    after_archive: Mutex::new(None),
                 },
                 view: fleet(),
                 guard: Box::new(AlwaysHeld(1)),
@@ -5183,6 +5190,156 @@ mod tests {
                 .map(|finished| finished.run.clone())
                 .collect();
             assert_eq!(runs, vec![second, first]);
+        }
+    }
+
+    mod the_sweep_when_the_store_fails {
+        use super::*;
+        use crate::factory::ledger::events::Outcome;
+
+        fn finish(rig: &Rig, run: &RunId) {
+            rig.ledger
+                .write(
+                    run,
+                    &Event::Finished {
+                        outcome: Outcome::PrOpen,
+                        total_ms: 0,
+                        gate_attempts: 0,
+                        review_cycles: None,
+                        pr_url: None,
+                        pr_end: None,
+                    },
+                    &Cause::new(CauseStep::Start, "test"),
+                )
+                .unwrap();
+        }
+
+        /// A finished run of `issue`.
+        fn finished(rig: &Rig, issue: u64) -> RunId {
+            let run = rig.run_in(issue, 1, State::Building);
+            finish(rig, &run);
+            run
+        }
+
+        fn workspace_of(issue: u64) -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(0xa00 + u128::from(issue)))
+        }
+
+        /// The fleet with the build workspace of each of `issues` live on the builder.
+        fn fleet_with(issues: &[u64]) -> FleetView {
+            let mut view = FleetView::builder().online(me()).online(builder_machine());
+            for issue in issues {
+                view = view.workspace(Record {
+                    owner: builder_machine(),
+                    version: 1,
+                    deleted: false,
+                    body: Workspace {
+                        id: workspace_of(*issue),
+                        project: project_id(),
+                        name: format!("fac/{issue}-1"),
+                        branch: format!("fac/{issue}-1"),
+                        base: "main".into(),
+                        setup: None,
+                    },
+                });
+            }
+            view.build()
+        }
+
+        /// From the archive of `issue`'s workspace on, every read of the store fails with an
+        /// error that is not a decode error: the table is gone, as a store that fails does.
+        fn break_store_when_archived(rig: &Rig, issue: u64) {
+            break_store_with(rig, issue, "ALTER TABLE factory_records RENAME TO gone");
+        }
+
+        /// The same, with `sql` run on the database as the store's failure.
+        fn break_store_with(rig: &Rig, issue: u64, sql: &'static str) {
+            let path = rig._dir.path().join("foundry.db");
+            *rig.worker.after_archive.lock().unwrap() = Some(Box::new(move |archived| {
+                if archived == workspace_of(issue) {
+                    rusqlite::Connection::open(&path)
+                        .unwrap()
+                        .execute_batch(sql)
+                        .unwrap();
+                }
+            }));
+        }
+
+        fn unreadable_notes(report: &PassReport) -> Vec<&RunId> {
+            report
+                .runs
+                .iter()
+                .filter(|(_, said)| said == UNREADABLE_SWEPT)
+                .map(|(run, _)| run)
+                .collect()
+        }
+
+        /// Run 3 and run 4 are finished and seen so by a first pass. Then run 3's workspace
+        /// is live again, the sweep is due, and the store fails once run 3's is archived.
+        #[test]
+        fn a_reconcile_that_fails_in_the_store_ends_the_pass_and_notes_no_run() {
+            let mut rig = Rig::new();
+            let (first, second) = (finished(&rig, 3), finished(&rig, 4));
+            assert_eq!(rig.pass().failed, None);
+            rig.view = fleet_with(&[3]);
+            rig.clock.advance(STUCK_READ_EVERY);
+            break_store_when_archived(&rig, 3);
+            let report = rig.pass();
+            assert!(report.failed.is_some(), "{report:?}");
+            assert!(
+                report.archived.contains(&workspace_of(3)),
+                "run {first}'s workspace was archived before the store failed: {report:?}"
+            );
+            assert_eq!(
+                unreadable_notes(&report),
+                Vec::<&RunId>::new(),
+                "run {second} is readable: only the store failed: {report:?}"
+            );
+        }
+
+        /// Run 4 finished after the first pass, so the memo does not know it: asking the store
+        /// whether it finished is the first read to fail. A failed question is not an answer of
+        /// "not finished": the sweep did not reach run 4, and the pass says so.
+        #[test]
+        fn a_failed_check_for_a_finished_run_ends_the_pass() {
+            let mut rig = Rig::new();
+            finished(&rig, 3);
+            assert_eq!(rig.pass().failed, None);
+            let second = finished(&rig, 4);
+            rig.view = fleet_with(&[3]);
+            rig.clock.advance(STUCK_READ_EVERY);
+            break_store_with(&rig, 3, "ALTER TABLE factory_records DROP COLUMN record");
+            let report = rig.pass();
+            assert!(
+                report.failed.is_some(),
+                "the sweep could not ask whether {second} finished: {report:?}"
+            );
+            assert_eq!(
+                unreadable_notes(&report),
+                Vec::<&RunId>::new(),
+                "{report:?}"
+            );
+        }
+
+        /// The store fails after run 3's reconcile, and the orphan read of the same run is the
+        /// first read to find it.
+        #[test]
+        fn an_orphan_read_that_fails_in_the_store_ends_the_pass_and_notes_no_run() {
+            let mut rig = Rig::new();
+            let run = finished(&rig, 3);
+            rig.view = fleet_with(&[3]);
+            break_store_when_archived(&rig, 3);
+            let report = rig.pass();
+            assert!(report.failed.is_some(), "{report:?}");
+            assert!(
+                report.archived.contains(&workspace_of(3)),
+                "the reconcile archived it before the store failed: {report:?}"
+            );
+            assert_eq!(
+                unreadable_notes(&report),
+                Vec::<&RunId>::new(),
+                "run {run} is readable: only the store failed: {report:?}"
+            );
         }
     }
 }
