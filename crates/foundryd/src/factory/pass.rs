@@ -1127,7 +1127,8 @@ impl<'a, 'w> Pass<'a, 'w> {
     }
 
     /// The feedback step of a run in `pr-open`, or one a round owns.
-    /// A run slot of the fleet is taken for the step, and given back when no round took it.
+    /// A run slot of the fleet is taken only once feedback is found and a round can start, and
+    /// given back when no round took it.
     fn feedback(&mut self, k: &Known, reserved: &mut Reserved) -> Result<String, RunError> {
         let run = &k.info.id;
         let config = run_config(self.config, k.info.base.as_deref());
@@ -1142,18 +1143,31 @@ impl<'a, 'w> Pass<'a, 'w> {
         }
         let book = self.world.book;
         let ticket = self.ticket();
-        // Only a run in `pr-open` can start a round; a round under way holds its slot already.
-        let taken = k.info.state == Some(State::PrOpen)
-            && book.take_run(ticket, self.settings.fleet.max_runs);
-        let mut slots = Slots {
-            runs_free: u32::from(taken),
+        // First with no slot: the read of GitHub, when one is due, then holds none of the
+        // fleet's, so another project's claim is not held up by a slow `gh`. A read that finds
+        // nothing starts no round and is done. One that found feedback and had no slot to start
+        // its round says `no run slot is free` (and records what it found, so the next read
+        // goes to that round): only then is a slot taken, if one is free, and the step run once
+        // more. Only a run in `pr-open` can start a round; one under way holds its slot already.
+        let mut none = Slots {
+            runs_free: 0,
             gates_free: 0,
         };
-        let step = feedback::advance(&ctx, run, self.world.shared, &mut slots, reserved);
-        if taken && slots.runs_free > 0 {
-            book.give_run(ticket);
+        let mut step = feedback::advance(&ctx, run, self.world.shared, &mut none, reserved)?;
+        if k.info.state == Some(State::PrOpen)
+            && matches!(&step, FeedbackStep::Waiting { reason } if reason == feedback::NO_SLOT)
+            && book.take_run(ticket, self.settings.fleet.max_runs)
+        {
+            let mut slots = Slots {
+                runs_free: 1,
+                gates_free: 0,
+            };
+            let again = feedback::advance(&ctx, run, self.world.shared, &mut slots, reserved);
+            if slots.runs_free > 0 {
+                book.give_run(ticket);
+            }
+            step = again?;
         }
-        let step = step?;
         if let FeedbackStep::Waiting { reason } = &step {
             let waiting = Waiting {
                 issue: run.issue(),
