@@ -216,6 +216,13 @@
 //! - `a conflict after a pass and a feedback relaunch gets the full send-back budget`: the
 //!   gate's own cases (`review_a_round_has_its_own_budget`); here
 //!   `a_round_is_a_return_to_building_after_pr_open_which_is_where_the_gate_starts_its_budget_again`.
+//! - `the time limit counts from the relaunch`: the runner's within-the-limit at 89 minutes and
+//!   stuck at 91 is a call of `building::time_limit`, which reads the wall clock, and
+//!   `time_limit_at`, which takes the time as an argument, is private to `building.rs`, not
+//!   this step's file; a test ledger is stamped from a fixed start, so no call can say a run is
+//!   within its limit. The part that is this step's is
+//!   `the_stint_the_time_limit_measures_starts_at_the_move_to_building`: the worked time and
+//!   the stint's start (`Seen::worked_ms`, `Seen::working_since`) that `time_limit` reads.
 //! - `forward does not send an issue comment again that went as feedback`: ported with `forward`.
 //! - `feedback: a run whose launch recorded a base other than the project's`: the case is
 //!   `relaunches_on_a_run_base_and_records_it`; the gate's read of that base's tip is the gate's.
@@ -4751,10 +4758,6 @@ mod tests {
             let seen = world.seen();
             assert!(seen.worked_ms < 60_000, "{}", seen.worked_ms);
             assert_eq!(seen.working_since, Some(moved));
-            let limit_ms = 90 * 60_000;
-            let worked = |now: u64| seen.worked_ms + now.saturating_sub(moved);
-            assert!(worked(moved + 89 * 60_000) <= limit_ms);
-            assert!(worked(moved + 91 * 60_000) > limit_ms);
             // And the wait before the round is not in it, however long it was.
             world.pad(100);
             assert_eq!(world.seen().worked_ms, seen.worked_ms);
