@@ -834,14 +834,24 @@ impl View {
                     .to_owned(),
             ));
         }
-        let answered = self
-            .peers
-            .call(acting, path, Some("application/json"), body)
-            .await;
-        Ok(Some(match answered {
+        Ok(Some(
+            self.carry_to(acting, path, Some("application/json"), body)
+                .await,
+        ))
+    }
+
+    /// `machine`'s answer to `path` with `body`, carried there, or why it could not be carried.
+    async fn carry_to(
+        &self,
+        machine: MachineId,
+        path: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Response {
+        match self.peers.call(machine, path, content_type, body).await {
             Ok(answer) => carry::answered(answer),
             Err(refused) => carry::not_carried(&refused),
-        }))
+        }
     }
 
     /// Sends `edit` through the coordinator, answering a failure as every shared-settings route
@@ -962,10 +972,7 @@ async fn stop_run(
     match holder {
         Some(holder) if holder != me => {
             let path = format!("/api/factory/runs/{run}/stop");
-            Ok(match view.peers.call(holder, &path, None, &[]).await {
-                Ok(answer) => carry::answered(answer),
-                Err(refused) => carry::not_carried(&refused),
-            })
+            Ok(view.carry_to(holder, &path, None, &[]).await)
         }
         Some(_) => Err(conflict(format!(
             "this machine's status says it holds the lease of {repo}, but it no longer does, \
@@ -1409,6 +1416,7 @@ mod view_tests {
     use crate::factory::ledger::events::{Cause, CauseStep, Event};
     use crate::factory::lifecycle::State;
     use crate::factory::runs::stop::{already_requested_message, requested_message};
+    use crate::factory::testing::Fixed;
     use crate::factory::worker::{AlwaysHeld, Guard};
     use crate::factory::{Leased, Leases, Leasing};
     use crate::secrets::{GITHUB_DEFAULT, Secrets};
@@ -1689,21 +1697,6 @@ mod view_tests {
                 },
             );
         }
-    }
-
-    struct Fixed {
-        state: LeaseState,
-        guard: Arc<dyn Guard>,
-    }
-
-    impl Leasing for Fixed {
-        fn tick(&self, _: u64) -> LeaseState {
-            self.state.clone()
-        }
-        fn guard(&self) -> Arc<dyn Guard> {
-            self.guard.clone()
-        }
-        fn release(&self) {}
     }
 
     fn on() -> Option<ProjectFactory> {

@@ -635,7 +635,7 @@ enum Factory {
 /// Sends a [`UiMessage::FactoryStatus`] for each project whose believed status is not the one
 /// `believed` says was sent. The statuses, and the settings they are believed by, are read only
 /// when the factory records, the settings' `seq` or the machines heard from (`online`) changed
-/// since the last read.
+/// since the last read. The web UI's handling of this message (`web/src/fleet.ts`) is #161's.
 async fn send_factory(
     api: &Api,
     socket: &mut WebSocket,

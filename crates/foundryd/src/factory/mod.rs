@@ -1132,6 +1132,32 @@ impl Factory<Daemon> {
     }
 }
 
+/// Test doubles of the leases handle, shared by its tests and the factory routes' tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::Arc;
+
+    use super::Leasing;
+    use super::lease::LeaseState;
+    use super::worker::Guard;
+
+    /// A lease whose every tick says `state` and whose guard is `guard`.
+    pub(crate) struct Fixed {
+        pub(crate) state: LeaseState,
+        pub(crate) guard: Arc<dyn Guard>,
+    }
+
+    impl Leasing for Fixed {
+        fn tick(&self, _: u64) -> LeaseState {
+            self.state.clone()
+        }
+        fn guard(&self) -> Arc<dyn Guard> {
+            self.guard.clone()
+        }
+        fn release(&self) {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3265,21 +3291,7 @@ mod tests {
 
     // ----- the leases handle the factory routes read -----
 
-    /// A lease whose every tick says `state` and whose guard is `guard`.
-    struct Fixed {
-        state: LeaseState,
-        guard: Arc<dyn Guard>,
-    }
-
-    impl Leasing for Fixed {
-        fn tick(&self, _: u64) -> LeaseState {
-            self.state.clone()
-        }
-        fn guard(&self) -> Arc<dyn Guard> {
-            self.guard.clone()
-        }
-        fn release(&self) {}
-    }
+    use super::testing::Fixed;
 
     fn leased(state: Option<LeaseState>, guard: Arc<dyn Guard>) -> Leased {
         let lease: Arc<dyn Leasing> = Arc::new(Fixed {
