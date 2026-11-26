@@ -199,7 +199,9 @@ To move one repo:
 4. Let the runner claim for its other repos again: `factory-runner claims resume`.
 5. Turn the project's factory on in Foundry, as above.
 
-Foundry leaves an issue in `factory:triage` or `factory:building` alone when its newest claim comment is the runner's, and lists it as a foreign claim on the attention list. An issue the runner left in `pr-open` gets no feedback round from Foundry. Label it `factory:ready` again and Foundry claims it. The run carries on from the issue's open pull request only when the project's login opened it, it is a branch of the same repo, and it targets the base. Otherwise the run starts again from the base and opens a second pull request. To keep the runner's branch, give the project the login the runner opened its pull requests as.
+Foundry leaves an issue in `factory:triage` or `factory:building` alone when its newest claim comment by the project's login is the runner's, and lists it as a foreign claim on the attention list. A runner claim posted as any other login is left alone too, but not listed.
+
+An issue the runner left in `pr-open` gets no feedback round from Foundry. Label it `factory:ready` again and Foundry claims it. The run carries on from the issue's open pull request when the project's login opened it, it is a branch of the same repo, and it targets the run's base, which must be the repo's default branch. To keep the runner's branch, give the project the login the runner opened its pull requests as. Otherwise close the runner's pull request and delete its branch before you relabel the issue. The run starts again from the base on a branch named the way the runner names its own, `fac/<issue>-1`, and would collide with it.
 
 The way back is per repo, and mirrors the way forward:
 
