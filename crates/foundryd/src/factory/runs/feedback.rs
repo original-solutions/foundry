@@ -3463,7 +3463,8 @@ mod tests {
             stuck.rig.moved(&stuck.run, State::PrOpen, State::Stuck);
             assert_eq!(stuck.go(), FeedbackStep::None);
             assert_eq!(stuck.hub.counted(), 0);
-            // A stop asked for is the stop step's.
+            // A stop asked for of a building run is the stop step's. (The line of a run in
+            // `pr-open` is the gate's stale one, and the run is read: see the next case.)
             let stopping = World::reviewed();
             stopping.rig.write(
                 &stopping.run,
@@ -3471,8 +3472,37 @@ mod tests {
                     by: "operator".into(),
                 },
             );
+            stopping
+                .rig
+                .moved(&stopping.run, State::PrOpen, State::Building);
             assert_eq!(stopping.go(), FeedbackStep::None);
             assert_eq!(stopping.hub.counted(), 0);
+        }
+
+        #[test]
+        fn a_pr_open_run_with_a_stale_stop_line_has_its_feedback_read_as_the_runners_does() {
+            // The runner's feedback.ts does not look at the stop request: the line a stop left
+            // before the gate passed is still on the ledger, and the instructors are heard.
+            let world = World::reviewed();
+            world.rig.write(
+                &world.run,
+                Event::StopRequested {
+                    by: "operator".into(),
+                },
+            );
+            // The line is older than the move to pr-open in a real run; here it is newest.
+            assert!(world.seen().stop_requested);
+            assert_eq!(world.seen().state, Some(State::PrOpen));
+            assert_eq!(
+                world.go(),
+                FeedbackStep::Decided {
+                    round: 1,
+                    pr: 12,
+                    items: 1
+                }
+            );
+            assert_eq!(world.hub.reads(), first_reads(&world));
+            assert_eq!(world.decisions().len(), 2);
         }
 
         #[test]
