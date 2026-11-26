@@ -1553,6 +1553,24 @@ mod tests {
             );
         }
 
+        /// `resume-ending-sessions <k>` alone says a start may have gone out, as
+        /// `resume-sending <k>` does. A cut ledger: the factory writes it only after a
+        /// `resume-sending <k>`.
+        #[test]
+        fn a_stop_after_a_resumes_ending_sessions_step_alone_ends_them() {
+            let (rig, run) = resume_being_set_up(&[
+                format!("resume-workspace 1 {RESUME_WS}"),
+                "resume-ending-sessions 1".into(),
+            ]);
+            assert!(matches!(pass(&rig, &run), StopStep::Stuck { .. }));
+            assert_eq!(
+                calls(&rig),
+                vec![Call::EndSessions {
+                    workspace: resume_ws()
+                }]
+            );
+        }
+
         #[test]
         fn a_stop_after_a_resume_workspace_and_before_its_start_ends_nothing() {
             let (rig, run) = resume_being_set_up(&[

@@ -5063,6 +5063,50 @@ mod tests {
             );
         }
 
+        /// The names looked for run one past the highest resume the ledger names: a workspace
+        /// under the next resume's name is the run's too. A cut ledger: the factory writes a
+        /// resume's `session_interrupted` line before it asks for that resume's workspace.
+        #[test]
+        fn orphans_see_a_resume_workspace_one_past_the_highest_resume_named() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.write(
+                &run,
+                Event::SessionInterrupted {
+                    resumes: 1,
+                    relaunch: false,
+                    run_ordinal: None,
+                    branch: None,
+                    t3_error: None,
+                    ended_in_pass: 0,
+                },
+            );
+            rig.write(
+                &run,
+                Event::SessionLaunched {
+                    thread_id: resumed_session().to_string(),
+                    worktree: Some(fresh().to_string()),
+                    branch: Some("fac/8-1-r1".into()),
+                    model_instance: None,
+                    model: None,
+                    model_options: None,
+                    resumed_from: None,
+                    base: None,
+                    title: None,
+                },
+            );
+            let view = FleetView::builder()
+                .online(m2())
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
+                .workspace(workspace_record(m2(), old(), "fac/8-1-r2", None))
+                .build();
+            assert_eq!(
+                orphans(&view, project_id(), &run, &rig.events(&run)),
+                vec![old()]
+            );
+        }
+
         // testing-11: what is adopted must be the run's.
 
         #[test]
