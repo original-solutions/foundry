@@ -1985,6 +1985,27 @@ mod view_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_is_never_carried_to_a_machine_whose_status_does_not_hold() {
+        let fleet = fleet(2, &format!("https://github.com/{REPO}"), on()).await;
+        let (coordinator, asked) = (&fleet[0], &fleet[1]);
+        building_run(coordinator, 1);
+        // The believed status is the coordinator's, and it says another machine holds the
+        // lease: nobody believed holds it, so the stop goes nowhere.
+        coordinator.write_status(not_holding(MachineId::random(), 4));
+        until(|| asked.statuses().len() == 1).await;
+        let (status, answer) = asked.post(&stop_path(), None).await;
+        assert_eq!(status, 409, "{answer}");
+        assert!(
+            answer["error"]
+                .as_str()
+                .unwrap()
+                .contains("no machine is known to hold the lease"),
+            "{answer}"
+        );
+        assert_eq!(stops_held(coordinator), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stop_of_a_run_that_is_not_building_or_has_no_ledger_is_refused() {
         let fleet = fleet(1, &format!("https://github.com/{REPO}"), on()).await;
         let holder = &fleet[0];
