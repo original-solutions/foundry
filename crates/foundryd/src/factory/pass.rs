@@ -568,6 +568,7 @@ fn run_pass(world: &World<'_>, memo: &mut Memo, pass: u64) -> PassReport {
         titles: BTreeMap::new(),
         ticket,
         others: Vec::new(),
+        counted: BTreeSet::new(),
     };
     match one.go() {
         Ok(()) => {
@@ -792,6 +793,9 @@ struct Pass<'a, 'w> {
     ticket: Ticket,
     /// The machines other projects placed runs on, whose sessions have not started.
     others: Vec<MachineId>,
+    /// The runs whose machine `reserved` already counts this pass: those the ledger showed
+    /// placed when the pass began, and each one the pass placed itself.
+    counted: BTreeSet<RunId>,
 }
 
 /// Whose claim an issue in `triage` or `building` carries.
@@ -880,19 +884,39 @@ impl<'a, 'w> Pass<'a, 'w> {
         Ok(known_of(self.ledger, &self.world.project.repo)?)
     }
 
-    /// The book holds what the ledger now says this project's runs hold, and the machines
-    /// reserved are those of its runs and of the other projects'. Called wherever a step may
-    /// have recorded a run that holds a slot with no slot taken for it (a claim carried on, a
-    /// claim that failed after it recorded), so that the count every project's pass claims
-    /// against is the ledger's.
-    fn recount(&self, reserved: &mut Reserved) -> Result<(), Ended> {
-        let held = Self::holding(&self.known()?);
-        *reserved = Reserved::default();
-        for machine in held.placed.iter().chain(&self.others) {
-            reserved.hold(*machine);
+    /// The book holds what the ledger now says this project's runs hold, and `reserved` gains
+    /// the machine of each run the ledger shows placed that it does not count yet. Called
+    /// wherever a step may have recorded a run that holds a slot with no slot taken for it (a
+    /// claim carried on, a claim that failed after it recorded), so that the count every
+    /// project's pass claims against is the ledger's. It only adds: a reservation the pass made
+    /// stays, though the ledger no longer shows its run placed (its session has started, or a
+    /// feedback round or a resume took it past `triage`), because the machine's samples do not
+    /// count that session yet.
+    fn recount(&mut self, reserved: &mut Reserved) -> Result<(), Ended> {
+        let known = self.known()?;
+        for (run, machine) in Self::placed_runs(&known) {
+            if self.counted.insert(run) {
+                reserved.hold(machine);
+            }
         }
-        self.world.book.finish(self.ticket, held);
+        self.world.book.finish(self.ticket, Self::holding(&known));
         Ok(())
+    }
+
+    /// The runs placed on a machine whose session has not started, with that machine.
+    fn placed_runs(known: &[Known]) -> Vec<(RunId, MachineId)> {
+        known
+            .iter()
+            .filter(|k| {
+                k.info.confirmed
+                    && !k.info.session
+                    && matches!(k.info.state, None | Some(State::Triage))
+            })
+            .filter_map(|k| {
+                let machine = k.seen.machine.as_deref().and_then(machine_id)?;
+                Some((k.info.id.clone(), machine))
+            })
+            .collect()
     }
 
     /// What this project's runs hold of the fleet, by their events.
@@ -906,14 +930,9 @@ impl<'a, 'w> Pass<'a, 'w> {
                     .filter(|k| gating::gate_running(&k.events))
                     .count(),
             ),
-            placed: known
-                .iter()
-                .filter(|k| {
-                    k.info.confirmed
-                        && !k.info.session
-                        && matches!(k.info.state, None | Some(State::Triage))
-                })
-                .filter_map(|k| k.seen.machine.as_deref().and_then(machine_id))
+            placed: Self::placed_runs(known)
+                .into_iter()
+                .map(|(_, machine)| machine)
                 .collect(),
         }
     }
@@ -926,8 +945,9 @@ impl<'a, 'w> Pass<'a, 'w> {
         // project's entry in the book holds theirs.
         let held = Self::holding(&known);
         let mut reserved = Reserved::default();
-        for machine in &held.placed {
-            reserved.hold(*machine);
+        for (run, machine) in Self::placed_runs(&known) {
+            self.counted.insert(run);
+            reserved.hold(machine);
         }
         let ticket = self.ticket;
         // A project stopped since the pass checked its lease: nothing more is changed.
@@ -1115,6 +1135,8 @@ impl<'a, 'w> Pass<'a, 'w> {
                         reserved,
                     ) {
                         Ok(machine) => {
+                            // Its machine is reserved now, whatever the ledger shows of it later.
+                            self.counted.insert(run.clone());
                             Ok(format!("resume: {:?}", resume::placed(&ctx, run, machine)?))
                         }
                         Err(reasons) => Ok(format!(
@@ -1367,6 +1389,8 @@ impl<'a, 'w> Pass<'a, 'w> {
             match outcome {
                 ClaimOutcome::Claimed { run } => {
                     self.report.claimed.push(run.clone());
+                    // Its machine is reserved now, whatever the ledger shows of it later.
+                    self.counted.insert(run.clone());
                     book.place(ticket, machine);
                     let ctx = self.ctx(self.config);
                     let said = match start::advance(&ctx, &run) {
