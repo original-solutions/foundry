@@ -308,7 +308,9 @@ pub fn state(home: &Path) -> io::Result<State> {
 /// reads and writes `update.json`, removes or renames directories under `versions/` and moves
 /// `current` (no network, no copy and no child process), so the wait is short. The lock is let
 /// go when the value is dropped. Never take it twice in one thread: a second open of the file
-/// waits for the first.
+/// waits for the first. The check swaps a version into `versions/` under it ([`make_ready`]);
+/// a hand install's [`place_version`] still swaps before it takes it, until #273 adds the hand
+/// install's lock.
 fn lock(home: &Path) -> io::Result<Flock<File>> {
     let file = OpenOptions::new()
         .write(true)
@@ -623,7 +625,8 @@ fn pick(tags: &[String], running: &str, refused: Option<&str>) -> Option<String>
 
 /// Makes `versions/<version>` from a fresh stage directory: `fill` puts the files in it,
 /// both binaries must be there and are made executable, then the stage is swapped in and
-/// [`commit_version`] records it and points `current` at it.
+/// [`commit_version`] records it and points `current` at it. The swap is made before the lock
+/// is taken; #273 moves it under the lock.
 pub(crate) fn place_version(
     home: &Path,
     version: &str,
@@ -642,7 +645,8 @@ pub(crate) fn place_version(
 /// Fills a fresh `versions/.staging-<version>-<pid>` with `fill` and checks that both binaries
 /// are there, made executable. Returns its path; a stage that fails is removed. The stage is this
 /// process's own, so a hand install and the daemon's check never wipe each other's. It takes no
-/// lock: nothing under it touches `update.json` or `current`.
+/// lock: nothing under it touches `update.json` or `current`. Crate-wide, like [`swap_in`], so
+/// #273's click install and hand install can build on it.
 pub(crate) fn stage_version(
     home: &Path,
     version: &str,
@@ -690,7 +694,8 @@ fn sweep_stages(home: &Path) {
     }
 }
 
-/// Renames `stage` to `versions/<version>`, replacing what is there.
+/// Renames `stage` to `versions/<version>`, replacing what is there. It takes no lock: a caller
+/// that must not race the check calls it under [`lock`], as [`make_ready`] does.
 pub(crate) fn swap_in(home: &Path, stage: &Path, version: &str) -> Result<(), UpdateError> {
     let target = home.join("versions").join(version);
     match fs::remove_dir_all(&target) {
