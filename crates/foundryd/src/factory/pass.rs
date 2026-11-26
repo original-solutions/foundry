@@ -183,6 +183,12 @@ pub const POSTPONED: &str = "postponed";
 /// What a ready issue whose older run is gating waits for.
 pub const GATE_RUNNING: &str = "the gate of an earlier run of the issue is running";
 
+/// What a ready issue waits for while an earlier run of it has events this build cannot read.
+pub const UNREADABLE_RUN: &str = "an earlier run's events cannot be read by this build";
+
+/// What the sweep says of a run whose events this build cannot read.
+const UNREADABLE_SWEPT: &str = "its events cannot be read by this build: the sweep left it";
+
 /// What a ready issue waits for when no run slot is free.
 pub const NO_SLOT: &str = "no run slot is free";
 
@@ -1160,6 +1166,12 @@ impl<'a, 'w> Pass<'a, 'w> {
                 wait(self, GATE_RUNNING.into());
                 continue;
             }
+            // Its events cannot be read, so the claim would end every pass at them: the issue
+            // waits, and the run is not counted as a slot freed for it.
+            if of_issue.iter().any(|k| k.info.unreadable) {
+                wait(self, UNREADABLE_RUN.into());
+                continue;
+            }
             if let Some(pause) = paused {
                 wait(self, pause.reason().into());
                 continue;
@@ -1298,7 +1310,15 @@ impl<'a, 'w> Pass<'a, 'w> {
         }
         let mut owed = false;
         for run in runs {
-            let events = self.ledger.read(&run)?;
+            // A run whose events this build cannot read (a newer build's) is noted, and the
+            // sweep goes on: it must not end every pass of the project.
+            let events = match self.ledger.read(&run) {
+                Ok(events) => events,
+                Err(_) => {
+                    self.note(&run, UNREADABLE_SWEPT);
+                    continue;
+                }
+            };
             let seen = read_progress(&events);
             if sweep_due && seen.finished {
                 let ctx = self.ctx(self.config);
