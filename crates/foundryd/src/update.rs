@@ -1629,9 +1629,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stage_another_process_made_is_left_alone() {
+    fn a_stage_a_live_process_is_filling_is_left_alone() {
         let home = installed_home();
-        let theirs = home.path().join("versions/.staging-0.2.0");
+        let live = std::os::unix::process::parent_id();
+        let theirs = home.path().join(format!("versions/.staging-0.2.0-{live}"));
         fs::create_dir_all(&theirs).unwrap();
         fs::write(theirs.join("foundryd"), "half copied").unwrap();
 
@@ -1652,7 +1653,84 @@ mod tests {
             fs::read_to_string(theirs.join("foundryd")).unwrap(),
             "half copied"
         );
-        assert_eq!(stages(home.path()), [".staging-0.2.0"]);
+        assert_eq!(stages(home.path()), [format!(".staging-0.2.0-{live}")]);
+    }
+
+    /// The pid of a process that has exited.
+    fn dead_pid() -> u32 {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn stages_left_by_dead_processes_and_older_releases_are_removed_by_the_next_stage() {
+        let home = installed_home();
+        let dead = dead_pid();
+        for name in [
+            format!(".staging-0.2.0-{dead}"),
+            format!(".staging-0.1.5-{dead}"),
+            ".staging-0.1.5".to_string(),
+        ] {
+            let left = home.path().join("versions").join(name);
+            fs::create_dir_all(&left).unwrap();
+            fs::write(left.join("foundryd"), "left behind").unwrap();
+        }
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |_, stage| {
+                release(stage, "0.2.0");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.as_deref(), Some("v0.2.0"));
+        assert_eq!(stages(home.path()), Vec::<String>::new());
+        assert_eq!(versions(home.path()), ["0.1.0", "0.2.0"]);
+    }
+
+    #[test]
+    fn a_trial_stranded_during_the_download_is_cleared_and_the_tag_made_ready() {
+        let home = installed_home();
+        let path = home.path().to_path_buf();
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            move |_, stage| {
+                release(stage, "0.2.0");
+                let stranded = State {
+                    trial: Some(Trial {
+                        version: "0.3.0".into(),
+                        previous: "0.1.0".into(),
+                        starts: 0,
+                    }),
+                    refused: None,
+                    ready: None,
+                };
+                save(&path, &stranded).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.as_deref(), Some("v0.2.0"));
+        assert_eq!(
+            state(home.path()).unwrap(),
+            State {
+                trial: None,
+                refused: None,
+                ready: Some("v0.2.0".into()),
+            }
+        );
     }
 
     #[test]
