@@ -875,6 +875,25 @@ impl ReadLog {
 
 // ----- what the ledger says of a round -----
 
+/// Whether a round is under way: the newest `feedback_relaunching` has no `session_launched`
+/// after it, and the run is not finished. It holds from the first decision line to the round's
+/// session, through the move to `building` and the second decision line, and so also in the
+/// moment a pass cut between them leaves.
+pub fn round_pending(events: &[RunEvent]) -> bool {
+    if events.iter().any(|event| event.event == names::FINISHED) {
+        return false;
+    }
+    let Some(at) = events
+        .iter()
+        .rposition(|event| event.event == "feedback_relaunching")
+    else {
+        return false;
+    };
+    !events[at + 1..]
+        .iter()
+        .any(|event| event.event == names::SESSION_LAUNCHED)
+}
+
 /// What the ledger records of the newest round.
 #[derive(Debug, Default)]
 struct Round {

@@ -152,6 +152,7 @@ use foundry_proto::factory::{RunEvent, RunId};
 use foundry_proto::ids::{MachineId, WorkspaceId};
 use serde_json::Value;
 
+use super::feedback;
 use super::gating::{self, GATE_REQUESTED};
 use super::progress::{Seen, pending_relaunch, read_progress};
 use super::resume::UNREACHABLE_FOR;
@@ -559,6 +560,8 @@ const UNVERIFIED_CODE: &str = "edits-unverifiable";
 const UNCONFIRMED_CODE: &str = "approval-unconfirmed";
 const LABEL_CODE: &str = "label-removed";
 const ASSIGNEE_CODE: &str = "assignee-changed";
+/// The codes `feedback` also begins, for the same text checks, while it sets a round up.
+const SHARED_CODES: [&str; 3] = [TEXT_CODE, UNVERIFIED_CODE, UNCONFIRMED_CODE];
 const OWN_CODES: [&str; 5] = [
     TEXT_CODE,
     UNVERIFIED_CODE,
@@ -593,6 +596,18 @@ pub fn reconcile(ctx: &RunContext<'_>, run: &RunId) -> Result<ReconcileStep, Run
             .as_deref()
             .and_then(|raw| serde_json::from_str::<StuckStop>(raw).ok())
             .is_some_and(|decision| OWN_CODES.contains(&decision.code.as_str()));
+        // While a feedback round is decided and not launched, the stuck path of the codes
+        // `feedback` shares is its own: it finishes it from the round's workspace.
+        let shared = seen
+            .stuck_stop
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<StuckStop>(raw).ok())
+            .is_some_and(|decision| SHARED_CODES.contains(&decision.code.as_str()));
+        if own && shared && feedback::round_pending(&events) {
+            return Ok(ReconcileStep::Skipped {
+                why: "relaunching",
+            });
+        }
         if own && matches!(seen.state, Some(State::Building | State::Stuck)) {
             let mut at = progress_from(run, CauseStep::Watch, &seen, State::Building);
             forget_unreachable_session(ctx, run, &events, &mut at);
@@ -655,6 +670,7 @@ fn building(
         .as_ref()
         .is_some_and(|interruption| interruption.relaunch || !interruption.sent)
         || pending_relaunch(seen).is_some()
+        || feedback::round_pending(events)
     {
         return skipped("relaunching");
     }
@@ -720,12 +736,14 @@ fn building(
 }
 
 /// Whether no transition of the factory's own is in flight for a building run: no questions
-/// begun, no approval being withdrawn, no re-gate or relaunch, and no stuck comment begun.
+/// begun, no approval being withdrawn, no re-gate, no relaunch decided and not launched (one
+/// whose session is recorded is over: the run is building and a person's move counts again),
+/// and no stuck comment begun.
 fn committed(seen: &Seen) -> bool {
     seen.questions_commenting.is_none()
         && !seen.withdrawn
         && !seen.regating
-        && seen.relaunch.is_none()
+        && pending_relaunch(seen).is_none()
         && seen.stuck_commenting.is_none()
 }
 
