@@ -57,7 +57,11 @@ A version is three numbers, like `0.9.1`, as `foundryd --version` prints it and 
 
 ### The updater
 
-The check every 10 minutes keeps today's rule for which tag it wants: the highest tag, and none if that one is refused or is not above the running version. It never falls back to a lower tag.
+The check every 10 minutes first reads the list of release tags, as today. A read that succeeds, an empty list included, and does not hold the ready tag means that release was pulled: deleted, or made a draft or a pre-release. The check then re-reads the state under the updater's lock and clears the ready tag only if it still names that tag. It leaves `current`, the trial, `refused` and `versions/` as they are. This happens before it picks a tag or downloads anything, so a failed download of a lower tag that remains cannot leave the pulled tag ready. A failed read changes nothing, and no second lookup confirms the miss. While the ready tag is still in the list, a refused or not-higher highest tag leaves it as it was.
+
+Pulling a release has limits. A machine that cannot read the list keeps the pulled tag ready until its first check that can. A machine already running the pulled release is not rolled back. A fix ships under a new tag, not by publishing the pulled tag again.
+
+The check then keeps today's rule for which tag it wants: the highest tag, and none if that one is refused or is not above the running version. It never falls back to a lower tag.
 
 - If the wanted tag is already the ready tag, the check does nothing more. It downloads nothing and touches nothing on disk.
 - Otherwise it downloads the archive and its signature, checks the signature, unpacks it and checks `foundryd --version`, as today. A bad release is refused, as today, and the ready tag stays as it was. Any other failure is tried again at the next check, and the ready tag stays as it was.
@@ -69,7 +73,9 @@ A machine has at most one ready tag. A daemon that does not run from `<home>/cur
 
 A ready tag counts only while both binaries of its version are on disk. One whose binaries are gone counts as not ready, so the next check fetches it again.
 
-A hand install clears the ready tag, whatever version it installs. It may unpack into a private stage first, then holds the updater's lock from clearing the ready tag through moving its files into `<home>/versions/` and pointing `current`, so no check or click runs between those steps.
+A hand install clears the ready tag, whatever version it installs. It copies its files into a private stage first, outside the lock, as it does today. It then holds the updater's lock from clearing the ready tag through moving its files into `<home>/versions/` and pointing `current`, so no check or click runs between those steps.
+
+Whoever holds the updater's lock only reads and writes `update.json`, removes or renames directories under `<home>/versions/` and points `current`. Nothing downloads, copies, unpacks or runs a program while holding it, so a check, a click or a hand install waits for it only briefly.
 
 A trial is on only while `current` names the trial's version. A trial whose version `current` does not name, as a crash between the install's two writes leaves, is cleared under the lock by the next check or install, which then goes on with the state that remains. Its tag is then no longer ready, so the next check fetches and stages it again.
 
@@ -114,7 +120,9 @@ When the serving machine restarts on a new version, the page reconnects and relo
 
 ## First rollout
 
-No hand install is needed. The release that adds this reaches each machine through that machine's current updater, which still installs on its own. From that release on, nothing installs on its own. Until every machine runs it, the older ones show their version as unknown, get no install button, and keep installing on their own. A machine that rolls this release back is again a machine that installs on its own, and takes the next higher tag by itself. A Mac that still needs the keychain copy described in `docs/install.md` needs the same hand install as today.
+No hand install is needed, as long as no release is tagged while the change is half built. The updater change that stops installing on its own (#272) and the parts that install from the UI (the endpoint, #274, and the badge, #275) must reach the fleet in the same release. So no `v*` tag is pushed after #272 merges until #274 and #275 have merged too. A release tagged in between installs on every machine on its own and then leaves each one with no way to install the next release but by hand.
+
+The release that adds this reaches each machine through that machine's current updater, which still installs on its own. From that release on, nothing installs on its own. Until every machine runs it, the older ones show their version as unknown, get no install button, and keep installing on their own. A machine that rolls this release back is again a machine that installs on its own, and takes the next higher tag by itself. A Mac that still needs the keychain copy described in `docs/install.md` needs the same hand install as today.
 
 ## Changes to other documents
 
@@ -125,10 +133,11 @@ No hand install is needed. The release that adds this reaches each machine throu
 
 Tests come first, as for every change.
 
-- `update.rs`: a check that finds a higher tag downloads, verifies and unpacks it, records it as ready, and leaves `current`, the trial and the daemon alone. A check whose wanted tag is already ready downloads nothing. A refused highest tag makes nothing ready and leaves the ready tag. A higher tag replaces the ready one. A check that finishes after an install moved `current` records nothing and removes nothing. Making a tag ready leaves `refused` alone. A ready tag whose binaries are gone is fetched again. A hand install clears the ready tag and places its files under one hold of the lock. A trial whose version `current` does not name is cleared, and the check goes on.
+- `update.rs`: a check that finds a higher tag downloads, verifies and unpacks it, records it as ready, and leaves `current`, the trial and the daemon alone. A check whose wanted tag is already ready downloads nothing. A refused highest tag, with the ready tag still in the list, makes nothing ready and leaves the ready tag. A tag list that succeeds without the ready tag, with a lower tag left or with no tag at all, clears it before any fetch. A pulled ready tag is cleared even when the download of the highest remaining tag then fails. A failed list read leaves it. A higher tag replaces the ready one. A check that finishes after an install moved `current` records nothing and removes nothing. Making a tag ready leaves `refused` alone. A ready tag whose binaries are gone is fetched again. A hand install clears the ready tag and places its files under one hold of the lock. A trial whose version `current` does not name is cleared, and the check goes on.
 - The endpoint: each `409` case changes nothing, including a stale ready tag after a hand install of a higher version. The ready tag saves the trial and clears the ready tag before `current` moves, keeps a refusal of a higher tag, answers `202` and then stops the daemon once. A failure to point `current` restores the state, answers `500` and does not stop.
 - Carry: the route runs on the machine it names. A peer on protocol 5 gets `503` with nothing sent. A carried install's `202` reaches the caller before the target stops.
-- `machine.rs`: the sample carries `version` and `update_ready`, and an older peer's sample without them still reads. A daemon not run from `current` reports no `update_ready`.
+- `record.rs` (`foundry-proto`): a sample with `version` and `update_ready` round-trips, and an older peer's sample without them still reads.
+- `machine.rs`: the sample this machine writes carries its `version` and its `update_ready`. A daemon not run from `current` reports no `update_ready`.
 - Fleet, three daemons: a UI on the first installs on the second and the third, the serving machine last. The third's sample shows the new version, its terminals keep running, and a machine left unticked keeps its version and its ready tag.
 - Web: the badge shows and hides with the records, groups machines by tag and leaves out removed machines. The checklist starts with every machine ticked, sends the serving machine's call last, and sends the tags shown at the click even when a record changes before a call goes. Each row follows the table above, in its order.
 
