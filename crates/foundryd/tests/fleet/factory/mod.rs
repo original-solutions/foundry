@@ -78,7 +78,7 @@ pub const HELPER_SECRET: &str = "MachineHelperPassword0123456789qrstuv";
 pub const WAIT: Duration = Duration::from_secs(120);
 
 /// How long a whole test may run in its child process.
-const CHILD_WAIT: Duration = Duration::from_secs(600);
+const CHILD_WAIT: Duration = Duration::from_secs(300);
 
 /// Names the test a child process runs.
 const CHILD: &str = "FOUNDRY_FLEET_FACTORY_TEST";
@@ -113,11 +113,18 @@ where
     let module = module.split_once("::").map_or(module, |(_, rest)| rest);
     let full = format!("{module}::{name}");
     if std::env::var(CHILD).ok().as_deref() == Some(full.as_str()) {
-        tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .unwrap()
-            .block_on(test());
+            .unwrap();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(test());
+        }));
+        // A pass on a blocking thread may wait on the runtime: dropping it would wait for ever.
+        runtime.shutdown_timeout(Duration::from_secs(5));
+        if let Err(panic) = ran {
+            std::panic::resume_unwind(panic);
+        }
         return;
     }
     let dir = tempfile::Builder::new()
@@ -643,43 +650,64 @@ impl Harness {
         let sent: Arc<Mutex<Vec<Sent>>> = Arc::default();
         let fleet = Fleet::start_coordinated(3);
         let project = ProjectId::random();
-        for daemon in &fleet.daemons {
-            let mut settings = daemon.settings();
-            settings.seq += 1;
-            settings.projects.push(Project {
-                id: project,
-                name: "widgets".into(),
-                repo: format!("https://github.com/{REPO}.git"),
-            });
-            settings.project_factory.insert(
-                project,
-                ProjectFactory {
-                    on: true,
-                    login: LOGIN.into(),
-                    paused: false,
-                },
-            );
-            settings.factory = Some(FactorySettings {
-                poll_seconds: 10,
-                feedback_seconds: 10,
-                max_runs: options.max_runs,
-                max_gates: 2,
-                model: "test-model".into(),
-                effort: "high".into(),
-                ..FactorySettings::default()
-            });
-            for d in &fleet.daemons {
-                settings.limits.insert(
-                    d.id,
-                    Limits {
-                        max_sessions: 4,
-                        max_load_per_core: 100.0,
-                        min_free_disk: 0,
-                    },
-                );
+        // The coordinators edit the settings too as they start, so the project and the
+        // factory settings are laid over the newest copy any daemon holds, again until every
+        // daemon holds them.
+        let factory = FactorySettings {
+            poll_seconds: 10,
+            feedback_seconds: 10,
+            max_runs: options.max_runs,
+            max_gates: 2,
+            model: "test-model".into(),
+            effort: "high".into(),
+            ..FactorySettings::default()
+        };
+        let on = ProjectFactory {
+            on: true,
+            login: LOGIN.into(),
+            paused: false,
+        };
+        let limits = Limits {
+            max_sessions: 4,
+            max_load_per_core: 100.0,
+            min_free_disk: 0,
+        };
+        let ids: Vec<MachineId> = fleet.daemons.iter().map(|d| d.id).collect();
+        let holds = |settings: &foundry_proto::settings::SharedSettings| {
+            settings.projects.iter().any(|p| p.id == project)
+                && settings.project_factory.get(&project) == Some(&on)
+                && settings.factory.as_ref() == Some(&factory)
+                && ids
+                    .iter()
+                    .all(|id| settings.limits.get(id) == Some(&limits))
+        };
+        until(WAIT, "every daemon holds the project", || {
+            let held: Vec<_> = fleet.daemons.iter().map(Daemon::settings).collect();
+            if held.iter().all(holds) {
+                return true;
             }
-            daemon.set_settings(settings);
-        }
+            let mut settings = held.into_iter().max_by_key(|s| s.seq).unwrap();
+            settings.seq += 1;
+            if !settings.projects.iter().any(|p| p.id == project) {
+                settings.projects.push(Project {
+                    id: project,
+                    name: "widgets".into(),
+                    repo: format!("https://github.com/{REPO}.git"),
+                });
+            }
+            settings.project_factory.insert(project, on.clone());
+            settings.factory = Some(factory.clone());
+            for id in &ids {
+                settings.limits.insert(*id, limits.clone());
+            }
+            for daemon in &fleet.daemons {
+                lock(&daemon.store)
+                    .apply_settings(settings.clone())
+                    .unwrap();
+            }
+            false
+        })
+        .await;
         let mut machines = Vec::new();
         for (i, daemon) in fleet.daemons.iter().enumerate() {
             let builds = options.builders.contains(&i);
@@ -697,7 +725,6 @@ impl Harness {
             daemon.write(sample(0));
             machines.push(machine);
         }
-        let ids: Vec<MachineId> = fleet.daemons.iter().map(|d| d.id).collect();
         until(WAIT, "every daemon hears every other", || {
             fleet.daemons.iter().all(|d| {
                 ids.iter()
@@ -751,6 +778,7 @@ impl Harness {
 
     /// Waits until issue `number` has only `label` of the factory's labels.
     pub async fn reaches(&self, number: u64, label: &str) {
+        eprintln!("fleet: waiting for #{number} to reach {label}");
         until(WAIT, &format!("issue #{number} reaches {label}"), || {
             self.state(number) == BTreeSet::from([label.to_owned()])
         })
@@ -820,6 +848,7 @@ impl Harness {
 
     /// Waits until a workspace named `name` is made, and answers it.
     pub async fn made(&self, name: &str) -> Record<Workspace> {
+        eprintln!("fleet: waiting for {name} to be made");
         until(WAIT, &format!("a workspace named {name} is made"), || {
             !self.workspaces_named(name).is_empty()
         })
@@ -830,6 +859,7 @@ impl Harness {
     /// Commits `file` with `text` on branch `branch` of `origin`, as a person would, and
     /// answers the commit's id.
     pub fn push_to(&self, branch: &str, file: &str, text: &str) -> String {
+        eprintln!("fleet: pushing {file} to {branch}");
         git(&self.work, &["fetch", "-q", "origin"]);
         git(
             &self.work,

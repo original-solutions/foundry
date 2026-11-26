@@ -30,6 +30,7 @@ fn builds_and_opens(pr: u64) -> String {
 
 /// Waits until the workspaces named `name` are all archived and their sessions all ended.
 async fn gone(h: &Harness, name: &str) {
+    eprintln!("fleet: waiting for {name} to be gone");
     until(
         WAIT,
         &format!("{name} is archived with its sessions ended"),
