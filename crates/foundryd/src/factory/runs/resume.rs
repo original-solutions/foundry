@@ -245,7 +245,6 @@
 //! - `is not resumed once a relaunch is decided, and nothing is written`
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use foundry_proto::factory::{RunEvent, RunId};
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, WorkspaceId};
@@ -254,8 +253,9 @@ use foundry_proto::state::{SessionState, TerminalState};
 use serde_json::Value;
 
 use super::progress::{
-    STUCK_DETAIL, STUCK_STOP, Seen, WORKSPACE_CREATED, WORKSPACE_REQUESTED, pending_relaunch,
-    read_progress,
+    STUCK_DETAIL, STUCK_STOP, Seen, TEXT_CODE, UNREACHABLE_FOR, UNVERIFIED_CODE, WORKSPACE_CREATED,
+    WORKSPACE_REQUESTED, build_name, feedback_name, highest, numbered, pending_relaunch,
+    read_progress, resume_name, step_text,
 };
 use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
 use super::{
@@ -278,10 +278,6 @@ use crate::factory::text;
 use crate::factory::worker::{CreateWorkspace, FleetView, WorkerError};
 use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
 use crate::workspaces::{Checkout, FactoryTag, Setup};
-
-/// How long a machine is unreachable before what it holds is given up on: 15 minutes, on the
-/// sleep-counting clock that [`FleetView::unreachable_for`] reads.
-pub const UNREACHABLE_FOR: Duration = Duration::from_secs(15 * 60);
 
 /// The public reason of a run whose session's machine stayed unreachable.
 pub const MACHINE_UNREACHABLE: &str = "the session's machine has been unreachable for 15 minutes";
@@ -486,16 +482,6 @@ enum Kind {
     Feedback(u32),
 }
 
-/// The build workspace's name: `fac/<N>-<attempt>`.
-fn build_name(run: &RunId) -> String {
-    format!("fac/{}-{}", run.issue(), run.attempt())
-}
-
-/// The k-th resume workspace's name: `fac/<N>-<attempt>-r<k>`.
-fn resume_name(run: &RunId, k: u32) -> String {
-    format!("{}-r{k}", build_name(run))
-}
-
 /// Every workspace of the project the fleet shows that is not archived and has one of the
 /// run's build, resume or feedback names, in the order of the names.
 fn named_workspaces<'a>(
@@ -505,22 +491,21 @@ fn named_workspaces<'a>(
     scan: Scan,
 ) -> Vec<(Kind, &'a Record<Workspace>)> {
     let mut found = Vec::new();
-    let base = build_name(run);
     found.extend(
-        view.workspaces_named(project, &base)
+        view.workspaces_named(project, &build_name(run))
             .into_iter()
             .map(|record| (Kind::Build, record)),
     );
     for k in 1..=scan.resumes {
         found.extend(
-            view.workspaces_named(project, &format!("{base}-r{k}"))
+            view.workspaces_named(project, &resume_name(run, k))
                 .into_iter()
                 .map(|record| (Kind::Resume(k), record)),
         );
     }
     for k in 1..=scan.feedback {
         found.extend(
-            view.workspaces_named(project, &format!("{base}-f{k}"))
+            view.workspaces_named(project, &feedback_name(run, k))
                 .into_iter()
                 .map(|record| (Kind::Feedback(k), record)),
         );
@@ -571,18 +556,9 @@ struct Scan {
 
 /// The names of `events`' run that can exist.
 fn scan_of(events: &[RunEvent]) -> Scan {
-    let highest = |name: &str, field: &str| -> u32 {
-        events
-            .iter()
-            .filter(|event| event.event == name)
-            .filter_map(|event| event.data.get(field).and_then(Value::as_u64))
-            .max()
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(0)
-    };
     Scan {
-        resumes: highest("session_interrupted", "resumes").saturating_add(1),
-        feedback: highest("feedback_relaunching", "n").saturating_add(1),
+        resumes: highest(events, names::SESSION_INTERRUPTED, "resumes").saturating_add(1),
+        feedback: highest(events, names::FEEDBACK_RELAUNCHING, "n").saturating_add(1),
     }
 }
 
@@ -628,8 +604,8 @@ enum Branch {
 
 /// What the ledger records of the resume the newest `session_interrupted` line owes.
 #[derive(Debug, Default)]
-struct Round {
-    k: u32,
+pub(super) struct Round {
+    pub(super) k: u32,
     /// The workspace the archive is of, as written: an id or `none`.
     archiving: Option<String>,
     archive_asked: bool,
@@ -638,26 +614,14 @@ struct Round {
     /// The machines recorded for it that were given up.
     gave_up: Vec<MachineId>,
     requested: bool,
-    workspace: Option<WorkspaceId>,
-    sending: bool,
+    pub(super) workspace: Option<WorkspaceId>,
+    /// `resume-sending <k>` is recorded since the machine.
+    pub(super) sending: bool,
+    /// `resume-ending-sessions <k>` is recorded since the machine: a start may have gone out,
+    /// as `stop` reads it.
+    pub(super) ending_sessions: bool,
     /// A session was launched since, and no launch came after it.
     launched: bool,
-}
-
-/// The text of a `step_changed` event.
-fn step_text(event: &RunEvent) -> Option<&str> {
-    if event.event != names::STEP_CHANGED {
-        return None;
-    }
-    event.data.get("step").and_then(Value::as_str)
-}
-
-/// What follows `prefix` and the count `k` in `step`, or `None` for a step of another kind or
-/// another count.
-fn numbered<'a>(step: &'a str, prefix: &str, k: u32) -> Option<&'a str> {
-    let rest = step.strip_prefix(prefix)?;
-    let (count, tail) = rest.split_once(' ').unwrap_or((rest, ""));
-    (count == k.to_string()).then_some(tail)
 }
 
 fn parse_machine(text: &str) -> Option<MachineId> {
@@ -665,9 +629,9 @@ fn parse_machine(text: &str) -> Option<MachineId> {
 }
 
 /// The newest `session_interrupted` line that is a resume, and the steps after it.
-fn read_round(events: &[RunEvent]) -> Option<Round> {
+pub(super) fn read_round(events: &[RunEvent]) -> Option<Round> {
     let at = events.iter().rposition(|event| {
-        event.event == "session_interrupted"
+        event.event == names::SESSION_INTERRUPTED
             && event.data.get("relaunch") != Some(&Value::Bool(true))
     })?;
     let k = events[at]
@@ -700,17 +664,21 @@ fn read_round(events: &[RunEvent]) -> Option<Round> {
             round.requested = false;
             round.workspace = None;
             round.sending = false;
+            round.ending_sessions = false;
         } else if let Some(rest) = numbered(step, MACHINE, k) {
             round.machine = parse_machine(rest);
             round.requested = false;
             round.workspace = None;
             round.sending = false;
+            round.ending_sessions = false;
         } else if numbered(step, REQUESTED, k).is_some() {
             round.requested = true;
         } else if let Some(rest) = numbered(step, WORKSPACE, k) {
             round.workspace = uuid::Uuid::parse_str(rest).ok().map(WorkspaceId);
         } else if numbered(step, SENDING, k).is_some() {
             round.sending = true;
+        } else if numbered(step, ENDING_SESSIONS, k).is_some() {
+            round.ending_sessions = true;
         }
     }
     round.launched = first.is_some() && first == last;
@@ -877,8 +845,6 @@ const STUCK_MACHINE: &str = "machine-unreachable";
 const STUCK_UNCONFIRMED: &str = "resume-approval-unconfirmed";
 const STUCK_LAUNCH: &str = "resume-launch-failed";
 const STUCK_SETUP: &str = "resume-setup-failed";
-const STUCK_TEXT: &str = "text-changed-during-build";
-const STUCK_UNVERIFIED: &str = "edits-unverifiable";
 const OWN_STUCK_CODES: [&str; 8] = [
     STUCK_GONE,
     STUCK_ENDED,
@@ -886,8 +852,8 @@ const OWN_STUCK_CODES: [&str; 8] = [
     STUCK_UNCONFIRMED,
     STUCK_LAUNCH,
     STUCK_SETUP,
-    STUCK_TEXT,
-    STUCK_UNVERIFIED,
+    TEXT_CODE,
+    UNVERIFIED_CODE,
 ];
 
 /// The machine that owns the run's newest workspace: its record's owner, else the claim's
@@ -1284,12 +1250,12 @@ fn choose_branch(ctx: &RunContext<'_>, issue: u64, seen: &Seen) -> Result<Branch
 fn resumes_this_round(events: &[RunEvent]) -> u64 {
     let round = events
         .iter()
-        .rposition(|event| event.event == super::feedback::FEEDBACK_RELAUNCHING)
+        .rposition(|event| event.event == names::FEEDBACK_RELAUNCHING)
         .map_or(0, |at| at + 1);
     events[round..]
         .iter()
         .filter(|event| {
-            event.event == super::feedback::SESSION_INTERRUPTED
+            event.event == names::SESSION_INTERRUPTED
                 && event.data.get("relaunch") != Some(&Value::Bool(true))
         })
         .count() as u64
@@ -1605,11 +1571,11 @@ fn carry_on(
         TextCheck::Unchanged => {}
         TextCheck::Changed => {
             let stop = Stop::new(CHANGED_DURING_BUILD);
-            return stuck(ctx, run, at, STUCK_TEXT, stop);
+            return stuck(ctx, run, at, TEXT_CODE, stop);
         }
         TextCheck::Unjudged => {
             let stop = Stop::new(CANNOT_VERIFY_DURING_BUILD);
-            return stuck(ctx, run, at, STUCK_UNVERIFIED, stop);
+            return stuck(ctx, run, at, UNVERIFIED_CODE, stop);
         }
     }
     let first = launch_message(ctx, run, seen, branch);
@@ -5084,6 +5050,50 @@ mod tests {
                 .online(m2())
                 .workspace(workspace_record(m2(), fresh(), "fac/8-1-r66", None))
                 .workspace(workspace_record(m2(), old(), "fac/8-1-r65", None))
+                .build();
+            assert_eq!(
+                orphans(&view, project_id(), &run, &rig.events(&run)),
+                vec![old()]
+            );
+        }
+
+        /// The names looked for run one past the highest resume the ledger names: a workspace
+        /// under the next resume's name is the run's too. A cut ledger: the factory writes a
+        /// resume's `session_interrupted` line before it asks for that resume's workspace.
+        #[test]
+        fn orphans_see_a_resume_workspace_one_past_the_highest_resume_named() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.write(
+                &run,
+                Event::SessionInterrupted {
+                    resumes: 1,
+                    relaunch: false,
+                    run_ordinal: None,
+                    branch: None,
+                    t3_error: None,
+                    ended_in_pass: 0,
+                },
+            );
+            rig.write(
+                &run,
+                Event::SessionLaunched {
+                    thread_id: resumed_session().to_string(),
+                    worktree: Some(fresh().to_string()),
+                    branch: Some("fac/8-1-r1".into()),
+                    model_instance: None,
+                    model: None,
+                    model_options: None,
+                    resumed_from: None,
+                    base: None,
+                    title: None,
+                },
+            );
+            let view = FleetView::builder()
+                .online(m2())
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
+                .workspace(workspace_record(m2(), old(), "fac/8-1-r2", None))
                 .build();
             assert_eq!(
                 orphans(&view, project_id(), &run, &rig.events(&run)),

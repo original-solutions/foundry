@@ -287,6 +287,8 @@ pub mod names {
     pub const STATE_CHANGED: &str = "state_changed";
     pub const STUCK: &str = "stuck";
     pub const FINISHED: &str = "finished";
+    pub const SESSION_INTERRUPTED: &str = "session_interrupted";
+    pub const FEEDBACK_RELAUNCHING: &str = "feedback_relaunching";
 }
 
 impl Event {
@@ -299,7 +301,7 @@ impl Event {
             Event::AnswerReceived { .. } => "answer_received",
             Event::SessionLaunched { .. } => names::SESSION_LAUNCHED,
             Event::CommentForwarded { .. } => "comment_forwarded",
-            Event::SessionInterrupted { .. } => "session_interrupted",
+            Event::SessionInterrupted { .. } => names::SESSION_INTERRUPTED,
             Event::SessionRateLimited { .. } => "session_rate_limited",
             Event::SessionPaused { .. } => "session_paused",
             Event::StopRequested { .. } => "stop_requested",
@@ -316,7 +318,7 @@ impl Event {
             Event::GateFinished { .. } => "gate_finished",
             Event::GateRegate { .. } => "gate_regate",
             Event::RegateRelaunching { .. } => "regate_relaunching",
-            Event::FeedbackRelaunching { .. } => "feedback_relaunching",
+            Event::FeedbackRelaunching { .. } => names::FEEDBACK_RELAUNCHING,
             Event::FeedbackForwarding { .. } => "feedback_forwarding",
             Event::GateCleanupFailed { .. } => "gate_cleanup_failed",
             Event::WorktreeRemoved { .. } => "worktree_removed",
@@ -370,7 +372,7 @@ pub const FIELDS: [(&str, &[&str]); 33] = [
     ),
     ("comment_forwarded", &["comment_id"]),
     (
-        "session_interrupted",
+        names::SESSION_INTERRUPTED,
         &[
             "resumes",
             "relaunch",
@@ -405,7 +407,10 @@ pub const FIELDS: [(&str, &[&str]); 33] = [
         &["sha", "base_sha", "previous_base_sha", "conflict"],
     ),
     ("regate_relaunching", &["attempt", "branch", "message"]),
-    ("feedback_relaunching", &["n", "branch", "items", "message"]),
+    (
+        names::FEEDBACK_RELAUNCHING,
+        &["n", "branch", "items", "message"],
+    ),
     (
         "feedback_forwarding",
         &["n", "run_ordinal", "items", "message"],
@@ -900,5 +905,31 @@ mod tests {
             serde_json::to_value(OptionValue::Flag(true)).unwrap(),
             json!(true)
         );
+    }
+
+    /// The names the round's reset and the workspace names are read by are the ones the
+    /// ledger writes: a rename of either event fails here, not in a silent miscount.
+    #[test]
+    fn the_event_names_are_the_ledgers() {
+        let relaunching = Event::FeedbackRelaunching {
+            n: 1,
+            branch: "feat/pr-12".into(),
+            items: vec![],
+            message: String::new(),
+        };
+        assert_eq!(relaunching.name(), names::FEEDBACK_RELAUNCHING);
+        let interrupted = Event::SessionInterrupted {
+            resumes: 1,
+            relaunch: false,
+            run_ordinal: None,
+            branch: None,
+            t3_error: None,
+            ended_in_pass: 0,
+        };
+        assert_eq!(interrupted.name(), names::SESSION_INTERRUPTED);
+        // The names as the ledgers already written hold them: `Event::name` returns the
+        // constants, so only these catch a rename of one.
+        assert_eq!(names::FEEDBACK_RELAUNCHING, "feedback_relaunching");
+        assert_eq!(names::SESSION_INTERRUPTED, "session_interrupted");
     }
 }
