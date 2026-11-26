@@ -2626,7 +2626,20 @@ mod view_tests {
                 &Cause::new(CauseStep::Pass, "test"),
             )
             .unwrap();
+        // The status and each ledger event reach the other machine as records of their own,
+        // so both answers there wait for the step that holds the token.
         until(|| other.statuses().len() == 1).await;
+        until(|| {
+            other
+                .store
+                .lock()
+                .unwrap()
+                .run_events(&run_id())
+                .unwrap()
+                .len()
+                == 4
+        })
+        .await;
         for machine in [holder, other] {
             let answers = [
                 machine.send("GET", "/api/factory", None, &[]).await,
