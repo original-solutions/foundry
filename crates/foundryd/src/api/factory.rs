@@ -2204,6 +2204,15 @@ mod view_tests {
                 .await;
             assert_eq!(status, 503, "{answer}");
         }
+        // The read of the default itself fails: still 503, never "no default login".
+        coordinator.secrets.readable_for(0);
+        let (status, answer) = coordinator
+            .post(
+                &project_path(),
+                Some(json!({ "on": true, "paused": false })),
+            )
+            .await;
+        assert_eq!(status, 503, "{answer}");
         assert_eq!(factory_of(coordinator), None);
     }
 
@@ -2250,6 +2259,17 @@ mod view_tests {
             factory_of(alone).map(|f| f.login),
             Some("softfac-bot".into())
         );
+
+        // A stop recorded on the holder, the store failing after the check.
+        alone.hold(LeaseState::Held { generation: 1 }, Arc::new(AlwaysHeld(1)));
+        building_run(alone, 1);
+        alone.secrets.readable_for(1);
+        let (status, said) = alone.send("POST", &stop_path(), None, &[]).await;
+        assert_eq!(status, 200, "{said}");
+        let answer: Value = serde_json::from_str(&said).unwrap();
+        assert_eq!(answer["stopped"], json!(true), "{answer}");
+        assert_eq!(answer["message"], json!(crate::secrets::HIDDEN_UNREADABLE));
+        assert_eq!(stops_held(alone), 1, "the stop was recorded");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2291,17 +2311,24 @@ mod view_tests {
             "https://gitlab.com/rawphp/softfac",
             "http://github.com/rawphp/softfac",
         ] {
-            let fleet = fleet(1, repo, None).await;
-            let alone = &fleet[0];
-            let (status, answer) = alone
-                .post(
-                    &project_path(),
-                    Some(json!({ "on": true, "paused": false, "login": "softfac-bot" })),
-                )
-                .await;
-            assert_eq!(status, 422, "{repo}: {answer}");
-            let said = answer["error"].as_str().unwrap();
-            assert!(said.contains("https://github.com/"), "{said}");
+            let fleet = fleet(2, repo, None).await;
+            let (alone, other) = (&fleet[0], &fleet[1]);
+            alone.secrets.set(GITHUB_DEFAULT, "coord-bot").unwrap();
+            // With a login named, and with none, which takes the coordinator's default: asked
+            // of the coordinator, and carried to it.
+            for (asked, body) in [
+                (
+                    alone,
+                    json!({ "on": true, "paused": false, "login": "softfac-bot" }),
+                ),
+                (alone, json!({ "on": true, "paused": false })),
+                (other, json!({ "on": true, "paused": false })),
+            ] {
+                let (status, answer) = asked.post(&project_path(), Some(body.clone())).await;
+                assert_eq!(status, 422, "{repo} {body}: {answer}");
+                let said = answer["error"].as_str().unwrap();
+                assert!(said.contains("https://github.com/"), "{said}");
+            }
             assert_eq!(factory_of(alone), None, "{repo}: nothing was sent");
             // Off, or a pause, is no turning on.
             let (status, answer) = alone
