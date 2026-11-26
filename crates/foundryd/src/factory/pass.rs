@@ -5486,13 +5486,9 @@ mod tests {
             );
         }
 
-        /// A finished stuck run whose issue GitHub refuses to show every time: the pass that
-        /// sweeps fails and the next one sweeps once more, then the sweep waits for
-        /// STUCK_READ_EVERY, so one run cannot fail every pass of its project.
-        #[test]
-        fn a_sweep_that_fails_again_waits_for_the_next_stuck_read() {
-            let mut rig = Rig::new();
-            let run = rig.run_in(3, 1, State::Stuck);
+        /// A run of `issue` that finished stuck.
+        fn finished_stuck(rig: &Rig, issue: u64) -> RunId {
+            let run = rig.run_in(issue, 1, State::Stuck);
             rig.ledger
                 .write(
                     &run,
@@ -5507,20 +5503,61 @@ mod tests {
                     &Cause::new(CauseStep::Start, "test"),
                 )
                 .unwrap();
+            run
+        }
+
+        /// A finished stuck run whose issue GitHub refuses to show every time: the pass that
+        /// sweeps fails, and the next one sweeps on from the run after it, so one run cannot
+        /// fail every pass of its project.
+        #[test]
+        fn a_sweep_that_fails_again_waits_for_the_next_stuck_read() {
+            let mut rig = Rig::new();
+            finished_stuck(&rig, 3);
             assert_eq!(rig.pass().failed, None);
             rig.view = fleet_with(&[3]);
             rig.hub.fail("issue view 3", usize::MAX);
             rig.clock.advance(STUCK_READ_EVERY);
             let first = rig.pass();
             assert!(first.failed.is_some(), "the sweep is due: {first:?}");
-            let retry = rig.pass();
-            assert!(
-                retry.failed.is_some(),
-                "the next pass sweeps once more: {retry:?}"
-            );
+            let next = rig.pass();
+            assert_eq!(next.failed, None, "it sweeps on after run 3: {next:?}");
             let after = rig.pass();
             assert_eq!(after.failed, None, "{after:?}");
             assert_eq!(rig.status().idle, None, "{:?}", rig.status());
+        }
+
+        /// Runs 3 and 4 finished stuck and keep a workspace each. Issue 3 cannot be read, and
+        /// issue 4 has left `factory:stuck`: the sweep that stops at run 3 goes on from run 4
+        /// at the next pass, and archives run 4's workspace. Run 3 is tried again at the
+        /// next sweep.
+        #[test]
+        fn a_run_whose_sweep_always_fails_does_not_keep_the_runs_after_it_from_being_swept() {
+            let mut rig = Rig::new();
+            finished_stuck(&rig, 3);
+            finished_stuck(&rig, 4);
+            rig.hub.issue(4, &[]);
+            assert_eq!(rig.pass().failed, None);
+            rig.view = fleet_with(&[3, 4]);
+            rig.hub.fail("issue view 3", usize::MAX);
+            rig.clock.advance(STUCK_READ_EVERY);
+            let first = rig.pass();
+            assert!(
+                first.failed.is_some(),
+                "the sweep stops at run 3: {first:?}"
+            );
+            assert!(!first.archived.contains(&workspace_of(4)), "{first:?}");
+            let next = rig.pass();
+            assert_eq!(next.failed, None, "{next:?}");
+            assert!(
+                next.archived.contains(&workspace_of(4)),
+                "the sweep goes on from run 4: {next:?}"
+            );
+            rig.clock.advance(STUCK_READ_EVERY);
+            let again = rig.pass();
+            assert!(
+                again.failed.is_some(),
+                "the next sweep tries run 3 again: {again:?}"
+            );
         }
     }
 }
