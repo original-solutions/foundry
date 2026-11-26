@@ -604,8 +604,8 @@ pub enum StartStep {
     Resent { session: SessionId },
     /// The run went stuck.
     Stuck { reason: String },
-    /// The approval was taken back before the session started: the run ended as the runner
-    /// refuses an unapproved issue.
+    /// A withdraw the ledger shows begun was finished: the run ended as the runner refuses an
+    /// unapproved issue.
     Unapproved { reason: String },
     /// The run is not this step's: nothing was written.
     Skipped { reason: String },
@@ -1254,7 +1254,8 @@ fn find_workspace(
 }
 
 /// Where the run's build stands until its session starts: asks for the workspace, waits for its
-/// record and its setup, checks the approval again, and starts the session.
+/// record and its setup, checks the text since the approval the run recorded, and starts the
+/// session.
 fn build(
     ctx: &RunContext<'_>,
     run: &RunId,
@@ -1479,8 +1480,8 @@ fn record_decision(
     ctx.record_step(run, &format!("{WORKSPACE_REQUESTED}{name}"), cause)
 }
 
-/// The run ends as the runner refuses an unapproved issue: the approval was taken back before
-/// the session started. The refusal is explained once, the issue goes back to
+/// The run ends as the runner refuses an unapproved issue, finishing a withdraw the ledger
+/// shows begun (no pass begins one now). The refusal is explained once, the issue goes back to
 /// `factory:proposed` without our assignee, the build workspace is archived by force and the run
 /// is finished.
 fn withdraw(
@@ -3219,6 +3220,35 @@ mod tests {
                     "tom",
                     &[("2026-10-04T10:30:00Z", "mallory")],
                 ));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: TEXT_CHANGED.into()
+                    }
+                );
+                assert!(start_sessions(&rig).is_empty());
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+            }
+
+            /// A text history that cannot be judged whole since the approval counts as changed:
+            /// the edit history is cut off and its oldest entry shown is after the approval.
+            #[test]
+            fn a_text_history_that_cannot_be_judged_goes_stuck() {
+                let (rig, run) = workspace_shown();
+                let mut answer: serde_json::Value = serde_json::from_str(&approval_answer(
+                    LABELED_AT,
+                    "tom",
+                    &[("2026-10-04T10:30:00Z", "tom")],
+                ))
+                .unwrap();
+                answer["data"]["repository"]["issue"]["userContentEdits"]["totalCount"] = 5.into();
+                rig.sim.set_approval(answer.to_string());
+                assert_eq!(
+                    rig.sim
+                        .text_check(REPO, ISSUE, LABELED_AT, &rig.ctx().config.instructors)
+                        .unwrap(),
+                    TextCheck::Unjudged
+                );
                 assert_eq!(
                     pass(&rig, &run),
                     StartStep::Stuck {
