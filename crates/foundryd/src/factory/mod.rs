@@ -543,6 +543,34 @@ fn one_pass<H: Host>(
     poll
 }
 
+/// The token held for `login`, trimmed, when git can be given it: none held, a blank one and one
+/// with a control character, which an environment variable could not carry whole, are `None`.
+/// The one place that rule is written in this module; `git_auth` holds its own copy.
+fn usable_token(
+    secrets: &dyn Secrets,
+    login: &str,
+) -> Result<Option<String>, crate::secrets::SecretsError> {
+    let Some(token) = crate::secrets::github_token(secrets, login)? else {
+        return Ok(None);
+    };
+    let token = token.trim();
+    if token.is_empty() || token.chars().any(char::is_control) {
+        return Ok(None);
+    }
+    Ok(Some(token.to_owned()))
+}
+
+/// A fingerprint of the token [`usable_token`] gives for `login`, never the token.
+fn token_mark_in(secrets: &dyn Secrets, login: &str) -> Result<Option<u64>, String> {
+    use std::hash::{Hash, Hasher};
+    let token = usable_token(secrets, login).map_err(|e| e.to_string())?;
+    Ok(token.map(|token| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        token.hash(&mut hasher);
+        hasher.finish()
+    }))
+}
+
 /// The daemon's [`Host`].
 pub struct Daemon {
     api: Api,
@@ -567,35 +595,19 @@ impl Host for Daemon {
     }
 
     fn tracker(&self, login: &str) -> Option<Arc<dyn Commenting>> {
-        let token = match crate::secrets::github_token(&*self.secrets, login) {
+        let token = match usable_token(&*self.secrets, login) {
             Ok(token) => token?,
             Err(error) => {
                 tracing::warn!("factory: the token for {login} could not be read: {error}");
                 return None;
             }
         };
-        let token = token.trim();
-        if token.is_empty() || token.chars().any(char::is_control) {
-            return None;
-        }
         let gh = github::Gh::new(login, token, self.clock.clone());
         Some(Arc::new(github::Hiding::new(Arc::new(gh), self.hide())))
     }
 
     fn token_mark(&self, login: &str) -> Result<Option<u64>, String> {
-        use std::hash::{Hash, Hasher};
-        let Some(token) =
-            crate::secrets::github_token(&*self.secrets, login).map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
-        };
-        let token = token.trim();
-        if token.is_empty() {
-            return Ok(None);
-        }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        token.hash(&mut hasher);
-        Ok(Some(hasher.finish()))
+        token_mark_in(&*self.secrets, login)
     }
 
     fn lease(&self, watched: &Watched) -> Arc<dyn Leasing> {
