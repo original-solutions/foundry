@@ -417,7 +417,7 @@ fn resuming_seen(events: &[RunEvent], seen: &Seen) -> Option<Seen> {
     })?;
     let k = interruption.resumes;
     let at = events.iter().rposition(|event| {
-        event.event == "session_interrupted"
+        event.event == feedback::SESSION_INTERRUPTED
             && event.data.get("relaunch") != Some(&Value::Bool(true))
     })?;
     let (mut workspace, mut sending) = (None, false);
@@ -586,11 +586,11 @@ pub(super) fn live_workspaces(ctx: &RunContext<'_>, run: &RunId, events: &[RunEv
         .unwrap_or(0);
     let mut named = vec![(base.clone(), false)];
     named.extend(
-        (1..=highest(events, "session_interrupted", "resumes").saturating_add(1))
+        (1..=highest(events, feedback::SESSION_INTERRUPTED, "resumes").saturating_add(1))
             .map(|k| (format!("{base}-r{k}"), false)),
     );
     named.extend(
-        (1..=highest(events, "feedback_relaunching", "n").saturating_add(1))
+        (1..=highest(events, feedback::FEEDBACK_RELAUNCHING, "n").saturating_add(1))
             .map(|k| (format!("{base}-f{k}"), false)),
     );
     named.extend((1..=gates.saturating_add(1)).map(|k| (gate::name(run, k), true)));

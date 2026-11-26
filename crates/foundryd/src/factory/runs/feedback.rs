@@ -122,7 +122,8 @@
 //! - Call `stop::reconcile` before this step: a merged pull request or a closed issue ends the
 //!   run there, and what both write is idempotent through the ledger. It judges nothing while
 //!   [`round_pending`] holds, and it leaves a stuck path of the text codes begun here to this
-//!   step.
+//!   step, as it leaves every stuck path of a run still in `pr-open` (the read's changed text
+//!   or refused branch, cut before its move to `stuck`): this step finishes those.
 //! - Call [`forward`] for a run in `building` every pass, before or after `building::advance`
 //!   (it holds back while the session's newest turn is unread). It sends at most one message
 //!   per run per pass.
@@ -147,9 +148,11 @@
 //! its count of prompts is the one it is sent under, and the count is read from a fleet view
 //! that shows a typed message a pass later, so a second send in the pass would be refused. What
 //! is left goes in the next pass. Nothing is typed (and nothing written for it) while the
-//! session is not idle, shows no turn to count by, has a question waiting, or has a newest turn
-//! `building` has not read yet: a message typed then would start a turn that hides the unread
-//! one, and a turn is acted on once. The pass shows that as [`ForwardStep::held_back`].
+//! session is not idle, shows no turn to count by, has not taken its first message (turn 0 with
+//! no prompt: the launch's or a round's, which its own resend sends by count, so a message typed
+//! first would take its place), has a question waiting, or has a newest turn `building` has not
+//! read yet: a message typed then would start a turn that hides the unread one, and a turn is
+//! acted on once. The pass shows that as [`ForwardStep::held_back`].
 //! `forward` can be called before or after `building::advance` for that reason. The text of
 //! what is sent is a body file named by a fixed line ([`FORWARD_COMMENT_LINE`],
 //! [`FORWARD_BODY_LINE`]), since a typed line is one short line.
@@ -311,6 +314,15 @@ use crate::factory::text;
 use crate::factory::worker::{CreateWorkspace, WorkerError};
 use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
 use crate::workspaces::{Checkout, FactoryTag, Setup};
+
+/// The name of a round's decision line (`Event::FeedbackRelaunching`), as the ledger writes it.
+/// `ledger::events::names` has no constant for it; the test `the_event_names_are_the_ledgers`
+/// pins this one to `Event::name`.
+pub const FEEDBACK_RELAUNCHING: &str = "feedback_relaunching";
+
+/// The name of an interruption line (`Event::SessionInterrupted`), which the round's reset of
+/// the resume cap counts after the newest [`FEEDBACK_RELAUNCHING`]; pinned as that one is.
+pub const SESSION_INTERRUPTED: &str = "session_interrupted";
 
 /// Why a round that has feedback does not start when every run slot is held.
 pub const NO_SLOT: &str = "no run slot is free";
@@ -677,8 +689,10 @@ fn send_outcome(result: Result<(), RunError>) -> Result<Sent, RunError> {
 }
 
 /// Whether the session cannot be typed into now: it is not idle, it shows no turn to count
-/// prompts by, a question waits for a person, or its newest turn is not read yet (a message
-/// typed now would start a turn that hides it, and `building` acts on a turn once).
+/// prompts by, it has not taken its first message (the launch's or a round's: a message typed
+/// now would be its first prompt, and that message's resend would read the risen count as its
+/// own), a question waits for a person, or its newest turn is not read yet (a message typed now
+/// would start a turn that hides it, and `building` acts on a turn once).
 fn cannot_take_a_message(ctx: &RunContext<'_>, seen: &Seen, session: SessionId) -> bool {
     if ctx.view.session_state(session) != Some(SessionState::Idle) {
         return true;
@@ -686,7 +700,9 @@ fn cannot_take_a_message(ctx: &RunContext<'_>, seen: &Seen, session: SessionId) 
     match ctx.view.session_turn(session) {
         None => true,
         Some(turn) => {
-            turn.question || (turn.turn > 0 && seen.turn_read.is_none_or(|read| turn.turn > read))
+            turn.question
+                || (turn.turn == 0 && turn.prompts == FIRST_PROMPT_COUNT)
+                || (turn.turn > 0 && seen.turn_read.is_none_or(|read| turn.turn > read))
         }
     }
 }
@@ -927,7 +943,7 @@ fn launches_since_the_round(events: &[RunEvent]) -> Option<usize> {
     }
     let at = events
         .iter()
-        .rposition(|event| event.event == "feedback_relaunching")?;
+        .rposition(|event| event.event == FEEDBACK_RELAUNCHING)?;
     Some(
         events[at + 1..]
             .iter()
@@ -962,7 +978,7 @@ impl Round {
 
     fn read(events: &[RunEvent]) -> Option<Round> {
         let number = |event: &RunEvent| {
-            (event.event == "feedback_relaunching")
+            (event.event == FEEDBACK_RELAUNCHING)
                 .then(|| event.data.get("n").and_then(Value::as_u64))
                 .flatten()
                 .and_then(|n| u32::try_from(n).ok())
@@ -1423,8 +1439,10 @@ fn decision_detail(events: &[RunEvent], code: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// A stuck path cut short while a round was being set up, or begun here for a setup or a
-/// launch, finished from the ledger with the words it recorded.
+/// A stuck path cut short while a round was being set up, begun here for a setup or a launch,
+/// or begun here by the read of a run still in `pr-open` (a changed text or a refused branch,
+/// which no other step finishes: `stop::reconcile` and `building` leave a `pr-open` run's stuck
+/// path alone), finished from the ledger with the words it recorded.
 fn finish_stuck(
     ctx: &RunContext<'_>,
     run: &RunId,
@@ -1437,18 +1455,24 @@ fn finish_stuck(
     };
     let decision: StuckStop = serde_json::from_str(raw)
         .map_err(|error| RunError::Invalid(format!("the stuck decision of {run}: {error}")))?;
+    // Only this step goes stuck from `pr-open`; a round is moved to `building` before its
+    // workspace is asked for.
+    let read = seen.state == Some(State::PrOpen);
     let owned = round.is_some_and(|round| !round.launched())
         || decision.code == STUCK_SETUP
-        || decision.code == STUCK_LAUNCH;
+        || decision.code == STUCK_LAUNCH
+        || read;
     if !owned {
         return Ok(None);
     }
     let mut stop = decision.stop;
     stop.detail = decision_detail(events, &decision.code);
+    // A path begun from `pr-open` ends no session, as when it was begun: the build's ended at
+    // the gate, and an earlier round's workspace is not this path's.
     let mut at = progress_from(
         run,
         CauseStep::Forward,
-        &round_seen(seen, round),
+        &round_seen(seen, if read { None } else { round }),
         State::Building,
     );
     // A path cut after its move to `stuck` is finished with the one line it lacks: `go_stuck`
@@ -1628,14 +1652,13 @@ fn carry_on(
     let n = round.n;
     // A round decided with its label not moved yet takes a slot with the move, so it needs
     // one free as a round that is not decided yet does: with none, nothing is written and the
-    // issue stays `pr-open`. One that has moved holds its slot already.
-    if seen.state == Some(State::PrOpen) {
-        if slots.runs_free == 0 {
-            return Ok(FeedbackStep::Waiting {
-                reason: NO_SLOT.into(),
-            });
-        }
-        slots.runs_free -= 1;
+    // issue stays `pr-open`. It takes the slot once it has a machine. One that has moved holds
+    // its slot already.
+    let moving = seen.state == Some(State::PrOpen);
+    if moving && slots.runs_free == 0 {
+        return Ok(FeedbackStep::Waiting {
+            reason: NO_SLOT.into(),
+        });
     }
     let stopping = round_seen(seen, Some(round));
     let mut at = progress_from(run, CauseStep::Forward, &stopping, State::Building);
@@ -1678,6 +1701,9 @@ fn carry_on(
             machine
         }
     };
+    if moving {
+        slots.runs_free -= 1;
+    }
     let placed = Round {
         machine: Some(machine),
         ..round.clone()
@@ -3278,6 +3304,63 @@ mod tests {
             world.rig.view = round_view();
         }
 
+        /// A pass cut after the archive of the earlier workspace was recorded and before it was
+        /// recorded asked: the next pass asks for the archive of the recorded workspace again,
+        /// and nothing is created while it shows.
+        #[test]
+        fn a_pass_cut_between_the_archive_and_its_record_asks_for_the_same_archive_again() {
+            let showing = || {
+                fleet()
+                    .workspace(workspace_record(old(), "fac/8-1", None))
+                    .build()
+            };
+            let mut found = false;
+            for checks in 0..40 {
+                let mut world = World::reviewed();
+                world.rig.view = showing();
+                world.rig.guard = Box::new(HeldFor::new(checks));
+                let cut = world.try_go().is_err();
+                world.rig.guard = Box::new(crate::factory::worker::AlwaysHeld(1));
+                let between = !world.steps_of("feedback-archiving").is_empty()
+                    && world.steps_of("feedback-archive-asked").is_empty();
+                if between {
+                    found = true;
+                    let label = format!("cut after {checks} checks");
+                    assert!(
+                        matches!(world.go(), FeedbackStep::Decided { .. }),
+                        "{label}"
+                    );
+                    assert_eq!(world.steps_of("feedback-archive-asked").len(), 1, "{label}");
+                    assert_eq!(
+                        world.go(),
+                        FeedbackStep::Preparing(Wait::Archive),
+                        "{label}"
+                    );
+                    assert!(world.creates().is_empty(), "{label}");
+                    world.rig.view = fleet().build();
+                    world.rig.worker.on_create(Ok(fresh()));
+                    assert_eq!(
+                        world.go(),
+                        FeedbackStep::Preparing(Wait::Workspace),
+                        "{label}"
+                    );
+                    assert_eq!(world.creates().len(), 1, "{label}");
+                    let archives = world.archives();
+                    assert!(archives.len() >= 2, "{label}: {archives:?}");
+                    assert!(
+                        archives
+                            .iter()
+                            .all(|call| *call == Call::Archive { workspace: old() }),
+                        "{label}: {archives:?}"
+                    );
+                }
+                if !cut {
+                    break;
+                }
+            }
+            assert!(found, "a pass was cut between the archive and its record");
+        }
+
         #[test]
         fn a_workspace_on_a_machine_unreachable_for_15_minutes_is_not_waited_for() {
             let mut world = World::reviewed();
@@ -3878,6 +3961,113 @@ mod tests {
             assert!(comment.contains(LAUNCH_FAILED), "{comment}");
             assert!(!comment.contains("a..b"), "{comment}");
         }
+
+        /// A stuck path begun from `pr-open` by the read, cut by a failed stuck comment: the
+        /// stuck line is written and the run is neither moved nor finished. The next pass
+        /// finishes it once, with the words it recorded, and says nothing twice.
+        fn a_pr_open_stuck_path_cut_short_is_finished_by_the_next_pass(
+            world: &World,
+            reason: &str,
+            said: &str,
+        ) {
+            world.rig.sim.fail("issue comment", 1);
+            assert!(world.try_go().is_err());
+            let seen = world.seen();
+            assert!(seen.stuck_stop.is_some());
+            assert_eq!(seen.state, Some(State::PrOpen));
+            assert!(!seen.finished);
+            assert!(world.rig.sim.comments().is_empty());
+            assert_eq!(
+                world.go(),
+                FeedbackStep::Stuck {
+                    reason: reason.into()
+                }
+            );
+            assert!(world.rig.finished(&world.run));
+            assert_eq!(world.rig.sim.labels(), ["factory:stuck"]);
+            let comments = world.rig.sim.comments();
+            let stuck: Vec<&String> = comments
+                .iter()
+                .filter(|comment| comment.contains("could not finish this issue"))
+                .collect();
+            assert_eq!(stuck.len(), 1, "{comments:?}");
+            assert!(stuck[0].contains(said), "{comments:?}");
+            assert!(world.rig.worker.calls().is_empty());
+            assert!(world.decisions().is_empty());
+            let count = world.count();
+            assert_eq!(world.go(), FeedbackStep::None);
+            assert_eq!(world.count(), count);
+        }
+
+        #[test]
+        fn a_text_stop_from_pr_open_cut_before_the_move_is_finished_by_the_next_pass() {
+            let world = World::reviewed();
+            world.rig.sim.set_approval(approval_answer(
+                LABELED_AT,
+                "tom",
+                &[("2026-10-04T10:30:00Z", "eve")],
+            ));
+            a_pr_open_stuck_path_cut_short_is_finished_by_the_next_pass(
+                &world,
+                messages::CHANGED_DURING_BUILD,
+                messages::CHANGED_DURING_BUILD,
+            );
+        }
+
+        #[test]
+        fn a_refused_branch_cut_before_the_move_is_finished_by_the_next_pass() {
+            let world = World::reviewed();
+            world.rig.sim.set_pull(
+                12,
+                SimPull {
+                    state: "OPEN",
+                    draft: false,
+                    head: "a..b".into(),
+                    base: "main".into(),
+                    cross: false,
+                },
+            );
+            a_pr_open_stuck_path_cut_short_is_finished_by_the_next_pass(
+                &world,
+                BRANCH_REFUSED,
+                LAUNCH_FAILED,
+            );
+            let comment = world.rig.sim.comments().join("\n");
+            assert!(!comment.contains("a..b"), "{comment}");
+        }
+
+        /// After a round whose session launched and a gate that passed again, the next read's
+        /// stuck path, cut short, is finished with nothing asked of the worker: the earlier
+        /// round's workspace is not this path's, though the fleet still shows it.
+        #[test]
+        fn a_text_stop_after_an_earlier_round_cut_before_the_move_ends_no_session() {
+            let mut world = World::reviewed();
+            world.round();
+            passed_gate(&world.rig, &world.run);
+            world.rig.moved(&world.run, State::Building, State::PrOpen);
+            world.hub.set_feedback(vec![
+                review(11, "2026-10-04T11:00:00Z"),
+                pr_comment(30, "2026-10-04T14:00:00Z", "one more"),
+            ]);
+            world.rig.sim.set_approval(approval_answer(
+                LABELED_AT,
+                "tom",
+                &[("2026-10-04T10:30:00Z", "eve")],
+            ));
+            world.wait(TEN_MINUTES);
+            let calls = world.rig.worker.calls().len();
+            world.rig.sim.fail("issue comment", 1);
+            assert!(world.try_go().is_err());
+            assert_eq!(world.seen().state, Some(State::PrOpen));
+            assert_eq!(
+                world.go(),
+                FeedbackStep::Stuck {
+                    reason: messages::CHANGED_DURING_BUILD.into()
+                }
+            );
+            assert!(world.rig.finished(&world.run));
+            assert_eq!(world.rig.worker.calls().len(), calls);
+        }
     }
 
     // ----- carrying a round on -----
@@ -4230,6 +4420,131 @@ mod tests {
             );
             assert_eq!(free.runs_free, 0);
             assert_eq!(world.rig.sim.labels(), ["factory:building"]);
+        }
+
+        /// A round whose machine stays away for 15 minutes before its session starts gives the
+        /// machine up and is placed again: the workspace is asked for on the new machine under
+        /// the round's name, and one session starts there.
+        #[test]
+        fn a_round_whose_machine_is_gone_for_15_minutes_is_placed_again_and_starts_once() {
+            let mut world = World::reviewed();
+            let m2 = MachineId(uuid::Uuid::from_u128(0x9));
+            let mut two = shared();
+            two.machines.push(Machine {
+                id: m2,
+                name: "studio".into(),
+                address: String::new(),
+                key: String::new(),
+            });
+            two.limits.insert(
+                m2,
+                Limits {
+                    max_sessions: 4,
+                    max_load_per_core: 1.0,
+                    min_free_disk: 10_000_000_000,
+                },
+            );
+            let pass = |world: &World| {
+                advance(
+                    &world.ctx(),
+                    &world.run,
+                    &two,
+                    &mut slots(1),
+                    &mut Reserved::default(),
+                )
+                .unwrap()
+            };
+            world.rig.worker.on_create(Ok(fresh()));
+            assert!(matches!(pass(&world), FeedbackStep::Decided { .. }));
+            assert_eq!(pass(&world), FeedbackStep::Preparing(Wait::Workspace));
+            // m1 answered the create and then went away; m2 can take the round.
+            let away = |span| {
+                FleetView::builder()
+                    .unreachable(m1(), span)
+                    .online(m2)
+                    .sample(sample(m2, 0))
+                    .held(
+                        m2,
+                        MachineHeld {
+                            logins: vec![LOGIN.into()],
+                            skill: true,
+                        },
+                    )
+            };
+            world.rig.view = away(Duration::from_secs(14 * 60)).build();
+            assert_eq!(pass(&world), FeedbackStep::Preparing(Wait::Workspace));
+            assert!(world.steps_of("feedback-machine-given-up").is_empty());
+            world.rig.view = away(UNREACHABLE_FOR).build();
+            assert_eq!(pass(&world), FeedbackStep::Preparing(Wait::Workspace));
+            assert_eq!(
+                world.steps_of("feedback-machine"),
+                [
+                    format!("feedback-machine 1 {}", m1()),
+                    format!("feedback-machine-given-up 1 {}", m1()),
+                    format!("feedback-machine 1 {m2}"),
+                ]
+            );
+            // The next pass asks m2 for the round's workspace, once.
+            let ours = WorkspaceId(uuid::Uuid::from_u128(0xb23));
+            world.rig.worker.on_create(Ok(ours));
+            assert_eq!(pass(&world), FeedbackStep::Preparing(Wait::Workspace));
+            let creates: Vec<(MachineId, String)> = world
+                .creates()
+                .into_iter()
+                .map(|call| match call {
+                    Call::Create { machine, request } => (machine, request.name),
+                    _ => unreachable!(),
+                })
+                .collect();
+            assert_eq!(
+                creates,
+                [(m1(), "fac/8-1-f1".into()), (m2, "fac/8-1-f1".into())]
+            );
+            // Its record shows on m2 with the setup done: the session starts there, once.
+            let mut record = workspace_record(ours, "fac/8-1-f1", Some(setup_terminal()));
+            record.owner = m2;
+            let mut terminal = terminal_record(TerminalState::Exited, Some(0));
+            terminal.owner = m2;
+            terminal.body.workspace = ours;
+            world.rig.view = away(UNREACHABLE_FOR)
+                .workspace(record)
+                .terminal(terminal)
+                .build();
+            world.rig.worker.on_start_session(Ok(round_session()));
+            assert_eq!(
+                pass(&world),
+                FeedbackStep::Started {
+                    round: 1,
+                    session: round_session()
+                }
+            );
+            let starts = world.starts();
+            assert_eq!(starts.len(), 1);
+            let Call::StartSession { workspace, .. } = &starts[0] else {
+                unreachable!()
+            };
+            assert_eq!(*workspace, ours);
+            assert_eq!(world.launches().len(), 2, "the build's and the round's");
+            assert!(!matches!(pass(&world), FeedbackStep::Started { .. }));
+            assert_eq!(world.starts().len(), 1);
+        }
+
+        /// A round cut before its machine was recorded, carried on in `pr-open` with no machine
+        /// to place it on, waits and leaves the slot free for the rest of the pass.
+        #[test]
+        fn a_round_carried_on_in_pr_open_that_cannot_be_placed_takes_no_run_slot() {
+            let mut world = cut_before_the_move();
+            assert!(world.steps_of("feedback-machine").is_empty());
+            // The only machine is at its limit of sessions.
+            world.rig.view = fleet_with(4).build();
+            let mut free = slots(1);
+            let step = world.try_pass(&mut free, &mut Reserved::default()).unwrap();
+            let FeedbackStep::Waiting { reason } = step else {
+                panic!("expected a wait, got {step:?}");
+            };
+            assert!(reason.starts_with("mac:"), "{reason}");
+            assert_eq!(free.runs_free, 1, "a round that waits takes no slot");
+            assert_eq!(world.rig.sim.labels(), ["factory:pr-open"]);
         }
 
         #[test]
@@ -4810,6 +5125,28 @@ mod tests {
 
     mod feedback_the_budgets_start_again {
         use super::*;
+
+        /// The names the round's reset and the workspace names are read by are the ones the
+        /// ledger writes: a rename of either event fails here, not in a silent miscount.
+        #[test]
+        fn the_event_names_are_the_ledgers() {
+            let relaunching = Event::FeedbackRelaunching {
+                n: 1,
+                branch: BRANCH.into(),
+                items: vec![],
+                message: String::new(),
+            };
+            assert_eq!(relaunching.name(), FEEDBACK_RELAUNCHING);
+            let interrupted = Event::SessionInterrupted {
+                resumes: 1,
+                relaunch: false,
+                run_ordinal: None,
+                branch: None,
+                t3_error: None,
+                ended_in_pass: 0,
+            };
+            assert_eq!(interrupted.name(), SESSION_INTERRUPTED);
+        }
 
         /// What `building::time_limit` measures from starts again at the round's move to
         /// `building`: the worked time and the running stint, which are what this checks.
@@ -5792,6 +6129,22 @@ mod tests {
             instructor_activity(&world);
             assert!(forward_in(&world).held_back);
             assert!(world.sends().is_empty());
+        }
+
+        /// A session started and idle whose turn record shows no prompt has not taken its
+        /// first message (the launch's, or a round's): a comment typed now would be its first
+        /// prompt, and the first message's resend would then read the risen count as its own.
+        #[test]
+        fn a_session_that_has_not_taken_its_first_message_is_waited_for() {
+            let mut world = forwarding();
+            world.rig.view = building_view(SessionState::Idle, Some((0, FIRST_PROMPT_COUNT)));
+            instructor_activity(&world);
+            assert!(forward_in(&world).held_back);
+            assert!(world.sends().is_empty());
+            // Once it has taken it and its turn is read, the comment goes in.
+            world.rig.view = building_view(SessionState::Idle, Some((1, 1)));
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(1, false));
         }
     }
 

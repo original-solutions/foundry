@@ -1283,11 +1283,11 @@ fn choose_branch(ctx: &RunContext<'_>, issue: u64, seen: &Seen) -> Result<Branch
 fn resumes_this_round(events: &[RunEvent]) -> u64 {
     let round = events
         .iter()
-        .rposition(|event| event.event == "feedback_relaunching")
+        .rposition(|event| event.event == super::feedback::FEEDBACK_RELAUNCHING)
         .map_or(0, |at| at + 1);
     events[round..]
         .iter()
-        .filter(|event| event.event == "session_interrupted")
+        .filter(|event| event.event == super::feedback::SESSION_INTERRUPTED)
         .count() as u64
 }
 
