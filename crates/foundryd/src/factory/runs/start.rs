@@ -2589,7 +2589,7 @@ mod tests {
         use super::super::super::testing::*;
         use super::super::*;
         use crate::factory::ledger::events::Event;
-        use crate::factory::lifecycle::approval::{Refusal, unapproved_comment};
+        use crate::factory::lifecycle::approval::Refusal;
         use crate::factory::messages::{
             CANNOT_CONFIRM, LAUNCH_FAILED, Message, ResumeFrom, TEXT_CHANGED,
         };
@@ -3162,31 +3162,54 @@ mod tests {
                 );
             }
 
-            /// Acceptance, and the spec: an approval taken back ends the run the way the runner
-            /// refuses an unapproved issue, and the workspace is archived by force. No session
-            /// was started.
+            /// The claim swaps `factory:ready` for `factory:triage`, and GitHub records that
+            /// removal: the approval then reads as no label in force. The claim already holds
+            /// the approval, so the check before the session is of the text since it, and the
+            /// session starts.
             #[test]
-            fn taken_back_means_no_session_and_ends_the_run_as_the_runner_refuses() {
+            fn a_label_the_claim_removed_still_starts_the_session() {
+                let (rig, run) = workspace_shown();
+                let mut answer: serde_json::Value =
+                    serde_json::from_str(&approval_answer(LABELED_AT, "tom", &[])).unwrap();
+                let timeline = &mut answer["data"]["repository"]["issue"]["timelineItems"];
+                timeline["totalCount"] = 2.into();
+                timeline["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "__typename": "UnlabeledEvent",
+                        "createdAt": "2026-10-04T10:05:00Z",
+                        "actor": {"__typename": "User", "login": LOGIN},
+                        "label": {"name": "factory:ready"},
+                    }));
+                rig.sim.set_approval(answer.to_string());
+                assert_eq!(
+                    rig.sim
+                        .approval(REPO, ISSUE, &rig.ctx().config.instructors)
+                        .unwrap(),
+                    Approval::Refused(Refusal::LabelNotFound)
+                );
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert_eq!(start_sessions(&rig).len(), 1);
+                assert_eq!(rig.sim.labels(), vec!["factory:building"]);
+                assert!(!rig.finished(&run));
+            }
+
+            /// Who applied the label in force now is not read again before the session: a label
+            /// that reads as a stranger's, with the text unchanged since the approval the run
+            /// recorded, still starts it.
+            #[test]
+            fn a_label_that_now_reads_as_a_strangers_still_starts_the_session() {
                 let (rig, run) = workspace_shown();
                 rig.sim
                     .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
-                let step = pass(&rig, &run);
-                assert_eq!(
-                    step,
-                    StartStep::Unapproved {
-                        reason: "factory:ready was not applied by an instructor".into()
-                    }
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert!(
+                    !rig.sim
+                        .comments()
+                        .iter()
+                        .any(|c| c.contains("did not start on this issue"))
                 );
-                assert!(start_sessions(&rig).is_empty());
-                assert!(calls(&rig).contains(&Call::Archive { workspace: ws_id() }));
-                assert_eq!(rig.sim.labels(), vec!["factory:proposed"]);
-                assert!(rig.sim.assignees().is_empty());
-                let comment = unapproved_comment(&Refusal::LabeledByNonInstructor {
-                    by: Some("mallory".into()),
-                    labeled_at: LABELED_AT.into(),
-                });
-                assert!(rig.sim.comments().iter().any(|c| c.starts_with(&comment)));
-                assert!(rig.finished(&run));
             }
 
             #[test]
@@ -6178,12 +6201,13 @@ mod tests {
                 assert!(rig.finished(&run));
             }
 
-            /// The withdraw, cut short by an archive that failed after the label moved to
+            /// A withdraw the ledger shows begun, cut short by an archive that failed after the label moved to
             /// `proposed`: the issue is no longer in triage, and the next pass archives and
             /// finishes.
             #[test]
             fn a_withdraw_cut_short_after_the_label_moved_is_finished_by_the_next_pass() {
                 let (rig, run) = workspace_shown();
+                rig.step(&run, "approval-withdrawn");
                 rig.sim
                     .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
                 rig.worker
@@ -6198,11 +6222,12 @@ mod tests {
                 assert_eq!(said(&rig, "did not start on this issue"), 1);
             }
 
-            /// The withdraw, cut short after the unassign by a label call that failed: the
+            /// A withdraw the ledger shows begun, cut short after the unassign by a label call that failed: the
             /// issue is in triage with nobody assigned, and the next pass finishes it.
             #[test]
             fn a_withdraw_cut_short_after_the_unassign_is_finished_by_the_next_pass() {
                 let (rig, run) = workspace_shown();
+                rig.step(&run, "approval-withdrawn");
                 rig.sim
                     .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
                 rig.sim.fail("--add-label factory:proposed", 1);
@@ -6216,11 +6241,12 @@ mod tests {
                 assert_eq!(said(&rig, "did not start on this issue"), 1);
             }
 
-            /// A withdraw cut short in triage whose approval reads as given again on the next
+            /// A withdraw the ledger shows begun, cut short in triage, whose approval reads as given again on the next
             /// pass: it is finished with no second explanation.
             #[test]
             fn a_withdraw_cut_short_and_approved_again_is_finished_with_no_second_comment() {
                 let (rig, run) = workspace_shown();
+                rig.step(&run, "approval-withdrawn");
                 rig.sim
                     .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
                 rig.sim.fail("--add-label factory:proposed", 1);
@@ -6493,10 +6519,10 @@ mod tests {
                 assert_eq!(end_sessions(&rig).len(), 1);
             }
 
-            /// A start retried a pass later checks the approval again, and an approval taken
-            /// back in between ends the run with the session stopped.
+            /// A start retried a pass later checks the text again, and a stranger's edit since
+            /// the approval ends the run stuck with the session stopped.
             #[test]
-            fn a_start_retried_a_pass_later_checks_the_approval_again() {
+            fn a_start_retried_a_pass_later_checks_the_text_again() {
                 let rig = Rig::new();
                 rig.worker.on_create(Ok(ws_id()));
                 rig.worker
@@ -6510,12 +6536,19 @@ mod tests {
                 pass(&rig, &run);
                 show_workspace(&mut rig);
                 assert!(advance(&rig.ctx(), &run).is_err());
-                rig.sim
-                    .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
-                assert!(matches!(pass(&rig, &run), StartStep::Unapproved { .. }));
+                rig.sim.set_approval(approval_answer(
+                    LABELED_AT,
+                    "tom",
+                    &[("2026-10-04T10:30:00Z", "mallory")],
+                ));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: TEXT_CHANGED.into()
+                    }
+                );
                 assert_eq!(start_sessions(&rig).len(), 1);
                 assert_eq!(end_sessions(&rig).len(), 1);
-                assert_eq!(archives(&rig).len(), 1);
                 assert!(rig.finished(&run));
             }
 
