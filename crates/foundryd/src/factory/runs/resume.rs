@@ -83,11 +83,15 @@
 //!   never written (`NotWritten`) is the interruption; any other error of the call decides
 //!   nothing, and the next pass asks again. A call that answers `Failed` without a break for
 //!   [`TURN_FAILING_FOR`] (an owner that runs an older Foundry, or one whose answer is not
-//!   JSON, fails the same way on every pass) is decided as `NotWritten`. Its first failure is
-//!   recorded before the error is returned (`resume-turn-failing <session> <turn> <generation>
-//!   <ms>`), on the sleep-counting clock as gating's `checks-waiting` is, so a daemon restart
-//!   keeps it and a takeover or a reset clock starts the count again. Any other answer to the
-//!   same probe clears it (`resume-turn-answered <session> <turn>`).
+//!   JSON, fails the same way on every pass) sends the run stuck for a person
+//!   ([`TURN_UNREADABLE`]): no resume is spent, and nothing more is asked of the owner (no
+//!   archive, no sessions ended, since the session has ended), which would refuse it the same
+//!   way; a turn that may still exist on an older owner is never archived by force. Its first
+//!   failure is recorded before the error is returned (`resume-turn-failing <session> <turn>
+//!   <generation> <ms>`), on the sleep-counting clock as gating's `checks-waiting` is, so a
+//!   daemon restart keeps it and a takeover or a reset clock starts the count again. Any other
+//!   answer to the same probe, or the fleet showing the session unreachable, clears it
+//!   (`resume-turn-answered <session> <turn>`).
 //! - Before a resumed session starts, the issue text is checked again against the approval the
 //!   ledger recorded, as the runner's `textStop` does: a text changed by someone who is not an
 //!   instructor, or whose edits cannot be judged, ends the run stuck and starts nothing. The
@@ -290,6 +294,11 @@ use crate::workspaces::{Checkout, FactoryTag, Setup};
 /// The public reason of a run whose session's machine stayed unreachable.
 pub const MACHINE_UNREACHABLE: &str = "the session's machine has been unreachable for 15 minutes";
 
+/// The public reason of a run whose session ended and whose next turn could not be read for
+/// [`TURN_FAILING_FOR`]. The call's error stays in the ledger.
+pub const TURN_UNREADABLE: &str =
+    "the session's last turn could not be read from its machine for 15 minutes";
+
 /// The detail of the stop of a run whose pull request's branch is not a plain branch name: the
 /// runner's `branchRefused` words.
 pub const BRANCH_REFUSED: &str = "the pull request's branch is not a plain branch name";
@@ -326,13 +335,14 @@ pub const CLAIM_GIVEN_UP: &str = "claim-moved-given-up ";
 /// The step written before a turn probe's first `Failed` answer is acted on:
 /// `resume-turn-failing <session> <turn> <generation> <ms>`, with the lease generation and the
 /// sleep-counting clock's reading it was read under. A probe that keeps failing for
-/// [`TURN_FAILING_FOR`] from it is decided as a turn that will not be written.
+/// [`TURN_FAILING_FOR`] from it sends the run stuck ([`TURN_UNREADABLE`]).
 pub const TURN_FAILING: &str = "resume-turn-failing ";
-/// The step written when the probe answers anything but `Failed` while a first failure is on
-/// record, which clears it: `resume-turn-answered <session> <turn>`.
+/// The step written when the probe answers anything but `Failed`, or the fleet shows the
+/// session unreachable, while a first failure is on record, which clears it:
+/// `resume-turn-answered <session> <turn>`.
 pub const TURN_ANSWERED: &str = "resume-turn-answered ";
-/// How long a turn probe answers `Failed` without a break before the turn is taken as one that
-/// will not be written: the 15 minutes an unreachable machine is waited for, on the same
+/// How long a turn probe answers `Failed` without a break before the run goes stuck for a
+/// person: the 15 minutes an unreachable machine is waited for, on the same
 /// sleep-counting clock. An owner that runs an older Foundry, or answers with a body that is
 /// not JSON, fails the same way on every pass, and the run would otherwise never be decided.
 pub const TURN_FAILING_FOR: Duration = UNREACHABLE_FOR;
@@ -596,6 +606,9 @@ enum Ended {
     },
     /// Its machine has been unreachable for 15 minutes.
     Unreachable,
+    /// Its process ended and the turn after the newest read could not be read for
+    /// [`TURN_FAILING_FOR`]: the call's newest error.
+    TurnUnreadable(String),
 }
 
 impl Ended {
@@ -612,6 +625,14 @@ impl Ended {
                 },
             ),
             Ended::Unreachable => (STUCK_MACHINE, Stop::new(MACHINE_UNREACHABLE)),
+            Ended::TurnUnreadable(error) => (
+                STUCK_TURN,
+                Stop {
+                    reason: TURN_UNREADABLE.into(),
+                    detail: Some(format!("{TURN_UNREADABLE}: {error}")),
+                    ..Stop::default()
+                },
+            ),
         }
     }
 }
@@ -867,10 +888,12 @@ const STUCK_MACHINE: &str = "machine-unreachable";
 const STUCK_UNCONFIRMED: &str = "resume-approval-unconfirmed";
 const STUCK_LAUNCH: &str = "resume-launch-failed";
 const STUCK_SETUP: &str = "resume-setup-failed";
-const OWN_STUCK_CODES: [&str; 8] = [
+const STUCK_TURN: &str = "turn-unreadable";
+const OWN_STUCK_CODES: [&str; 9] = [
     STUCK_GONE,
     STUCK_ENDED,
     STUCK_MACHINE,
+    STUCK_TURN,
     STUCK_UNCONFIRMED,
     STUCK_LAUNCH,
     STUCK_SETUP,
@@ -1013,7 +1036,12 @@ fn finish_own_stuck(
         (Some(round), record) if round.workspace.is_some() => record
             .filter(|record| !unreachable_long(ctx, record.owner))
             .map(|record| record.body.id.to_string()),
-        _ if decision.code == STUCK_MACHINE || old_machine_gone(ctx, run, events, seen) => None,
+        _ if decision.code == STUCK_MACHINE
+            || decision.code == STUCK_TURN
+            || old_machine_gone(ctx, run, events, seen) =>
+        {
+            None
+        }
         _ => at.worktree.take(),
     };
     let reason = stop.reason.clone();
@@ -1050,6 +1078,15 @@ fn ended(
     };
     match state {
         SessionState::Unreachable => {
+            // The probe is not asked while the owner is away, which breaks its failures.
+            let next = seen.turn_read.map_or(1, |read| read + 1);
+            probe_answered(
+                ctx,
+                run,
+                failing_since(events, session, next),
+                session,
+                next,
+            )?;
             let owner = seen
                 .worktree
                 .as_deref()
@@ -1073,7 +1110,8 @@ fn ended(
                 // answers is written and not shown yet, so nothing is decided until it shows. One
                 // it says was never written means the process ended before a result line. Any
                 // other error decides nothing: the next pass asks again, unless the call has
-                // failed without a break for `TURN_FAILING_FOR` (`probe_failed`).
+                // failed without a break for `TURN_FAILING_FOR` (`probe_failed`), which sends the
+                // run stuck.
                 None => {
                     let next = seen.turn_read.map_or(1, |read| read + 1);
                     let generation = ctx.held()?;
@@ -1083,12 +1121,15 @@ fn ended(
                             probe_answered(ctx, run, since, session, next)?;
                             return Ok(None);
                         }
-                        Err(WorkerError::NotWritten(_)) => None,
+                        Err(WorkerError::NotWritten(_)) => {
+                            probe_answered(ctx, run, since, session, next)?;
+                            None
+                        }
                         Err(error @ WorkerError::Failed(_)) => {
                             if !probe_failed(ctx, run, since, generation, session, next)? {
                                 return Err(error.into());
                             }
-                            None
+                            return Ok(Some(Ended::TurnUnreadable(error.to_string())));
                         }
                         Err(error) => {
                             probe_answered(ctx, run, since, session, next)?;
@@ -1396,6 +1437,12 @@ fn decide(
     // The machine is gone: nothing can be asked of it, and it ends its own sessions.
     if *ended == Ended::Unreachable {
         at.worktree = None;
+    }
+    // The owner fails every call the same way: the run is a person's, with no resume spent
+    // and nothing more asked of it. The session has ended, so there is none to end.
+    if matches!(ended, Ended::TurnUnreadable(_)) {
+        at.worktree = None;
+        return stuck(ctx, run, at, code, stop);
     }
     if used >= ctx.config.limits.interruption_resumes {
         return stuck(ctx, run, at, code, stop);
