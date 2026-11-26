@@ -80,7 +80,8 @@
 //!   a session that finished or failed with no unread turn shown is first asked of the worker
 //!   for the turn after the newest read. A turn the worker answers is written and not shown yet,
 //!   so nothing is decided until it shows (`building` reads it then); one the worker says was
-//!   never written is the interruption.
+//!   never written (`NotWritten`) is the interruption; any other error of the call decides
+//!   nothing, and the next pass asks again.
 //! - Before a resumed session starts, the issue text is checked again against the approval the
 //!   ledger recorded, as the runner's `textStop` does: a text changed by someone who is not an
 //!   instructor, or whose edits cannot be judged, ends the run stuck and starts nothing. The
@@ -1049,13 +1050,14 @@ fn ended(
                 // A turn record syncs apart from its session's, and can be written after the
                 // session ended: the turn after the newest read is asked of the worker. One it
                 // answers is written and not shown yet, so nothing is decided until it shows. One
-                // it says was never written means the process ended before a result line.
+                // it says was never written means the process ended before a result line. Any other error
+                // decides nothing: the next pass asks again.
                 None => {
                     let next = seen.turn_read.map_or(1, |read| read + 1);
                     ctx.held()?;
                     match ctx.worker.turn(session, next) {
                         Ok(_) => return Ok(None),
-                        Err(WorkerError::Failed(_)) => None,
+                        Err(WorkerError::NotWritten(_)) => None,
                         Err(error) => return Err(error.into()),
                     }
                 }
