@@ -14,10 +14,10 @@
 //! machine: it runs here, where a handler refuses anything this machine does not own, and is
 //! never carried on. Every other request, and one that names nothing elsewhere, runs here.
 //!
-//! Two Factory view routes are taken from a peer too, and carried by their own handlers
+//! Three Factory view routes are taken from a peer too, and carried by their own handlers
 //! ([`super::factory::view_router`]), never by this layer: `POST /api/factory/runs/{id}/stop`,
-//! to the machine believed to hold the run's lease, and `POST /api/projects/{id}/factory`, to
-//! the acting coordinator when it must fill in its default login.
+//! to the machine believed to hold the run's lease, and `POST /api/factory/settings` and
+//! `POST /api/projects/{id}/factory`, to the acting coordinator.
 //!
 //! The factory's worker routes ([`super::factory`]) are carried too, but never by this layer: a
 //! request to one runs here, where it is `404` unless marked. A run carries its own call with
@@ -51,8 +51,8 @@ enum Target {
     Terminal(TerminalId),
     /// A factory worker route, which only a run carries.
     Worker(Worker),
-    /// A Factory view route whose handler carries it: a stop, to the lease holder, and a
-    /// project's factory edit, to the acting coordinator.
+    /// A Factory view route whose handler carries it: a stop, to the lease holder, and an edit
+    /// of the fleet's or a project's factory settings, to the acting coordinator.
     View,
 }
 
@@ -84,8 +84,8 @@ pub(super) const WORKER_ROUTES: [&str; 6] = [
     "/api/terminals/{id}/tail",
 ];
 
-/// Whether a `POST` to `path` is a route a carried call may name: one this layer carries, or a
-/// worker route a run carries.
+/// Whether a `POST` to `path` is a route a carried call may name: one this layer carries, a
+/// worker route a run carries, or a Factory view route its own handler carries.
 pub(crate) fn carries(path: &str) -> bool {
     target(path).is_some()
 }
@@ -131,6 +131,7 @@ fn target(path: &str) -> Option<Target> {
             id.parse::<uuid::Uuid>().ok()?;
             Some(Target::View)
         }
+        ["factory", "settings"] => Some(Target::View),
         _ => None,
     }
 }

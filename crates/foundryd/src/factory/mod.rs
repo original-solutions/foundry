@@ -285,21 +285,24 @@ pub struct Leases {
 
 impl Leases {
     /// The lease of `project`, while this machine runs it.
-    pub fn of(&self, project: ProjectId) -> Option<Leased> {
+    #[cfg(test)]
+    pub(crate) fn of(&self, project: ProjectId) -> Option<Leased> {
         lock(&self.held).get(&project).cloned()
     }
 
-    /// The project this machine runs on `repo`, `owner/name`, and its lease. Projects that
-    /// name one repo are run from none of them, so there is at most one.
+    /// The project this machine runs on `repo`, `owner/name` in any case, as a run id folds
+    /// it, and its lease. Projects that name one repo are run from none of them, so there is at
+    /// most one.
     pub fn of_repo(&self, repo: &str) -> Option<(ProjectId, Leased)> {
         lock(&self.held)
             .iter()
-            .find(|(_, leased)| leased.repo == repo)
+            .find(|(_, leased)| leased.repo.eq_ignore_ascii_case(repo))
             .map(|(project, leased)| (*project, leased.clone()))
     }
 
     /// The projects held.
-    pub fn projects(&self) -> Vec<ProjectId> {
+    #[cfg(test)]
+    pub(crate) fn projects(&self) -> Vec<ProjectId> {
         lock(&self.held).keys().copied().collect()
     }
 

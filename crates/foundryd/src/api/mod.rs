@@ -14,8 +14,11 @@
 //!   of it ([`factory`]'s `GET /api/factory` believes the same one), and another each time the
 //!   status believed of a project changes: the factory records, the machines heard from and
 //!   the settings are looked at every [`EVENTS_EVERY`], and only a change of one of them reads
-//!   the statuses again. Its strings have the known secrets hidden ([`Api::secrets`]). No run
-//!   event is ever sent, on this socket or in `GET /api/state`: those are P1's records.
+//!   the statuses again. When a project that had a status has none believed any more, the
+//!   whole state is sent again, then the statuses still believed, so the UI drops what it
+//!   held. Its strings have the known secrets hidden ([`Api::secrets`]); a status is not sent
+//!   while the secret store cannot be read, and is tried again. No run event is ever sent, on
+//!   this socket or in `GET /api/state`: those are P1's records.
 //! - `GET /api/terminals/{id}`, a WebSocket: see [`terminals`].
 //! - `GET /api/machine`: `{id}`, the machine that serves the UI, see [`machine`].
 //! - `GET /api/machines`: `{me, machines: [{id, name, online}]}`, this machine's id and each
@@ -606,33 +609,49 @@ struct Believed {
     statuses: BTreeMap<ProjectId, foundry_proto::factory::FactoryStatus>,
 }
 
+/// What [`send_factory`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum Factory {
+    /// Every status it had to send went, or there was none.
+    Sent,
+    /// A project it had sent a status of has none believed now. The UI is to be sent the whole
+    /// state again, after which only the statuses still believed follow.
+    Gone,
+    /// A send failed: the UI has gone.
+    Closed,
+}
+
 /// Sends a [`UiMessage::FactoryStatus`] for each project whose believed status is not the one
-/// `believed` says was sent, when the factory records, the settings or the machines heard from
-/// changed since the last read. Says whether every send went.
+/// `believed` says was sent. The statuses, and the settings they are believed by, are read only
+/// when the factory records, the settings' `seq` or the machines heard from (`online`) changed
+/// since the last read.
 async fn send_factory(
     api: &Api,
     socket: &mut WebSocket,
     believed: &mut Believed,
-) -> Result<bool, StoreError> {
-    let online = api.peers.online();
-    let heard = online.clone();
-    let (versions, settings) = on_store(&api.store, |store| {
-        Ok((store.factory_versions()?, store.settings()?))
-    })
-    .await?;
-    let now = (versions, settings.seq, online);
+    seq: u64,
+    online: &BTreeSet<MachineId>,
+) -> Result<Factory, StoreError> {
+    let versions = on_store(&api.store, |store| store.factory_versions()).await?;
+    let now = (versions, seq, online.clone());
     if believed.read_at.as_ref() == Some(&now) {
-        return Ok(true);
+        return Ok(Factory::Sent);
     }
+    let heard = online.clone();
     let read = on_store(&api.store, move |store| {
+        let settings = store.settings()?;
         factory::believed_statuses(store, &settings, &heard)
     })
     .await?;
+    if believed
+        .statuses
+        .keys()
+        .any(|project| !read.contains_key(project))
+    {
+        return Ok(Factory::Gone);
+    }
     // A status that could not be written leaves the read to be made again on the next tick.
     believed.read_at = Some(now);
-    believed
-        .statuses
-        .retain(|project, _| read.contains_key(project));
     for (project, (_, status)) in read {
         if believed.statuses.get(&project) == Some(&status) {
             continue;
@@ -646,16 +665,16 @@ async fn send_factory(
             continue;
         };
         if socket.send(ws::Message::Text(text.into())).await.is_err() {
-            return Ok(false);
+            return Ok(Factory::Closed);
         }
         believed.statuses.insert(project, status);
     }
-    Ok(true)
+    Ok(Factory::Sent)
 }
 
 /// `message` as JSON text, every string in it hidden with the known secrets of
 /// [`Api::secrets`], or only the passwords of URLs without one. `None`, logged, when it cannot
-/// be written.
+/// be written, or the secret store cannot be read.
 async fn hidden_text(api: &Api, message: &UiMessage) -> Option<String> {
     let mut value = match serde_json::to_value(message) {
         Ok(value) => value,
@@ -666,17 +685,21 @@ async fn hidden_text(api: &Api, message: &UiMessage) -> Option<String> {
     };
     let secrets = api.secrets.clone();
     let hidden = tokio::task::spawn_blocking(move || {
-        match &secrets {
+        let hidden = match &secrets {
             Some(secrets) => factory::hide_strings(&mut value, &|text| {
                 crate::secrets::hide_known(text, &**secrets)
             }),
             None => factory::hide_strings(&mut value, &|text| redact(text)),
-        }
-        value.to_string()
+        };
+        hidden.map(|()| value.to_string())
     })
     .await;
     match hidden {
-        Ok(text) => Some(text),
+        Ok(Ok(text)) => Some(text),
+        Ok(Err(factory::Unreadable)) => {
+            tracing::warn!("api: a factory status is not sent: the secret store could not be read");
+            None
+        }
         Err(error) => {
             tracing::warn!("api: an event cannot be sent: {error}");
             None
@@ -749,8 +772,13 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
                 return Ok(());
             }
         }
-        if !send_factory(api, &mut socket, &mut sent.factory).await? {
-            return Ok(());
+        match send_factory(api, &mut socket, &mut sent.factory, sent.seq, &sent.online).await? {
+            Factory::Sent => {}
+            Factory::Closed => return Ok(()),
+            Factory::Gone => match send_state(api, &mut socket).await? {
+                Some(again) => sent = again,
+                None => return Ok(()),
+            },
         }
     }
 }
@@ -767,8 +795,9 @@ async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, S
     if !send(socket, &state).await {
         return Ok(None);
     }
+    // Nothing was sent before, so no status can be gone.
     let mut factory = Believed::default();
-    if !send_factory(api, socket, &mut factory).await? {
+    if send_factory(api, socket, &mut factory, seq, &online).await? == Factory::Closed {
         return Ok(None);
     }
     Ok(Some(Sent {
