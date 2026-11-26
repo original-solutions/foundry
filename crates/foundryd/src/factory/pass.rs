@@ -4108,4 +4108,61 @@ mod tests {
             assert_eq!(waiting_reason(&report, 6).as_deref(), Some(NO_SLOT));
         }
     }
+
+    mod a_pass_that_panics {
+        use super::*;
+
+        /// A tracker that panics on every call, as a bad record or an answer of an unexpected
+        /// shape does somewhere in a pass.
+        struct Panics;
+
+        impl crate::factory::github::Tracker for Panics {
+            fn gh(&self, _: &[String]) -> Result<String, TrackerError> {
+                panic!("an answer of a shape nobody expected");
+            }
+        }
+
+        fn panicking(rig: &mut Rig) {
+            rig.tracker = Hiding::new(Arc::new(Panics), Arc::new(|text: &str| text.to_string()));
+        }
+
+        #[test]
+        fn is_counted_as_a_failed_pass_and_says_so() {
+            let mut rig = Rig::new();
+            panicking(&mut rig);
+            let report = rig.pass();
+            assert!(report.failed.is_some(), "{report:?}");
+            assert_eq!(rig.memo.failures, 1);
+            assert_eq!(rig.status().pass, 1, "a status is written");
+        }
+
+        #[test]
+        fn three_in_a_row_make_the_status_idle() {
+            let mut rig = Rig::new();
+            panicking(&mut rig);
+            for _ in 0..IDLE_AFTER_FAILURES {
+                rig.pass();
+            }
+            let idle = rig.status().idle.unwrap_or_default();
+            assert!(idle.contains("3 passes in a row failed"), "{idle}");
+        }
+
+        #[test]
+        fn keeps_what_the_last_good_pass_found() {
+            let mut rig = Rig::new();
+            rig.hub.ready(5);
+            rig.fleet_settings(|f| f.max_runs = 0);
+            rig.pass();
+            assert!(rig.memo.last.is_some());
+            panicking(&mut rig);
+            rig.pass();
+            assert!(rig.memo.last.is_some(), "the memo is not reset");
+            assert_eq!(rig.memo.failures, 1);
+            assert_eq!(
+                rig.status().ready.len(),
+                1,
+                "the last good results are written again"
+            );
+        }
+    }
 }

@@ -951,6 +951,51 @@ mod tests {
         assert!(came(done), "{what}");
     }
 
+    /// A tracker that panics on every call.
+    struct Panics;
+
+    impl Tracker for Panics {
+        fn gh(&self, _: &[String]) -> Result<String, TrackerError> {
+            panic!("an answer of a shape nobody expected");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passes_that_panic_are_counted_and_the_third_makes_the_status_idle() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN)]))
+            .unwrap();
+        let host = fake_host();
+        host.trackers.lock().unwrap().insert(
+            LOGIN.into(),
+            Arc::new(Hiding::new(Arc::new(Panics), shown())),
+        );
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host, freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let (store2, clock2) = (store.clone(), clock.clone());
+        let idle = tokio::task::spawn_blocking(move || {
+            came(|| {
+                clock2.advance(Duration::from_secs(3600));
+                status_of(&store2, project(1)).is_some_and(|status| status.idle.is_some())
+            })
+        })
+        .await
+        .unwrap();
+        running.abort();
+        assert!(
+            idle,
+            "three passes that panicked in a row leave the status idle"
+        );
+        let status = status_of(&store, project(1)).unwrap();
+        let said = status.idle.clone().unwrap_or_default();
+        assert!(said.contains("3 passes in a row failed"), "{status:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_slow_gh_in_one_project_does_not_hold_up_the_next() {
         let (_dir, store) = open_store();
