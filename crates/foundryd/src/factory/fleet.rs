@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_not_written_yet_is_asked_again_and_one_never_written_is_failed() {
+    fn a_turn_not_written_yet_is_asked_again_and_only_a_gone_one_is_not_written() {
         let read = turn_read(&answer(
             200,
             r#"{"message":"FACTORY-DONE: x","question":null}"#,
@@ -531,8 +531,15 @@ mod tests {
         ));
         assert_eq!(
             turn_read(&answer(410, r#"{"error":"will not be written"}"#)),
-            Err(WorkerError::Failed("will not be written".into()))
+            Err(WorkerError::NotWritten("will not be written".into()))
         );
+        for status in [500, 502, 503] {
+            assert_eq!(
+                turn_read(&answer(status, r#"{"error":"store"}"#)),
+                Err(WorkerError::Failed("store".into())),
+                "{status}"
+            );
+        }
     }
 
     #[test]

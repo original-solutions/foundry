@@ -1719,4 +1719,21 @@ mod tests {
         assert_eq!(view.unreachable_for(b), Duration::from_secs(40));
         assert_eq!(view.unreachable_for(c), Duration::ZERO);
     }
+
+    #[test]
+    fn a_fake_worker_answers_a_turn_never_written_and_then_the_default() {
+        let worker = FakeWorker::new();
+        worker.on_turn(Err(WorkerError::NotWritten("gone".into())));
+        assert_eq!(
+            worker.turn(SessionId(id(1)), 1),
+            Err(WorkerError::NotWritten("gone".into()))
+        );
+        assert_eq!(
+            worker.turn(SessionId(id(1)), 2),
+            Ok(TurnText {
+                message: String::new(),
+                question: None
+            })
+        );
+    }
 }

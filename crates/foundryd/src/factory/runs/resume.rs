@@ -2181,7 +2181,7 @@ mod tests {
     /// The worker says the next turn asked for was never written: a session whose process ended
     /// with no turn after the newest read, as a pass that decides asks.
     fn never_written(rig: &Rig) {
-        rig.worker.on_turn(Err(WorkerError::Failed(
+        rig.worker.on_turn(Err(WorkerError::NotWritten(
             "the turn will not be written".into(),
         )));
     }
@@ -6123,7 +6123,7 @@ mod tests {
                 }]
             );
             // The worker says turn 3 was never written: the process ended before a result line.
-            rig.worker.on_turn(Err(WorkerError::Failed(
+            rig.worker.on_turn(Err(WorkerError::NotWritten(
                 "turn 3 will not be written".into(),
             )));
             pass_one(&rig, &run);
@@ -6138,6 +6138,22 @@ mod tests {
             assert!(advance(&rig.ctx(), &run).is_err());
             assert_eq!(event_count(&rig, &run), before);
             assert!(archive_calls(&rig).is_empty());
+        }
+
+        #[test]
+        fn a_turn_call_that_failed_decides_nothing_and_a_later_not_written_decides() {
+            let (rig, run) = failed_with_turns_unasked();
+            rig.worker.on_turn(Err(WorkerError::Failed(
+                "the store could not be read".into(),
+            )));
+            let before = event_count(&rig, &run);
+            assert!(advance(&rig.ctx(), &run).is_err());
+            assert_eq!(event_count(&rig, &run), before);
+            assert!(interruptions(&rig, &run).is_empty());
+            assert!(archive_calls(&rig).is_empty());
+            never_written(&rig);
+            pass_one(&rig, &run);
+            assert!(!interruptions(&rig, &run).is_empty());
         }
 
         // f6 (a): a resend the worker refuses is left for the next pass, with no error.
