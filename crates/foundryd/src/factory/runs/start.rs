@@ -1435,8 +1435,8 @@ fn build(
             reason: messages::TEXT_CHANGED.into(),
         });
     }
-    // `approval-rechecked` is the runner's own name for this step, which records its check of
-    // the text since the approval; the name stays so the ledger reads as the runner's.
+    // `approval-rechecked` is the runner's name for its check of the text since the approval.
+    // Foundry records it here, before the session starts; the runner records it after the launch.
     if !seen.rechecked {
         ctx.record_step(
             run,
