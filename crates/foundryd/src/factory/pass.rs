@@ -4025,4 +4025,67 @@ mod tests {
             );
         }
     }
+
+    mod a_run_this_build_cannot_read {
+        use super::*;
+
+        /// A run event row of `run` that this build cannot read, as a newer build leaves one.
+        fn unreadable_row(rig: &Rig, run: &RunId) {
+            let owner = MachineId::random();
+            let conn = rusqlite::Connection::open(rig._dir.path().join("foundry.db")).unwrap();
+            conn.execute(
+                "INSERT INTO factory_records (kind, id, owner, version, record)
+                 VALUES ('run_event', ?1, ?2, 1, ?3)",
+                rusqlite::params![
+                    format!("{run}/{owner}/1"),
+                    owner.to_string(),
+                    r#"{"kind":"run_event","later":true}"#
+                ],
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn the_sweep_notes_it_and_the_pass_goes_on() {
+            let mut rig = Rig::new();
+            unreadable_row(&rig, &RunId::new(REPO, 5, 1).unwrap());
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(rig.status().idle, None);
+            let again = rig.pass();
+            assert_eq!(again.failed, None, "{again:?}");
+            assert_eq!(rig.status().pass, 2);
+        }
+
+        #[test]
+        fn its_issue_is_not_claimed_and_does_not_end_the_pass() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 2);
+            unreadable_row(&rig, &RunId::new(REPO, 5, 1).unwrap());
+            rig.hub.ready(5);
+            rig.hub.ready(6);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(rig.claimed_issues(), vec![6], "{report:?}");
+            let reason = waiting_reason(&report, 5).unwrap_or_default();
+            assert!(reason.contains("cannot be read"), "{reason}");
+            assert!(
+                rig.status().ready.iter().any(|w| w.issue == 5),
+                "the ready queue lists it with the reason"
+            );
+        }
+
+        #[test]
+        fn it_holds_its_slot_and_is_not_counted_as_freed() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            unreadable_row(&rig, &RunId::new(REPO, 5, 1).unwrap());
+            rig.hub.ready(5);
+            rig.hub.ready(6);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert!(rig.claimed_issues().is_empty(), "{report:?}");
+            assert_eq!(waiting_reason(&report, 6).as_deref(), Some(NO_SLOT));
+        }
+    }
 }
