@@ -141,7 +141,7 @@ A Vims project's claim, gate, wake, resume and feedback round each start only wh
 - the lease holder's Vims sign-in works and its GitHub login is the project's,
 - the template, and the gate template when one is named, each exist, are not retired, and have this project's repo as their source,
 - the Vims profile holds the `factory-build` skill, and
-- Vims has room for the machine of the template the step makes or starts a workspace from. `vims quota show` does not say (check 12), so until it does the lease holder counts the vCPU of the workspaces its `host_run` records hold as running against `host:vims.vcpu_limit`, which starts as 8, and a create or start that Vims refuses for quota waits as V10 has it.
+- Vims has room for the machine of the template the step makes or starts a workspace from. `vims quota show` does not say (check 12), so until it does the lease holder counts the vCPU of the workspaces its `host_run` records hold as running, and of the creates and starts this pass has already sent or Vims has not yet answered, against `host:vims.vcpu_limit`, which starts as 8, and a create or start that Vims refuses for quota waits as V10 has it.
 
 In a pass, room goes first to wakes, then gates, then resumes and feedback rounds, then claims. A gate is made only on a pass that has seen its build workspace's pause finish.
 
@@ -223,7 +223,7 @@ A build that does not know about Vims must never build a Vims project on the fle
   - a gate whose grant is gone before the checkout
   - a gate whose `composer.lock` the template's Composer cache does not hold, whose workspace is removed and which waits with no gate retry spent, no gate slot held and none of the wait counted toward `limits.minutes`, and "factory idle" raised on the third pass of the wait and not the second; a takeover that carries the wait on; and a changed gate template source key that makes the gate again under the next attempt, which waits again while the new build still does not hold that lockfile
   - a gate whose checkout has no `composer.lock`, and one made from a template with no Composer cache record, each of which runs `provision` without waiting
-  - a claim and a start held back while the vCPU of the running workspaces in the lease holder's `host_run` records leaves no room under `host:vims.vcpu_limit`, with `vims quota show` reporting 0
+  - a claim and a start held back while the vCPU of the running workspaces in the lease holder's `host_run` records leaves no room under `host:vims.vcpu_limit`, with `vims quota show` reporting 0, and a wake and a gate in one pass whose two sends together would go over the limit, of which only the wake is sent
   - a gate's `operation logs` and a turn's result text holding a word of 24 or more mixed letters and digits and a `github.com` pull request link: the event and the comment hide the word and keep the link whole, and the result line is read from the text before anything is hidden
   - a project with both switches on left idle, and each refusal of "Settings and sync" and "When things go wrong": Vims turned on with a fleet run not ended or a blank template, the project removed or its owner taken out of `host:vims.owners` while Vims is on, and Vims turned off or a template changed while a run has not ended
   - a protocol 5 link that carries no `host_run` record and reads a Vims run's status, a machine that moves to protocol 6 and then receives every `host_run` record, and a fleet with one protocol 5 machine where Vims cannot be turned on
@@ -291,7 +291,7 @@ Each check that fails stops the plan, and this spec is revised. All but 9, 10 an
 
 ## What the checks have found so far
 
-Run on 2026-11-25 and 2026-11-26 in throwaway workspaces, all removed since. Checks 9, 10 and 13 are not run.
+Run on 2026-11-25 and 2026-11-26 in throwaway workspaces, all removed since. Checks 9, 10 and 13 are not run. Check 6 has no row of its own: of it, only `gh api user` answering `tomkaczocha` is recorded (see 3, 4).
 
 | Check | Result |
 |---|---|
