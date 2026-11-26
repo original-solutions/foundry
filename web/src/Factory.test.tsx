@@ -139,6 +139,12 @@ describe("Factory", () => {
     expect(done[1].textContent).toContain("needs-info");
   });
 
+  it("shows an empty holding project: its lease and no lists", async () => {
+    const { project } = await show(overview({ status: status() }), { p1: status() });
+    expect(within(project).getByText(/Holds the lease at generation 7, on studio/)).toBeDefined();
+    for (const name of ["Ready", "Feedback waiting", "Live runs", "Held up", "Finished"]) expect(within(project).queryByRole("list", { name })).toBeNull();
+  });
+
   it("says a run's workspace is not here yet when no machine holds it", async () => {
     const live = status({ runs: [{ run: RUN, title: "t", step: "s", machine: OTHER, gate_retries_used: 0, minutes_used: 0, workspaces: ["gone"], sessions: [] }] });
     const { project } = await show(overview({ status: live }), { p1: live });
@@ -241,12 +247,13 @@ describe("Factory", () => {
     it("does not read it again for the same statuses and seq, whatever else is new", async () => {
       const same = { p1: believed() };
       const calls = mockFetch(json(200, overview({ status: believed() })), json(200, overview()));
-      function Quiet() {
-        const [n, setN] = useState(0);
-        bump = () => setN((x) => x + 1);
-        return <Factory statuses={same} settings={{ ...shared, seq: 1 }} machines={[...machines, ...(n ? [] : [])]} />;
-      }
       let bump = () => {};
+      function Quiet() {
+        const [, setN] = useState(0);
+        bump = () => setN((x) => x + 1);
+        // A fresh machines array and settings object on every render, with the same statuses and seq.
+        return <Factory statuses={same} settings={{ ...shared, seq: 1 }} machines={[...machines]} />;
+      }
       await renderApp(<Quiet />);
       await screen.findByRole("region", { name: "foundry" });
       act(() => bump());

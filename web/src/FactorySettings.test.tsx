@@ -100,6 +100,15 @@ describe("FleetSettings", () => {
     expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("haiku");
   });
 
+  it("keeps the submitted model when the daemon answers its placeholder for one it could not read", async () => {
+    mockFetch(json(200, { settings: { ...current, model: "[hidden: the secret store could not be read]" } }));
+    await renderApp(<FleetSettings settings={current} />);
+    type("Model", "sonnet");
+    save();
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("sonnet");
+  });
+
   it("shows the daemon's refusal", async () => {
     mockFetch(json(422, { error: "poll_seconds is out of range" }));
     await renderApp(<FleetSettings settings={current} />);
@@ -262,6 +271,100 @@ describe("ProjectFactoryControls", () => {
     act(() => set({ on: false, login: "x", paused: false }));
     expect(toggle().getAttribute("aria-checked")).toBe("false");
     expect(pause().checked).toBe(false);
+  });
+
+  const HIDDEN = "[hidden: the secret store could not be read]";
+  type Setting = { on: boolean; login: string; paused: boolean };
+  /** The controls under a harness that moves their props, and handles on what they show. */
+  function controls(first: Setting) {
+    const hold: { set: (f: Setting) => void } = { set: () => {} };
+    function Harness() {
+      const [f, setF] = useState(first);
+      hold.set = setF;
+      return <ProjectFactoryControls project={project} factory={f} />;
+    }
+    return {
+      Harness,
+      set: (f: Setting) => act(() => hold.set(f)),
+      toggle: () => screen.getByRole("switch", { name: "Factory for demo" }),
+      pause: () => screen.getByLabelText("Pause claims for demo") as HTMLInputElement,
+      box: () => screen.getByLabelText("GitHub login for demo") as HTMLInputElement,
+      ready: () => waitFor(() => expect((screen.getByLabelText("Pause claims for demo") as HTMLInputElement).disabled).toBe(false)),
+    };
+  }
+
+  it("keeps a chain whose answers come in sorted key order, as the daemon's do", async () => {
+    const c = controls({ on: false, login: "", paused: false });
+    mockFetch(json(200, { factory: { login: "bot", on: true, paused: false } }), json(200, { factory: { login: "bot", on: true, paused: true } }));
+    await renderApp(<c.Harness />);
+    fireEvent.click(c.toggle());
+    await waitFor(() => expect(c.toggle().getAttribute("aria-checked")).toBe("true"));
+    await c.ready();
+    fireEvent.click(c.pause());
+    await waitFor(() => expect(c.pause().checked).toBe(true));
+    c.set({ on: true, login: "bot", paused: false });
+    expect(c.pause().checked).toBe(true);
+    c.set({ on: true, login: "bot", paused: true });
+    expect(c.pause().checked).toBe(true);
+    c.set({ on: true, login: "bot", paused: false });
+    expect(c.pause().checked).toBe(false);
+  });
+
+  it("keeps the answer of a change still pending when the settings catch up to the one before", async () => {
+    let answer: (r: Response) => void = () => {};
+    const later = new Promise<Response>((resolve) => (answer = resolve));
+    const c = controls({ on: false, login: "", paused: false });
+    const calls = mockFetch(json(200, { factory: { on: true, login: "bot", paused: false } }), later as unknown as Response, json(200, { factory: { on: true, login: "bot", paused: false } }));
+    await renderApp(<c.Harness />);
+    fireEvent.click(c.toggle());
+    await waitFor(() => expect(c.toggle().getAttribute("aria-checked")).toBe("true"));
+    await c.ready();
+    fireEvent.click(c.pause());
+    c.set({ on: true, login: "bot", paused: false });
+    await act(async () => answer(json(200, { factory: { on: true, login: "bot", paused: true } })));
+    await c.ready();
+    expect(c.pause().checked).toBe(true);
+    fireEvent.click(c.pause());
+    await waitFor(() => expect(calls).toHaveLength(3));
+    expect(calls[2].body).toEqual({ on: true, paused: false, login: "bot" });
+  });
+
+  it("follows settings that go back to an earlier setting after two changes", async () => {
+    const c = controls({ on: true, login: "bot", paused: false });
+    mockFetch(json(200, { factory: { on: true, login: "bot", paused: true } }), json(200, { factory: { on: true, login: "bot", paused: false } }));
+    await renderApp(<c.Harness />);
+    fireEvent.click(c.pause());
+    await waitFor(() => expect(c.pause().checked).toBe(true));
+    await c.ready();
+    fireEvent.click(c.pause());
+    await waitFor(() => expect(c.pause().checked).toBe(false));
+    c.set({ on: true, login: "bot", paused: true });
+    c.set({ on: true, login: "bot", paused: false });
+    c.set({ on: true, login: "bot", paused: true });
+    expect(c.pause().checked).toBe(true);
+  });
+
+  it("shows the login the coordinator picked after a blank login is saved", async () => {
+    const c = controls({ on: true, login: "bot", paused: false });
+    mockFetch(json(200, { factory: { on: true, login: "fac-default", paused: false } }));
+    await renderApp(<c.Harness />);
+    fireEvent.change(c.box(), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save login" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Save login" })).toBeNull());
+    expect(c.box().value).toBe("fac-default");
+  });
+
+  it("never shows or sends the daemon's placeholder for a login it could not read", async () => {
+    const c = controls({ on: false, login: "bot", paused: false });
+    const calls = mockFetch(json(200, { factory: { on: true, login: HIDDEN, paused: false } }), json(200, { factory: { on: false, login: "bot", paused: true } }));
+    await renderApp(<c.Harness />);
+    fireEvent.click(c.toggle());
+    await waitFor(() => expect(calls).toHaveLength(1));
+    await c.ready();
+    expect(c.box().value).toBe("bot");
+    fireEvent.click(c.pause());
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1].body).toMatchObject({ login: "bot" });
   });
 
   it("shows a refusal beside the row", async () => {
