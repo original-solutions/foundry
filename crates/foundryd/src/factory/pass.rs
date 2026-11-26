@@ -4254,7 +4254,7 @@ mod tests {
         use super::*;
 
         /// A run event row of `run` that this build cannot read, as a newer build leaves one.
-        fn unreadable_row(rig: &Rig, run: &RunId) {
+        pub(super) fn unreadable_row(rig: &Rig, run: &RunId) {
             let owner = MachineId::random();
             let conn = rusqlite::Connection::open(rig._dir.path().join("foundry.db")).unwrap();
             conn.execute(
@@ -4275,6 +4275,12 @@ mod tests {
             unreadable_row(&rig, &RunId::new(REPO, 5, 1).unwrap());
             let report = rig.pass();
             assert_eq!(report.failed, None, "{report:?}");
+            assert!(
+                report
+                    .runs
+                    .contains(&(RunId::new(REPO, 5, 1).unwrap(), UNREADABLE_SWEPT.into())),
+                "the run is noted: {report:?}"
+            );
             assert_eq!(rig.status().idle, None);
             let again = rig.pass();
             assert_eq!(again.failed, None, "{again:?}");
@@ -5065,6 +5071,39 @@ mod tests {
                 rig.book.runs_free(1),
                 0,
                 "no other project's pass may take the slot of a run that is going"
+            );
+        }
+    }
+
+    mod a_finished_run_this_build_cannot_fully_read {
+        use super::a_run_this_build_cannot_read::unreadable_row;
+        use super::*;
+        use crate::factory::ledger::events::Outcome;
+
+        #[test]
+        fn is_noted_by_the_sweep_and_does_not_fail_the_pass() {
+            let mut rig = Rig::new();
+            let run = rig.run_in(5, 1, State::Building);
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::Finished {
+                        outcome: Outcome::PrOpen,
+                        total_ms: 0,
+                        gate_attempts: 0,
+                        review_cycles: None,
+                        pr_url: None,
+                        pr_end: None,
+                    },
+                    &Cause::new(CauseStep::Start, "test"),
+                )
+                .unwrap();
+            unreadable_row(&rig, &run);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert!(
+                report.runs.contains(&(run, UNREADABLE_SWEPT.into())),
+                "the run is noted: {report:?}"
             );
         }
     }
