@@ -96,24 +96,29 @@
 //!    when its count has not risen, as `start`'s and `resume`'s resends are.
 //!
 //! What the pass (task 30) must do with this step, keyed on [`round_pending`] (the newest
-//! `feedback_relaunching` has no `session_launched` after it, and the run is not finished):
+//! `feedback_relaunching` has no `session_launched` after it, and the run is not finished) and
+//! [`round_owns`] (the round is decided, the run is not finished, and the round is pending or
+//! its own session is the newest launch):
 //!
-//! - Call [`advance`] for a run in `pr-open`, and for a run for which [`round_pending`] holds,
+//! - Call [`advance`] for a run in `pr-open`, and for a run for which [`round_owns`] holds,
 //!   every pass, with the `slots` and the `reserved` of the pass, after the claims' placement
-//!   and before they take the slots left. It also covers a run in `building` whose newest
-//!   `session_launched` is a round's and shows no turn yet (the first message resent, step 7).
-//!   `Seen` clears a decision at a `state_changed` and the round writes its decision again
+//!   and before they take the slots left. That covers a run in `building` whose newest
+//!   `session_launched` is the round's and shows no turn yet (the first message resent, step
+//!   7). `Seen` clears a decision at a `state_changed` and the round writes its decision again
 //!   after its move, so a pass cut between the two leaves a run whose `pending_relaunch` is
 //!   `None` and for which [`round_pending`] still holds; [`advance`] carries the round on from
 //!   the ledger's own record of it (its `Round`), not from `Seen`.
-//! - Not call `building::advance`, `resume::advance`, `start::advance` or `gating::advance` for
-//!   a run while [`round_pending`] holds. `building` and `resume` skip a run only on
-//!   `pending_relaunch` today, which is `None` in that window: they would take the build's
-//!   old, ended session for an interruption. It is the pass's routing that closes the window.
-//!   `start`'s resend would send the build's launch words to the round's session, and `gating`
-//!   reads the old, ended session; `gating` is for a run `building::advance` said
-//!   `ReadyForGate` for. Once the round's session shows a turn, `building::advance` follows it
-//!   as any building session, and its pull request is gated again.
+//! - Never call `start::advance` for a run while [`round_owns`] holds: its resend would type
+//!   the build's launch words into the round's session, and the round has its own resend
+//!   (step 7).
+//! - Not call `building::advance`, `resume::advance` or `gating::advance` for a run while
+//!   [`round_pending`] holds. `building` and `resume` skip a run only on `pending_relaunch`
+//!   today, which is `None` in that window: they would take the build's old, ended session for
+//!   an interruption. It is the pass's routing that closes the window. `gating` would read the
+//!   old, ended session; it is for a run `building::advance` said `ReadyForGate` for. Once the
+//!   round's session shows a turn, `building::advance` follows it as any building session, and
+//!   `gating` takes a run `building` said is ready, as it does today: its pull request is
+//!   gated again.
 //! - Call `stop::reconcile` before this step: a merged pull request or a closed issue ends the
 //!   run there, and what both write is idempotent through the ledger. It judges nothing while
 //!   [`round_pending`] holds, and it leaves a stuck path of the text codes begun here to this
@@ -922,6 +927,28 @@ pub fn round_pending(events: &[RunEvent]) -> bool {
     !events[at + 1..]
         .iter()
         .any(|event| event.event == names::SESSION_LAUNCHED)
+}
+
+/// Whether the newest round owns the run: it is decided, the run is not finished, and either
+/// the round is pending ([`round_pending`]) or its own session is the newest launch (no
+/// `session_launched` after it but the round's). A later launch, a resume's, ends it. While it
+/// holds the build's launch words must never be sent again: `start::advance`'s resend would
+/// type them into the round's session, which has its own resend.
+pub fn round_owns(events: &[RunEvent]) -> bool {
+    if events.iter().any(|event| event.event == names::FINISHED) {
+        return false;
+    }
+    let Some(at) = events
+        .iter()
+        .rposition(|event| event.event == "feedback_relaunching")
+    else {
+        return false;
+    };
+    events[at + 1..]
+        .iter()
+        .filter(|event| event.event == names::SESSION_LAUNCHED)
+        .count()
+        <= 1
 }
 
 /// What the ledger records of the newest round.
