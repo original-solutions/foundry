@@ -4794,4 +4794,49 @@ mod tests {
             );
         }
     }
+
+    mod seeding_the_book {
+        use super::*;
+
+        #[test]
+        fn a_project_whose_pass_has_not_begun_counts_what_its_ledger_holds_once_seeded() {
+            let rig = Rig::new();
+            rig.run_in(3, 1, State::Building);
+            let book = Book::default();
+            seed(&book, &rig.ledger, project_id(), REPO).unwrap();
+            assert_eq!(book.runs_free(3), 2);
+        }
+
+        #[test]
+        fn seeding_again_counts_the_runs_once() {
+            let rig = Rig::new();
+            rig.run_in(3, 1, State::Building);
+            let book = Book::default();
+            seed(&book, &rig.ledger, project_id(), REPO).unwrap();
+            seed(&book, &rig.ledger, project_id(), REPO).unwrap();
+            assert_eq!(book.runs_free(3), 2);
+        }
+
+        #[test]
+        fn a_pass_begun_before_the_seed_changes_nothing_after_it() {
+            let rig = Rig::new();
+            rig.run_in(3, 1, State::Building);
+            let book = Book::default();
+            let stale = book.ticket(project_id());
+            seed(&book, &rig.ledger, project_id(), REPO).unwrap();
+            book.finish(stale, Held::default());
+            assert!(!book.take_run(stale, 9));
+            assert_eq!(book.runs_free(3), 2, "the seed stands");
+        }
+
+        #[test]
+        fn a_project_forgotten_holds_nothing_even_when_it_was_seeded() {
+            let rig = Rig::new();
+            rig.run_in(3, 1, State::Building);
+            let book = Book::default();
+            seed(&book, &rig.ledger, project_id(), REPO).unwrap();
+            book.forget(project_id());
+            assert_eq!(book.runs_free(3), 3);
+        }
+    }
 }

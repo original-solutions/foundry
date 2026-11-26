@@ -995,6 +995,81 @@ mod tests {
         assert!(said.contains("3 passes in a row failed"), "{status:?}");
     }
 
+    /// A run of issue 3 that holds a slot: approved and claimed.
+    fn a_run_holding_a_slot(store: &Arc<Mutex<Store>>) {
+        use crate::factory::ledger::events::{Cause, CauseStep, Event};
+        let ledger = ledger::Ledger::new(
+            store.clone(),
+            me(),
+            1,
+            Arc::new(|text: &str| text.to_owned()),
+        );
+        let run = foundry_proto::factory::RunId::new("rawphp/softfac", 3, 1).unwrap();
+        let cause = Cause::new(CauseStep::Start, "test");
+        let step = Event::StepChanged {
+            step: "approved 2026-10-04T10:00:00Z".into(),
+        };
+        ledger.write(&run, &step, &cause).unwrap();
+        let claimed = Event::Claimed {
+            machine: me().to_string(),
+            github_user: LOGIN.into(),
+        };
+        ledger.write(&run, &claimed, &cause).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_project_whose_pass_has_not_begun_still_counts_its_runs_and_a_restart_keeps_them() {
+        let (_dir, store) = open_store();
+        let mut settings = settings_with(&[(1, "slow-bot")]);
+        settings.factory.as_mut().unwrap().max_runs = 1;
+        store.lock().unwrap().apply_settings(settings).unwrap();
+        a_run_holding_a_slot(&store);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let slow = Arc::new(Slow {
+            inner: Hub::new(),
+            gate: gate.clone(),
+            entered: AtomicBool::new(false),
+        });
+        let host = fake_host();
+        host.trackers.lock().unwrap().insert(
+            "slow-bot".into(),
+            Arc::new(Hiding::new(slow.clone(), shown())),
+        );
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let book = service.book.clone();
+        let running = tokio::spawn(service.serve());
+        let (slow2, book2) = (slow.clone(), book.clone());
+        let before_restart = tokio::task::spawn_blocking(move || {
+            // The pass is parked in its first read of GitHub: it has not reached its begin.
+            came(|| slow2.entered.load(Ordering::SeqCst)).then(|| book2.runs_free(1))
+        })
+        .await
+        .unwrap();
+        // The token is replaced: the project starts again, its old pass still parked.
+        host.marks.lock().unwrap().insert("slow-bot".into(), 2);
+        clock.advance(SCAN);
+        let (host2, book2) = (host.clone(), book.clone());
+        let after_restart = tokio::task::spawn_blocking(move || {
+            came(|| host2.made.lock().unwrap().len() == 2).then(|| book2.runs_free(1))
+        })
+        .await
+        .unwrap();
+        {
+            let (open, turned) = &*gate;
+            *open.lock().unwrap() = true;
+            turned.notify_all();
+        }
+        running.abort();
+        assert_eq!(
+            before_restart,
+            Some(0),
+            "the run its ledger holds is counted"
+        );
+        assert_eq!(after_restart, Some(0), "a restart does not drop it");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_slow_gh_in_one_project_does_not_hold_up_the_next() {
         let (_dir, store) = open_store();
