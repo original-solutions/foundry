@@ -4184,4 +4184,148 @@ mod tests {
             );
         }
     }
+
+    mod the_finished_runs_of_the_status {
+        use super::*;
+        use crate::factory::ledger::events::Outcome;
+
+        fn finish(rig: &Rig, run: &RunId) {
+            rig.ledger
+                .write(
+                    run,
+                    &Event::Finished {
+                        outcome: Outcome::PrOpen,
+                        total_ms: 0,
+                        gate_attempts: 0,
+                        review_cycles: None,
+                        pr_url: None,
+                        pr_end: None,
+                    },
+                    &Cause::new(CauseStep::Start, "test"),
+                )
+                .unwrap();
+        }
+
+        /// A run of `issue` that took `padding` more events and then finished.
+        fn finished_run(rig: &Rig, issue: u64, padding: u32) -> RunId {
+            let run = rig.run_in(issue, 1, State::Building);
+            for n in 0..padding {
+                rig.ledger
+                    .write(
+                        &run,
+                        &Event::StepChanged {
+                            step: format!("padding {n}"),
+                        },
+                        &Cause::new(CauseStep::Start, "test"),
+                    )
+                    .unwrap();
+            }
+            finish(rig, &run);
+            run
+        }
+
+        #[test]
+        fn are_newest_first_by_when_each_finished_and_not_by_issue_number() {
+            let mut rig = Rig::new();
+            for issue in 2..=21 {
+                finished_run(&rig, issue, 0);
+            }
+            // Issue 1 is the lowest number and finishes last.
+            finished_run(&rig, 1, 0);
+            rig.pass();
+            let issues: Vec<u64> = rig
+                .status()
+                .finished
+                .iter()
+                .map(|finished| finished.run.issue())
+                .collect();
+            let mut expected = vec![1];
+            expected.extend((3..=21).rev());
+            assert_eq!(issues, expected, "twenty kept, the oldest cut");
+        }
+
+        #[test]
+        fn a_second_attempt_that_finishes_last_comes_first() {
+            let mut rig = Rig::new();
+            for issue in [3, 4] {
+                finished_run(&rig, issue, 0);
+            }
+            let again = rig.run_in(3, 2, State::Building);
+            finish(&rig, &again);
+            rig.pass();
+            let runs: Vec<RunId> = rig
+                .status()
+                .finished
+                .iter()
+                .map(|finished| finished.run.clone())
+                .collect();
+            assert_eq!(
+                runs,
+                vec![
+                    again,
+                    RunId::new(REPO, 4, 1).unwrap(),
+                    RunId::new(REPO, 3, 1).unwrap()
+                ]
+            );
+        }
+
+        #[test]
+        fn a_pass_over_an_unchanged_history_reads_no_finished_runs_events() {
+            let mut rig = Rig::new();
+            // Four runs of fifteen events each.
+            for issue in 1..=4 {
+                finished_run(&rig, issue, 10);
+            }
+            rig.pass();
+            let read = Store::run_rows_read;
+            let before = read();
+            rig.pass();
+            // Only the runs' ids are listed, a handful of times; no event of a finished run.
+            assert!(read() - before <= 4 * 4, "{} rows", read() - before);
+            assert_eq!(rig.status().finished.len(), 4);
+        }
+
+        #[test]
+        fn a_run_that_finishes_later_joins_the_kept_ones_at_the_front() {
+            let mut rig = Rig::new();
+            finished_run(&rig, 1, 0);
+            rig.pass();
+            let live = rig.run_in(2, 1, State::Building);
+            rig.hub.issue(2, &["factory:building"]);
+            rig.pass();
+            finish(&rig, &live);
+            rig.pass();
+            let issues: Vec<u64> = rig
+                .status()
+                .finished
+                .iter()
+                .map(|finished| finished.run.issue())
+                .collect();
+            assert_eq!(issues, vec![2, 1]);
+        }
+
+        #[test]
+        fn the_sweep_reads_a_finished_run_once_not_twice() {
+            let mut rig = Rig::new();
+            for issue in 1..=3 {
+                finished_run(&rig, issue, 10);
+            }
+            rig.pass();
+            let read = Store::run_rows_read;
+            let before = read();
+            rig.pass();
+            let plain = read() - before;
+            rig.clock.advance(STUCK_READ_EVERY);
+            let before = read();
+            rig.pass();
+            let swept = read() - before;
+            // Three runs of fifteen events: the reconcile reads each once, and the pass does
+            // not read them again for itself.
+            assert!(
+                swept >= plain + 3 * 15,
+                "the reconcile reads: {plain} {swept}"
+            );
+            assert!(swept <= plain + 3 * 15, "one read of each: {plain} {swept}");
+        }
+    }
 }
