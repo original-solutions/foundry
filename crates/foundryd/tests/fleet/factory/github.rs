@@ -65,10 +65,45 @@ pub struct Issue {
     pub labels: Vec<String>,
     pub assignees: Vec<String>,
     pub closed: bool,
-    /// Each label applied: the label, when, and by whom.
-    pub labeled: Vec<(String, String, String)>,
-    /// Each label removed: the label, when, and by whom.
-    pub unlabeled: Vec<(String, String, String)>,
+    /// Each label applied or removed, in the order it was made, as GitHub's timeline keeps
+    /// it. A label applied while it is on the issue, or removed while it is not, leaves none.
+    pub label_changes: Vec<LabelChange>,
+}
+
+/// A label applied (`LabeledEvent`) or removed (`UnlabeledEvent`): when, and by whom.
+#[derive(Clone, Debug)]
+pub struct LabelChange {
+    pub kind: &'static str,
+    pub label: String,
+    pub at: String,
+    pub by: String,
+}
+
+impl Issue {
+    /// `by` applies `label`, now: GitHub records it only when the label was not on the issue.
+    fn add_label(&mut self, label: &str, by: &str) {
+        if !self.labels.iter().any(|l| l == label) {
+            self.labels.push(label.into());
+            self.record("LabeledEvent", label, by);
+        }
+    }
+
+    /// `by` removes `label`, now: GitHub records it only when the label was on the issue.
+    fn remove_label(&mut self, label: &str, by: &str) {
+        if self.labels.iter().any(|l| l == label) {
+            self.labels.retain(|l| l != label);
+            self.record("UnlabeledEvent", label, by);
+        }
+    }
+
+    fn record(&mut self, kind: &'static str, label: &str, by: &str) {
+        self.label_changes.push(LabelChange {
+            kind,
+            label: label.into(),
+            at: now(),
+            by: by.into(),
+        });
+    }
 }
 
 /// One comment, on an issue or a pull request: GitHub keeps both as issue comments.
@@ -142,8 +177,7 @@ impl FakeTracker {
                 labels: Vec::new(),
                 assignees: Vec::new(),
                 closed: false,
-                labeled: Vec::new(),
-                unlabeled: Vec::new(),
+                label_changes: Vec::new(),
             },
         );
     }
@@ -152,10 +186,7 @@ impl FakeTracker {
     pub fn label(&self, number: u64, label: &str, by: &str) {
         let mut hub = self.lock();
         let issue = hub.issues.get_mut(&number).expect("an issue");
-        if !issue.labels.iter().any(|l| l == label) {
-            issue.labels.push(label.into());
-        }
-        issue.labeled.push((label.into(), now(), by.into()));
+        issue.add_label(label, by);
     }
 
     /// A pull request numbered `number` from `head`, closing issue `closes`: a draft, open
@@ -367,16 +398,10 @@ impl FakeTracker {
                     None => Err(Self::failed(args, "Could not resolve to an issue")),
                     Some(issue) => {
                         for label in Self::values(args, "--add-label") {
-                            if !issue.labels.contains(&label) {
-                                issue.labels.push(label.clone());
-                            }
-                            issue.labeled.push((label, now(), login.clone()));
+                            issue.add_label(&label, &login);
                         }
                         for label in Self::values(args, "--remove-label") {
-                            if issue.labels.contains(&label) {
-                                issue.labels.retain(|l| *l != label);
-                                issue.unlabeled.push((label, now(), login.clone()));
-                            }
+                            issue.remove_label(&label, &login);
                         }
                         for who in Self::values(args, "--add-assignee") {
                             if !issue.assignees.contains(&who) {
@@ -547,23 +572,16 @@ impl FakeTracker {
             json!({"data": {"repository": {"issue": {"closedByPullRequestsReferences": {"nodes": nodes}}}}})
         } else if query.contains("timelineItems") {
             let issue = hub.issues.get(&number)?;
-            // Oldest first, as GitHub lists the timeline; a change in the same second as
-            // another keeps the order it was made in.
-            let mut changes: Vec<(&str, &(String, String, String))> = issue
-                .labeled
+            // Oldest first, as GitHub lists the timeline: the order the changes were made in.
+            let nodes: Vec<Value> = issue
+                .label_changes
                 .iter()
-                .map(|c| ("LabeledEvent", c))
-                .chain(issue.unlabeled.iter().map(|c| ("UnlabeledEvent", c)))
-                .collect();
-            changes.sort_by(|a, b| a.1.1.cmp(&b.1.1));
-            let nodes: Vec<Value> = changes
-                .into_iter()
-                .map(|(kind, (label, at, by))| {
+                .map(|change| {
                     json!({
-                        "__typename": kind,
-                        "createdAt": at,
-                        "actor": Self::actor(by),
-                        "label": {"name": label},
+                        "__typename": change.kind,
+                        "createdAt": change.at,
+                        "actor": Self::actor(&change.by),
+                        "label": {"name": change.label},
                     })
                 })
                 .collect();
