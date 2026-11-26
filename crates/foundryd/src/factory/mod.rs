@@ -706,7 +706,7 @@ impl Factory<Daemon> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::Instant;
 
@@ -1332,5 +1332,213 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![project(1), project(3)]
         );
+    }
+
+    /// A host that counts the lease ticks of each project and the trackers asked for each
+    /// login, which is one per pass, over a [`FakeHost`].
+    struct Counting {
+        inner: Arc<FakeHost>,
+        ticks: Mutex<BTreeMap<ProjectId, Arc<AtomicUsize>>>,
+        passes: Mutex<BTreeMap<String, usize>>,
+    }
+
+    /// A lease that counts its ticks and leaves the rest to `inner`.
+    struct Ticked {
+        inner: Arc<dyn Leasing>,
+        ticks: Arc<AtomicUsize>,
+    }
+
+    impl Leasing for Ticked {
+        fn tick(&self, highest: u64) -> LeaseState {
+            self.ticks.fetch_add(1, Ordering::SeqCst);
+            self.inner.tick(highest)
+        }
+        fn guard(&self) -> Arc<dyn Guard> {
+            self.inner.guard()
+        }
+        fn release(&self) {
+            self.inner.release();
+        }
+    }
+
+    impl Counting {
+        fn new(inner: Arc<FakeHost>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                ticks: Mutex::new(BTreeMap::new()),
+                passes: Mutex::new(BTreeMap::new()),
+            })
+        }
+        fn ticks(&self, project: ProjectId) -> usize {
+            self.ticks
+                .lock()
+                .unwrap()
+                .get(&project)
+                .map_or(0, |n| n.load(Ordering::SeqCst))
+        }
+        fn passes(&self, login: &str) -> usize {
+            self.passes.lock().unwrap().get(login).copied().unwrap_or(0)
+        }
+    }
+
+    impl Host for Counting {
+        fn acting(&self) -> Answering<'_, bool> {
+            self.inner.acting()
+        }
+        fn tracker(&self, login: &str) -> Option<Arc<dyn Commenting>> {
+            *self.passes.lock().unwrap().entry(login.into()).or_default() += 1;
+            self.inner.tracker(login)
+        }
+        fn token_mark(&self, login: &str) -> Result<Option<u64>, String> {
+            self.inner.token_mark(login)
+        }
+        fn lease(&self, watched: &Watched) -> Arc<dyn Leasing> {
+            let ticks: Arc<AtomicUsize> = Arc::default();
+            self.ticks
+                .lock()
+                .unwrap()
+                .insert(watched.project, ticks.clone());
+            Arc::new(Ticked {
+                inner: self.inner.lease(watched),
+                ticks,
+            })
+        }
+        fn worker(&self) -> Arc<dyn Worker> {
+            self.inner.worker()
+        }
+        fn online(&self) -> BTreeSet<MachineId> {
+            self.inner.online()
+        }
+        fn hide(&self) -> Hide {
+            self.inner.hide()
+        }
+    }
+
+    /// Lets the service run a little, so a thing that should not happen has had its chance.
+    async fn a_while() {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_project_turned_off_releases_its_lease_and_another_projects_is_kept() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN), (2, "other-bot")]))
+            .unwrap();
+        let host = fake_host();
+        for login in [LOGIN, "other-bot"] {
+            host.trackers
+                .lock()
+                .unwrap()
+                .insert(login.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        }
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("both leases", || host2.made.lock().unwrap().len() == 2)
+        })
+        .await
+        .unwrap();
+        let mut off = settings_with(&[(1, LOGIN), (2, "other-bot")]);
+        off.seq = 2;
+        off.project_factory.get_mut(&project(2)).unwrap().on = false;
+        store.lock().unwrap().apply_settings(off).unwrap();
+        clock.advance(SCAN);
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the turned-off project's lease is released", || {
+                host2.leases.lock().unwrap()[&project(2)]
+                    .released
+                    .load(Ordering::SeqCst)
+            })
+        })
+        .await
+        .unwrap();
+        a_while().await;
+        let leases = host.leases.lock().unwrap();
+        assert!(!leases[&project(1)].released.load(Ordering::SeqCst));
+        drop(leases);
+        assert_eq!(host.made.lock().unwrap().len(), 2, "no lease was remade");
+        running.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_lease_ticks_once_every_lease_tick() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN)]))
+            .unwrap();
+        let fake = fake_host();
+        fake.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        let host = Counting::new(fake);
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the first tick", || host2.ticks(project(1)) == 1)
+        })
+        .await
+        .unwrap();
+        clock.advance(LEASE_TICK - Duration::from_secs(1));
+        a_while().await;
+        assert_eq!(host.ticks(project(1)), 1, "no tick before LEASE_TICK");
+        clock.advance(Duration::from_secs(1));
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("a tick after LEASE_TICK", || host2.ticks(project(1)) == 2)
+        })
+        .await
+        .unwrap();
+        running.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pass_runs_every_configured_poll_seconds() {
+        let (_dir, store) = open_store();
+        let mut settings = settings_with(&[(1, LOGIN)]);
+        // Not the default 30, so a pass that ignores the setting is seen.
+        settings.factory.as_mut().unwrap().poll_seconds = 45;
+        store.lock().unwrap().apply_settings(settings).unwrap();
+        let fake = fake_host();
+        fake.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        let host = Counting::new(fake);
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let (host2, store2) = (host.clone(), store.clone());
+        tokio::task::spawn_blocking(move || {
+            wait_for("the first pass", || {
+                host2.passes(LOGIN) == 1 && status_of(&store2, project(1)).is_some()
+            })
+        })
+        .await
+        .unwrap();
+        clock.advance(Duration::from_secs(44));
+        a_while().await;
+        assert_eq!(host.passes(LOGIN), 1, "no pass before poll_seconds");
+        clock.advance(Duration::from_secs(1));
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("a pass after poll_seconds", || host2.passes(LOGIN) == 2)
+        })
+        .await
+        .unwrap();
+        running.abort();
     }
 }
