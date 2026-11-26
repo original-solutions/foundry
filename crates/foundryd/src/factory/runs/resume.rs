@@ -67,8 +67,9 @@
 //!   same thread a message. Foundry resumes in a new workspace of the same run, so the runner's
 //!   attempt+1 mechanics (`carryOutRelaunch`, `endUnbegunRelaunch`, `carryStopToNext`, a worktree
 //!   removed with `worktree_removed`, the next attempt's approval) have no counterpart. The
-//!   counter is the newest `session_interrupted` line's `resumes`; the feedback round's reset is
-//!   task 28's.
+//!   count on a `session_interrupted` line (`resumes`, which names `-r<k>`) is the run's whole
+//!   count, while the cap counts only the lines after the newest `feedback_relaunching`: a
+//!   feedback round starts `interruption_resumes` again (task 28), and no name is reused.
 //! - A session is read by the fleet, not by a thread's status: there is no T3 evidence (a T3
 //!   error in the machine log, `endedInPass`, T3 starts and stops), so a session that ended is
 //!   resumed up to the cap with none, where the runner needed evidence or a second end in one
@@ -1276,6 +1277,24 @@ fn choose_branch(ctx: &RunContext<'_>, issue: u64, seen: &Seen) -> Result<Branch
     Ok(Branch::Use(None))
 }
 
+/// How many resumes count against `limits.interruption_resumes`: the `session_interrupted`
+/// lines after the newest `feedback_relaunching`, since a feedback round starts the cap again,
+/// less a relaunch's (`relaunch: true`), which is no resume. The `-r<k>` names keep the run's
+/// whole count, so no name is reused.
+fn resumes_this_round(events: &[RunEvent]) -> u64 {
+    let round = events
+        .iter()
+        .rposition(|event| event.event == super::feedback::FEEDBACK_RELAUNCHING)
+        .map_or(0, |at| at + 1);
+    events[round..]
+        .iter()
+        .filter(|event| {
+            event.event == super::feedback::SESSION_INTERRUPTED
+                && event.data.get("relaunch") != Some(&Value::Bool(true))
+        })
+        .count() as u64
+}
+
 /// The first pass: the cap, the branch, the decision, and the archive of the earlier workspace.
 fn decide(
     ctx: &RunContext<'_>,
@@ -1291,16 +1310,18 @@ fn decide(
         return Ok(step);
     }
     ensure_building(ctx, issue, at)?;
-    let used = seen
+    // The names count across the whole run; the cap counts this round's resumes only.
+    let resumes = seen
         .interruption
         .as_ref()
         .map_or(0, |interruption| interruption.resumes);
+    let used = resumes_this_round(events);
     let (code, stop) = ended.stop();
     // The machine is gone: nothing can be asked of it, and it ends its own sessions.
     if *ended == Ended::Unreachable {
         at.worktree = None;
     }
-    if u64::from(used) >= ctx.config.limits.interruption_resumes {
+    if used >= ctx.config.limits.interruption_resumes {
         return stuck(ctx, run, at, code, stop);
     }
     // A resume starts a session, which the approval must stand behind.
@@ -1323,7 +1344,7 @@ fn decide(
             return stuck(ctx, run, at, STUCK_LAUNCH, stop);
         }
     };
-    let k = used + 1;
+    let k = resumes + 1;
     ctx.held()?;
     ctx.record(
         run,
@@ -2457,8 +2478,10 @@ mod tests {
             ws: WorkspaceId,
         ) -> SessionId {
             fail_the_session(rig, thread, ws);
+            let step = pass(rig, run);
             assert!(
-                matches!(pass(rig, run), ResumeStep::Archiving { resumes, .. } if resumes == k)
+                matches!(step, ResumeStep::Archiving { resumes, .. } if resumes == k),
+                "resume {k}: {step:?}"
             );
             rig.view = archived();
             assert_eq!(
@@ -2557,6 +2580,145 @@ mod tests {
                 .find(|e| e.event == "stuck")
                 .unwrap();
             assert_eq!(stuck.cause.unwrap()["reason"], "thread-gone");
+        }
+
+        /// The round's workspace, its session and its name, as `feedback` makes them.
+        fn round_workspace(n: u32) -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(0xe00 + u128::from(n)))
+        }
+
+        fn round_session(n: u32) -> SessionId {
+            SessionId(uuid::Uuid::from_u128(0xf00 + u128::from(n)))
+        }
+
+        /// A run in `pr-open`: feedback round `n` moved it back to `building` and
+        /// started its session, with the lines `feedback` writes for it.
+        fn a_feedback_round(rig: &mut Rig, run: &RunId, n: u32) -> SessionId {
+            let relaunching = || Event::FeedbackRelaunching {
+                n,
+                branch: BRANCH.into(),
+                items: vec![format!("comment-{n}")],
+                message: "Address the review.".into(),
+            };
+            rig.write(run, relaunching());
+            rig.step(run, &format!("feedback-machine {n} {}", m2()));
+            rig.moved(run, State::PrOpen, State::Building);
+            rig.write(run, relaunching());
+            rig.step(run, &format!("feedback-requested {n} fac/8-1-f{n}"));
+            rig.step(
+                run,
+                &format!("feedback-workspace {n} {}", round_workspace(n)),
+            );
+            rig.step(run, &format!("feedback-sending {n}"));
+            rig.write(
+                run,
+                Event::SessionLaunched {
+                    thread_id: round_session(n).to_string(),
+                    worktree: Some(round_workspace(n).to_string()),
+                    branch: Some(BRANCH.into()),
+                    model_instance: None,
+                    model: Some("opus".into()),
+                    model_options: None,
+                    resumed_from: Some(ResumedFrom {
+                        run: run.to_string(),
+                        branch: BRANCH.into(),
+                    }),
+                    base: Some("main".into()),
+                    title: Some("Make it faster".into()),
+                },
+            );
+            round_session(n)
+        }
+
+        /// Acceptance (task 28): a feedback round starts `interruption_resumes` again. A run
+        /// that used both of its resumes before `pr-open` is resumed, not stuck, on the first
+        /// interruption of the round's session, and its resume workspace is named one past the
+        /// run's highest (`-r3`), so no name is reused.
+        #[test]
+        fn a_feedback_round_starts_the_resumes_again() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            let first = resume_once(&mut rig, &run, 1, session(), old());
+            resume_once(
+                &mut rig,
+                &run,
+                2,
+                first,
+                WorkspaceId(uuid::Uuid::from_u128(0xc01)),
+            );
+            rig.moved(&run, State::Building, State::PrOpen);
+            let thread = a_feedback_round(&mut rig, &run, 1);
+            let next = resume_once(&mut rig, &run, 3, thread, round_workspace(1));
+            let names: Vec<String> = create_calls(&rig)
+                .into_iter()
+                .filter_map(|call| match call {
+                    Call::Create { request, .. } => Some(request.name),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names, vec!["fac/8-1-r1", "fac/8-1-r2", "fac/8-1-r3"]);
+            assert!(!rig.finished(&run));
+            // The round has one resume left of its two, and then the cap ends it.
+            let next = resume_once(
+                &mut rig,
+                &run,
+                4,
+                next,
+                WorkspaceId(uuid::Uuid::from_u128(0xc03)),
+            );
+            fail_the_session(&mut rig, next, WorkspaceId(uuid::Uuid::from_u128(0xc04)));
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Stuck {
+                    reason: "the session run ended as failed".into()
+                }
+            );
+            let resumes: Vec<u64> = interruptions(&rig, &run)
+                .iter()
+                .map(|line| line["resumes"].as_u64().unwrap())
+                .collect();
+            assert_eq!(resumes, vec![1, 2, 3, 4]);
+        }
+
+        /// Only the newest round's interruptions count: two rounds each get the whole cap, and a
+        /// cap of zero still ends the round's first interruption stuck.
+        #[test]
+        fn only_the_interruptions_after_the_newest_round_count() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            rig.config.limits.interruption_resumes = 1;
+            resume_once(&mut rig, &run, 1, session(), old());
+            rig.moved(&run, State::Building, State::PrOpen);
+            let thread = a_feedback_round(&mut rig, &run, 1);
+            resume_once(&mut rig, &run, 2, thread, round_workspace(1));
+            rig.moved(&run, State::Building, State::PrOpen);
+            let thread = a_feedback_round(&mut rig, &run, 2);
+            resume_once(&mut rig, &run, 3, thread, round_workspace(2));
+            assert!(!rig.finished(&run));
+
+            let (mut rig, run) = failed_with_turns_unasked();
+            rig.config.limits.interruption_resumes = 0;
+            rig.moved(&run, State::Building, State::PrOpen);
+            let thread = a_feedback_round(&mut rig, &run, 1);
+            fail_the_session(&mut rig, thread, round_workspace(1));
+            assert!(matches!(pass(&rig, &run), ResumeStep::Stuck { .. }));
+            assert!(interruptions(&rig, &run).is_empty());
+        }
+
+        /// A relaunch's interruption line (`relaunch: true`) is no resume, as `read_round` and
+        /// the newest `resumes` read it: it does not count against the cap.
+        #[test]
+        fn a_relaunch_interruption_does_not_count_against_the_cap() {
+            let (rig, run) = failed_with_turns_unasked();
+            let line = |resumes, relaunch| Event::SessionInterrupted {
+                resumes,
+                relaunch,
+                run_ordinal: None,
+                branch: None,
+                t3_error: None,
+                ended_in_pass: 0,
+            };
+            rig.write(&run, line(0, true));
+            rig.write(&run, line(1, false));
+            assert_eq!(resumes_this_round(&rig.events(&run)), 1);
         }
     }
 
