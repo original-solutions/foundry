@@ -1104,6 +1104,44 @@ mod tests {
     }
 
     #[test]
+    fn a_summary_of_chosen_runs_reads_the_events_of_those_runs_only() {
+        let (_dir, store) = open_store();
+        run_at(&store, &softfac(1), T0, Some(State::Building), false, true);
+        let ledger = run_at(&store, &softfac(2), T0, Some(State::Stuck), true, true);
+        run_at(&store, &softfac(3), T0, Some(State::Building), false, true);
+        let whole = summaries_of(&store, "rawphp/softfac");
+        let its_events = store.lock().unwrap().run_events(&softfac(2)).unwrap().len();
+        let read = Store::run_rows_read;
+
+        let before = read();
+        let chosen = ledger.run_summaries(&BTreeSet::from([softfac(2)]));
+        // The chosen run's events, and no run id or event of the other two.
+        assert_eq!(read() - before, its_events);
+        let same = whole.into_iter().find(|run| run.id == softfac(2)).unwrap();
+        assert_eq!(chosen, [same]);
+    }
+
+    #[test]
+    fn an_unreadable_run_among_the_chosen_ones_comes_back_last_marked_unreadable() {
+        let (dir, store) = open_store();
+        let ledger = run_at(&store, &softfac(7), T0, Some(State::Building), false, true);
+        unreadable_run(dir.path(), &softfac(6));
+        run_at(&store, &softfac(8), T0, Some(State::Building), false, true);
+        let whole = summaries_of(&store, "rawphp/softfac");
+        let seven = whole.into_iter().find(|run| run.id == softfac(7)).unwrap();
+        assert_eq!(
+            ledger.run_summaries(&BTreeSet::from([softfac(7), softfac(6)])),
+            [
+                seven,
+                RunSummary {
+                    unreadable: true,
+                    ..summary(softfac(6))
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn orders_runs_with_the_same_start_by_repo_then_issue_and_attempt_as_numbers() {
         let (_dir, store) = open_store();
         for id in [
