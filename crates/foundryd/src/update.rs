@@ -91,7 +91,7 @@ const VERSION_LIMIT: Duration = Duration::from_secs(10);
 /// Set once this daemon has run long enough to be healthy; the watchdog reads it.
 static HEALTHY: AtomicBool = AtomicBool::new(false);
 
-/// Why a tag could not be installed. None of these ever holds a secret.
+/// Why a tag could not be made ready, or a version installed. None of these ever holds a secret.
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     /// The release could not be listed, downloaded or checked; tried again later.
@@ -255,14 +255,19 @@ pub struct State {
     pub ready: Option<String>,
 }
 
-/// True when both binaries of `tag`'s version are in `versions/`, so the tag counts as ready.
-pub fn is_ready(home: &Path, tag: &str) -> bool {
+/// The version a release tag names: `v0.2.0` gives `0.2.0`. `None` unless the tag is `v`
+/// and three numbers.
+pub(crate) fn tag_version(tag: &str) -> Option<&str> {
     tag.strip_prefix('v')
         .filter(|version| parse(version).is_some())
-        .is_some_and(|version| {
-            let dir = home.join("versions").join(version);
-            BINARIES.iter().all(|name| dir.join(name).is_file())
-        })
+}
+
+/// True when both binaries of `tag`'s version are in `versions/`, so the tag counts as ready.
+pub fn is_ready(home: &Path, tag: &str) -> bool {
+    tag_version(tag).is_some_and(|version| {
+        let dir = home.join("versions").join(version);
+        BINARIES.iter().all(|name| dir.join(name).is_file())
+    })
 }
 
 /// True when `state` holds a trial and `current` names its version: a trial is on, by the rule
@@ -596,7 +601,7 @@ pub fn placed_by_hand(
         let held = state
             .refused
             .as_deref()
-            .and_then(|r| parse(r.strip_prefix('v')?));
+            .and_then(|r| parse(tag_version(r)?));
         if held.is_none_or(|held| held < parse(before).unwrap_or_default()) {
             state.refused = Some(format!("v{before}"));
         }
@@ -605,12 +610,12 @@ pub fn placed_by_hand(
     Ok(state.refused.filter(|_| went_back))
 }
 
-/// The tag to install: the highest valid one, if it is above `running` and is not the
+/// The tag to make ready: the highest valid one, if it is above `running` and is not the
 /// refused one. A tag above the refused one is picked.
 fn pick(tags: &[String], running: &str, refused: Option<&str>) -> Option<String> {
     let (top, version) = tags
         .iter()
-        .filter_map(|tag| Some((tag, parse(tag.strip_prefix('v')?)?)))
+        .filter_map(|tag| Some((tag, parse(tag_version(tag)?)?)))
         .max_by_key(|(_, version)| *version)?;
     let beyond = version > parse(running)?;
     (beyond && refused != Some(top.as_str())).then(|| top.clone())
@@ -735,10 +740,7 @@ fn make_ready(
     version_limit: Duration,
     fetch: impl FnOnce(&str, &Path) -> Result<(), UpdateError>,
 ) -> Result<(), UpdateError> {
-    let version = tag
-        .strip_prefix('v')
-        .filter(|version| parse(version).is_some())
-        .ok_or_else(|| UpdateError::BadTag(tag.to_string()))?;
+    let version = tag_version(tag).ok_or_else(|| UpdateError::BadTag(tag.to_string()))?;
     let stage = stage_version(home, version, |stage| {
         fetch(tag, stage)?;
         make_executable(stage)?;
@@ -1178,6 +1180,23 @@ mod tests {
     }
 
     #[test]
+    fn tag_version_reads_only_v_and_three_numbers() {
+        assert_eq!(tag_version("v0.2.0"), Some("0.2.0"));
+        assert_eq!(tag_version("v10.0.1"), Some("10.0.1"));
+        for tag in [
+            "0.2.0",
+            "v0.2",
+            "v0.2.0.1",
+            "v0.2.0-rc1",
+            "v../x",
+            "V0.2.0",
+            "",
+        ] {
+            assert_eq!(tag_version(tag), None, "{tag}");
+        }
+    }
+
+    #[test]
     fn pick_takes_the_highest_tag_above_the_running_version() {
         let picked = pick(&tags(&["v0.2.0", "v0.3.0", "v0.1.5"]), "0.2.0", None);
 
@@ -1590,6 +1609,49 @@ mod tests {
         );
         assert!(is_ready(home.path(), "v0.3.0"));
         assert_eq!(versions(home.path()), ["0.1.0", "0.3.0"]);
+    }
+
+    #[test]
+    fn an_update_json_the_previous_release_wrote_without_a_ready_tag_is_read_and_made_ready() {
+        let home = installed_home();
+        // Written by hand in the shape the release before `ready` existed wrote, with no
+        // `ready` key. `save` always writes one, so a fixture made with it cannot hold this.
+        fs::write(
+            home.path().join("update.json"),
+            r#"{"trial":null,"refused":"v0.2.0"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state(home.path()).unwrap(),
+            State {
+                trial: None,
+                refused: Some("v0.2.0".into()),
+                ready: None,
+            }
+        );
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.1.0", "v0.2.0", "v0.3.0"])),
+            |_, stage| {
+                release(stage, "0.3.0");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.as_deref(), Some("v0.3.0"));
+        assert_eq!(
+            state(home.path()).unwrap(),
+            State {
+                trial: None,
+                refused: Some("v0.2.0".into()),
+                ready: Some("v0.3.0".into()),
+            }
+        );
     }
 
     /// Puts both binaries of `version` in `versions/` and saves `v<version>` as the ready tag,

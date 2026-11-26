@@ -267,9 +267,7 @@ fn update_ready_with(home: &Path, exe: &Path, running: &str) -> Option<String> {
         }
     };
     let ready = state.ready?;
-    let above = ready
-        .strip_prefix('v')
-        .is_some_and(|version| update::above(version, running));
+    let above = update::tag_version(&ready).is_some_and(|version| update::above(version, running));
     (above
         && state.refused.as_deref() != Some(ready.as_str())
         && update::is_ready(home, &ready)
