@@ -177,23 +177,29 @@ describe("ProjectFactoryControls", () => {
     expect(screen.getByRole("button", { name: "Save login" })).toBeDefined();
   });
 
-  it("drops the value last sent when new props arrive", async () => {
+  it("keeps the value last sent through settings that have not caught up, and drops it once they move", async () => {
     let set: (f: { on: boolean; login: string; paused: boolean }) => void = () => {};
     function Harness() {
       const [f, setF] = useState({ on: false, login: "", paused: false });
       set = setF;
       return <ProjectFactoryControls project={project} factory={f} />;
     }
-    const calls = mockFetch(json(200, { factory: { on: true, login: "", paused: false } }), json(200, { factory: { on: false, login: "", paused: true } }));
+    const calls = mockFetch(json(200, { factory: { on: true, login: "bot", paused: false } }), json(200, { factory: { on: false, login: "bot", paused: true } }));
     await renderApp(<Harness />);
-    fireEvent.click(screen.getByRole("switch", { name: "Factory for demo" }));
-    await waitFor(() => expect(screen.getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("true"));
+    const toggle = () => screen.getByRole("switch", { name: "Factory for demo" });
+    fireEvent.click(toggle());
+    await waitFor(() => expect(toggle().getAttribute("aria-checked")).toBe("true"));
+    // A settings message from before the edit was numbered: a new object, the same setting.
     act(() => set({ on: false, login: "", paused: false }));
-    expect(screen.getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("false");
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    // The edit arrives, then someone else turns the factory off.
+    act(() => set({ on: true, login: "bot", paused: false }));
+    act(() => set({ on: false, login: "bot", paused: false }));
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
     await waitFor(() => expect((screen.getByLabelText("Pause claims for demo") as HTMLInputElement).disabled).toBe(false));
     fireEvent.click(screen.getByLabelText("Pause claims for demo"));
     await waitFor(() => expect(calls).toHaveLength(2));
-    expect(calls[1].body).toEqual({ on: false, paused: true, login: null });
+    expect(calls[1].body).toEqual({ on: false, paused: true, login: "bot" });
   });
 
   it("shows a refusal beside the row", async () => {
