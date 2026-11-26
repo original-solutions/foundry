@@ -693,6 +693,95 @@ mod tests {
         assert_eq!(written.body.update_refused, None);
     }
 
+    /// A home where the daemon of `0.1.0` runs from `current`, with both binaries of `ready`'s
+    /// version on disk and `update.json` naming `ready` and `refused`. Returns the daemon's path.
+    fn ready_home(home: &Path, ready: &str, refused: Option<&str>) -> PathBuf {
+        for version in ["0.1.0", ready.trim_start_matches('v')] {
+            let dir = home.join("versions").join(version);
+            std::fs::create_dir_all(&dir).unwrap();
+            for name in ["foundryd", "foundry-holder"] {
+                std::fs::write(dir.join(name), version).unwrap();
+            }
+        }
+        crate::update::point_current(home, "0.1.0").unwrap();
+        let state = serde_json::json!({ "ready": ready, "refused": refused });
+        std::fs::write(home.join("update.json"), state.to_string()).unwrap();
+        home.join("versions/0.1.0/foundryd")
+    }
+
+    #[test]
+    fn update_ready_is_the_ready_tag_above_the_running_version_with_its_binaries_on_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let exe = ready_home(home.path(), "v0.2.0", Some("v0.1.5"));
+
+        assert_eq!(
+            update_ready_with(home.path(), &exe, "0.1.0").as_deref(),
+            Some("v0.2.0")
+        );
+    }
+
+    #[test]
+    fn update_ready_is_none_for_a_tag_not_above_the_running_version() {
+        for ready in ["v0.1.0", "v0.0.9"] {
+            let home = tempfile::tempdir().unwrap();
+            let exe = ready_home(home.path(), ready, None);
+            assert_eq!(update_ready_with(home.path(), &exe, "0.1.0"), None, "{ready}");
+        }
+    }
+
+    #[test]
+    fn update_ready_is_none_while_a_binary_of_the_ready_version_is_gone() {
+        for gone in ["foundryd", "foundry-holder"] {
+            let home = tempfile::tempdir().unwrap();
+            let exe = ready_home(home.path(), "v0.2.0", None);
+            std::fs::remove_file(home.path().join("versions/0.2.0").join(gone)).unwrap();
+            assert_eq!(update_ready_with(home.path(), &exe, "0.1.0"), None, "{gone}");
+        }
+    }
+
+    #[test]
+    fn update_ready_is_none_for_the_refused_tag() {
+        let home = tempfile::tempdir().unwrap();
+        let exe = ready_home(home.path(), "v0.2.0", Some("v0.2.0"));
+
+        assert_eq!(update_ready_with(home.path(), &exe, "0.1.0"), None);
+    }
+
+    #[test]
+    fn update_ready_is_none_for_a_daemon_not_run_from_current() {
+        let home = tempfile::tempdir().unwrap();
+        ready_home(home.path(), "v0.2.0", None);
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::write(&elsewhere, "0.1.0").unwrap();
+
+        assert_eq!(update_ready_with(home.path(), &elsewhere, "0.1.0"), None);
+    }
+
+    #[test]
+    fn update_ready_is_none_with_no_ready_tag_or_an_unreadable_update_state() {
+        let home = tempfile::tempdir().unwrap();
+        let exe = ready_home(home.path(), "v0.2.0", None);
+        std::fs::write(home.path().join("update.json"), r#"{"ready":null}"#).unwrap();
+        assert_eq!(update_ready_with(home.path(), &exe, "0.1.0"), None);
+
+        std::fs::write(home.path().join("update.json"), "not json").unwrap();
+        assert_eq!(update_ready_with(home.path(), &exe, "0.1.0"), None);
+        assert_eq!(update_ready(home.path()), None);
+    }
+
+    #[test]
+    fn every_sample_carries_the_ready_tag_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(Store::open(dir.path().join("foundry.db")).unwrap());
+        let me = MachineId::random();
+        let machine = read(dir.path(), 0).unwrap();
+
+        let written = store_sample(&store, me, machine, None, Some("v9.9.9".into())).unwrap();
+
+        assert_eq!(written.body.update_ready.as_deref(), Some("v9.9.9"));
+        assert_eq!(held_sample(&store.lock().unwrap(), me), Some(written));
+    }
+
     #[test]
     fn write_sample_reads_the_machine_before_taking_the_store() {
         let dir = tempfile::tempdir().unwrap();

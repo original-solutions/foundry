@@ -950,6 +950,7 @@ mod tests {
                     starts: 0,
                 }),
                 refused: None,
+                ready: None,
             },
         )
         .unwrap();
@@ -1132,18 +1133,19 @@ mod tests {
     }
 
     #[test]
-    fn install_tag_installs_points_current_and_starts_a_trial() {
+    fn make_ready_places_the_version_and_saves_it_ready_without_moving_current() {
         let home = installed_home();
         save(
             home.path(),
             &State {
                 trial: None,
                 refused: Some("v0.2.0".into()),
+                ready: None,
             },
         )
         .unwrap();
 
-        install_tag(home.path(), "v0.2.0", "0.1.0", LIMIT, |tag, stage| {
+        make_ready(home.path(), "v0.2.0", "0.1.0", LIMIT, |tag, stage| {
             assert_eq!(tag, "v0.2.0");
             script(&stage.join("foundryd"), "foundryd 0.2.0");
             script(&stage.join("foundry-holder"), "holder");
@@ -1151,7 +1153,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
         for name in ["foundryd", "foundry-holder"] {
             let mode = fs::metadata(home.path().join("versions/0.2.0").join(name))
                 .unwrap()
@@ -1159,24 +1161,22 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o755, 0o755, "{name}");
         }
-        let state = state(home.path()).unwrap();
         assert_eq!(
-            state.trial,
-            Some(Trial {
-                version: "0.2.0".into(),
-                previous: "0.1.0".into(),
-                starts: 0
-            })
+            state(home.path()).unwrap(),
+            State {
+                trial: None,
+                refused: Some("v0.2.0".into()),
+                ready: Some("v0.2.0".into()),
+            }
         );
-        assert_eq!(state.refused, None);
         assert!(!home.path().join("versions/.staging-0.2.0").exists());
     }
 
     #[test]
-    fn install_tag_refuses_a_binary_that_prints_another_version() {
+    fn make_ready_refuses_a_binary_that_prints_another_version() {
         let home = installed_home();
 
-        let error = install_tag(home.path(), "v0.2.0", "0.1.0", LIMIT, |_, stage| {
+        let error = make_ready(home.path(), "v0.2.0", "0.1.0", LIMIT, |_, stage| {
             script(&stage.join("foundryd"), "foundryd 0.9.9");
             script(&stage.join("foundry-holder"), "holder");
             Ok(())
@@ -1190,10 +1190,10 @@ mod tests {
     }
 
     #[test]
-    fn install_tag_refuses_an_asset_without_the_holder() {
+    fn make_ready_refuses_an_asset_without_the_holder() {
         let home = installed_home();
 
-        let error = install_tag(home.path(), "v0.2.0", "0.1.0", LIMIT, |_, stage| {
+        let error = make_ready(home.path(), "v0.2.0", "0.1.0", LIMIT, |_, stage| {
             script(&stage.join("foundryd"), "foundryd 0.2.0");
             Ok(())
         })
@@ -1204,10 +1204,10 @@ mod tests {
     }
 
     #[test]
-    fn install_tag_passes_a_failed_fetch_on_and_changes_nothing() {
+    fn make_ready_passes_a_failed_fetch_on_and_changes_nothing() {
         let home = installed_home();
 
-        let error = install_tag(home.path(), "v0.2.0", "0.1.0", LIMIT, |_, _| {
+        let error = make_ready(home.path(), "v0.2.0", "0.1.0", LIMIT, |_, _| {
             Err(UpdateError::Fetch("gh is not logged in".into()))
         })
         .unwrap_err();
@@ -1302,6 +1302,7 @@ mod tests {
                     starts: 1,
                 }),
                 refused: None,
+                ready: None,
             },
         )
         .unwrap();
@@ -1342,6 +1343,7 @@ mod tests {
             &State {
                 trial: None,
                 refused: Some("v0.5.0".into()),
+                ready: None,
             },
         )
         .unwrap();
@@ -1422,6 +1424,7 @@ mod tests {
             &State {
                 trial: None,
                 refused: Some("v0.2.0".into()),
+                ready: None,
             },
         )
         .unwrap();
@@ -1440,13 +1443,14 @@ mod tests {
     }
 
     #[test]
-    fn check_with_installs_a_higher_tag_and_clears_the_refusal() {
+    fn check_with_makes_a_higher_tag_ready_and_leaves_current_the_trial_and_the_refusal() {
         let home = installed_home();
         save(
             home.path(),
             &State {
                 trial: None,
                 refused: Some("v0.2.0".into()),
+                ready: None,
             },
         )
         .unwrap();
@@ -1465,10 +1469,332 @@ mod tests {
         .unwrap();
 
         assert_eq!(done.as_deref(), Some("v0.3.0"));
-        assert_eq!(current(home.path()), PathBuf::from("versions/0.3.0"));
-        let state = state(home.path()).unwrap();
-        assert_eq!(state.refused, None);
-        assert_eq!(state.trial.unwrap().version, "0.3.0");
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert_eq!(
+            state(home.path()).unwrap(),
+            State {
+                trial: None,
+                refused: Some("v0.2.0".into()),
+                ready: Some("v0.3.0".into()),
+            }
+        );
+        assert!(is_ready(home.path(), "v0.3.0"));
+        assert_eq!(versions(home.path()), ["0.1.0", "0.3.0"]);
+    }
+
+    /// Puts both binaries of `version` in `versions/` and saves `v<version>` as the ready tag,
+    /// with `refused`.
+    fn with_ready(home: &Path, version: &str, refused: Option<&str>) {
+        let dir = home.join("versions").join(version);
+        fs::create_dir_all(&dir).unwrap();
+        release(&dir, version);
+        save(
+            home,
+            &State {
+                trial: None,
+                refused: refused.map(str::to_string),
+                ready: Some(format!("v{version}")),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_ready_tag_counts_only_while_both_its_binaries_are_on_disk() {
+        for gone in BINARIES {
+            let home = installed_home();
+            with_ready(home.path(), "0.2.0", None);
+            assert!(is_ready(home.path(), "v0.2.0"));
+
+            fs::remove_file(home.path().join("versions/0.2.0").join(gone)).unwrap();
+
+            assert!(!is_ready(home.path(), "v0.2.0"), "{gone}");
+        }
+        let home = installed_home();
+        assert!(!is_ready(home.path(), "v0.3.0"));
+        assert!(!is_ready(home.path(), "0.1.0"));
+    }
+
+    #[test]
+    fn a_check_whose_tag_is_already_ready_fetches_nothing_and_changes_nothing() {
+        let home = installed_home();
+        with_ready(home.path(), "0.2.0", None);
+        let before = fs::read(home.path().join("update.json")).unwrap();
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.1.0", "v0.2.0"])),
+            |_, _| panic!("a ready tag was fetched"),
+        )
+        .unwrap();
+
+        assert_eq!(done, None);
+        assert_eq!(fs::read(home.path().join("update.json")).unwrap(), before);
+        assert_eq!(versions(home.path()), ["0.1.0", "0.2.0"]);
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+    }
+
+    #[test]
+    fn a_ready_tag_whose_foundryd_was_deleted_is_fetched_again() {
+        let home = installed_home();
+        with_ready(home.path(), "0.2.0", None);
+        fs::remove_file(home.path().join("versions/0.2.0/foundryd")).unwrap();
+        let fetched = AtomicUsize::new(0);
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |_, stage| {
+                fetched.fetch_add(1, Ordering::Relaxed);
+                release(stage, "0.2.0");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.as_deref(), Some("v0.2.0"));
+        assert_eq!(fetched.load(Ordering::Relaxed), 1);
+        assert!(is_ready(home.path(), "v0.2.0"));
+        assert_eq!(state(home.path()).unwrap().ready.as_deref(), Some("v0.2.0"));
+    }
+
+    #[test]
+    fn a_refused_highest_tag_makes_nothing_ready_and_leaves_the_ready_tag() {
+        let home = installed_home();
+        with_ready(home.path(), "0.2.0", Some("v0.3.0"));
+        let before = fs::read(home.path().join("update.json")).unwrap();
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0", "v0.3.0"])),
+            |_, _| panic!("a refused tag was fetched"),
+        )
+        .unwrap();
+
+        assert_eq!(done, None);
+        assert_eq!(fs::read(home.path().join("update.json")).unwrap(), before);
+        assert_eq!(state(home.path()).unwrap().ready.as_deref(), Some("v0.2.0"));
+    }
+
+    #[test]
+    fn a_higher_tag_replaces_the_ready_one_and_the_old_version_stays_on_disk() {
+        let home = installed_home();
+        with_ready(home.path(), "0.2.0", None);
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0", "v0.3.0"])),
+            |tag, stage| {
+                assert_eq!(tag, "v0.3.0");
+                release(stage, "0.3.0");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.as_deref(), Some("v0.3.0"));
+        assert_eq!(state(home.path()).unwrap().ready.as_deref(), Some("v0.3.0"));
+        assert_eq!(versions(home.path()), ["0.1.0", "0.2.0", "0.3.0"]);
+        assert!(is_ready(home.path(), "v0.2.0"));
+    }
+
+    /// The names under `versions/` that are stage directories.
+    fn stages(home: &Path) -> Vec<String> {
+        versions(home)
+            .into_iter()
+            .filter(|name| name.starts_with(".staging"))
+            .collect()
+    }
+
+    #[test]
+    fn current_moved_during_the_download_makes_nothing_ready_and_leaves_no_stage() {
+        let home = installed_home();
+        let path = home.path().to_path_buf();
+
+        let result = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |_, stage| {
+                release(stage, "0.2.0");
+                fs::create_dir_all(path.join("versions/0.0.9")).unwrap();
+                point_current(&path, "0.0.9").unwrap();
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.0.9"));
+        assert_eq!(state(home.path()).unwrap(), State::default());
+        assert_eq!(versions(home.path()), ["0.0.9", "0.1.0"]);
+        assert_eq!(stages(home.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_trial_on_during_the_download_makes_nothing_ready_and_leaves_no_stage() {
+        let home = installed_home();
+        let path = home.path().to_path_buf();
+        let trial = State {
+            trial: Some(Trial {
+                version: "0.1.0".into(),
+                previous: "0.0.9".into(),
+                starts: 1,
+            }),
+            refused: None,
+            ready: None,
+        };
+        let saved = trial.clone();
+
+        let result = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            move |_, stage| {
+                release(stage, "0.2.0");
+                save(&path, &saved).unwrap();
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(state(home.path()).unwrap(), trial);
+        assert_eq!(versions(home.path()), ["0.1.0"]);
+    }
+
+    #[test]
+    fn a_trial_current_does_not_name_is_cleared_and_the_check_makes_the_tag_ready() {
+        let home = installed_home();
+        save(
+            home.path(),
+            &State {
+                trial: Some(Trial {
+                    version: "0.2.0".into(),
+                    previous: "0.1.0".into(),
+                    starts: 0,
+                }),
+                refused: Some("v0.1.5".into()),
+                ready: None,
+            },
+        )
+        .unwrap();
+        assert!(!trial_live(home.path(), &state(home.path()).unwrap()));
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |_, stage| {
+                release(stage, "0.2.0");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.as_deref(), Some("v0.2.0"));
+        assert_eq!(
+            state(home.path()).unwrap(),
+            State {
+                trial: None,
+                refused: Some("v0.1.5".into()),
+                ready: Some("v0.2.0".into()),
+            }
+        );
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+    }
+
+    #[test]
+    fn a_trial_is_live_only_while_current_names_its_version() {
+        let home = trial_home();
+        let held = state(home.path()).unwrap();
+        assert!(trial_live(home.path(), &held));
+
+        point_current(home.path(), "0.1.0").unwrap();
+        assert!(!trial_live(home.path(), &held));
+        assert!(trial_on(home.path()), "trial_on keeps its rule");
+        assert!(!trial_live(home.path(), &State::default()));
+    }
+
+    #[test]
+    fn a_list_without_the_ready_tag_clears_it_before_any_fetch() {
+        for left in [tags(&["v0.1.5"]), tags(&[])] {
+            let home = installed_home();
+            with_ready(home.path(), "0.2.0", Some("v0.0.5"));
+            let path = home.path().to_path_buf();
+
+            let done = check_with(
+                home.path(),
+                "0.1.0",
+                LIMIT,
+                || Ok(left.clone()),
+                |tag, stage| {
+                    assert_eq!(tag, "v0.1.5");
+                    assert_eq!(state(&path).unwrap().ready, None, "cleared before the fetch");
+                    release(stage, "0.1.5");
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            let state = state(home.path()).unwrap();
+            if left.is_empty() {
+                assert_eq!(done, None);
+                assert_eq!(state.ready, None);
+            } else {
+                assert_eq!(done.as_deref(), Some("v0.1.5"));
+                assert_eq!(state.ready.as_deref(), Some("v0.1.5"));
+            }
+            assert_eq!(state.refused.as_deref(), Some("v0.0.5"), "{left:?}");
+            assert_eq!(state.trial, None);
+            assert!(is_ready(home.path(), "v0.2.0"), "{left:?}");
+            assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        }
+    }
+
+    #[test]
+    fn a_pulled_ready_tag_is_cleared_even_when_the_next_download_fails() {
+        let home = installed_home();
+        with_ready(home.path(), "0.2.0", None);
+
+        let result = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.1.5"])),
+            |_, _| Err(UpdateError::Fetch("offline".into())),
+        );
+
+        assert!(matches!(result, Err(UpdateError::Fetch(_))), "{result:?}");
+        assert_eq!(state(home.path()).unwrap(), State::default());
+        assert!(is_ready(home.path(), "v0.2.0"));
+    }
+
+    #[test]
+    fn a_failed_tag_list_leaves_the_ready_tag() {
+        let home = installed_home();
+        with_ready(home.path(), "0.2.0", None);
+        let before = fs::read(home.path().join("update.json")).unwrap();
+
+        let result = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Err(UpdateError::Fetch("offline".into())),
+            |_, _| panic!("fetched"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(home.path().join("update.json")).unwrap(), before);
     }
 
     #[test]
@@ -1646,6 +1972,7 @@ mod tests {
             &State {
                 trial: None,
                 refused: Some("v0.1.5".into()),
+                ready: None,
             },
         )
         .unwrap();
@@ -1810,29 +2137,19 @@ mod tests {
         Ok(Some("v0.3.0".into()))
     }
 
-    /// Runs `run_with` on a paused clock with a check that gives `result`.
+    /// Runs `run_with` on a paused clock with a check that gives `result`, counted in `checks`.
     fn spawn_run(
         home: &Path,
         exe: io::Result<PathBuf>,
         flag: &'static AtomicBool,
-        counts: (&'static AtomicUsize, &'static AtomicUsize),
+        checks: &'static AtomicUsize,
         result: fn() -> Result<Option<String>, UpdateError>,
     ) -> tokio::task::JoinHandle<()> {
         let home = home.to_path_buf();
-        let (checks, stops) = counts;
-        tokio::spawn(run_with(
-            home,
-            exe,
-            "0.2.0",
-            flag,
-            move || {
-                checks.fetch_add(1, Ordering::Relaxed);
-                result()
-            },
-            move || {
-                stops.fetch_add(1, Ordering::Relaxed);
-            },
-        ))
+        tokio::spawn(run_with(home, exe, "0.2.0", flag, move || {
+            checks.fetch_add(1, Ordering::Relaxed);
+            result()
+        }))
     }
 
     /// Lets the blocking check threads run until `counter` reaches `n`.
@@ -1850,10 +2167,9 @@ mod tests {
     async fn run_marks_a_trial_healthy_after_the_wait_and_then_checks_every_interval() {
         static FLAG: AtomicBool = AtomicBool::new(false);
         static CHECKS: AtomicUsize = AtomicUsize::new(0);
-        static STOPS: AtomicUsize = AtomicUsize::new(0);
         let home = trial_home();
         let exe = exe_in(home.path(), "0.2.0");
-        let task = spawn_run(home.path(), Ok(exe), &FLAG, (&CHECKS, &STOPS), nothing);
+        let task = spawn_run(home.path(), Ok(exe), &FLAG, &CHECKS, nothing);
 
         tokio::time::sleep(HEALTHY_AFTER / 2).await;
         assert!(!FLAG.load(Ordering::Relaxed));
@@ -1867,26 +2183,29 @@ mod tests {
         tokio::time::sleep(CHECK_EVERY + Duration::from_secs(1)).await;
         reach(&CHECKS, 2).await;
         assert_eq!(CHECKS.load(Ordering::Relaxed), 2);
-        assert_eq!(STOPS.load(Ordering::Relaxed), 0);
         task.abort();
     }
 
     #[tokio::test(start_paused = true)]
-    async fn run_stops_the_daemon_once_when_a_check_installs_a_tag_and_checks_no_more() {
+    async fn run_never_stops_the_daemon_when_a_check_makes_a_tag_ready_and_keeps_checking() {
+        // `run_with` has nothing it could call to stop the daemon, and a SIGTERM raised here
+        // would end this test binary.
         static FLAG: AtomicBool = AtomicBool::new(false);
         static CHECKS: AtomicUsize = AtomicUsize::new(0);
-        static STOPS: AtomicUsize = AtomicUsize::new(0);
         let home = trial_home();
         let exe = exe_in(home.path(), "0.2.0");
-        let task = spawn_run(home.path(), Ok(exe), &FLAG, (&CHECKS, &STOPS), found);
+        let task = spawn_run(home.path(), Ok(exe), &FLAG, &CHECKS, found);
 
         tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
-        reach(&STOPS, 1).await;
-        tokio::time::sleep(CHECK_EVERY * 3).await;
-        std::thread::sleep(Duration::from_millis(100));
+        reach(&CHECKS, 1).await;
+        for n in 2..=3 {
+            tokio::time::sleep(CHECK_EVERY).await;
+            reach(&CHECKS, n).await;
+        }
 
-        assert_eq!(STOPS.load(Ordering::Relaxed), 1);
-        assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 3);
+        assert!(!task.is_finished());
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
         task.abort();
     }
 
@@ -1894,7 +2213,6 @@ mod tests {
     async fn run_from_elsewhere_sets_the_flag_but_never_checks() {
         static FLAG: AtomicBool = AtomicBool::new(false);
         static CHECKS: AtomicUsize = AtomicUsize::new(0);
-        static STOPS: AtomicUsize = AtomicUsize::new(0);
         let home = trial_home();
         let elsewhere = home.path().join("elsewhere");
         script(&elsewhere, "foundryd 0.2.0");
@@ -1902,7 +2220,7 @@ mod tests {
             home.path(),
             Ok(elsewhere),
             &FLAG,
-            (&CHECKS, &STOPS),
+            &CHECKS,
             nothing,
         );
 
@@ -1919,13 +2237,12 @@ mod tests {
     async fn run_with_no_executable_path_still_sets_the_flag() {
         static FLAG: AtomicBool = AtomicBool::new(false);
         static CHECKS: AtomicUsize = AtomicUsize::new(0);
-        static STOPS: AtomicUsize = AtomicUsize::new(0);
         let home = trial_home();
         let task = spawn_run(
             home.path(),
             Err(io::Error::other("no exe")),
             &FLAG,
-            (&CHECKS, &STOPS),
+            &CHECKS,
             nothing,
         );
 
@@ -2071,6 +2388,7 @@ mod tests {
             &State {
                 trial: None,
                 refused: Some(refused.into()),
+                ready: None,
             },
         )
         .unwrap();
@@ -2147,6 +2465,31 @@ mod tests {
             state(home.path()).unwrap().refused.as_deref(),
             Some("v0.2.0")
         );
+
+        let home = installed_home();
+        let path = home.path().to_path_buf();
+        assert!(!finished_while_locked(home.path(), move || {
+            check_with(
+                &path,
+                "0.1.0",
+                LIMIT,
+                || Ok(tags(&["v0.2.0"])),
+                |_, stage| {
+                    release(stage, "0.2.0");
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }));
+        assert_eq!(state(home.path()).unwrap().ready.as_deref(), Some("v0.2.0"));
+
+        let home = installed_home();
+        with_ready(home.path(), "0.2.0", None);
+        let path = home.path().to_path_buf();
+        assert!(!finished_while_locked(home.path(), move || {
+            check_with(&path, "0.1.0", LIMIT, || Ok(tags(&[])), |_, _| unreachable!()).unwrap();
+        }));
+        assert_eq!(state(home.path()).unwrap().ready, None);
     }
 
     #[test]
@@ -2457,14 +2800,14 @@ mod tests {
     }
 
     #[test]
-    fn a_release_with_a_valid_signature_places_both_binaries() {
+    fn a_release_with_a_valid_signature_places_both_binaries_and_is_ready() {
         let home = installed_home();
         let key = signing_key();
         let served = Served::release("0.2.0").signed_by(&key);
 
-        let installed = check_served(home.path(), &served, key.public_key().as_ref()).unwrap();
+        let ready = check_served(home.path(), &served, key.public_key().as_ref()).unwrap();
 
-        assert_eq!(installed.as_deref(), Some("v0.2.0"));
+        assert_eq!(ready.as_deref(), Some("v0.2.0"));
         assert_eq!(versions(home.path()), ["0.1.0", "0.2.0"]);
         for name in BINARIES {
             assert!(
@@ -2472,7 +2815,38 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert_eq!(state(home.path()).unwrap().ready.as_deref(), Some("v0.2.0"));
+    }
+
+    #[test]
+    fn a_bad_signature_refuses_the_tag_and_keeps_the_ready_one() {
+        let home = installed_home();
+        with_ready(home.path(), "0.2.0", None);
+        let served = Served::release("0.3.0").signed_by(&signing_key());
+        let trusted = signing_key();
+
+        let error = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0", "v0.3.0"])),
+            |tag, stage| {
+                download_with(
+                    served.gh().as_os_str(),
+                    trusted.public_key().as_ref(),
+                    tag,
+                    stage,
+                )
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, UpdateError::BadSignature(_)), "{error}");
+        let state = state(home.path()).unwrap();
+        assert_eq!(state.refused.as_deref(), Some("v0.3.0"));
+        assert_eq!(state.ready.as_deref(), Some("v0.2.0"));
+        assert_eq!(versions(home.path()), ["0.1.0", "0.2.0"]);
     }
 
     #[test]
@@ -2496,10 +2870,9 @@ mod tests {
     async fn run_keeps_checking_after_a_failed_check_and_never_stops_the_daemon() {
         static FLAG: AtomicBool = AtomicBool::new(false);
         static CHECKS: AtomicUsize = AtomicUsize::new(0);
-        static STOPS: AtomicUsize = AtomicUsize::new(0);
         let home = trial_home();
         let exe = exe_in(home.path(), "0.2.0");
-        let task = spawn_run(home.path(), Ok(exe), &FLAG, (&CHECKS, &STOPS), failing);
+        let task = spawn_run(home.path(), Ok(exe), &FLAG, &CHECKS, failing);
 
         tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
         reach(&CHECKS, 1).await;
@@ -2508,7 +2881,6 @@ mod tests {
         reach(&CHECKS, 2).await;
 
         assert_eq!(CHECKS.load(Ordering::Relaxed), 2);
-        assert_eq!(STOPS.load(Ordering::Relaxed), 0);
         assert!(!task.is_finished());
         task.abort();
     }
@@ -2517,13 +2889,12 @@ mod tests {
     async fn a_healthy_mark_that_cannot_be_saved_is_tried_again_at_the_next_check() {
         static FLAG: AtomicBool = AtomicBool::new(false);
         static CHECKS: AtomicUsize = AtomicUsize::new(0);
-        static STOPS: AtomicUsize = AtomicUsize::new(0);
         let home = trial_home();
         let exe = exe_in(home.path(), "0.2.0");
         // A directory where `save` writes its temporary file: every save fails.
         let blocker = home.path().join("update.json.tmp");
         fs::create_dir(&blocker).unwrap();
-        let task = spawn_run(home.path(), Ok(exe), &FLAG, (&CHECKS, &STOPS), nothing);
+        let task = spawn_run(home.path(), Ok(exe), &FLAG, &CHECKS, nothing);
 
         tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
         reach(&CHECKS, 1).await;
