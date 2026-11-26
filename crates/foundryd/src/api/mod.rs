@@ -1230,9 +1230,58 @@ mod factory_events {
         }
     }
 
+    /// A secret store in memory that can be made unreadable.
+    #[derive(Default)]
+    struct Switch {
+        held: MemorySecrets,
+        unreadable: std::sync::atomic::AtomicBool,
+    }
+
+    impl Switch {
+        fn check(&self) -> Result<(), crate::secrets::SecretsError> {
+            if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(crate::secrets::SecretsError::CannotList)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn readable(&self, readable: bool) {
+            self.unreadable
+                .store(!readable, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Secrets for Switch {
+        fn get(&self, name: &str) -> Result<Option<String>, crate::secrets::SecretsError> {
+            self.check()?;
+            self.held.get(name)
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), crate::secrets::SecretsError> {
+            self.held.set(name, value)
+        }
+        fn update(
+            &self,
+            name: &str,
+            edit: crate::secrets::Edit<'_>,
+        ) -> Result<(), crate::secrets::SecretsError> {
+            self.check()?;
+            self.held.update(name, edit)
+        }
+        fn names(&self) -> Result<Vec<String>, crate::secrets::SecretsError> {
+            self.check()?;
+            self.held.names()
+        }
+        fn entries(&self) -> Result<BTreeMap<String, String>, crate::secrets::SecretsError> {
+            self.check()?;
+            self.held.entries()
+        }
+    }
+
     /// One machine's API, alone, on a loopback port, with a secret store that holds [`TOKEN`].
     struct Served {
         me: MachineId,
+        secrets: Arc<Switch>,
         store: Arc<Mutex<Store>>,
         addr: SocketAddr,
         server: tokio::task::JoinHandle<()>,
@@ -1307,9 +1356,9 @@ mod factory_events {
             sessions,
             Vec::new(),
         );
-        let secrets = Arc::new(MemorySecrets::default());
+        let secrets = Arc::new(Switch::default());
         secrets.set("github:softfac-bot", TOKEN).unwrap();
-        api.secrets = Some(secrets);
+        api.secrets = Some(secrets.clone());
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1317,6 +1366,7 @@ mod factory_events {
         });
         Served {
             me,
+            secrets,
             store,
             addr,
             server,
@@ -1452,6 +1502,22 @@ mod factory_events {
         assert_eq!(status, holding(2, None));
         let texts = texts_within(&mut socket, Duration::from_secs(1)).await;
         assert!(texts.is_empty(), "each change is sent once: {texts:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_is_not_sent_while_the_secret_store_cannot_be_read_and_follows_once_it_can() {
+        let served = serve().await;
+        let mut socket = served.events().await;
+        served.secrets.readable(false);
+        served.write_status(served.me, holding(1, Some(format!("gh said {TOKEN}"))));
+        let texts = texts_within(&mut socket, Duration::from_secs(2)).await;
+        assert!(texts.is_empty(), "nothing is sent unhidden: {texts:?}");
+        served.secrets.readable(true);
+        let (text, status) = next_status(&mut socket).await;
+        assert!(!text.contains(TOKEN), "{text}");
+        assert_eq!(status.idle.as_deref(), Some("gh said ***"));
+        let texts = texts_within(&mut socket, Duration::from_secs(1)).await;
+        assert!(texts.is_empty(), "sent once: {texts:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

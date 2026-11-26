@@ -1269,10 +1269,14 @@ mod tests {
             "one read"
         );
 
-        // A string that holds the joint itself is hidden on its own.
+        // A string that holds the joint, or any of its middle, is hidden on its own, so no
+        // text moves from one string to the next.
         let mut value = serde_json::json!([format!("a{JOINT}b {token}"), "c"]);
         hide_strings(&mut value, &hide).unwrap();
         assert_eq!(value, serde_json::json!([format!("a{JOINT}b ***"), "c"]));
+        let mut value = serde_json::json!(["a\n\u{E000}", format!("b {token}")]);
+        hide_strings(&mut value, &hide).unwrap();
+        assert_eq!(value, serde_json::json!(["a\n\u{E000}", "b ***"]));
 
         let unreadable = |_: &str| crate::secrets::HIDDEN_UNREADABLE.to_owned();
         let mut value = serde_json::json!({"a": "one", "b": "two"});
@@ -1972,9 +1976,10 @@ mod view_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stop_reaches_the_holder_of_its_runs_repo_and_not_the_coordinator_or_another_projects_holder()
      {
+        // The other project is listed first, so only the run's repo picks its holder.
         let projects = [
-            (project_id(), "https://github.com/rawphp/softfac", on()),
             (other_project(), "https://github.com/rawphp/other", on()),
+            (project_id(), "https://github.com/rawphp/softfac", on()),
         ];
         let fleet = fleet_of(3, &projects).await;
         let (coordinator, asked, holder) = (&fleet[0], &fleet[1], &fleet[2]);
@@ -2054,7 +2059,10 @@ mod view_tests {
             .set(GITHUB_DEFAULT, "coord-bot")
             .unwrap();
         let (status, answer) = other
-            .post(&project_path(), Some(json!({ "on": true })))
+            .post(
+                &project_path(),
+                Some(json!({ "on": true, "paused": false })),
+            )
             .await;
         assert_eq!(status, 200, "{answer}");
         let wanted = ProjectFactory {
@@ -2070,7 +2078,10 @@ mod view_tests {
         let ssh = fleet(1, "git@github.com:rawphp/softfac.git", on()).await;
         let alone = &ssh[0];
         let (status, answer) = alone
-            .post(&project_path(), Some(json!({ "paused": true })))
+            .post(
+                &project_path(),
+                Some(json!({ "on": true, "paused": true, "login": "softfac-bot" })),
+            )
             .await;
         assert_eq!(status, 200, "{answer}");
         assert_eq!(
@@ -2085,14 +2096,14 @@ mod view_tests {
         let (status, answer) = bare[0]
             .post(
                 &project_path(),
-                Some(json!({ "on": true, "login": "softfac-bot" })),
+                Some(json!({ "on": true, "paused": false, "login": "softfac-bot" })),
             )
             .await;
         assert_eq!(status, 422, "{answer}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_edit_carried_to_a_machine_that_does_not_act_is_refused_and_sent_nowhere() {
+    async fn a_turn_on_carried_to_a_machine_that_does_not_act_is_refused_and_sent_nowhere() {
         let fleet = fleet(2, &format!("https://github.com/{REPO}"), None).await;
         let (coordinator, other) = (&fleet[0], &fleet[1]);
         coordinator
@@ -2104,16 +2115,7 @@ mod view_tests {
             .send(
                 "POST",
                 &project_path(),
-                Some(json!({ "on": true })),
-                &[(CARRIED, "1")],
-            )
-            .await;
-        assert_eq!(status, 503, "{said}");
-        let (status, said) = other
-            .send(
-                "POST",
-                "/api/factory/settings",
-                Some(json!({ "paused": true })),
+                Some(json!({ "on": true, "paused": false })),
                 &[(CARRIED, "1")],
             )
             .await;
@@ -2121,55 +2123,35 @@ mod view_tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         for machine in [coordinator, other] {
             assert_eq!(factory_of(machine), None);
-            assert_eq!(machine.settings().factory, None);
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_edit_is_merged_with_the_coordinators_copy_not_the_asking_machines() {
-        let fleet = fleet(2, &format!("https://github.com/{REPO}"), None).await;
-        let (coordinator, other) = (&fleet[0], &fleet[1]);
-        let (status, _) = coordinator
-            .post("/api/factory/settings", Some(json!({ "paused": true })))
+    async fn a_write_is_refused_before_it_is_made_when_the_secret_store_cannot_be_read() {
+        let fleet = fleet(1, &format!("https://github.com/{REPO}"), on()).await;
+        let alone = &fleet[0];
+        alone.hold(LeaseState::Held { generation: 1 }, Arc::new(AlwaysHeld(1)));
+        building_run(alone, 1);
+        alone
+            .secrets
+            .unreadable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, said) = alone
+            .post("/api/factory/settings", Some(fleet_body(|_| {})))
             .await;
-        assert_eq!(status, 200);
-        let (status, _) = coordinator
-            .post(&project_path(), Some(json!({ "paused": true })))
+        assert_eq!(status, 503, "{said}");
+        let (status, said) = alone
+            .post(
+                &project_path(),
+                Some(json!({ "on": true, "paused": true, "login": "softfac-bot" })),
+            )
             .await;
-        assert_eq!(status, 200);
-        // The asking machine's copy is older than the coordinator's, as a copy not yet merged
-        // would be: its own store is put back by hand.
-        until(|| other.settings().factory.is_some() && factory_of(other).is_some()).await;
-        {
-            let mut store = other.store.lock().unwrap();
-            let mut stale = store.settings().unwrap();
-            stale.factory = Some(FactorySettings::default());
-            stale.project_factory.remove(&project_id());
-            store.apply_settings(stale).unwrap();
-        }
-        let (status, answer) = other
-            .post("/api/factory/settings", Some(json!({ "max_runs": 5 })))
-            .await;
-        assert_eq!(status, 200, "{answer}");
-        let (status, answer) = other
-            .post(&project_path(), Some(json!({ "login": "named-bot" })))
-            .await;
-        assert_eq!(status, 200, "{answer}");
-        let fleet_wanted = FactorySettings {
-            paused: true,
-            max_runs: 5,
-            ..FactorySettings::default()
-        };
-        let project_wanted = ProjectFactory {
-            on: false,
-            login: "named-bot".into(),
-            paused: true,
-        };
-        until(|| {
-            coordinator.settings().factory.as_ref() == Some(&fleet_wanted)
-                && factory_of(coordinator).as_ref() == Some(&project_wanted)
-        })
-        .await;
+        assert_eq!(status, 503, "{said}");
+        let (status, said) = alone.post(&stop_path(), None).await;
+        assert_eq!(status, 503, "{said}");
+        assert_eq!(alone.settings().factory, None);
+        assert_eq!(factory_of(alone), on());
+        assert_eq!(stops_held(alone), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2219,7 +2201,7 @@ mod view_tests {
             let (status, answer) = alone
                 .post(
                     &project_path(),
-                    Some(json!({ "on": true, "login": "softfac-bot" })),
+                    Some(json!({ "on": true, "paused": false, "login": "softfac-bot" })),
                 )
                 .await;
             assert_eq!(status, 422, "{repo}: {answer}");
@@ -2228,7 +2210,10 @@ mod view_tests {
             assert_eq!(factory_of(alone), None, "{repo}: nothing was sent");
             // Off, or a pause, is no turning on.
             let (status, answer) = alone
-                .post(&project_path(), Some(json!({ "paused": true })))
+                .post(
+                    &project_path(),
+                    Some(json!({ "on": false, "paused": true })),
+                )
                 .await;
             assert_eq!(status, 200, "{repo}: {answer}");
             assert_eq!(
@@ -2252,7 +2237,10 @@ mod view_tests {
             .unwrap();
         other.secrets.set(GITHUB_DEFAULT, "other-bot").unwrap();
         let (status, answer) = other
-            .post(&project_path(), Some(json!({ "on": true })))
+            .post(
+                &project_path(),
+                Some(json!({ "on": true, "paused": false })),
+            )
             .await;
         assert_eq!(status, 200, "{answer}");
         let wanted = ProjectFactory {
@@ -2264,19 +2252,32 @@ mod view_tests {
         until(|| factory_of(other).as_ref() == Some(&wanted)).await;
         assert_eq!(factory_of(coordinator), Some(wanted));
 
-        // A login named is written as named, and an edit that names none keeps it.
+        // A login named is written as named, through the coordinator from any machine.
         let (status, answer) = other
-            .post(&project_path(), Some(json!({ "login": "named-bot" })))
-            .await;
-        assert_eq!(status, 200, "{answer}");
-        let (status, answer) = coordinator
-            .post(&project_path(), Some(json!({ "paused": true })))
+            .post(
+                &project_path(),
+                Some(json!({ "on": true, "paused": true, "login": "named-bot" })),
+            )
             .await;
         assert_eq!(status, 200, "{answer}");
         let wanted = ProjectFactory {
             on: true,
             login: "named-bot".into(),
             paused: true,
+        };
+        until(|| factory_of(coordinator).as_ref() == Some(&wanted)).await;
+        // An edit of a project on that names none takes the default again: the value is sent
+        // whole.
+        let (status, answer) = other
+            .post(
+                &project_path(),
+                Some(json!({ "on": true, "paused": true, "login": null })),
+            )
+            .await;
+        assert_eq!(status, 200, "{answer}");
+        let wanted = ProjectFactory {
+            login: "coord-bot".into(),
+            ..wanted
         };
         until(|| factory_of(other).as_ref() == Some(&wanted)).await;
     }
@@ -2288,7 +2289,10 @@ mod view_tests {
         // Only a machine that is not the coordinator names a default: it is not used.
         other.secrets.set(GITHUB_DEFAULT, "other-bot").unwrap();
         let (status, answer) = other
-            .post(&project_path(), Some(json!({ "on": true })))
+            .post(
+                &project_path(),
+                Some(json!({ "on": true, "paused": false })),
+            )
             .await;
         assert_eq!(status, 422, "{answer}");
         assert!(
@@ -2304,10 +2308,22 @@ mod view_tests {
         let fleet = fleet(1, &format!("https://github.com/{REPO}"), None).await;
         let alone = &fleet[0];
         for (body, status) in [
-            (json!({ "on": true, "login": "bad/login" }), 422),
-            (json!({ "on": true, "login": "x".repeat(40) }), 422),
-            (json!({ "on": "yes" }), 422),
-            (json!({ "colour": "red" }), 422),
+            (
+                json!({ "on": true, "paused": false, "login": "bad/login" }),
+                422,
+            ),
+            (
+                json!({ "on": true, "paused": false, "login": "x".repeat(40) }),
+                422,
+            ),
+            (json!({ "on": true, "paused": false, "login": 7 }), 422),
+            (json!({ "on": "yes", "paused": false }), 422),
+            (json!({ "on": true }), 422),
+            (json!({ "paused": true }), 422),
+            (
+                json!({ "on": false, "paused": false, "colour": "red" }),
+                422,
+            ),
             (json!(["on"]), 422),
         ] {
             let (said, answer) = alone.post(&project_path(), Some(body.clone())).await;
@@ -2319,7 +2335,7 @@ mod view_tests {
         let (status, _) = alone
             .post(
                 &format!("/api/projects/{unknown}/factory"),
-                Some(json!({ "on": false })),
+                Some(json!({ "on": false, "paused": false })),
             )
             .await;
         assert_eq!(status, 404);
@@ -2328,16 +2344,23 @@ mod view_tests {
 
     // ----- POST /api/factory/settings -----
 
+    /// The fleet's default factory settings as a body, changed by `change`.
+    fn fleet_body(change: impl FnOnce(&mut serde_json::Map<String, Value>)) -> Value {
+        let mut body = serde_json::to_value(FactorySettings::default()).unwrap();
+        change(body.as_object_mut().unwrap());
+        body
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_fleets_settings_go_through_the_coordinator_and_a_value_out_of_range_is_refused() {
+    async fn the_fleets_settings_go_through_the_coordinator_whole_and_a_value_out_of_range_is_refused()
+     {
         let fleet = fleet(2, &format!("https://github.com/{REPO}"), None).await;
         let (coordinator, other) = (&fleet[0], &fleet[1]);
-        let (status, answer) = other
-            .post(
-                "/api/factory/settings",
-                Some(json!({ "paused": true, "max_runs": 5 })),
-            )
-            .await;
+        let body = fleet_body(|body| {
+            body.insert("paused".into(), json!(true));
+            body.insert("max_runs".into(), json!(5));
+        });
+        let (status, answer) = other.post("/api/factory/settings", Some(body)).await;
         assert_eq!(status, 200, "{answer}");
         let wanted = FactorySettings {
             paused: true,
@@ -2346,24 +2369,36 @@ mod view_tests {
         };
         assert_eq!(answer["settings"], serde_json::to_value(&wanted).unwrap());
         until(|| coordinator.settings().factory.as_ref() == Some(&wanted)).await;
-        // Another edit keeps what it does not name.
-        let (status, _) = coordinator
-            .post("/api/factory/settings", Some(json!({ "poll_seconds": 15 })))
-            .await;
-        assert_eq!(status, 200);
         let wanted = FactorySettings {
             poll_seconds: 15,
             ..wanted
         };
+        let (status, _) = coordinator
+            .post(
+                "/api/factory/settings",
+                Some(serde_json::to_value(&wanted).unwrap()),
+            )
+            .await;
+        assert_eq!(status, 200);
         until(|| other.settings().factory.as_ref() == Some(&wanted)).await;
 
+        let set = |name: &str, value: Value| {
+            let name = name.to_owned();
+            fleet_body(move |body| {
+                body.insert(name, value);
+            })
+        };
         for body in [
-            json!({ "poll_seconds": 5 }),
-            json!({ "poll_seconds": 61 }),
-            json!({ "max_runs": -1 }),
-            json!({ "model": "-x" }),
-            json!({ "effort": "two words" }),
-            json!({ "colour": "red" }),
+            set("poll_seconds", json!(5)),
+            set("poll_seconds", json!(61)),
+            set("max_runs", json!(-1)),
+            set("model", json!("-x")),
+            set("effort", json!("two words")),
+            set("colour", json!("red")),
+            fleet_body(|body| {
+                body.remove("model");
+            }),
+            json!({ "paused": true }),
         ] {
             let (status, answer) = other
                 .post("/api/factory/settings", Some(body.clone()))
@@ -2371,10 +2406,20 @@ mod view_tests {
             assert_eq!(status, 422, "{body}: {answer}");
         }
         let (_, answer) = other
-            .post("/api/factory/settings", Some(json!({ "poll_seconds": 5 })))
+            .post("/api/factory/settings", Some(set("poll_seconds", json!(5))))
             .await;
         let said = answer["error"].as_str().unwrap();
         assert!(said.contains("10") && said.contains("60"), "{said}");
+        let (_, answer) = other
+            .post(
+                "/api/factory/settings",
+                Some(fleet_body(|body| {
+                    body.remove("model");
+                })),
+            )
+            .await;
+        let said = answer["error"].as_str().unwrap();
+        assert!(said.contains("model"), "{said}");
         assert_eq!(other.settings().factory, Some(wanted));
     }
 

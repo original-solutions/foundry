@@ -413,7 +413,6 @@ mod tests {
         for path in [
             "/api/factory/runs/rawphp__softfac__8__1/stop".to_owned(),
             format!("/api/projects/{project}/factory"),
-            "/api/factory/settings".to_owned(),
         ] {
             assert!(carries(&path), "{path} is taken from a peer");
             assert!(matches!(target(&path), Some(Target::View)), "{path}");
@@ -425,7 +424,7 @@ mod tests {
             "/api/projects/not-an-id/factory".to_owned(),
             format!("/api/projects/{project}/remove"),
             format!("/api/projects/{project}/factory/more"),
-            "/api/factory/settings/more".to_owned(),
+            "/api/factory/settings".to_owned(),
         ] {
             assert!(!carries(&path), "{path}");
         }
