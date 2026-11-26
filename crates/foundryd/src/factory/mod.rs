@@ -1863,4 +1863,264 @@ mod tests {
         running.abort();
         assert_eq!(after, before + 1, "no write in three scans");
     }
+
+    /// A run of issue 3 in `repo` that holds a slot, as `a_run_holding_a_slot` writes for project 1.
+    fn a_run_holding_a_slot_in(store: &Arc<Mutex<Store>>, repo: &str, login: &str) {
+        use crate::factory::ledger::events::{Cause, CauseStep, Event};
+        let ledger = ledger::Ledger::new(
+            store.clone(),
+            me(),
+            1,
+            Arc::new(|text: &str| text.to_owned()),
+        );
+        let run = foundry_proto::factory::RunId::new(repo, 3, 1).unwrap();
+        let cause = Cause::new(CauseStep::Start, "test");
+        let step = Event::StepChanged {
+            step: "approved 2026-10-04T10:00:00Z".into(),
+        };
+        ledger.write(&run, &step, &cause).unwrap();
+        let claimed = Event::Claimed {
+            machine: me().to_string(),
+            github_user: login.into(),
+        };
+        ledger.write(&run, &claimed, &cause).unwrap();
+    }
+
+    /// Lets a parked tracker go.
+    fn let_go(gate: &Arc<(Mutex<bool>, Condvar)>) {
+        let (open, turned) = &**gate;
+        *open.lock().unwrap() = true;
+        turned.notify_all();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_project_turned_off_gives_the_slots_its_runs_held_back_to_the_book() {
+        let (_dir, store) = open_store();
+        let mut settings = settings_with(&[(1, LOGIN), (2, "slow-bot")]);
+        settings.factory.as_mut().unwrap().max_runs = 1;
+        store.lock().unwrap().apply_settings(settings).unwrap();
+        // Project 2's repo is softfac2.
+        a_run_holding_a_slot_in(&store, "rawphp/softfac2", "slow-bot");
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let slow = Arc::new(Slow {
+            inner: Hub::new(),
+            gate: gate.clone(),
+            entered: AtomicBool::new(false),
+        });
+        let host = fake_host();
+        host.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        host.trackers.lock().unwrap().insert(
+            "slow-bot".into(),
+            Arc::new(Hiding::new(slow.clone(), shown())),
+        );
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let book = service.book.clone();
+        let running = tokio::spawn(service.serve());
+        let (slow2, book2) = (slow.clone(), book.clone());
+        // Project 2's pass is parked in its first read of GitHub: only its seed counts its run.
+        let held = tokio::task::spawn_blocking(move || {
+            came(|| slow2.entered.load(Ordering::SeqCst)).then(|| book2.runs_free(1))
+        })
+        .await
+        .unwrap();
+        let mut off = settings_with(&[(1, LOGIN), (2, "slow-bot")]);
+        off.seq = 2;
+        off.factory.as_mut().unwrap().max_runs = 1;
+        off.project_factory.get_mut(&project(2)).unwrap().on = false;
+        store.lock().unwrap().apply_settings(off).unwrap();
+        clock.advance(SCAN);
+        let (host2, book2) = (host.clone(), book.clone());
+        let freed = tokio::task::spawn_blocking(move || {
+            let released = came(|| {
+                host2.leases.lock().unwrap()[&project(2)]
+                    .released
+                    .load(Ordering::SeqCst)
+            });
+            released && came(|| book2.runs_free(1) == 1)
+        })
+        .await
+        .unwrap();
+        let_go(&gate);
+        running.abort();
+        assert_eq!(held, Some(0), "the run its ledger holds is counted");
+        assert!(freed, "the slot comes back once the project is turned off");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restart_whose_seed_fails_keeps_what_the_book_held() {
+        let (dir, store) = open_store();
+        let mut settings = settings_with(&[(1, "slow-bot")]);
+        settings.factory.as_mut().unwrap().max_runs = 1;
+        store.lock().unwrap().apply_settings(settings).unwrap();
+        a_run_holding_a_slot(&store);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let slow = Arc::new(Slow {
+            inner: Hub::new(),
+            gate: gate.clone(),
+            entered: AtomicBool::new(false),
+        });
+        let host = fake_host();
+        host.trackers.lock().unwrap().insert(
+            "slow-bot".into(),
+            Arc::new(Hiding::new(slow.clone(), shown())),
+        );
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let book = service.book.clone();
+        let running = tokio::spawn(service.serve());
+        let slow2 = slow.clone();
+        let entered =
+            tokio::task::spawn_blocking(move || came(|| slow2.entered.load(Ordering::SeqCst)))
+                .await
+                .unwrap();
+        // A row no run id parses in the project's repo: the next count of its runs fails.
+        rusqlite::Connection::open(dir.path().join("foundry.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO factory_records (kind, id, owner, version, record)
+                 VALUES ('run_event', 'rawphp__softfac1__bad/x/1', 'x', 1, '{}')",
+                [],
+            )
+            .unwrap();
+        host.marks.lock().unwrap().insert("slow-bot".into(), 2);
+        clock.advance(SCAN);
+        let (host2, book2) = (host.clone(), book.clone());
+        let after_restart = tokio::task::spawn_blocking(move || {
+            came(|| host2.made.lock().unwrap().len() == 2).then(|| book2.runs_free(1))
+        })
+        .await
+        .unwrap();
+        let_go(&gate);
+        running.abort();
+        assert!(entered, "the first pass is under way");
+        assert_eq!(
+            after_restart,
+            Some(0),
+            "the old entry still counts when the new count fails"
+        );
+    }
+
+    /// A tracker that refuses every call while it is down, and otherwise answers as `inner`.
+    struct Flaky {
+        inner: Arc<Hub>,
+        down: AtomicBool,
+        refused: AtomicUsize,
+    }
+
+    impl Tracker for Flaky {
+        fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
+            if self.down.load(Ordering::SeqCst) {
+                self.refused.fetch_add(1, Ordering::SeqCst);
+                return Err(TrackerError::Other {
+                    kind: github::OtherKind::NotStarted,
+                    message: "down".into(),
+                });
+            }
+            self.inner.gh(args)
+        }
+    }
+
+    /// A host whose worker panics once when armed, then answers.
+    struct DiesOnce {
+        inner: Arc<FakeHost>,
+        armed: AtomicBool,
+        fired: AtomicBool,
+    }
+
+    impl Host for DiesOnce {
+        fn acting(&self) -> Answering<'_, bool> {
+            self.inner.acting()
+        }
+        fn tracker(&self, login: &str) -> Option<Arc<dyn Commenting>> {
+            self.inner.tracker(login)
+        }
+        fn token_mark(&self, login: &str) -> Result<Option<u64>, String> {
+            self.inner.token_mark(login)
+        }
+        fn lease(&self, watched: &Watched) -> Arc<dyn Leasing> {
+            self.inner.lease(watched)
+        }
+        fn worker(&self) -> Arc<dyn Worker> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.fired.store(true, Ordering::SeqCst);
+                panic!("the host could not make a worker");
+            }
+            self.inner.worker()
+        }
+        fn online(&self) -> BTreeSet<MachineId> {
+            self.inner.online()
+        }
+        fn hide(&self) -> Hide {
+            self.inner.hide()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_that_dies_outside_the_pass_keeps_the_memo_for_the_next() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN)]))
+            .unwrap();
+        let hub = Hub::new();
+        hub.ready(5);
+        let flaky = Arc::new(Flaky {
+            inner: hub,
+            down: AtomicBool::new(false),
+            refused: AtomicUsize::new(0),
+        });
+        let fake = fake_host();
+        fake.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(flaky.clone(), shown())));
+        let host = Arc::new(DiesOnce {
+            inner: fake,
+            armed: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+        });
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let (store2, host2, flaky2, clock2) =
+            (store.clone(), host.clone(), flaky.clone(), clock.clone());
+        let ready_after = tokio::task::spawn_blocking(move || {
+            let first = came(|| {
+                status_of(&store2, project(1)).is_some_and(|status| !status.ready.is_empty())
+            });
+            // A good pass is in the memo. The next pass dies outside `pass::run`.
+            host2.armed.store(true, Ordering::SeqCst);
+            let died = came(|| {
+                clock2.advance(Duration::from_secs(3600));
+                host2.fired.load(Ordering::SeqCst)
+            });
+            // Then GitHub fails: such a pass writes the last good results again.
+            flaky2.down.store(true, Ordering::SeqCst);
+            let failed = came(|| {
+                clock2.advance(Duration::from_secs(3600));
+                flaky2.refused.load(Ordering::SeqCst) >= 2
+            });
+            let ready = status_of(&store2, project(1)).map(|status| status.ready.len());
+            (first, died, failed, ready)
+        })
+        .await
+        .unwrap();
+        running.abort();
+        assert!(ready_after.0, "the first pass queued the ready issue");
+        assert!(ready_after.1, "a pass died outside the pass");
+        assert!(ready_after.2, "the passes after it ran");
+        assert_eq!(
+            ready_after.3,
+            Some(1),
+            "the failed pass wrote the last good results, which the dead pass did not drop"
+        );
+    }
 }
