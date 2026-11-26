@@ -1565,10 +1565,11 @@ mod tests {
         }
 
         /// A start sent (and its sessions being ended again) on one machine is that machine's:
-        /// once the claim moves on and the next machine's workspace is shown with no start yet,
-        /// a stop ends nothing.
+        /// once the resume's machine changes and the workspace made on it is shown with no start
+        /// yet, a stop ends nothing.
         #[test]
         fn a_stop_after_a_new_machines_resume_workspace_and_before_its_start_ends_nothing() {
+            const NEXT_MACHINE: &str = "00000000-0000-0000-0000-000000000c22";
             for moved in ["resume-machine", "resume-machine-given-up"] {
                 for ended in [false, true] {
                     let mut steps = vec![
@@ -1580,7 +1581,7 @@ mod tests {
                         steps.push("resume-ending-sessions 1".into());
                     }
                     steps.extend([
-                        format!("{moved} 1 {RESUME_WS}"),
+                        format!("{moved} 1 {NEXT_MACHINE}"),
                         "resume-requested 1 fac/8-1-r1".into(),
                         format!("resume-workspace 1 {RESUME_WS}"),
                     ]);
