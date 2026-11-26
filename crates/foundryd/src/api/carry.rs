@@ -14,6 +14,11 @@
 //! machine: it runs here, where a handler refuses anything this machine does not own, and is
 //! never carried on. Every other request, and one that names nothing elsewhere, runs here.
 //!
+//! Two Factory view routes are taken from a peer too, and carried by their own handlers
+//! ([`super::factory::view_router`]), never by this layer: `POST /api/factory/runs/{id}/stop`,
+//! to the machine believed to hold the run's lease, and `POST /api/projects/{id}/factory`, to
+//! the acting coordinator when it must fill in its default login.
+//!
 //! The factory's worker routes ([`super::factory`]) are carried too, but never by this layer: a
 //! request to one runs here, where it is `404` unless marked. A run carries its own call with
 //! [`super::factory::call`], which finds the owner with [`worker_owner`]: the machine a factory
@@ -46,6 +51,10 @@ enum Target {
     Terminal(TerminalId),
     /// A factory worker route, which only a run carries.
     Worker(Worker),
+    /// A Factory view route whose handler carries it: a stop, to the lease holder, and a
+    /// project's factory edit, to the acting coordinator when it must fill in its default
+    /// login.
+    View,
 }
 
 /// A factory worker route, with what its path names.
@@ -76,8 +85,8 @@ pub(super) const WORKER_ROUTES: [&str; 6] = [
     "/api/terminals/{id}/tail",
 ];
 
-/// Whether a `POST` to `path` is a route a carried call may name: one this layer carries, or a
-/// worker route a run carries.
+/// Whether a `POST` to `path` is a route a carried call may name: one this layer carries, a
+/// worker route a run carries, or a Factory view route its own handler carries.
 pub(crate) fn carries(path: &str) -> bool {
     target(path).is_some()
 }
@@ -115,6 +124,14 @@ fn target(path: &str) -> Option<Target> {
         ["terminals", id, "tail"] => {
             Some(Target::Worker(Worker::Tail(TerminalId(id.parse().ok()?))))
         }
+        ["factory", "runs", run, "stop"] => {
+            run.parse::<foundry_proto::factory::RunId>().ok()?;
+            Some(Target::View)
+        }
+        ["projects", id, "factory"] => {
+            id.parse::<uuid::Uuid>().ok()?;
+            Some(Target::View)
+        }
         _ => None,
     }
 }
@@ -126,7 +143,7 @@ pub(super) async fn carry(State(api): State<Api>, request: Request, next: Next) 
     let Some(target) = target(request.uri().path()) else {
         return next.run(request).await;
     };
-    if matches!(target, Target::Worker(_)) {
+    if matches!(target, Target::Worker(_) | Target::View) {
         return next.run(request).await;
     }
     let create = matches!(target, Target::Create);
@@ -258,13 +275,14 @@ async fn owner(api: &Api, target: Target, body: &Bytes) -> Result<Option<Machine
             .filter(|record| !record.deleted && record.owner != me)
             .map(|record| record.owner)),
         Target::Terminal(id) => Ok(api.peers.owner_of(id).await?),
-        // Never carried by this layer: a run's call finds its owner with `worker_owner`.
-        Target::Worker(_) => Ok(None),
+        // Never carried by this layer: a run's call finds its owner with `worker_owner`, and
+        // a Factory view route's handler carries it itself.
+        Target::Worker(_) | Target::View => Ok(None),
     }
 }
 
 /// The owner's answer, as it gave it.
-fn answered(answer: Answer) -> Response {
+pub(super) fn answered(answer: Answer) -> Response {
     let Ok(status) = StatusCode::from_u16(answer.status) else {
         return error(
             StatusCode::BAD_GATEWAY,
@@ -354,7 +372,7 @@ mod tests {
             format!("/api/terminals/{id}"),
             format!("/elsewhere/workspaces/{id}/shells"),
             "/api/factory".to_owned(),
-            format!("/api/factory/runs/{id}/stop"),
+            format!("/api/factory/runs/{id}"),
             format!("/api/workspaces/{id}/factory"),
             format!("/api/workspaces/{id}/factory/archive"),
             format!("/api/sessions/{id}/trail"),
@@ -386,6 +404,29 @@ mod tests {
         ] {
             assert!(carries(&path), "{path}");
             assert!(worker(&path).is_none(), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_factory_views_carried_routes_are_taken_from_a_peer_and_carried_by_their_handlers() {
+        let project = uuid::Uuid::new_v4();
+        for path in [
+            "/api/factory/runs/rawphp__softfac__8__1/stop".to_owned(),
+            format!("/api/projects/{project}/factory"),
+        ] {
+            assert!(carries(&path), "{path} is taken from a peer");
+            assert!(matches!(target(&path), Some(Target::View)), "{path}");
+            assert!(worker(&path).is_none(), "{path}");
+        }
+        for path in [
+            "/api/factory/runs/not-a-run/stop".to_owned(),
+            "/api/factory/runs/rawphp__softfac__8__1".to_owned(),
+            "/api/projects/not-an-id/factory".to_owned(),
+            format!("/api/projects/{project}/remove"),
+            format!("/api/projects/{project}/factory/more"),
+            "/api/factory/settings".to_owned(),
+        ] {
+            assert!(!carries(&path), "{path}");
         }
     }
 
