@@ -4112,6 +4112,70 @@ mod tests {
             assert!(!round_pending(&world.events()));
         }
 
+        fn a_later_launch(world: &World) {
+            world.rig.write(
+                &world.run,
+                Event::SessionLaunched {
+                    thread_id: SessionId(uuid::Uuid::from_u128(0x5e6)).to_string(),
+                    worktree: Some(fresh().to_string()),
+                    branch: Some(BRANCH.into()),
+                    model_instance: None,
+                    model: Some("opus".into()),
+                    model_options: None,
+                    resumed_from: None::<ResumedFrom>,
+                    base: Some("main".into()),
+                    title: None,
+                },
+            );
+        }
+
+        #[test]
+        fn a_run_with_no_round_is_not_owned_by_one() {
+            let world = healthy();
+            assert!(!round_owns(&world.events()));
+        }
+
+        #[test]
+        fn a_round_owns_the_run_while_it_is_pending_and_after_its_launch() {
+            let mut world = healthy();
+            assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+            assert!(round_owns(&world.events()), "pending");
+            drive(&mut world);
+            assert!(!round_pending(&world.events()));
+            assert!(
+                round_owns(&world.events()),
+                "the round's session is the newest"
+            );
+        }
+
+        #[test]
+        fn a_later_launch_ends_the_rounds_hold_on_the_run() {
+            let mut world = healthy();
+            drive(&mut world);
+            assert!(round_owns(&world.events()));
+            a_later_launch(&world);
+            assert!(!round_owns(&world.events()));
+        }
+
+        #[test]
+        fn a_finished_run_is_owned_by_no_round() {
+            let world = healthy();
+            assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+            world
+                .rig
+                .ledger
+                .finish(
+                    &world.run,
+                    crate::factory::ledger::events::Outcome::Stuck,
+                    None,
+                    None,
+                    &Cause::new(CauseStep::Forward, "test"),
+                    None,
+                )
+                .unwrap();
+            assert!(!round_owns(&world.events()));
+        }
+
         /// A world whose first pass was cut right after the decision was recorded: the run is
         /// still `pr-open`, its label not moved.
         fn cut_before_the_move() -> World {
