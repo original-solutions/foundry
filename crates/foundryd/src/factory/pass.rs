@@ -4643,4 +4643,118 @@ mod tests {
             );
         }
     }
+
+    mod the_book_follows_the_ledger {
+        use super::*;
+        use crate::factory::github::{Commenting, Tracker};
+
+        /// The hub as a tracker whose status comment cannot be written, as a `gh` that fails
+        /// after the claim has landed does.
+        struct StatusFails(Arc<crate::factory::pass::testing::Hub>);
+
+        impl Tracker for StatusFails {
+            fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
+                self.0.gh(args)
+            }
+        }
+
+        impl Commenting for StatusFails {
+            fn hide(&self, text: &str) -> String {
+                text.to_owned()
+            }
+
+            fn upsert_status_comment(
+                &self,
+                _: &str,
+                _: u64,
+                _: &str,
+                _: &str,
+            ) -> Result<(), TrackerError> {
+                Err(TrackerError::Other {
+                    kind: crate::factory::github::OtherKind::Failed,
+                    message: "the status comment could not be written".into(),
+                })
+            }
+        }
+
+        fn pass_over(rig: &mut Rig, tracker: &dyn Commenting, book: &Book) -> PassReport {
+            let world = World {
+                project: &rig.project,
+                lease: &rig.lease,
+                guard: rig.guard.as_ref(),
+                tracker,
+                worker: &rig.worker,
+                view: &rig.view,
+                ledger: &rig.ledger,
+                store: &rig.store,
+                me: me(),
+                shared: &rig.shared,
+                book,
+                clock: &rig.clock,
+            };
+            run(&world, &mut rig.memo)
+        }
+
+        #[test]
+        fn a_run_carried_on_from_its_claim_holds_a_slot_before_the_claims_read_them() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            let run = RunId::new(REPO, 5, 1).unwrap();
+            rig.hub.issue(5, &["factory:triage"]);
+            rig.hub
+                .edit(5, |issue| issue.assignees = vec![LOGIN.into()]);
+            rig.hub.comment_as(
+                5,
+                LOGIN,
+                &crate::factory::github::claim_comment(&run, &builder_machine()),
+            );
+            rig.hub.ready(6);
+            let report = rig.pass();
+            assert!(rig.claimed_issues().is_empty(), "{report:?}");
+            assert_eq!(waiting_reason(&report, 6).as_deref(), Some(NO_SLOT));
+            assert_eq!(rig.book.runs_free(1), 0, "the carried run holds the slot");
+        }
+
+        #[test]
+        fn a_run_carried_on_and_a_claim_both_fit_when_two_slots_are_free() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 2);
+            let run = RunId::new(REPO, 5, 1).unwrap();
+            rig.hub.issue(5, &["factory:triage"]);
+            rig.hub
+                .edit(5, |issue| issue.assignees = vec![LOGIN.into()]);
+            rig.hub.comment_as(
+                5,
+                LOGIN,
+                &crate::factory::github::claim_comment(&run, &builder_machine()),
+            );
+            rig.hub.ready(6);
+            let report = rig.pass();
+            assert_eq!(rig.claimed_issues(), vec![6], "{report:?}");
+            assert_eq!(rig.book.runs_free(2), 0, "both runs hold a slot");
+        }
+
+        #[test]
+        fn a_claim_that_errors_after_it_recorded_keeps_its_slot() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            rig.hub.ready(5);
+            let book = Book::default();
+            let tracker = StatusFails(rig.hub.clone());
+            let report = pass_over(&mut rig, &tracker, &book);
+            assert!(report.failed.is_some(), "{report:?}");
+            assert!(
+                !rig.ledger
+                    .read(&RunId::new(REPO, 5, 1).unwrap())
+                    .unwrap()
+                    .is_empty(),
+                "the claim was recorded"
+            );
+            assert_eq!(
+                book.runs_free(1),
+                0,
+                "another project's pass must not take the slot of a run that is going"
+            );
+        }
+    }
 }
