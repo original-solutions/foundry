@@ -489,7 +489,7 @@ impl Live {
 }
 
 /// The text of a `step_changed` event.
-fn step_text(event: &RunEvent) -> Option<&str> {
+pub(super) fn step_text(event: &RunEvent) -> Option<&str> {
     if event.event != names::STEP_CHANGED {
         return None;
     }
@@ -497,7 +497,7 @@ fn step_text(event: &RunEvent) -> Option<&str> {
 }
 
 /// The highest number `field` holds in the `event` lines of `events`, 0 for none.
-fn highest(events: &[RunEvent], event: &str, field: &str) -> u32 {
+pub(super) fn highest(events: &[RunEvent], event: &str, field: &str) -> u32 {
     events
         .iter()
         .filter(|line| line.event == event)
@@ -571,9 +571,9 @@ pub enum ReconcileStep {
 }
 
 /// The codes of the stuck paths this step decides, the runner's `watch` and its own.
-const TEXT_CODE: &str = "text-changed-during-build";
-const UNVERIFIED_CODE: &str = "edits-unverifiable";
-const UNCONFIRMED_CODE: &str = "approval-unconfirmed";
+pub(super) const TEXT_CODE: &str = "text-changed-during-build";
+pub(super) const UNVERIFIED_CODE: &str = "edits-unverifiable";
+pub(super) const UNCONFIRMED_CODE: &str = "approval-unconfirmed";
 const LABEL_CODE: &str = "label-removed";
 const ASSIGNEE_CODE: &str = "assignee-changed";
 /// The codes `feedback` also begins, for the same text checks, while it sets a round up.
@@ -769,7 +769,7 @@ fn committed(seen: &Seen) -> bool {
 /// `None`. A run with no `approved` step fails closed without a read; otherwise every rename and
 /// body edit since the approval must be an instructor's. A history that cannot be judged counts
 /// as changed; a failed read is an error, never an answer.
-fn text_stop(
+pub(super) fn text_stop(
     ctx: &RunContext<'_>,
     issue: u64,
     seen: &Seen,

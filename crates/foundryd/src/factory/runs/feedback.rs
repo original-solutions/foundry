@@ -265,7 +265,6 @@
 
 use foundry_proto::factory::{RunEvent, RunId};
 use foundry_proto::ids::{MachineId, SessionId, WorkspaceId};
-use foundry_proto::record::{Record, Workspace};
 use foundry_proto::settings::SharedSettings;
 use foundry_proto::state::{SessionState, TerminalState};
 use serde_json::Value;
@@ -276,6 +275,8 @@ use super::progress::{
 };
 use super::resume::{BRANCH_REFUSED, UNREACHABLE_FOR};
 use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
+use super::stop::Live;
+use super::stop::{live_workspaces, step_text, text_stop as shared_text_stop};
 use super::{
     ActionPayload, Closing, ForwardPayload, Progress, RunContext, RunError, Stop, StuckStop,
     abandon, apply_actions, closed_issue, end_own_merge, end_run, go_stuck, moved_on_by_closing,
@@ -289,11 +290,9 @@ use crate::factory::github::{OtherKind, TrackerError};
 use crate::factory::ledger::events::{
     Cause, CauseStep, Event, ModelOption, OptionValue, ResumedFrom, names,
 };
-use crate::factory::lifecycle::approval::TextCheck;
 use crate::factory::lifecycle::{Event as LifecycleEvent, State, transition};
 use crate::factory::messages::{
-    self, CANNOT_CONFIRM, CANNOT_VERIFY_DURING_BUILD, CHANGED_DURING_BUILD, CommentDropReason,
-    LAUNCH_FAILED, Message, prepare_output_tail,
+    self, CommentDropReason, LAUNCH_FAILED, Message, prepare_output_tail,
 };
 use crate::factory::placing::{self, Reserved, Slots};
 use crate::factory::text;
@@ -341,9 +340,6 @@ const CLEAN_READ_MARGIN_MS: u64 = 60_000;
 /// The codes of the stuck paths this step begins once a round is decided.
 const STUCK_SETUP: &str = "feedback-setup-failed";
 const STUCK_LAUNCH: &str = "feedback-launch-failed";
-const STUCK_TEXT: &str = "text-changed-during-build";
-const STUCK_UNVERIFIED: &str = "edits-unverifiable";
-const STUCK_UNCONFIRMED: &str = "approval-unconfirmed";
 const STUCK_BRANCH: &str = "launch-failed";
 
 /// What a pass of [`advance`] did.
@@ -814,14 +810,6 @@ fn second_before(ms: u64) -> String {
     format!("{}Z", &text[..19])
 }
 
-/// The text of a `step_changed` event.
-fn step_text(event: &RunEvent) -> Option<&str> {
-    if event.event != names::STEP_CHANGED {
-        return None;
-    }
-    event.data.get("step").and_then(Value::as_str)
-}
-
 /// What follows `prefix` and the count `n` in `step`, or `None` for a step of another kind or
 /// another round.
 fn numbered<'a>(step: &'a str, prefix: &str, n: u32) -> Option<&'a str> {
@@ -1017,33 +1005,18 @@ impl Round {
     }
 }
 
-/// Every workspace of the project the fleet shows that is not archived and has one of the run's
-/// build, resume or feedback names.
-fn live_workspace<'a>(
-    ctx: &'a RunContext<'_>,
+/// The run's build, resume or feedback workspace `id` the fleet shows, not archived: stop's
+/// list of the run's workspaces without the gate's (`-g<k>`), which is not one this step
+/// archives.
+fn live_workspace(
+    ctx: &RunContext<'_>,
     run: &RunId,
     events: &[RunEvent],
     id: WorkspaceId,
-) -> Option<&'a Record<Workspace>> {
-    let highest = |name: &str, field: &str| -> u32 {
-        events
-            .iter()
-            .filter(|event| event.event == name)
-            .filter_map(|event| event.data.get(field).and_then(Value::as_u64))
-            .max()
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(0)
-    };
-    let base = format!("fac/{}-{}", run.issue(), run.attempt());
-    let mut names = vec![base.clone()];
-    names.extend(
-        (1..=highest("session_interrupted", "resumes") + 1).map(|k| format!("{base}-r{k}")),
-    );
-    names.extend((1..=highest("feedback_relaunching", "n") + 1).map(|k| format!("{base}-f{k}")));
-    names
-        .iter()
-        .flat_map(|name| ctx.view.workspaces_named(ctx.project.id, name))
-        .find(|record| record.body.id == id)
+) -> Option<Live> {
+    live_workspaces(ctx, run, events)
+        .into_iter()
+        .find(|live| live.id == id && !live.gate)
 }
 
 fn unreachable_long(ctx: &RunContext<'_>, machine: MachineId) -> bool {
@@ -1390,25 +1363,14 @@ fn record_decision(ctx: &RunContext<'_>, run: &RunId, round: &Round) -> Result<(
 }
 
 /// Whether the issue text was changed since the approval by someone who is not an instructor,
-/// or cannot be judged: the code and the stop of the run, or `None` when it stands.
+/// or cannot be judged: the code and the stop of the run, or `None` when it stands. The rule is
+/// `stop`'s, which `building`'s watch is.
 fn text_stop(
     ctx: &RunContext<'_>,
     issue: u64,
     seen: &Seen,
 ) -> Result<Option<(&'static str, Stop)>, RunError> {
-    let Some(approved_at) = &seen.approved_at else {
-        return Ok(Some((STUCK_UNCONFIRMED, Stop::new(CANNOT_CONFIRM))));
-    };
-    Ok(
-        match ctx
-            .tracker
-            .text_check(ctx.repo(), issue, approved_at, &ctx.config.instructors)?
-        {
-            TextCheck::Unchanged => None,
-            TextCheck::Changed => Some((STUCK_TEXT, Stop::new(CHANGED_DURING_BUILD))),
-            TextCheck::Unjudged => Some((STUCK_UNVERIFIED, Stop::new(CANNOT_VERIFY_DURING_BUILD))),
-        },
-    )
+    Ok(shared_text_stop(ctx, issue, seen)?.map(|(code, reason)| (code, Stop::new(reason))))
 }
 
 /// The run goes stuck under `code`, with `stop`.
@@ -1537,7 +1499,7 @@ fn decision_phase(
         .as_deref()
         .map(workspace_id)
         .transpose()?
-        .and_then(|id| live_workspace(ctx, run, events, id).map(|record| record.body.id));
+        .and_then(|id| live_workspace(ctx, run, events, id).map(|live| live.id));
     let asked = match (&round.archiving, round.archive_asked, old) {
         (None, _, Some(old)) => Some((old, Records::Both)),
         (Some(named), false, _) => Some((workspace_id(named)?, Records::Asked)),
@@ -1713,10 +1675,10 @@ fn carry_on(
     // The earlier workspace is waited for, until it shows archived or its machine is gone.
     if let Some(named) = &round.archiving {
         let old = workspace_id(named)?;
-        if let Some(record) = live_workspace(ctx, run, events, old)
-            && !unreachable_long(ctx, record.owner)
+        if let Some(live) = live_workspace(ctx, run, events, old)
+            && !live.gone(ctx)
         {
-            if ctx.view.online(record.owner) {
+            if ctx.view.online(live.machine) {
                 archive_old(ctx, run, n, old, Records::Nothing)?;
             }
             return Ok(FeedbackStep::Preparing(Wait::Archive));
