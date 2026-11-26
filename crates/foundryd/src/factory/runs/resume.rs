@@ -6155,7 +6155,8 @@ mod tests {
                 "{error}"
             );
             assert_eq!(rig.worker.calls(), vec![probe(1)]);
-            assert_eq!(event_count(&rig, &run), before);
+            // The one line written is the first failure's record.
+            assert_eq!(event_count(&rig, &run), before + 1);
             assert!(interruptions(&rig, &run).is_empty());
             assert!(archive_calls(&rig).is_empty());
             never_written(&rig);
@@ -6208,6 +6209,211 @@ mod tests {
                 )),
                 "{detail}"
             );
+        }
+    }
+
+    /// #268: a turn probe that answers `Failed` without a break for longer than
+    /// [`TURN_FAILING_FOR`] decides the interruption as if the turn will not be written.
+    mod a_turn_probe_that_keeps_failing {
+        use std::sync::{Arc, Mutex};
+
+        use super::*;
+        use crate::clock::FakeClock;
+        use crate::factory::ledger::testing::{T0, ticking};
+        use crate::factory::worker::AlwaysHeld;
+        use crate::store::Store;
+
+        fn call_failed(rig: &Rig) {
+            rig.worker.on_turn(Err(WorkerError::Failed(
+                "the owner runs an older Foundry".into(),
+            )));
+        }
+
+        /// A pass whose probe fails: an error, and no interruption.
+        fn fails(rig: &Rig, run: &RunId) {
+            call_failed(rig);
+            let error = advance(&rig.ctx(), run).unwrap_err();
+            assert!(
+                matches!(error, RunError::Worker(WorkerError::Failed(_))),
+                "{error}"
+            );
+            assert!(interruptions(rig, run).is_empty());
+            assert!(archive_calls(rig).is_empty());
+        }
+
+        fn minutes(rig: &Rig, n: u64) {
+            rig.clock.advance(secs(n * 60));
+        }
+
+        /// The first-failure and answered lines of `run`, in order.
+        fn records(rig: &Rig, run: &RunId) -> Vec<String> {
+            rig.steps(run)
+                .into_iter()
+                .filter(|step| step.starts_with(TURN_FAILING) || step.starts_with(TURN_ANSWERED))
+                .collect()
+        }
+
+        fn failing(turn: u64, generation: u64, ms: u64) -> String {
+            format!("{TURN_FAILING}{SESSION} {turn} {generation} {ms}")
+        }
+
+        fn answered(turn: u64) -> String {
+            format!("{TURN_ANSWERED}{SESSION} {turn}")
+        }
+
+        #[test]
+        fn the_limit_is_the_unreachable_limit() {
+            assert_eq!(TURN_FAILING_FOR, UNREACHABLE_FOR);
+        }
+
+        #[test]
+        fn the_first_failure_is_recorded_on_the_clock_before_the_error_is_returned() {
+            let (rig, run) = failed_with_turns_unasked();
+            minutes(&rig, 3);
+            fails(&rig, &run);
+            assert_eq!(records(&rig, &run), [failing(1, 1, 180_000)]);
+            // A second failure keeps the first one's time.
+            minutes(&rig, 1);
+            fails(&rig, &run);
+            assert_eq!(records(&rig, &run), [failing(1, 1, 180_000)]);
+        }
+
+        #[test]
+        fn a_probe_that_keeps_failing_past_the_limit_is_decided_as_never_written() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 14);
+            fails(&rig, &run);
+            minutes(&rig, 1);
+            call_failed(&rig);
+            pass_one(&rig, &run);
+            assert_eq!(interruptions(&rig, &run).len(), 1);
+            assert_eq!(
+                rig.worker.calls(),
+                vec![probe(1), probe(1), probe(1), archived_call()]
+            );
+        }
+
+        #[test]
+        fn a_probe_that_recovers_before_the_limit_decides_nothing_and_clears_the_record() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            // The turn is written and its record has not synced: nothing is decided.
+            say(&rig, DONE_MESSAGE);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert!(interruptions(&rig, &run).is_empty());
+            assert_eq!(records(&rig, &run), [failing(1, 1, 0), answered(1)]);
+            // A failure after the read counts from itself, not from the first.
+            minutes(&rig, 10);
+            fails(&rig, &run);
+            assert_eq!(
+                records(&rig, &run),
+                [failing(1, 1, 0), answered(1), failing(1, 1, 1_200_000)]
+            );
+            minutes(&rig, 14);
+            fails(&rig, &run);
+            minutes(&rig, 1);
+            call_failed(&rig);
+            pass_one(&rig, &run);
+        }
+
+        #[test]
+        fn a_read_with_no_failure_recorded_writes_nothing() {
+            let (rig, run) = failed_with_turns_unasked();
+            say(&rig, DONE_MESSAGE);
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+        }
+
+        #[test]
+        fn an_unreachable_answer_breaks_the_failures() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            rig.worker
+                .on_turn(Err(WorkerError::Unreachable("timed out".into())));
+            assert!(advance(&rig.ctx(), &run).is_err());
+            assert_eq!(records(&rig, &run), [failing(1, 1, 0), answered(1)]);
+            minutes(&rig, 10);
+            fails(&rig, &run);
+            assert_eq!(records(&rig, &run).len(), 3);
+        }
+
+        #[test]
+        fn a_restart_of_the_daemon_keeps_the_first_failure_time() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            // The daemon restarts: the ledger is opened again from its store, the lease is
+            // renewed at the same generation, and the clock has counted on.
+            let store = Store::open(rig._dir.path().join("foundry.db")).unwrap();
+            rig.ledger = crate::factory::ledger::testing::ledger(
+                &Arc::new(Mutex::new(store)),
+                MachineId(uuid::Uuid::from_u128(0x1)),
+                1,
+                ticking(T0 + 3_600_000, 1000),
+            );
+            assert_eq!(records(&rig, &run), [failing(1, 1, 0)]);
+            minutes(&rig, 4);
+            fails(&rig, &run);
+            minutes(&rig, 1);
+            call_failed(&rig);
+            pass_one(&rig, &run);
+        }
+
+        #[test]
+        fn a_takeover_starts_the_count_again_and_never_ends_it_early() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            rig.guard = Box::new(AlwaysHeld(2));
+            // 20 minutes since the first failure, but the count is a new coordinator's.
+            minutes(&rig, 10);
+            fails(&rig, &run);
+            assert_eq!(
+                records(&rig, &run),
+                [failing(1, 1, 0), failing(1, 2, 1_200_000)]
+            );
+            minutes(&rig, 14);
+            fails(&rig, &run);
+            minutes(&rig, 1);
+            call_failed(&rig);
+            pass_one(&rig, &run);
+        }
+
+        #[test]
+        fn a_clock_reading_below_the_record_starts_the_count_again() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            minutes(&rig, 30);
+            fails(&rig, &run);
+            // A reboot reset the clock.
+            rig.clock = FakeClock::new();
+            minutes(&rig, 5);
+            fails(&rig, &run);
+            assert_eq!(
+                records(&rig, &run),
+                [failing(1, 1, 1_800_000), failing(1, 1, 300_000)]
+            );
+            minutes(&rig, 15);
+            call_failed(&rig);
+            pass_one(&rig, &run);
+        }
+
+        #[test]
+        fn a_failure_of_another_turn_does_not_count() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            // Building read turn 1 since: the probe asks for turn 2 now.
+            rig.step(&run, "turn-read 1");
+            minutes(&rig, 20);
+            fails(&rig, &run);
+            assert_eq!(
+                records(&rig, &run),
+                [failing(1, 1, 0), failing(2, 1, 1_200_000)]
+            );
+            assert_eq!(rig.worker.calls(), vec![probe(1), probe(2)]);
         }
     }
 }
