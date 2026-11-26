@@ -188,14 +188,29 @@ fn shared_reason(others: &[String]) -> String {
     }
 }
 
-/// Writes the status of a project left out because other projects name its repo: not holding,
-/// with `reason` as the idle text, in the shape a pass writes for a lease it cannot read.
+/// Writes the status of a project left out because other projects name its repo, unless this
+/// machine's own status for it already says `reason` and does not hold: not holding, with
+/// `reason` as the idle text, in the shape a pass writes for a lease it cannot read. It carries
+/// the pass and generation of this machine's stored status, so the count never falls.
 fn write_shared_status(
     store: &Mutex<Store>,
     me: MachineId,
     project: ProjectId,
     reason: String,
 ) -> Result<(), String> {
+    let mut store = lock(store);
+    let own = store
+        .statuses(project)
+        .map_err(|error| format!("the status could not be read: {error}"))?
+        .into_iter()
+        .find(|(writer, _)| *writer == me)
+        .map(|(_, status)| status);
+    if own
+        .as_ref()
+        .is_some_and(|s| !s.holds && s.not_holding.is_none() && s.idle.as_deref() == Some(&reason))
+    {
+        return Ok(());
+    }
     let mut status = status::not_holding(
         project,
         foundry_proto::factory::NotHolding::NoToken {
@@ -204,7 +219,10 @@ fn write_shared_status(
     );
     status.not_holding = None;
     status.idle = Some(reason);
-    let mut store = lock(store);
+    if let Some(own) = own {
+        status.pass = own.pass;
+        status.generation = own.generation;
+    }
     let written = store.own_next_factory_version().and_then(|version| {
         store.apply_factory(
             &FactoryRecord {
@@ -317,20 +335,22 @@ impl<H: Host> Factory<H> {
                             .iter()
                             .map(|(project, others)| (*project, shared_reason(others)))
                             .collect();
-                        if reasons != said_shared {
-                            if !reasons.is_empty() {
-                                tracing::warn!(projects = ?reasons.keys().collect::<Vec<_>>(), "factory: projects that name one repo are watched from none of them");
-                            }
-                            let new: Vec<(ProjectId, String)> = reasons
+                        if reasons != said_shared && !reasons.is_empty() {
+                            tracing::warn!(projects = ?reasons.keys().collect::<Vec<_>>(), "factory: projects that name one repo are watched from none of them");
+                        }
+                        // Every scan checks what the store holds, not what was said last: a
+                        // pass still running on its blocking thread when its project became
+                        // shared writes its own status after the shared one, and a failed
+                        // write is tried again.
+                        if !reasons.is_empty() {
+                            let hidden: Vec<(ProjectId, String)> = reasons
                                 .iter()
-                                .filter(|(project, reason)| {
-                                    said_shared.get(*project) != Some(*reason)
-                                })
                                 .map(|(project, reason)| (*project, (self.host.hide())(reason)))
                                 .collect();
                             let (store, me) = (self.store.clone(), self.me);
                             let written = tokio::task::spawn_blocking(move || {
-                                new.into_iter()
+                                hidden
+                                    .into_iter()
                                     .map(|(project, reason)| {
                                         let done = write_shared_status(&store, me, project, reason);
                                         (project, done)
@@ -339,15 +359,13 @@ impl<H: Host> Factory<H> {
                             })
                             .await
                             .unwrap_or_default();
-                            said_shared = reasons;
                             for (project, done) in written {
                                 if let Err(error) = done {
                                     tracing::warn!(%project, "factory: {error}");
-                                    // Written again at the next scan.
-                                    said_shared.remove(&project);
                                 }
                             }
                         }
+                        said_shared = reasons;
                         Some(watched)
                     }
                     Ok(Err(error)) => {
