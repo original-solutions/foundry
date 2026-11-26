@@ -170,7 +170,11 @@ use serde_json::Value;
 use super::feedback;
 use super::gating::{self, GATE_REQUESTED};
 use super::progress::{Seen, pending_relaunch, read_progress};
-use super::resume::UNREACHABLE_FOR;
+use super::resume::{
+    ENDING_SESSIONS as RESUME_ENDING_SESSIONS, MACHINE as RESUME_MACHINE,
+    MACHINE_GIVEN_UP as RESUME_MACHINE_GIVEN_UP, SENDING as RESUME_SENDING, UNREACHABLE_FOR,
+    WORKSPACE as RESUME_WORKSPACE,
+};
 use super::{
     Closing, Progress, RunContext, RunError, Stop, StuckStop, abandon, closed_issue, end_own_merge,
     end_run, go_stuck, progress_from, recorded_reason, workspace_id,
@@ -336,7 +340,8 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StopStep, RunError> 
     }
     // While a round is under way the session to end is the round's, in its workspace: the
     // build's ended at the gate and its workspace is archived.
-    let round = feedback::stopping_seen(&events, &seen);
+    // The same for a resume whose workspace was made: the old one is archived.
+    let round = feedback::stopping_seen(&events, &seen).or_else(|| resuming_seen(&events, &seen));
     let seen = round.unwrap_or(seen);
     let mut at = progress_from(run, CauseStep::Advance, &seen, State::Building);
     if begun(&seen) {
@@ -389,6 +394,52 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StopStep, RunError> 
     Ok(StopStep::Stuck {
         reason: STOPPED_BY_HAND.into(),
     })
+}
+
+/// `seen` as a stop must read it while a resume is being set up: an interruption's resume
+/// decided and not sent (`interruption-sent` not recorded), with a `resume-workspace <k> <id>`
+/// step recorded for it. The session to end is in that workspace (`-r<k>`), the earlier one
+/// being archived; a start may have gone out once `resume-sending <k>` or
+/// `resume-ending-sessions <k>` is recorded, and then the session may exist without a
+/// `session_launched` line. `None` when no resume has a workspace yet: `seen` stands. The step
+/// names are `resume.rs`'s constants.
+fn resuming_seen(events: &[RunEvent], seen: &Seen) -> Option<Seen> {
+    let interruption = seen
+        .interruption
+        .as_ref()
+        .filter(|interruption| !interruption.relaunch && !interruption.sent)?;
+    let k = interruption.resumes;
+    let at = events.iter().rposition(|event| {
+        event.event == "session_interrupted"
+            && event.data.get("relaunch") != Some(&Value::Bool(true))
+    })?;
+    let numbered = |step: &str, prefix: &str| -> Option<String> {
+        let tail = step.strip_prefix(prefix)?;
+        let (count, rest) = tail.split_once(' ').unwrap_or((tail, ""));
+        (count == k.to_string()).then(|| rest.to_owned())
+    };
+    let (mut workspace, mut sending) = (None, false);
+    for step in events[at + 1..].iter().filter_map(step_text) {
+        if numbered(step, RESUME_MACHINE_GIVEN_UP).is_some()
+            || numbered(step, RESUME_MACHINE).is_some()
+        {
+            workspace = None;
+            sending = false;
+        } else if let Some(rest) = numbered(step, RESUME_WORKSPACE) {
+            workspace = uuid::Uuid::parse_str(&rest).ok().map(WorkspaceId);
+        } else if numbered(step, RESUME_SENDING).is_some()
+            || numbered(step, RESUME_ENDING_SESSIONS).is_some()
+        {
+            sending = true;
+        }
+    }
+    let id = workspace?;
+    let mut stopping = seen.clone();
+    stopping.workspace = None;
+    stopping.worktree = Some(id.to_string());
+    stopping.thread_id = None;
+    stopping.launch_sent = sending;
+    Some(stopping)
 }
 
 /// A stuck decision is on record and the run is not finished.
