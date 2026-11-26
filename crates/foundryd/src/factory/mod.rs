@@ -364,20 +364,35 @@ impl<H: Host> Factory<H> {
                 Some(Vec::new())
             };
             if let Some(want) = want {
+                // The secret store is read on a blocking thread, as the settings are.
+                let logins: Vec<(ProjectId, String)> = running
+                    .iter()
+                    .map(|(project, run)| (*project, run.watched.login.clone()))
+                    .collect();
+                let host = self.host.clone();
+                let marks = tokio::task::spawn_blocking(move || {
+                    logins
+                        .into_iter()
+                        .map(|(project, login)| (project, host.token_mark(&login)))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .await
+                .unwrap_or_default();
                 running.retain(|project, run| {
                     // A lease made with another token than the one held now, or with none, or
                     // whose token could not be given to git, is made again.
                     // A store that cannot be read says nothing of the token: the lease stays.
-                    let same = match self.host.token_mark(&run.watched.login) {
-                        Ok(mark) => {
-                            mark == run.mark
+                    let same = match marks.get(project) {
+                        Some(Ok(mark)) => {
+                            *mark == run.mark
                                 && !(mark.is_some()
                                     && matches!(*lock(&run.state), Some(LeaseState::NoToken)))
                         }
-                        Err(error) => {
+                        Some(Err(error)) => {
                             tracing::warn!(project = %project, "factory: the token could not be read: {error}");
                             true
                         }
+                        None => true,
                     };
                     let keep = want.contains(&run.watched) && same;
                     if !keep {
@@ -390,37 +405,69 @@ impl<H: Host> Factory<H> {
                     }
                     keep
                 });
-                // Every project about to start counts its runs before any pass of any
-                // project may claim.
-                for watched in &want {
-                    if !running.contains_key(&watched.project) {
-                        self.seed(watched);
-                    }
-                }
-                for watched in want {
-                    if let std::collections::btree_map::Entry::Vacant(slot) =
-                        running.entry(watched.project)
-                    {
-                        slot.insert(self.start(watched.clone(), offline.clone()));
-                    }
+                let starting: Vec<Watched> = want
+                    .into_iter()
+                    .filter(|watched| !running.contains_key(&watched.project))
+                    .collect();
+                for (watched, mark, lease) in self.prepare(starting).await {
+                    let project = watched.project;
+                    running.insert(project, self.start(watched, mark, lease, offline.clone()));
                 }
             }
             wait(&*self.clock, looked, SCAN).await;
         }
     }
 
-    /// The project's entry in the book, from its ledger.
-    fn seed(&self, watched: &Watched) {
-        let ledger = ledger::Ledger::new(self.store.clone(), self.me, 0, self.host.hide());
-        if let Err(error) = pass::seed(&self.book, &ledger, watched.project, &watched.repo) {
-            tracing::warn!(project = %watched.project, "factory: the project's runs could not be counted: {error}");
+    /// What the projects about to start need from the store and the secret store, on one
+    /// blocking thread: each one's entry in the book, seeded from its ledger, so that every
+    /// project about to start counts its runs before any pass of any project may claim; the
+    /// fingerprint of its token; and its lease. A thread that fails starts none of them, and the
+    /// next scan tries again.
+    async fn prepare(
+        &self,
+        starting: Vec<Watched>,
+    ) -> Vec<(Watched, Option<u64>, Arc<dyn Leasing>)> {
+        if starting.is_empty() {
+            return Vec::new();
         }
+        let (store, me, host, book) = (
+            self.store.clone(),
+            self.me,
+            self.host.clone(),
+            self.book.clone(),
+        );
+        let prepared = tokio::task::spawn_blocking(move || {
+            let ledger = ledger::Ledger::new(store, me, 0, host.hide());
+            for watched in &starting {
+                if let Err(error) = pass::seed(&book, &ledger, watched.project, &watched.repo) {
+                    tracing::warn!(project = %watched.project, "factory: the project's runs could not be counted: {error}");
+                }
+            }
+            starting
+                .into_iter()
+                .map(|watched| {
+                    let mark = host.token_mark(&watched.login).ok().flatten();
+                    let lease = host.lease(&watched);
+                    (watched, mark, lease)
+                })
+                .collect()
+        })
+        .await;
+        prepared.unwrap_or_else(|error| {
+            tracing::warn!("factory: the projects could not be prepared: {error}");
+            Vec::new()
+        })
     }
 
-    /// Starts the lease task and the pass task of `watched`.
-    fn start(&self, watched: Watched, offline: Arc<Mutex<Offline>>) -> Running {
-        let mark = self.host.token_mark(&watched.login).ok().flatten();
-        let lease = self.host.lease(&watched);
+    /// Starts the lease task and the pass task of `watched`, whose token's fingerprint is `mark`
+    /// and whose lease is `lease`.
+    fn start(
+        &self,
+        watched: Watched,
+        mark: Option<u64>,
+        lease: Arc<dyn Leasing>,
+        offline: Arc<Mutex<Offline>>,
+    ) -> Running {
         let state: Arc<Mutex<Option<LeaseState>>> = Arc::default();
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(lease_task(
