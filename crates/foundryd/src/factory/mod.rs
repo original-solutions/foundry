@@ -1679,4 +1679,89 @@ mod tests {
         .unwrap();
         running.abort();
     }
+
+    /// Settings of projects 1 and 2 on one repo (written two ways) and 3 on another, all on.
+    fn two_projects_on_one_repo_and_a_third() -> SharedSettings {
+        let mut settings = settings_with(&[(1, "a-bot"), (2, "b-bot"), (3, "c-bot")]);
+        settings.projects[0].repo = "https://github.com/rawphp/shared".into();
+        settings.projects[1].repo = "git@github.com:RawPHP/shared.git".into();
+        settings
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn projects_that_share_a_repo_each_get_a_status_that_names_the_other() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(two_projects_on_one_repo_and_a_third())
+            .unwrap();
+        let host = fake_host();
+        for login in ["a-bot", "b-bot", "c-bot"] {
+            host.trackers
+                .lock()
+                .unwrap()
+                .insert(login.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        }
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let (store2, host2) = (store.clone(), host.clone());
+        let said = tokio::task::spawn_blocking(move || {
+            // The third project is watched: its pass writes its status.
+            let third = came(|| status_of(&store2, project(3)).is_some());
+            let both = came(|| {
+                status_of(&store2, project(1)).is_some() && status_of(&store2, project(2)).is_some()
+            });
+            (third && both, host2.made.lock().unwrap().len())
+        })
+        .await
+        .unwrap();
+        running.abort();
+        assert!(said.0, "each project has a status");
+        assert_eq!(said.1, 1, "only the third project has a lease");
+        for (mine, other) in [(1, "p2"), (2, "p1")] {
+            let status = status_of(&store, project(mine)).unwrap();
+            assert!(!status.holds, "{status:?}");
+            assert_eq!(status.not_holding, None, "{status:?}");
+            let idle = status.idle.clone().unwrap_or_default();
+            assert!(idle.contains(other), "the other project is named: {idle}");
+            assert!(idle.contains("neither"), "{idle}");
+            assert!(!idle.contains(&format!("p{mine}")), "{idle}");
+        }
+        let third = status_of(&store, project(3)).unwrap();
+        assert!(!third.idle.unwrap_or_default().contains("neither"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_status_of_a_shared_repo_is_written_once_and_not_every_scan() {
+        let (_dir, store) = open_store();
+        let mut settings = two_projects_on_one_repo_and_a_third();
+        settings.projects.truncate(2);
+        store.lock().unwrap().apply_settings(settings).unwrap();
+        let host = fake_host();
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host, freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let store2 = store.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("both statuses", || {
+                status_of(&store2, project(1)).is_some() && status_of(&store2, project(2)).is_some()
+            })
+        })
+        .await
+        .unwrap();
+        let next =
+            |store: &Arc<Mutex<Store>>| store.lock().unwrap().own_next_factory_version().unwrap();
+        let before = next(&store);
+        for _ in 0..3 {
+            clock.advance(SCAN);
+            a_while().await;
+        }
+        let after = next(&store);
+        running.abort();
+        assert_eq!(after, before + 1, "no write in three scans");
+    }
 }
