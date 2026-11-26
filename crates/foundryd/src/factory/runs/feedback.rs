@@ -4442,6 +4442,71 @@ mod tests {
             assert_eq!(world.rig.sim.labels(), ["factory:stuck"]);
         }
 
+        /// A round's stuck path as a cut leaves it: the decision, the stuck line and the move
+        /// to `stuck` are written, `finished` is not. The lease is checked before the move and
+        /// not between it and `finished`, so no cut of a lease reaches this point: the lines
+        /// are written as the stuck path writes them, and the issue's label and comment are
+        /// what the path left (the label is `stuck` before the ledger's move).
+        fn stuck_path_cut_after_the_move(world: &World, code: &str, reason: &str) {
+            world.rig.step(
+                &world.run,
+                &format!("stuck-stop {{\"code\":\"{code}\",\"stop\":{{\"reason\":\"{reason}\"}}}}"),
+            );
+            world.rig.write(
+                &world.run,
+                Event::Stuck {
+                    reason: reason.into(),
+                    branch: None,
+                    commits_ahead: None,
+                },
+            );
+            world.rig.moved(&world.run, State::Building, State::Stuck);
+            let seen = world.seen();
+            assert_eq!(seen.state, Some(State::Stuck));
+            assert!(!seen.finished);
+            assert!(round_pending(&world.events()));
+        }
+
+        fn a_round_in_setup() -> World {
+            let mut world = World::reviewed();
+            world.rig.worker.on_create(Ok(fresh()));
+            assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+            assert_eq!(world.go(), FeedbackStep::Preparing(Wait::Workspace));
+            world.rig.view = round_view();
+            world
+        }
+
+        fn assert_finished_once_and_nothing_said_again(world: &World) {
+            let comments = world.rig.sim.comments();
+            let writes = world.writes();
+            let calls = world.rig.worker.calls().len();
+            let FeedbackStep::Stuck { .. } = world.go() else {
+                panic!("the cut stuck path is finished by the next pass");
+            };
+            assert!(world.seen().finished);
+            assert_eq!(world.events().last().unwrap().event, "finished");
+            assert_eq!(world.rig.sim.comments(), comments);
+            assert_eq!(world.writes(), writes);
+            assert_eq!(world.rig.worker.calls().len(), calls);
+            let count = world.count();
+            assert_eq!(world.go(), FeedbackStep::None);
+            assert_eq!(world.count(), count);
+        }
+
+        #[test]
+        fn a_text_stop_of_a_round_cut_after_the_move_to_stuck_is_finished_by_the_next_pass() {
+            let world = a_round_in_setup();
+            stuck_path_cut_after_the_move(&world, "text-changed-during-build", "said so");
+            assert_finished_once_and_nothing_said_again(&world);
+        }
+
+        #[test]
+        fn a_failed_setup_of_a_round_cut_after_the_move_to_stuck_is_finished_by_the_next_pass() {
+            let world = a_round_in_setup();
+            stuck_path_cut_after_the_move(&world, STUCK_SETUP, "the setup failed");
+            assert_finished_once_and_nothing_said_again(&world);
+        }
+
         #[test]
         fn a_closed_issue_ends_a_round_under_way_and_ends_the_sessions_of_its_workspace() {
             let world = World::reviewed();

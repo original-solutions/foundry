@@ -2688,6 +2688,41 @@ mod tests {
             }
 
             #[test]
+            fn a_stuck_path_of_a_round_cut_after_its_move_to_stuck_is_left_to_feedback() {
+                for (code, skipped) in [
+                    ("text-changed-during-build", "relaunching"),
+                    ("feedback-setup-failed", "not-building"),
+                    ("feedback-launch-failed", "not-building"),
+                ] {
+                    let (rig, run) = round_moved();
+                    rig.step(
+                        &run,
+                        &format!(
+                            "stuck-stop {{\"code\":\"{code}\",\"stop\":{{\"reason\":\"said so\"}}}}"
+                        ),
+                    );
+                    rig.write(
+                        &run,
+                        Event::Stuck {
+                            reason: "said so".into(),
+                            branch: None,
+                            commits_ahead: None,
+                        },
+                    );
+                    rig.moved(&run, State::Building, State::Stuck);
+                    let events = rig.events(&run).len();
+                    assert_eq!(
+                        pass(&rig, &run),
+                        ReconcileStep::Skipped { why: skipped },
+                        "{code}"
+                    );
+                    assert_eq!(rig.events(&run).len(), events, "{code}");
+                    assert!(calls(&rig).is_empty(), "{code}");
+                    assert!(rig.sim.writes().is_empty(), "{code}");
+                }
+            }
+
+            #[test]
             fn the_projects_own_login_assigned_is_what_a_claim_leaves() {
                 let (rig, run) = building_run();
                 rig.sim.set_assignees(&["Softfac-Bot"]);
