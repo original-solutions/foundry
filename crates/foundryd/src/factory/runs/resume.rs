@@ -81,7 +81,13 @@
 //!   for the turn after the newest read. A turn the worker answers is written and not shown yet,
 //!   so nothing is decided until it shows (`building` reads it then); one the worker says was
 //!   never written (`NotWritten`) is the interruption; any other error of the call decides
-//!   nothing, and the next pass asks again.
+//!   nothing, and the next pass asks again. A call that answers `Failed` without a break for
+//!   [`TURN_FAILING_FOR`] (an owner that runs an older Foundry, or one whose answer is not
+//!   JSON, fails the same way on every pass) is decided as `NotWritten`. Its first failure is
+//!   recorded before the error is returned (`resume-turn-failing <session> <turn> <generation>
+//!   <ms>`), on the sleep-counting clock as gating's `checks-waiting` is, so a daemon restart
+//!   keeps it and a takeover or a reset clock starts the count again. Any other answer to the
+//!   same probe clears it (`resume-turn-answered <session> <turn>`).
 //! - Before a resumed session starts, the issue text is checked again against the approval the
 //!   ledger recorded, as the runner's `textStop` does: a text changed by someone who is not an
 //!   instructor, or whose edits cannot be judged, ends the run stuck and starts nothing. The
@@ -246,6 +252,7 @@
 //! - `is not resumed once a relaunch is decided, and nothing is written`
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use foundry_proto::factory::{RunEvent, RunId};
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, WorkspaceId};
@@ -315,6 +322,20 @@ pub const CLAIM_MOVED: &str = "claim-moved ";
 /// The step written when the machine a claim moved to was unreachable for 15 minutes before its
 /// workspace was answered: `claim-moved-given-up <id>`.
 pub const CLAIM_GIVEN_UP: &str = "claim-moved-given-up ";
+
+/// The step written before a turn probe's first `Failed` answer is acted on:
+/// `resume-turn-failing <session> <turn> <generation> <ms>`, with the lease generation and the
+/// sleep-counting clock's reading it was read under. A probe that keeps failing for
+/// [`TURN_FAILING_FOR`] from it is decided as a turn that will not be written.
+pub const TURN_FAILING: &str = "resume-turn-failing ";
+/// The step written when the probe answers anything but `Failed` while a first failure is on
+/// record, which clears it: `resume-turn-answered <session> <turn>`.
+pub const TURN_ANSWERED: &str = "resume-turn-answered ";
+/// How long a turn probe answers `Failed` without a break before the turn is taken as one that
+/// will not be written: the 15 minutes an unreachable machine is waited for, on the same
+/// sleep-counting clock. An owner that runs an older Foundry, or answers with a body that is
+/// not JSON, fails the same way on every pass, and the run would otherwise never be decided.
+pub const TURN_FAILING_FOR: Duration = UNREACHABLE_FOR;
 
 /// What one pass of [`advance`] or [`placed`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1051,14 +1072,28 @@ fn ended(
                 // session ended: the turn after the newest read is asked of the worker. One it
                 // answers is written and not shown yet, so nothing is decided until it shows. One
                 // it says was never written means the process ended before a result line. Any
-                // other error decides nothing: the next pass asks again.
+                // other error decides nothing: the next pass asks again, unless the call has
+                // failed without a break for `TURN_FAILING_FOR` (`probe_failed`).
                 None => {
                     let next = seen.turn_read.map_or(1, |read| read + 1);
-                    ctx.held()?;
+                    let generation = ctx.held()?;
+                    let since = failing_since(events, session, next);
                     match ctx.worker.turn(session, next) {
-                        Ok(_) => return Ok(None),
+                        Ok(_) => {
+                            probe_answered(ctx, run, since, session, next)?;
+                            return Ok(None);
+                        }
                         Err(WorkerError::NotWritten(_)) => None,
-                        Err(error) => return Err(error.into()),
+                        Err(error @ WorkerError::Failed(_)) => {
+                            if !probe_failed(ctx, run, since, generation, session, next)? {
+                                return Err(error.into());
+                            }
+                            None
+                        }
+                        Err(error) => {
+                            probe_answered(ctx, run, since, session, next)?;
+                            return Err(error.into());
+                        }
                     }
                 }
                 Some(turn) => {
@@ -1082,6 +1117,79 @@ fn ended(
         | SessionState::WaitingForYou
         | SessionState::Stuck => Ok(None),
     }
+}
+
+/// The lease generation and clock reading of the first `Failed` answer to the probe of turn
+/// `turn` of `session` that is still on record: the newest `resume-turn-failing` line of that
+/// turn with no `resume-turn-answered` line of it after, in the ledger's order.
+fn failing_since(events: &[RunEvent], session: SessionId, turn: u64) -> Option<(u64, u64)> {
+    let key = format!("{session} {turn}");
+    let mut since = None;
+    for step in events.iter().filter_map(step_text) {
+        if let Some(rest) = step.strip_prefix(TURN_FAILING) {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            if let [id, n, generation, ms] = parts.as_slice()
+                && format!("{id} {n}") == key
+                && let (Ok(generation), Ok(ms)) = (generation.parse(), ms.parse())
+            {
+                since = Some((generation, ms));
+            }
+        } else if step.strip_prefix(TURN_ANSWERED) == Some(key.as_str()) {
+            since = None;
+        }
+    }
+    since
+}
+
+/// A `Failed` answer to the probe of turn `turn` of `session`: whether the call has failed
+/// without a break for [`TURN_FAILING_FOR`], counted on the sleep-counting clock from the
+/// first failure on record (`since`). With none, or one of another lease generation or above
+/// the clock now (a takeover, or a reboot that reset the clock), the first failure is recorded
+/// now, before the error is returned: a takeover can lengthen the wait, never end it early. A
+/// daemon restart keeps the generation and the clock, and so the first failure's time.
+fn probe_failed(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    since: Option<(u64, u64)>,
+    generation: u64,
+    session: SessionId,
+    turn: u64,
+) -> Result<bool, RunError> {
+    let now = u64::try_from(ctx.clock.now().as_millis()).unwrap_or(u64::MAX);
+    match since {
+        Some((from, at)) if from == generation && now >= at => {
+            Ok(Duration::from_millis(now - at) >= TURN_FAILING_FOR)
+        }
+        _ => {
+            note(
+                ctx,
+                run,
+                &format!("{TURN_FAILING}{session} {turn} {generation} {now}"),
+                "resume-turn-failing",
+            )?;
+            Ok(false)
+        }
+    }
+}
+
+/// An answer to the probe of turn `turn` of `session` that is not `Failed` breaks the
+/// failures: a first failure on record (`since`) is cleared. With none, nothing is written.
+fn probe_answered(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    since: Option<(u64, u64)>,
+    session: SessionId,
+    turn: u64,
+) -> Result<(), RunError> {
+    if since.is_none() {
+        return Ok(());
+    }
+    note(
+        ctx,
+        run,
+        &format!("{TURN_ANSWERED}{session} {turn}"),
+        "resume-turn-answered",
+    )
 }
 
 /// The workspace the run's newest session works in.
