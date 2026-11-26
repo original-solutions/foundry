@@ -18,7 +18,9 @@
 //!   `stop-requested` and [`STOPPED_BY_HAND`] (the runner's code and words), its session ended
 //!   and its workspace kept, and a stuck path cut short is finished from the ledger with the
 //!   words it recorded. A closed issue is a person's move or the run's own merge and ends the
-//!   run first, as the runner's `advance` does.
+//!   run first, as the runner's `advance` does. While a feedback round is decided and not
+//!   launched (`feedback::round_pending`) the session to end is the round's, in its workspace
+//!   (none before it has one): the build's ended at the gate and its workspace is archived.
 //! - [`reconcile`] is the runner's `watch` and what the spec says of a person's edit and of the
 //!   end of a run: see below.
 //!
@@ -112,8 +114,11 @@
 //! - A stop by hand is a ledger line written by the lease holder, not a file taken by the pass,
 //!   and the state is checked before a stop already on record (the runner's `leaveStopRequest`
 //!   order, not `requestStop`'s). A stale `stop_requested` line stays in a run's ledger after
-//!   the gate passed: `progress::read_progress` never clears it, so a later feedback round that
-//!   returns the run to `building` would read it as a stop (the runner has the same edge).
+//!   the gate passed: `progress::read_progress` never clears it. The feedback step does not look
+//!   at it for a run in `pr-open` (the runner's does not either), so a round starts; once the
+//!   round has returned the run to `building`, this step reads the line as a stop and the run
+//!   goes stuck as stopped by hand, its session ended in the round's workspace (the runner has
+//!   the same edge).
 //! - The pull request a stopped session left (`recordLeftPullRequest`, `pr_left`) is not
 //!   written (`building`'s doc says so too).
 //!

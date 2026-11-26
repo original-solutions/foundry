@@ -14,8 +14,9 @@
 //!
 //! 1. **Not this step's.** A run with no events (an issue the runner left in `pr-open`, which
 //!    Foundry never ran), a finished run, one with no session or pull request recorded, one in
-//!    another repo, one that is stuck or whose stop was asked for, and one with a re-gate under
-//!    way (`gate_regate`, or a `regate_relaunching` decision of the runner's) is left alone:
+//!    another repo, one that is stuck, one that is building with a stop asked for (the stop
+//!    line of a run in `pr-open` is a stale one, as the runner's feedback takes it), and one
+//!    with a re-gate under way (`gate_regate`, or a `regate_relaunching` decision of the runner's) is left alone:
 //!    [`FeedbackStep::None`], with no call to GitHub and nothing written.
 //! 2. **A round under way** is carried on before anything is read: see 5 and 6.
 //! 3. **The read.** Only a run in `pr-open` that has a window (`Seen::pr_open_since`, the pass
@@ -1078,9 +1079,12 @@ pub fn advance(
     if let Some(step) = finish_stuck(ctx, run, &events, &seen, round.as_ref())? {
         return Ok(step);
     }
+    // A stop asked for is the stop step's while the run is building, a round under way
+    // included. The line of a run in `pr-open` is a stale one (`Seen` never clears it), and
+    // the runner's feedback does not look at it either.
     if seen.stuck.is_some()
         || seen.stuck_stop.is_some()
-        || seen.stop_requested
+        || (seen.stop_requested && seen.state == Some(State::Building))
         || seen.state == Some(State::Stuck)
     {
         return Ok(FeedbackStep::None);
@@ -3493,6 +3497,7 @@ mod tests {
             // The line is older than the move to pr-open in a real run; here it is newest.
             assert!(world.seen().stop_requested);
             assert_eq!(world.seen().state, Some(State::PrOpen));
+            let first = first_reads(&world);
             assert_eq!(
                 world.go(),
                 FeedbackStep::Decided {
@@ -3501,7 +3506,7 @@ mod tests {
                     items: 1
                 }
             );
-            assert_eq!(world.hub.reads(), first_reads(&world));
+            assert_eq!(world.hub.reads(), first);
             assert_eq!(world.decisions().len(), 2);
         }
 
