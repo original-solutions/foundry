@@ -5,6 +5,10 @@
 //! in the order the ledger gives them (lease generation, then the writer's factory version),
 //! into a [`Seen`]. Nothing here orders anything by `ts` or `ms`; those only measure time.
 //!
+//! It also holds the readers the run steps share, once: a step's text ([`step_text`],
+//! [`numbered`], [`highest`]), the names of a run's workspaces, the ones the fleet shows
+//! ([`live_workspaces`]) and whether the issue text still stands ([`text_stop`]).
+//!
 //! Where it differs from the runner:
 //!
 //! - `worked_ms` counts the time in `triage` and `building`, less the time a gate ran (from its

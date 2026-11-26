@@ -486,7 +486,6 @@ enum Kind {
     Feedback(u32),
 }
 
-/// The build workspace's name: `fac/<N>-<attempt>`.
 /// Every workspace of the project the fleet shows that is not archived and has one of the
 /// run's build, resume or feedback names, in the order of the names.
 fn named_workspaces<'a>(

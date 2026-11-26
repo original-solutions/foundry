@@ -521,7 +521,9 @@ pub enum ReconcileStep {
     Waiting { workspaces: Vec<WorkspaceId> },
 }
 
-/// The codes of the stuck paths this step decides, the runner's `watch` and its own.
+/// The codes of the stuck paths this step decides, the runner's `watch` and its own, beside the
+/// text checks' codes ([`TEXT_CODE`], [`UNVERIFIED_CODE`], [`UNCONFIRMED_CODE`]) that
+/// [`text_stop`] answers.
 const LABEL_CODE: &str = "label-removed";
 const ASSIGNEE_CODE: &str = "assignee-changed";
 /// The codes `feedback` also begins, for the same text checks, while it sets a round up.
