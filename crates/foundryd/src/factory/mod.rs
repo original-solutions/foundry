@@ -5,8 +5,10 @@
 //! protocol 5 ([`FACTORY_SINCE`]), each project whose factory is on gets two tasks of its own:
 //!
 //! - its lease task, which ticks the project's [`Lease`] every [`LEASE_TICK`] on a blocking
-//!   thread, keeps what the tick said for the pass, and calls [`Freshness::held`] on the
-//!   daemon's one freshness each time a tick answers that this machine holds the lease. The
+//!   thread, given the highest generation of the project's statuses and run events (a tick
+//!   waits while either cannot be read), keeps what the tick said for the pass, and calls
+//!   [`Freshness::held`] on the daemon's one freshness each time a tick answers that this
+//!   machine holds the lease. The
 //!   lease gives no word of its pushes, and it answers held only while less than
 //!   [`lease::ACT_WITHIN`] has passed since the start of its last successful push, renewed every
 //!   [`lease::RENEW_AFTER`]: so `held` is called on each successful push, and on the ticks that
@@ -581,19 +583,27 @@ async fn wait(clock: &dyn Clock, from: Duration, span: Duration) {
     }
 }
 
-/// The highest lease generation the run events of `repo` were written under. The store's lock
-/// is the whole daemon's, so it is taken for one run at a time, never across the history.
-fn highest_event_generation(store: &Mutex<Store>, repo: &str) -> u64 {
-    let runs = lock(store).runs_of(repo).unwrap_or_default();
+/// The highest lease generation the run events of `repo` were written under, or the store's
+/// error: a run whose events cannot be read may hold a higher one. The store's lock is the
+/// whole daemon's, so it is taken for one run at a time, never across the history.
+fn highest_event_generation(
+    store: &Mutex<Store>,
+    repo: &str,
+) -> Result<u64, crate::store::StoreError> {
+    let runs = lock(store).runs_of(repo)?;
     let mut highest = 0;
     for run in runs {
-        let events = lock(store).run_events(&run).unwrap_or_default();
-        for event in events {
+        for event in lock(store).run_events(&run)? {
             highest = highest.max(event.generation);
         }
     }
-    highest
+    Ok(highest)
 }
+
+/// What a project's lease says before its first tick, when the generations it must be given
+/// could not be read.
+const GENERATIONS_UNREAD: &str =
+    "the lease waits: the generations of the project's statuses and run events could not be read";
 
 /// Ticks `lease` every [`LEASE_TICK`], for ever.
 async fn lease_task(
@@ -610,14 +620,26 @@ async fn lease_task(
         let looked = clock.now();
         let (store2, lease2, repo) = (store.clone(), lease.clone(), watched.repo.clone());
         let known = events;
+        // The lease is ticked only with every generation read: one it did not see could be
+        // above the generation it takes. The run events are read until a read succeeds.
         let ticked = tokio::task::spawn_blocking(move || {
-            let statuses = lock(&store2).highest_generation(project).unwrap_or(0);
-            let events = known.unwrap_or_else(|| highest_event_generation(&store2, &repo));
-            (lease2.tick(statuses.max(events)), events)
+            let statuses = lock(&store2).highest_generation(project)?;
+            let events = match known {
+                Some(events) => events,
+                None => highest_event_generation(&store2, &repo)?,
+            };
+            Ok::<_, crate::store::StoreError>((lease2.tick(statuses.max(events)), events))
         })
         .await;
         match ticked {
-            Ok((tick, seen)) => {
+            Ok(Err(error)) => {
+                tracing::warn!(%project, "factory: the lease did not tick: the generations could not be read: {error}");
+                // Before any tick, the pass is told why the lease waits.
+                lock(&state).get_or_insert(LeaseState::Unknown {
+                    reason: GENERATIONS_UNREAD,
+                });
+            }
+            Ok(Ok((tick, seen))) => {
                 events = Some(seen);
                 if matches!(tick, LeaseState::Held { .. }) && lease.guard().check().is_ok() {
                     freshness.held(project);
@@ -2108,6 +2130,91 @@ mod tests {
             "the run events' generation is above the statuses'"
         );
         assert_eq!(host.given(project(1)), vec![7, 9]);
+    }
+
+    /// A run event row this build cannot read is in the project's repo: its generation is not
+    /// known, so the lease is not ticked, and the pass runs on what the lease says, which is why
+    /// it waits (the real lease's guard then fails, so the pass writes that as its idle text).
+    /// Once the row is gone, the next tick is given the generation of the events it can read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_lease_waits_while_a_generation_of_the_run_events_cannot_be_read() {
+        use crate::factory::ledger::events::{Cause, CauseStep, Event};
+        let (dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN)]))
+            .unwrap();
+        let run = foundry_proto::factory::RunId::new("rawphp/softfac", 3, 1).unwrap();
+        ledger::Ledger::new(store.clone(), me(), 7, Arc::new(|t: &str| t.to_owned()))
+            .write(
+                &run,
+                &Event::StepChanged {
+                    step: "a step".into(),
+                },
+                &Cause::new(CauseStep::Start, "test"),
+            )
+            .unwrap();
+        let newer = foundry_proto::factory::RunId::new("rawphp/softfac", 4, 1).unwrap();
+        let other = MachineId(uuid::Uuid::from_u128(0x2));
+        let db = dir.path().join("foundry.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO factory_records (kind, id, owner, version, record) \
+                 VALUES ('run_event', ?1, ?2, 1, ?3)",
+                rusqlite::params![
+                    format!("{newer}/{other}/1"),
+                    other.to_string(),
+                    r#"{"kind":"run_event","later":true}"#
+                ],
+            )
+            .unwrap();
+        let fake = fake_host();
+        fake.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        let host = Counting::new(fake);
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the lease", || host2.inner.made.lock().unwrap().len() == 1)
+        })
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            clock.advance(LEASE_TICK);
+            a_while().await;
+        }
+        let while_unread = host.ticks(project(1));
+        let host2 = host.clone();
+        let passed = tokio::task::spawn_blocking(move || came(|| host2.passes(LOGIN) >= 1))
+            .await
+            .unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "DELETE FROM factory_records WHERE owner = ?1",
+                [other.to_string()],
+            )
+            .unwrap();
+        clock.advance(LEASE_TICK);
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("a tick once the row is gone", || {
+                host2.ticks(project(1)) == 1
+            })
+        })
+        .await
+        .unwrap();
+        running.abort();
+        assert_eq!(while_unread, 0, "no tick while a generation is unread");
+        assert!(passed, "the pass does not wait for a first tick for ever");
+        assert_eq!(host.given(project(1)), vec![7]);
     }
 
     /// A lease that ticks as held by another machine, or as holding no token, while its guard

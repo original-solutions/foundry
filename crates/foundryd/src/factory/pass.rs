@@ -4513,6 +4513,67 @@ mod tests {
         }
     }
 
+    mod a_ready_issue_whose_own_run_holds_the_last_slot {
+        use super::*;
+
+        /// The fleet's one run slot is held by run 5/1 of issue 5, which is ready again.
+        fn rig_with(state: State, session: bool) -> (Rig, RunId) {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            let run = rig.run_in(5, 1, state);
+            if session {
+                rig.ledger
+                    .write(
+                        &run,
+                        &Event::SessionLaunched {
+                            thread_id: SessionId(uuid::Uuid::from_u128(0x56)).to_string(),
+                            worktree: None,
+                            branch: Some("fac/5-1".into()),
+                            model_instance: None,
+                            model: None,
+                            model_options: None,
+                            resumed_from: None,
+                            base: Some("main".into()),
+                            title: Some("Issue 5".into()),
+                        },
+                        &Cause::new(CauseStep::Start, "test"),
+                    )
+                    .unwrap();
+            }
+            rig.hub.ready(5);
+            (rig, run)
+        }
+
+        /// A run in triage with no session ends with the claim, which takes its slot.
+        #[test]
+        fn is_claimed_in_the_slot_of_its_triage_run_that_has_no_session() {
+            let (mut rig, _) = rig_with(State::Triage, false);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(rig.claimed_issues(), vec![5], "{report:?}");
+            assert_eq!(rig.book.runs_free(1), 0, "the claim holds the one slot");
+        }
+
+        /// A run with a session, or one past triage (here a building run with no session
+        /// recorded, which the pass notes and leaves), keeps its slot: the issue waits.
+        #[test]
+        fn waits_while_its_run_has_a_session_or_is_building() {
+            for (state, session) in [(State::Triage, true), (State::Building, false)] {
+                let (mut rig, _) = rig_with(state, session);
+                let report = rig.pass();
+                assert!(
+                    rig.claimed_issues().is_empty(),
+                    "{state:?} {session}: {report:?}"
+                );
+                assert_eq!(
+                    waiting_reason(&report, 5).as_deref(),
+                    Some(NO_SLOT),
+                    "{state:?} {session}: {report:?}"
+                );
+            }
+        }
+    }
+
     mod a_pass_that_panics {
         use super::*;
 
