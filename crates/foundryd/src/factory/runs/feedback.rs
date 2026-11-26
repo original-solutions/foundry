@@ -288,7 +288,7 @@ use super::progress::{
 use super::resume::{BRANCH_REFUSED, UNREACHABLE_FOR};
 use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
 use super::stop::Live;
-use super::stop::{live_workspaces, step_text, text_stop as shared_text_stop};
+use super::stop::{live_workspaces, numbered, step_text, text_stop as shared_text_stop};
 use super::{
     ActionPayload, Closing, ForwardPayload, Progress, RunContext, RunError, Stop, StuckStop,
     abandon, apply_actions, closed_issue, end_own_merge, end_run, go_stuck, moved_on_by_closing,
@@ -822,14 +822,6 @@ fn second_before(ms: u64) -> String {
     format!("{}Z", &text[..19])
 }
 
-/// What follows `prefix` and the count `n` in `step`, or `None` for a step of another kind or
-/// another round.
-fn numbered<'a>(step: &'a str, prefix: &str, n: u32) -> Option<&'a str> {
-    let rest = step.strip_prefix(prefix)?;
-    let (count, tail) = rest.split_once(' ').unwrap_or((rest, ""));
-    (count == n.to_string()).then_some(tail)
-}
-
 fn parse_machine(text: &str) -> Option<MachineId> {
     uuid::Uuid::parse_str(text).ok().map(MachineId)
 }
@@ -915,18 +907,7 @@ impl ReadLog {
 /// session, through the move to `building` and the second decision line, and so also in the
 /// moment a pass cut between them leaves.
 pub fn round_pending(events: &[RunEvent]) -> bool {
-    if events.iter().any(|event| event.event == names::FINISHED) {
-        return false;
-    }
-    let Some(at) = events
-        .iter()
-        .rposition(|event| event.event == "feedback_relaunching")
-    else {
-        return false;
-    };
-    !events[at + 1..]
-        .iter()
-        .any(|event| event.event == names::SESSION_LAUNCHED)
+    launches_since_the_round(events) == Some(0)
 }
 
 /// Whether the newest round owns the run: it is decided, the run is not finished, and either
@@ -935,20 +916,24 @@ pub fn round_pending(events: &[RunEvent]) -> bool {
 /// holds the build's launch words must never be sent again: `start::advance`'s resend would
 /// type them into the round's session, which has its own resend.
 pub fn round_owns(events: &[RunEvent]) -> bool {
+    launches_since_the_round(events).is_some_and(|launches| launches <= 1)
+}
+
+/// The number of `session_launched` lines after the newest `feedback_relaunching`, or `None`
+/// when the run is finished or has no round.
+fn launches_since_the_round(events: &[RunEvent]) -> Option<usize> {
     if events.iter().any(|event| event.event == names::FINISHED) {
-        return false;
+        return None;
     }
-    let Some(at) = events
+    let at = events
         .iter()
-        .rposition(|event| event.event == "feedback_relaunching")
-    else {
-        return false;
-    };
-    events[at + 1..]
-        .iter()
-        .filter(|event| event.event == names::SESSION_LAUNCHED)
-        .count()
-        <= 1
+        .rposition(|event| event.event == "feedback_relaunching")?;
+    Some(
+        events[at + 1..]
+            .iter()
+            .filter(|event| event.event == names::SESSION_LAUNCHED)
+            .count(),
+    )
 }
 
 /// What the ledger records of the newest round.

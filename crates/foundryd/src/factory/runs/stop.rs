@@ -408,7 +408,9 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StopStep, RunError> 
 /// being archived; a start may have gone out once `resume-sending <k>` or
 /// `resume-ending-sessions <k>` is recorded, and then the session may exist without a
 /// `session_launched` line. `None` when no resume has a workspace yet: `seen` stands. The step
-/// names are `resume.rs`'s constants.
+/// names are `resume.rs`'s constants. It reads resume.rs's own steps (`RESUME_MACHINE`,
+/// `RESUME_MACHINE_GIVEN_UP`, `RESUME_WORKSPACE`, `RESUME_SENDING`, `RESUME_ENDING_SESSIONS`)
+/// and must follow `resume::read_round` if those rules change.
 fn resuming_seen(events: &[RunEvent], seen: &Seen) -> Option<Seen> {
     let interruption = seen
         .interruption
@@ -419,22 +421,17 @@ fn resuming_seen(events: &[RunEvent], seen: &Seen) -> Option<Seen> {
         event.event == "session_interrupted"
             && event.data.get("relaunch") != Some(&Value::Bool(true))
     })?;
-    let numbered = |step: &str, prefix: &str| -> Option<String> {
-        let tail = step.strip_prefix(prefix)?;
-        let (count, rest) = tail.split_once(' ').unwrap_or((tail, ""));
-        (count == k.to_string()).then(|| rest.to_owned())
-    };
     let (mut workspace, mut sending) = (None, false);
     for step in events[at + 1..].iter().filter_map(step_text) {
-        if numbered(step, RESUME_MACHINE_GIVEN_UP).is_some()
-            || numbered(step, RESUME_MACHINE).is_some()
+        if numbered(step, RESUME_MACHINE_GIVEN_UP, k).is_some()
+            || numbered(step, RESUME_MACHINE, k).is_some()
         {
             workspace = None;
             sending = false;
-        } else if let Some(rest) = numbered(step, RESUME_WORKSPACE) {
-            workspace = uuid::Uuid::parse_str(&rest).ok().map(WorkspaceId);
-        } else if numbered(step, RESUME_SENDING).is_some()
-            || numbered(step, RESUME_ENDING_SESSIONS).is_some()
+        } else if let Some(rest) = numbered(step, RESUME_WORKSPACE, k) {
+            workspace = uuid::Uuid::parse_str(rest).ok().map(WorkspaceId);
+        } else if numbered(step, RESUME_SENDING, k).is_some()
+            || numbered(step, RESUME_ENDING_SESSIONS, k).is_some()
         {
             sending = true;
         }
@@ -556,8 +553,16 @@ pub(super) fn step_text(event: &RunEvent) -> Option<&str> {
     event.data.get("step").and_then(Value::as_str)
 }
 
+/// What follows `prefix` and the count `n` in `step`, or `None` for a step of another kind or
+/// another count.
+pub(super) fn numbered<'a>(step: &'a str, prefix: &str, n: u32) -> Option<&'a str> {
+    let rest = step.strip_prefix(prefix)?;
+    let (count, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+    (count == n.to_string()).then_some(tail)
+}
+
 /// The highest number `field` holds in the `event` lines of `events`, 0 for none.
-pub(super) fn highest(events: &[RunEvent], event: &str, field: &str) -> u32 {
+fn highest(events: &[RunEvent], event: &str, field: &str) -> u32 {
     events
         .iter()
         .filter(|line| line.event == event)
@@ -631,9 +636,9 @@ pub enum ReconcileStep {
 }
 
 /// The codes of the stuck paths this step decides, the runner's `watch` and its own.
-pub(super) const TEXT_CODE: &str = "text-changed-during-build";
-pub(super) const UNVERIFIED_CODE: &str = "edits-unverifiable";
-pub(super) const UNCONFIRMED_CODE: &str = "approval-unconfirmed";
+const TEXT_CODE: &str = "text-changed-during-build";
+const UNVERIFIED_CODE: &str = "edits-unverifiable";
+const UNCONFIRMED_CODE: &str = "approval-unconfirmed";
 const LABEL_CODE: &str = "label-removed";
 const ASSIGNEE_CODE: &str = "assignee-changed";
 /// The codes `feedback` also begins, for the same text checks, while it sets a round up.
@@ -667,19 +672,20 @@ pub fn reconcile(ctx: &RunContext<'_>, run: &RunId) -> Result<ReconcileStep, Run
     }
     if begun(&seen) {
         // A stuck path begun is its owner's to finish: this step's own is finished here.
-        let own = seen
+        let code = seen
             .stuck_stop
             .as_deref()
             .and_then(|raw| serde_json::from_str::<StuckStop>(raw).ok())
-            .is_some_and(|decision| OWN_CODES.contains(&decision.code.as_str()));
+            .map(|decision| decision.code);
+        let own = code
+            .as_deref()
+            .is_some_and(|code| OWN_CODES.contains(&code));
         // While a feedback round is decided and not launched, the stuck path of the codes
         // `feedback` shares is its own: it finishes it from the round's workspace.
-        let shared = seen
-            .stuck_stop
+        let shared = code
             .as_deref()
-            .and_then(|raw| serde_json::from_str::<StuckStop>(raw).ok())
-            .is_some_and(|decision| SHARED_CODES.contains(&decision.code.as_str()));
-        if own && shared && feedback::round_pending(&events) {
+            .is_some_and(|code| SHARED_CODES.contains(&code));
+        if shared && feedback::round_pending(&events) {
             return Ok(ReconcileStep::Skipped { why: "relaunching" });
         }
         if own && matches!(seen.state, Some(State::Building | State::Stuck)) {
