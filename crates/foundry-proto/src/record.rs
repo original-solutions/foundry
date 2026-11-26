@@ -84,6 +84,14 @@ pub struct MachineSample {
     /// version installed is not above it. `None` in a sample from a peer that does not write it.
     #[serde(default)]
     pub update_refused: Option<String>,
+    /// The version the daemon that wrote this sample was built as, like `0.9.0`. `None` in a
+    /// sample from a peer that does not write it.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// The tag ready on this machine, like `v0.9.1`. `None` in a sample from a peer that does
+    /// not write it.
+    #[serde(default)]
+    pub update_ready: Option<String>,
 }
 
 /// Any kind of record, tagged by `kind`, so one message can carry several kinds.
@@ -188,6 +196,8 @@ pub(crate) mod tests {
                 free_disk: 512 * 1024 * 1024 * 1024,
                 sessions: 4,
                 update_refused: Some("v0.2.0".into()),
+                version: None,
+                update_ready: None,
             },
         }
     }
@@ -228,6 +238,34 @@ pub(crate) mod tests {
         );
         let json = serde_json::to_value(machine_sample()).unwrap();
         assert_eq!(json["body"]["update_refused"], "v0.2.0");
+    }
+
+    #[test]
+    fn a_sample_with_no_version_and_no_ready_tag_reads_with_neither() {
+        let json = serde_json::json!({
+            "load_per_core": 0.5,
+            "free_memory": 1,
+            "free_disk": 2,
+            "sessions": 3,
+        });
+        let sample: MachineSample = serde_json::from_value(json).unwrap();
+        assert_eq!(sample.version, None);
+        assert_eq!(sample.update_ready, None);
+    }
+
+    #[test]
+    fn a_sample_with_a_version_and_a_ready_tag_round_trips_under_their_names() {
+        let mut record = machine_sample();
+        record.body.version = Some("0.9.0".into());
+        record.body.update_ready = Some("v0.9.1".into());
+        assert_round_trip(&record);
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["body"]["version"], "0.9.0");
+        assert_eq!(json["body"]["update_ready"], "v0.9.1");
+        assert_eq!(json["version"], u64::MAX);
+        let back: Record<MachineSample> = serde_json::from_value(json).unwrap();
+        assert_eq!(back.body.version.as_deref(), Some("0.9.0"));
+        assert_eq!(back.body.update_ready.as_deref(), Some("v0.9.1"));
     }
 
     #[test]
@@ -354,6 +392,8 @@ pub(crate) mod tests {
                         free_disk: 2,
                         sessions: 3,
                         update_refused: None,
+                        version: None,
+                        update_ready: None,
                     },
                 }),
             ),

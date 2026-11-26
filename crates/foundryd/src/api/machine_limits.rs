@@ -361,6 +361,8 @@ mod tests {
                     free_disk,
                     sessions,
                     update_refused: None,
+                    version: None,
+                    update_ready: None,
                 },
             });
             assert_eq!(
