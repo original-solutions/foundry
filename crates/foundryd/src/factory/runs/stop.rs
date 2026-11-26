@@ -1562,6 +1562,34 @@ mod tests {
             assert!(rig.finished(&run));
         }
 
+        /// A start sent (and its sessions being ended again) on one machine is that machine's:
+        /// once the claim moves on and the next machine's workspace is shown with no start yet,
+        /// a stop ends nothing.
+        #[test]
+        fn a_stop_after_a_new_machines_resume_workspace_and_before_its_start_ends_nothing() {
+            for moved in ["resume-machine", "resume-machine-given-up"] {
+                for ended in [false, true] {
+                    let mut steps = vec![
+                        "resume-requested 1 fac/8-1-r1".to_owned(),
+                        format!("resume-workspace 1 {RESUME_WS}"),
+                        "resume-sending 1".to_owned(),
+                    ];
+                    if ended {
+                        steps.push("resume-ending-sessions 1".into());
+                    }
+                    steps.extend([
+                        format!("{moved} 1 {RESUME_WS}"),
+                        "resume-requested 1 fac/8-1-r1".into(),
+                        format!("resume-workspace 1 {RESUME_WS}"),
+                    ]);
+                    let (rig, run) = resume_being_set_up(&steps);
+                    assert!(matches!(pass(&rig, &run), StopStep::Stuck { .. }));
+                    assert!(calls(&rig).is_empty(), "{moved} {ended}: {:?}", calls(&rig));
+                    assert!(rig.finished(&run));
+                }
+            }
+        }
+
         #[test]
         fn a_machine_given_up_after_a_resume_workspace_is_not_the_stops_target() {
             let (rig, run) = resume_being_set_up(&[

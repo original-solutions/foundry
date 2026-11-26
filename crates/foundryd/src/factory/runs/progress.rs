@@ -4175,7 +4175,7 @@ mod tests {
             let events = read_lines(&[line(
                 0,
                 names::FEEDBACK_RELAUNCHING,
-                json!({ "n": u64::from(u32::MAX) + 1 }),
+                json!({ "n": u64::from(u32::MAX) + 5 }),
             )]);
             assert_eq!(highest(&events, names::FEEDBACK_RELAUNCHING, "n"), 0);
         }

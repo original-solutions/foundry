@@ -927,5 +927,9 @@ mod tests {
             ended_in_pass: 0,
         };
         assert_eq!(interrupted.name(), names::SESSION_INTERRUPTED);
+        // The names as the ledgers already written hold them: `Event::name` returns the
+        // constants, so only these catch a rename of one.
+        assert_eq!(names::FEEDBACK_RELAUNCHING, "feedback_relaunching");
+        assert_eq!(names::SESSION_INTERRUPTED, "session_interrupted");
     }
 }
