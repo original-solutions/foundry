@@ -50,6 +50,17 @@ describe("apply and the factory", () => {
     expect(state.settings.seq).toBe(9);
   });
 
+  it("keeps the very same statuses object through a record and a settings message", () => {
+    const first = apply(emptyState, said(status("p1", 1)));
+    const before = first.factory;
+    const appended = apply(first, one(workspace(ME, "w1", "a", { version: 1 })));
+    const replaced = apply(appended, one(workspace(ME, "w1", "b", { version: 2 })));
+    const moved = apply(replaced, { type: "settings", protocol: 1, settings: settings({ seq: 9 }) });
+    expect(appended.factory).toBe(before);
+    expect(replaced.factory).toBe(before);
+    expect(moved.factory).toBe(before);
+  });
+
   it("returns the very same state for a message type it does not know", () => {
     const state = apply(apply(emptyState, full([workspace(ME, "w1", "a")])), said(status("p1", 1)));
     const next = apply(state, { type: "something_new", protocol: 6 } as unknown as UiMessage);

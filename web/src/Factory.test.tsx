@@ -129,7 +129,7 @@ describe("Factory", () => {
     expect(held.textContent).toContain("the gate failed 3 times");
     expect(held.textContent).toContain("any uncommitted work there is lost then");
 
-    expect(p.queryByRole("list", { name: "Claimed by another factory" })).toBeNull();
+    expect(p.queryByText(/Taken elsewhere/)).toBeNull();
 
     const done = within(p.getByRole("list", { name: "Finished" })).getAllByRole("listitem");
     expect(done).toHaveLength(20);
@@ -236,6 +236,22 @@ describe("Factory", () => {
       expect(reads(calls)).toBe(1);
       act(() => set({ seq: 2 }));
       await waitFor(() => expect(reads(calls)).toBe(2));
+    });
+
+    it("does not read it again for the same statuses and seq, whatever else is new", async () => {
+      const same = { p1: believed() };
+      const calls = mockFetch(json(200, overview({ status: believed() })), json(200, overview()));
+      function Quiet() {
+        const [n, setN] = useState(0);
+        bump = () => setN((x) => x + 1);
+        return <Factory statuses={same} settings={{ ...shared, seq: 1 }} machines={[...machines, ...(n ? [] : [])]} />;
+      }
+      let bump = () => {};
+      await renderApp(<Quiet />);
+      await screen.findByRole("region", { name: "foundry" });
+      act(() => bump());
+      await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+      expect(reads(calls)).toBe(1);
     });
 
     it("reads it again for any new status from the socket", async () => {

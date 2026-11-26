@@ -95,6 +95,8 @@ describe("FleetSettings", () => {
     save();
     type("Model", "haiku");
     await act(async () => answer(json(200, { settings: { ...current, model: "sonnet" } })));
+    // Let the save's success handler run before looking.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
     expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("haiku");
   });
 
@@ -200,6 +202,66 @@ describe("ProjectFactoryControls", () => {
     fireEvent.click(screen.getByLabelText("Pause claims for demo"));
     await waitFor(() => expect(calls).toHaveLength(2));
     expect(calls[1].body).toEqual({ on: false, paused: true, login: "bot" });
+  });
+
+  it("keeps login typed while Save login is on its way, and clears what the save sent", async () => {
+    let answer: (r: Response) => void = () => {};
+    const later = new Promise<Response>((resolve) => (answer = resolve));
+    mockFetch(later as unknown as Response);
+    await renderApp(<ProjectFactoryControls project={project} factory={{ on: true, login: "bot", paused: false }} />);
+    const box = () => screen.getByLabelText("GitHub login for demo") as HTMLInputElement;
+    fireEvent.change(box(), { target: { value: "bot2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save login" }));
+    fireEvent.change(box(), { target: { value: "bot3" } });
+    await act(async () => answer(json(200, { factory: { on: true, login: "bot2", paused: false } })));
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(box().value).toBe("bot3");
+    expect(screen.getByRole("button", { name: "Save login" })).toBeDefined();
+  });
+
+  it("clears what Save login sent, so the login the settings then hold shows", async () => {
+    let set: (f: { on: boolean; login: string; paused: boolean }) => void = () => {};
+    function Harness() {
+      const [f, setF] = useState({ on: true, login: "bot", paused: false });
+      set = setF;
+      return <ProjectFactoryControls project={project} factory={f} />;
+    }
+    mockFetch(json(200, { factory: { on: true, login: "bot2", paused: false } }));
+    await renderApp(<Harness />);
+    const box = () => screen.getByLabelText("GitHub login for demo") as HTMLInputElement;
+    fireEvent.change(box(), { target: { value: "bot2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save login" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Save login" })).toBeNull());
+    act(() => set({ on: true, login: "bot3", paused: false }));
+    expect(box().value).toBe("bot3");
+    expect(screen.queryByRole("button", { name: "Save login" })).toBeNull();
+  });
+
+  it("keeps a chain of changes through settings that catch up one at a time", async () => {
+    let set: (f: { on: boolean; login: string; paused: boolean }) => void = () => {};
+    function Harness() {
+      const [f, setF] = useState({ on: false, login: "", paused: false });
+      set = setF;
+      return <ProjectFactoryControls project={project} factory={f} />;
+    }
+    const a1 = { on: true, login: "bot", paused: false };
+    const a2 = { on: true, login: "bot", paused: true };
+    mockFetch(json(200, { factory: a1 }), json(200, { factory: a2 }));
+    await renderApp(<Harness />);
+    const toggle = () => screen.getByRole("switch", { name: "Factory for demo" });
+    const pause = () => screen.getByLabelText("Pause claims for demo") as HTMLInputElement;
+    fireEvent.click(toggle());
+    await waitFor(() => expect(toggle().getAttribute("aria-checked")).toBe("true"));
+    await waitFor(() => expect(pause().disabled).toBe(false));
+    fireEvent.click(pause());
+    await waitFor(() => expect(pause().checked).toBe(true));
+    act(() => set(a1));
+    expect(pause().checked).toBe(true);
+    act(() => set(a2));
+    expect(pause().checked).toBe(true);
+    act(() => set({ on: false, login: "x", paused: false }));
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+    expect(pause().checked).toBe(false);
   });
 
   it("shows a refusal beside the row", async () => {
