@@ -119,35 +119,38 @@ export function FleetSettings({ settings }: { settings: FactorySettings }) {
 /**
  * One project's factory setting beside its row: a switch, the GitHub login it acts as (blank takes
  * the coordinator's default when turned on) with a Save login button once the typed login
- * differs, and a pause for its claims. Each change sends the whole setting, built from the value
- * last sent until the settings arrive back over the events socket; the switch and the pause send
- * the saved login, and only Save login sends what is typed. A refusal says why beside the row.
+ * differs, and a pause for its claims. Each change sends the whole setting, built from the
+ * daemon's answer to the last change until the settings catch up over the events socket; the
+ * switch and the pause send the saved login, and only Save login sends what is typed. A refusal
+ * says why beside the row.
  */
 export function ProjectFactoryControls({ project, factory }: { project: Project; factory: ProjectFactory }) {
   const client = useQueryClient();
   const [typed, setTyped] = useState<string>();
   /**
-   * What the daemon answered to the last accepted change, with the setting the props held when it
-   * was sent: dropped once the props hold another setting. Settings that have not caught up yet
-   * come as a new object holding the same setting, so they are compared by content.
+   * The daemon's answer to the last accepted change, with the setting the props held when the
+   * first change of the chain was sent (`base`) and the answers before it (`seen`), as JSON. Settings
+   * that have not caught up come as a new object holding the same setting, so the props are
+   * compared by content. It is dropped once the props hold the answer, or a setting that is
+   * neither the base nor an earlier answer.
    */
-  const [sent, setSent] = useState<{ value: ProjectFactory; base: string }>();
+  const [answered, setAnswered] = useState<{ value: ProjectFactory; base: string; seen: string[] }>();
   const now = JSON.stringify(factory);
-  if (sent && sent.base !== now) setSent(undefined);
-  const held = sent?.value ?? factory;
+  if (answered && (now === JSON.stringify(answered.value) || (now !== answered.base && !answered.seen.includes(now)))) setAnswered(undefined);
+  const held = answered?.value ?? factory;
   const shown = typed ?? held.login;
   const send = useMutation({
-    mutationFn: ({ next }: { next: { on: boolean; paused: boolean; login: string | null }; base: string; login: boolean }) => setProjectFactory(project.id, next),
-    onSuccess: (answer, { base, login }) => {
-      // Typing is cleared when it was what was saved, or the daemon now holds it; unsent typing stays.
-      setTyped((t) => (login || t?.trim() === answer.login ? undefined : t));
-      setSent({ value: answer, base });
+    mutationFn: ({ next }: { next: { on: boolean; paused: boolean; login: string | null }; base: string; savingLogin: boolean; sentTyped?: string }) => setProjectFactory(project.id, next),
+    onSuccess: (answer, { base, savingLogin, sentTyped }) => {
+      // Typing is cleared when it is what was sent or the daemon now holds it; typing since stays.
+      setTyped((t) => (t === undefined || (savingLogin && t === sentTyped) || t.trim() === answer.login ? undefined : t));
+      setAnswered((prev) => (prev ? { value: answer, base: prev.base, seen: [...prev.seen, JSON.stringify(prev.value)] } : { value: answer, base, seen: [] }));
       return client.invalidateQueries({ queryKey: factoryKey });
     },
   });
-  const change = (edit: Partial<ProjectFactory>, login = false) => {
+  const change = (edit: Partial<ProjectFactory>, savingLogin = false) => {
     const next = { on: held.on, paused: held.paused, login: held.login, ...edit };
-    send.mutate({ next: { on: next.on, paused: next.paused, login: next.login.trim() === "" ? null : next.login.trim() }, base: now, login });
+    send.mutate({ next: { on: next.on, paused: next.paused, login: next.login.trim() === "" ? null : next.login.trim() }, base: now, savingLogin, sentTyped: typed });
   };
 
   return (
