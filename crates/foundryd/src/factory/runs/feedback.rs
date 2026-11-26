@@ -90,7 +90,9 @@
 //!    unreachable for 15 minutes before that is given up (`feedback-machine-given-up`) and
 //!    placement picks another. A round that is under way and whose issue was closed (or whose
 //!    own merge closed it) ends the run and ends the sessions of its workspace; one whose pull
-//!    request was merged is `Ended`.
+//!    request was merged or closed, its issue left open, is `Ended` the same way: its pull
+//!    request is read on each pass the round is set up, since `stop::reconcile` leaves the run
+//!    to this step until the round's session is recorded.
 //! 7. **The first message again.** A session idle with no prompt a pass later has the first
 //!    message asked for again by count (`feedback-resending <n> 0`), which the worker types only
 //!    when its count has not risen, as `start`'s and `resume`'s resends are.
@@ -1677,6 +1679,14 @@ fn carry_on(
                 end_own_merge(ctx, run, &stopping, CauseStep::Forward, &pull)?;
                 return Ok(FeedbackStep::Ended);
             }
+        }
+        // A pull request merged or closed with its issue left open ends the run too: no
+        // workspace or session is made for a pull request that is gone. `stop::reconcile`
+        // leaves a run whose round is under way to this step.
+        let pull = ctx.tracker.pull_request(ctx.repo(), last.pr)?;
+        if pull.as_ref().is_none_or(|pull| !pull.open) {
+            end_run(ctx, &at, &last.url, pull.as_ref(), CauseStep::Forward)?;
+            return Ok(FeedbackStep::Ended);
         }
         title = Some(detail.title);
     }
@@ -4932,6 +4942,58 @@ mod tests {
             );
         }
 
+        /// A pull request merged or closed while the round is set up, its issue left open, ends
+        /// the run before any workspace or session; once the workspace is made, its sessions
+        /// are ended.
+        #[test]
+        fn a_pull_request_merged_or_closed_while_the_round_is_set_up_ends_the_run() {
+            for (state, end) in [("MERGED", "merged"), ("CLOSED", "closed")] {
+                let world = World::reviewed();
+                assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+                world.rig.sim.set_pull(
+                    12,
+                    SimPull {
+                        state,
+                        draft: false,
+                        head: BRANCH.into(),
+                        base: "main".into(),
+                        cross: false,
+                    },
+                );
+                assert_eq!(world.go(), FeedbackStep::Ended, "{state}");
+                assert!(world.rig.worker.calls().is_empty(), "{state}");
+                let last = world.events().pop().unwrap();
+                assert_eq!(last.event, "finished", "{state}");
+                assert_eq!(last.data["pr_end"], end, "{state}");
+
+                let mut made = World::reviewed();
+                made.rig.worker.on_create(Ok(fresh()));
+                assert!(matches!(made.go(), FeedbackStep::Decided { .. }));
+                assert_eq!(made.go(), FeedbackStep::Preparing(Wait::Workspace));
+                made.rig.view = round_view();
+                made.rig.sim.set_pull(
+                    12,
+                    SimPull {
+                        state,
+                        draft: false,
+                        head: BRANCH.into(),
+                        base: "main".into(),
+                        cross: false,
+                    },
+                );
+                assert_eq!(made.go(), FeedbackStep::Ended, "{state}");
+                assert!(made.starts().is_empty(), "{state}");
+                assert!(
+                    made.rig
+                        .worker
+                        .calls()
+                        .contains(&Call::EndSessions { workspace: fresh() }),
+                    "{state}"
+                );
+                assert!(made.rig.finished(&made.run), "{state}");
+            }
+        }
+
         #[test]
         fn a_merge_that_closed_the_issue_ends_a_round_under_way() {
             let world = World::reviewed();
@@ -6129,6 +6191,41 @@ mod tests {
             instructor_activity(&world);
             assert!(forward_in(&world).held_back);
             assert!(world.sends().is_empty());
+        }
+
+        /// A session idle on a turn that was read, with a question waiting for a person, takes
+        /// no message: the comment would be typed over the question.
+        #[test]
+        fn a_session_with_a_question_waiting_is_waited_for_and_nothing_is_written() {
+            let mut world = forwarding();
+            world.rig.view = fleet()
+                .workspace(workspace_record(old(), "fac/8-1", None))
+                .session(Record {
+                    owner: m1(),
+                    version: 1,
+                    deleted: false,
+                    body: foundry_proto::record::Session {
+                        id: the_session(),
+                        workspace: old(),
+                        terminal: TerminalId(uuid::Uuid::from_u128(0x5e6)),
+                        model: "opus".into(),
+                        state: SessionState::Idle,
+                    },
+                })
+                .turn(foundry_proto::factory::SessionTurn {
+                    session: the_session(),
+                    workspace: old(),
+                    project: project_id(),
+                    turn: 1,
+                    prompts: 1,
+                    question: true,
+                })
+                .build();
+            instructor_activity(&world);
+            let count = world.count();
+            assert!(forward_in(&world).held_back);
+            assert!(world.sends().is_empty());
+            assert_eq!(world.count(), count);
         }
 
         /// A session started and idle whose turn record shows no prompt has not taken its

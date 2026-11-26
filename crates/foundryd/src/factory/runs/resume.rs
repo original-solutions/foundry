@@ -1278,8 +1278,9 @@ fn choose_branch(ctx: &RunContext<'_>, issue: u64, seen: &Seen) -> Result<Branch
 }
 
 /// How many resumes count against `limits.interruption_resumes`: the `session_interrupted`
-/// lines after the newest `feedback_relaunching`, since a feedback round starts the cap again.
-/// The `-r<k>` names keep the run's whole count, so no name is reused.
+/// lines after the newest `feedback_relaunching`, since a feedback round starts the cap again,
+/// less a relaunch's (`relaunch: true`), which is no resume. The `-r<k>` names keep the run's
+/// whole count, so no name is reused.
 fn resumes_this_round(events: &[RunEvent]) -> u64 {
     let round = events
         .iter()
@@ -1287,7 +1288,10 @@ fn resumes_this_round(events: &[RunEvent]) -> u64 {
         .map_or(0, |at| at + 1);
     events[round..]
         .iter()
-        .filter(|event| event.event == super::feedback::SESSION_INTERRUPTED)
+        .filter(|event| {
+            event.event == super::feedback::SESSION_INTERRUPTED
+                && event.data.get("relaunch") != Some(&Value::Bool(true))
+        })
         .count() as u64
 }
 
@@ -2697,6 +2701,24 @@ mod tests {
             fail_the_session(&mut rig, thread, round_workspace(1));
             assert!(matches!(pass(&rig, &run), ResumeStep::Stuck { .. }));
             assert!(interruptions(&rig, &run).is_empty());
+        }
+
+        /// A relaunch's interruption line (`relaunch: true`) is no resume, as `read_round` and
+        /// the newest `resumes` read it: it does not count against the cap.
+        #[test]
+        fn a_relaunch_interruption_does_not_count_against_the_cap() {
+            let (rig, run) = failed_with_turns_unasked();
+            let line = |resumes, relaunch| Event::SessionInterrupted {
+                resumes,
+                relaunch,
+                run_ordinal: None,
+                branch: None,
+                t3_error: None,
+                ended_in_pass: 0,
+            };
+            rig.write(&run, line(0, true));
+            rig.write(&run, line(1, false));
+            assert_eq!(resumes_this_round(&rig.events(&run)), 1);
         }
     }
 
