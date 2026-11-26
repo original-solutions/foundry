@@ -4735,12 +4735,15 @@ mod tests {
                 finished_run(&rig, issue, 10);
             }
             rig.pass();
-            finished_run(&rig, 5, 0);
+            let new = finished_run(&rig, 5, 0);
+            let its_events = rig.store.lock().unwrap().run_events(&new).unwrap().len();
             let read = Store::run_rows_read;
             let before = read();
             rig.pass();
-            // The runs' ids and the new run's events, fewer than the seen runs' sixty events.
-            assert!(read() - before < 4 * 15, "{} rows", read() - before);
+            // The runs' ids, a handful of times, and the new run's events, a few times. Reading
+            // even one seen run's fifteen events again goes over.
+            let most = 5 * 4 + 3 * its_events;
+            assert!(read() - before <= most, "{} rows", read() - before);
             assert_eq!(rig.status().finished.len(), 5);
         }
 
