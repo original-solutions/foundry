@@ -3797,7 +3797,7 @@ mod tests {
         }
     }
 
-    mod review_cycle_4_coverage {
+    mod stuck_runs_failed_starts_review_rounds_and_the_fleets_slots {
         use super::*;
 
         /// A step line written to `run`'s ledger.
@@ -5113,6 +5113,76 @@ mod tests {
                 report.runs.contains(&(run, UNREADABLE_SWEPT.into())),
                 "the run is noted: {report:?}"
             );
+        }
+    }
+
+    mod the_finished_runs_across_a_change_of_lease_holder {
+        use super::*;
+        use crate::factory::ledger::events::Outcome;
+
+        #[test]
+        fn a_run_finished_at_a_higher_generation_comes_first_whatever_its_version() {
+            let mut rig = Rig::new();
+            let finished = Event::Finished {
+                outcome: Outcome::PrOpen,
+                total_ms: 0,
+                gate_attempts: 0,
+                review_cycles: None,
+                pr_url: None,
+                pr_end: None,
+            };
+            let cause = Cause::new(CauseStep::Start, "test");
+            // This machine finishes run 3 late in its own versions, at generation 1.
+            let first = rig.run_in(3, 1, State::Building);
+            for n in 0..20 {
+                rig.ledger
+                    .write(
+                        &first,
+                        &Event::StepChanged {
+                            step: format!("padding {n}"),
+                        },
+                        &cause,
+                    )
+                    .unwrap();
+            }
+            rig.ledger.write(&first, &finished, &cause).unwrap();
+            // The lease passes to another machine, whose versions start low and whose
+            // generation is higher: it finishes run 4 last.
+            let second = rig.run_in(4, 1, State::Building);
+            let taker_id = MachineId(uuid::Uuid::from_u128(0x3));
+            let (_taker_dir, taker_store) = open_store();
+            let taker = Ledger::new(
+                taker_store.clone(),
+                taker_id,
+                2,
+                crate::factory::ledger::testing::shown(),
+            );
+            taker.write(&second, &finished, &cause).unwrap();
+            // Its record reaches this machine as a synced one does.
+            let synced = taker_store
+                .lock()
+                .unwrap()
+                .factory_since(taker_id, 0, 10)
+                .unwrap();
+            assert_eq!(synced.len(), 1);
+            assert!(
+                synced[0].version < 5,
+                "a low version: {}",
+                synced[0].version
+            );
+            rig.store
+                .lock()
+                .unwrap()
+                .apply_factory(&synced[0], taker_id)
+                .unwrap();
+            rig.pass();
+            let runs: Vec<RunId> = rig
+                .status()
+                .finished
+                .iter()
+                .map(|finished| finished.run.clone())
+                .collect();
+            assert_eq!(runs, vec![second, first]);
         }
     }
 }
