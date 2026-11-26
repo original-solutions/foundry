@@ -1251,7 +1251,7 @@ mod factory_events {
     use super::*;
     use crate::factory::ledger::Ledger;
     use crate::factory::ledger::events::{Cause, CauseStep, Event};
-    use crate::secrets::{MemorySecrets, Secrets};
+    use crate::secrets::Secrets;
     use crate::sessions::{self, Gateway};
     use crate::sync::{Conn, Dialer};
 
@@ -1273,53 +1273,7 @@ mod factory_events {
         }
     }
 
-    /// A secret store in memory that can be made unreadable.
-    #[derive(Default)]
-    struct Switch {
-        held: MemorySecrets,
-        unreadable: std::sync::atomic::AtomicBool,
-    }
-
-    impl Switch {
-        fn check(&self) -> Result<(), crate::secrets::SecretsError> {
-            if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
-                Err(crate::secrets::SecretsError::CannotList)
-            } else {
-                Ok(())
-            }
-        }
-
-        fn readable(&self, readable: bool) {
-            self.unreadable
-                .store(!readable, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    impl Secrets for Switch {
-        fn get(&self, name: &str) -> Result<Option<String>, crate::secrets::SecretsError> {
-            self.check()?;
-            self.held.get(name)
-        }
-        fn set(&self, name: &str, value: &str) -> Result<(), crate::secrets::SecretsError> {
-            self.held.set(name, value)
-        }
-        fn update(
-            &self,
-            name: &str,
-            edit: crate::secrets::Edit<'_>,
-        ) -> Result<(), crate::secrets::SecretsError> {
-            self.check()?;
-            self.held.update(name, edit)
-        }
-        fn names(&self) -> Result<Vec<String>, crate::secrets::SecretsError> {
-            self.check()?;
-            self.held.names()
-        }
-        fn entries(&self) -> Result<BTreeMap<String, String>, crate::secrets::SecretsError> {
-            self.check()?;
-            self.held.entries()
-        }
-    }
+    use super::test_secrets::Switch;
 
     /// One machine's API, alone, on a loopback port, with a secret store that holds [`TOKEN`].
     struct Served {
@@ -1564,6 +1518,37 @@ mod factory_events {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_the_store_cannot_hide_is_tried_again_after_a_wait_not_every_tick() {
+        let served = serve().await;
+        let mut socket = served.events().await;
+        served.secrets.readable(false);
+        let before = served.secrets.reads();
+        served.write_status(served.me, holding(1, None));
+        // Ticks come every 200 ms; the tries at 0, 1 and 3 seconds read the store once each.
+        let texts = texts_within(&mut socket, Duration::from_millis(2500)).await;
+        assert!(texts.is_empty(), "{texts:?}");
+        let reads = served.secrets.reads() - before;
+        assert!((1..=3).contains(&reads), "the store was read {reads} times");
+    }
+
+    #[test]
+    fn the_wait_before_a_status_is_tried_again_doubles_from_a_second_to_half_a_minute() {
+        assert_eq!(next_wait(None), Duration::from_secs(1));
+        assert_eq!(
+            next_wait(Some(Duration::from_secs(1))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            next_wait(Some(Duration::from_secs(16))),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            next_wait(Some(Duration::from_secs(30))),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_status_no_longer_believed_sends_the_state_again_and_no_status_after_it() {
         let served = serve().await;
         let mut socket = served.events().await;
@@ -1622,5 +1607,81 @@ mod factory_events {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(!response.contains(&run().to_string()), "{response}");
         assert!(!response.contains("stop_requested"), "{response}");
+    }
+}
+
+/// A secret store for the API's tests that can be made unreadable, now or after some reads.
+#[cfg(test)]
+pub(crate) mod test_secrets {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use crate::secrets::{Edit, MemorySecrets, Secrets, SecretsError};
+
+    /// Secrets in memory. Each read counts; a store made unreadable, or past its last good read,
+    /// fails every read with [`SecretsError::CannotList`].
+    #[derive(Default)]
+    pub struct Switch {
+        held: MemorySecrets,
+        unreadable: AtomicBool,
+        reads: AtomicUsize,
+        /// Reads that still succeed, plus one; 0 is no limit.
+        good_reads: AtomicUsize,
+    }
+
+    impl Switch {
+        fn check(&self) -> Result<(), SecretsError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let left = self.good_reads.load(Ordering::SeqCst);
+            if left == 1 {
+                self.unreadable.store(true, Ordering::SeqCst);
+            } else if left > 1 {
+                self.good_reads.store(left - 1, Ordering::SeqCst);
+            }
+            if self.unreadable.load(Ordering::SeqCst) {
+                Err(SecretsError::CannotList)
+            } else {
+                Ok(())
+            }
+        }
+
+        /// Makes every read succeed, or fail, from now on.
+        pub fn readable(&self, readable: bool) {
+            self.good_reads.store(0, Ordering::SeqCst);
+            self.unreadable.store(!readable, Ordering::SeqCst);
+        }
+
+        /// Lets `reads` more reads succeed, and fails every one after them.
+        pub fn readable_for(&self, reads: usize) {
+            self.unreadable.store(false, Ordering::SeqCst);
+            self.good_reads.store(reads + 1, Ordering::SeqCst);
+        }
+
+        /// How many reads were made.
+        pub fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Secrets for Switch {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            self.check()?;
+            self.held.get(name)
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+            self.held.set(name, value)
+        }
+        fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
+            self.check()?;
+            self.held.update(name, edit)
+        }
+        fn names(&self) -> Result<Vec<String>, SecretsError> {
+            self.check()?;
+            self.held.names()
+        }
+        fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+            self.check()?;
+            self.held.entries()
+        }
     }
 }

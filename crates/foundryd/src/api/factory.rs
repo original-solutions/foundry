@@ -1310,9 +1310,13 @@ mod tests {
         let mut value = serde_json::json!([format!("a{JOINT}b {token}"), "c"]);
         hide_strings(&mut value, &hide).unwrap();
         assert_eq!(value, serde_json::json!([format!("a{JOINT}b ***"), "c"]));
-        let mut value = serde_json::json!(["a\n\u{E000}", format!("b {token}")]);
+        assert_eq!(JOINT, format!("\n{JOINT_MARK}\n"));
+        let mut value = serde_json::json!([format!("a\n{JOINT_MARK}"), format!("b {token}")]);
         hide_strings(&mut value, &hide).unwrap();
-        assert_eq!(value, serde_json::json!(["a\n\u{E000}", "b ***"]));
+        assert_eq!(
+            value,
+            serde_json::json!([format!("a\n{JOINT_MARK}"), "b ***"])
+        );
 
         let unreadable = |_: &str| crate::secrets::HIDDEN_UNREADABLE.to_owned();
         let mut value = serde_json::json!({"a": "one", "b": "two"});
@@ -1365,9 +1369,7 @@ mod view_tests {
     use crate::factory::runs::stop::{already_requested_message, requested_message};
     use crate::factory::worker::{AlwaysHeld, Guard};
     use crate::factory::{Leased, Leases, Leasing};
-    use crate::secrets::{
-        Edit as SecretEdit, GITHUB_DEFAULT, MemorySecrets, Secrets, SecretsError,
-    };
+    use crate::secrets::{GITHUB_DEFAULT, Secrets};
     use crate::store::Store;
     use crate::sync::call::CARRIED;
     use crate::sync::{Conn, Dialer, Peers};
@@ -1394,44 +1396,7 @@ mod view_tests {
         }
     }
 
-    /// A secret store in memory that can be made unreadable.
-    #[derive(Default)]
-    struct Switch {
-        held: MemorySecrets,
-        unreadable: std::sync::atomic::AtomicBool,
-    }
-
-    impl Switch {
-        fn check(&self) -> Result<(), SecretsError> {
-            if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
-                Err(SecretsError::CannotList)
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    impl Secrets for Switch {
-        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
-            self.check()?;
-            self.held.get(name)
-        }
-        fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
-            self.held.set(name, value)
-        }
-        fn update(&self, name: &str, edit: SecretEdit<'_>) -> Result<(), SecretsError> {
-            self.check()?;
-            self.held.update(name, edit)
-        }
-        fn names(&self) -> Result<Vec<String>, SecretsError> {
-            self.check()?;
-            self.held.names()
-        }
-        fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
-            self.check()?;
-            self.held.entries()
-        }
-    }
+    use crate::api::test_secrets::Switch;
 
     /// One machine: its store, peers, coordinator, secret store and leases, with the view's
     /// routes served on a loopback port that its peers also carry calls to.
@@ -2168,10 +2133,7 @@ mod view_tests {
         let alone = &fleet[0];
         alone.hold(LeaseState::Held { generation: 1 }, Arc::new(AlwaysHeld(1)));
         building_run(alone, 1);
-        alone
-            .secrets
-            .unreadable
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        alone.secrets.readable(false);
         let (status, said) = alone
             .post("/api/factory/settings", Some(fleet_body(|_| {})))
             .await;
@@ -2191,15 +2153,78 @@ mod view_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_turn_on_that_needs_the_default_is_503_while_the_coordinators_store_cannot_be_read() {
+        let fleet = fleet(2, &format!("https://github.com/{REPO}"), None).await;
+        let (coordinator, other) = (&fleet[0], &fleet[1]);
+        coordinator
+            .secrets
+            .set(GITHUB_DEFAULT, "coord-bot")
+            .unwrap();
+        coordinator.secrets.readable(false);
+        for asked in [other, coordinator] {
+            let (status, answer) = asked
+                .post(
+                    &project_path(),
+                    Some(json!({ "on": true, "paused": false })),
+                )
+                .await;
+            assert_eq!(status, 503, "{answer}");
+        }
+        assert_eq!(factory_of(coordinator), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_made_before_the_store_stopped_reading_is_200_with_its_strings_unreadable() {
+        let fleet = fleet(1, &format!("https://github.com/{REPO}"), None).await;
+        let alone = &fleet[0];
+        // The store reads for the check before the write, and not for the answer after it.
+        let body = fleet_body(|body| {
+            body.insert("model".into(), json!(TOKEN));
+        });
+        alone.secrets.readable_for(1);
+        let (status, said) = alone
+            .send("POST", "/api/factory/settings", Some(body), &[])
+            .await;
+        assert_eq!(status, 200, "{said}");
+        assert!(!said.contains(TOKEN), "{said}");
+        let answer: Value = serde_json::from_str(&said).unwrap();
+        assert_eq!(
+            answer["settings"]["model"],
+            json!(crate::secrets::HIDDEN_UNREADABLE)
+        );
+        assert_eq!(
+            alone.settings().factory.map(|f| f.model),
+            Some(TOKEN.to_owned()),
+            "the edit was made"
+        );
+        alone.secrets.readable_for(1);
+        let (status, said) = alone
+            .send(
+                "POST",
+                &project_path(),
+                Some(json!({ "on": true, "paused": false, "login": "softfac-bot" })),
+                &[],
+            )
+            .await;
+        assert_eq!(status, 200, "{said}");
+        let answer: Value = serde_json::from_str(&said).unwrap();
+        assert_eq!(
+            answer["factory"]["login"],
+            json!(crate::secrets::HIDDEN_UNREADABLE)
+        );
+        assert_eq!(
+            factory_of(alone).map(|f| f.login),
+            Some("softfac-bot".into())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_answer_is_refused_whole_when_the_secret_store_cannot_be_read() {
         let fleet = fleet(1, &format!("https://github.com/{REPO}"), on()).await;
         let alone = &fleet[0];
         alone.write_status(holding(1, 1));
         building_run(alone, 1);
-        alone
-            .secrets
-            .unreadable
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        alone.secrets.readable(false);
         for path in [
             "/api/factory".to_owned(),
             format!("/api/factory/runs/{}", run_id()),
@@ -2302,18 +2327,46 @@ mod view_tests {
             paused: true,
         };
         until(|| factory_of(coordinator).as_ref() == Some(&wanted)).await;
-        // An edit of a project on that names none takes the default again: the value is sent
-        // whole.
+        // A project that is on acts as its login: an edit of it that names none is refused,
+        // from any machine, and changes nothing.
+        for login in [json!(null), json!(""), json!("  ")] {
+            for asked in [other, coordinator] {
+                let (status, answer) = asked
+                    .post(
+                        &project_path(),
+                        Some(json!({ "on": true, "paused": false, "login": login })),
+                    )
+                    .await;
+                assert_eq!(status, 422, "{login}: {answer}");
+                assert!(
+                    answer["error"].as_str().unwrap().contains("login"),
+                    "{answer}"
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(factory_of(coordinator), Some(wanted));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_blank_login_names_none_and_takes_the_default_when_turning_on() {
+        let fleet = fleet(2, &format!("https://github.com/{REPO}"), None).await;
+        let (coordinator, other) = (&fleet[0], &fleet[1]);
+        coordinator
+            .secrets
+            .set(GITHUB_DEFAULT, "coord-bot")
+            .unwrap();
         let (status, answer) = other
             .post(
                 &project_path(),
-                Some(json!({ "on": true, "paused": true, "login": null })),
+                Some(json!({ "on": true, "paused": false, "login": "  " })),
             )
             .await;
         assert_eq!(status, 200, "{answer}");
         let wanted = ProjectFactory {
+            on: true,
             login: "coord-bot".into(),
-            ..wanted
+            paused: false,
         };
         until(|| factory_of(other).as_ref() == Some(&wanted)).await;
     }
