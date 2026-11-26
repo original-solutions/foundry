@@ -10,7 +10,7 @@ use crate::record::AnyRecord;
 use crate::settings::{Edit, EditId, Outcome, SharedSettings};
 
 /// The protocol number this build speaks.
-pub const PROTOCOL: u16 = 5;
+pub const PROTOCOL: u16 = 6;
 
 /// The first protocol whose links carry the shared settings and edits. A link in an older
 /// protocol carries neither: a machine on it has no coordinator, and refuses a message whose
@@ -32,6 +32,11 @@ pub const ANSWERS_SINCE: u16 = 4;
 /// and a settings key it does not know. Its settings copy goes through
 /// [`SharedSettings::for_protocol`].
 pub const FACTORY_SINCE: u16 = 5;
+
+/// The first protocol whose links carry a call to `POST /api/machines/{id}/update`. A machine
+/// sends that call only on a link in it or later: an older peer has no such route and would
+/// answer it `400`.
+pub const UPDATES_SINCE: u16 = 6;
 
 /// A message between two machines' daemons, tagged by `type`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

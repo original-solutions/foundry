@@ -1131,6 +1131,8 @@ async fn the_daemons_peer_route_takes_a_keyed_peer_and_syncs_its_records() {
             free_disk: 1 << 35,
             sessions: 3,
             update_refused: None,
+            version: None,
+            update_ready: None,
         },
     });
     let records = PeerMessage::Records {

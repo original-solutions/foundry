@@ -165,6 +165,8 @@ fn read_with(
         free_disk: free_disk(data_dir)?,
         sessions,
         update_refused: None,
+        version: None,
+        update_ready: None,
     })
 }
 
@@ -215,6 +217,8 @@ fn store_sample(
     let body = MachineSample {
         sessions: store.live_session_count(me)?,
         update_refused,
+        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        update_ready: None,
         ..machine
     };
     let record = Record {
@@ -313,6 +317,8 @@ mod tests {
                 free_disk,
                 sessions,
                 update_refused: None,
+                version: None,
+                update_ready: None,
             },
         }
     }

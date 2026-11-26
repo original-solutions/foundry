@@ -84,6 +84,14 @@ pub struct MachineSample {
     /// version installed is not above it. `None` in a sample from a peer that does not write it.
     #[serde(default)]
     pub update_refused: Option<String>,
+    /// The version the daemon that wrote this sample was built as, like `0.9.0`. `None` in a
+    /// sample from a peer that does not write it.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// The tag ready on this machine, like `v0.9.1`. `None` in a sample from a peer that does
+    /// not write it.
+    #[serde(default)]
+    pub update_ready: Option<String>,
 }
 
 /// Any kind of record, tagged by `kind`, so one message can carry several kinds.
@@ -188,6 +196,8 @@ pub(crate) mod tests {
                 free_disk: 512 * 1024 * 1024 * 1024,
                 sessions: 4,
                 update_refused: Some("v0.2.0".into()),
+                version: None,
+                update_ready: None,
             },
         }
     }
@@ -382,6 +392,8 @@ pub(crate) mod tests {
                         free_disk: 2,
                         sessions: 3,
                         update_refused: None,
+                        version: None,
+                        update_ready: None,
                     },
                 }),
             ),
