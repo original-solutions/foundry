@@ -1,11 +1,10 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { saveFactorySettings, setProjectFactory, type FactorySettings, type Project, type ProjectFactory } from "./api";
+import { HIDDEN, saveFactorySettings, setProjectFactory, type FactorySettings, type Project, type ProjectFactory } from "./api";
 import { checkSettings, factoryKey, type NumericSetting } from "./factory";
 import { button, field, inlineField, primaryButton } from "./Modal";
 
 /** What the daemon gives in place of a model, effort or login it could not read safely. */
-const HIDDEN = "[hidden: the secret store could not be read]";
 
 /** The form's fields as text, so a half-typed number is kept as typed. */
 function texts(s: FactorySettings) {
@@ -150,13 +149,13 @@ export function ProjectFactoryControls({ project, factory }: { project: Project;
   const shown = typed ?? held.login;
   const send = useMutation({
     mutationFn: ({ next }: { next: { on: boolean; paused: boolean; login: string | null }; base: string; savingLogin: boolean; sentTyped?: string }) => setProjectFactory(project.id, next),
-    onSuccess: (answer, { base, savingLogin, sentTyped }) => {
+    onSuccess: (answer, { next, base, savingLogin, sentTyped }) => {
       // Typing is cleared when it is what was sent or the daemon now holds it; typing since stays.
       setTyped((t) => (t === undefined || (savingLogin && t === sentTyped) || t.trim() === answer.login ? undefined : t));
-      // A login the daemon could not read is no setting to show: let the settings catch up instead.
-      setAnswered((prev) =>
-        answer.login === HIDDEN ? undefined : { value: answer, seen: [...new Set([...(prev?.seen ?? []), base, props.current, ...(prev ? [keyOf(prev.value)] : [])])] },
-      );
+      // The daemon hides only strings when its secret store cannot be read: the switch and pause it
+      // answers are what it holds, and the login is the one sent (blank when the coordinator picked it).
+      const value = answer.login === HIDDEN ? { ...answer, login: next.login ?? "" } : answer;
+      setAnswered((prev) => ({ value, seen: [...new Set([...(prev?.seen ?? []), base, props.current, ...(prev ? [keyOf(prev.value)] : [])])] }));
       return client.invalidateQueries({ queryKey: factoryKey });
     },
   });

@@ -158,6 +158,12 @@ export interface Blockers {
   submodules: string[];
 }
 
+/**
+ * What the daemon puts in place of each string of an answer when its secret store cannot be read
+ * (`secrets::HIDDEN_UNREADABLE`): never a value to show or send back.
+ */
+export const HIDDEN = "[hidden: the secret store could not be read]";
+
 /** A request the daemon refused, with the text it gave. */
 export class ApiError extends Error {
   /** The HTTP status the daemon answered with, when it answered. */
