@@ -117,6 +117,110 @@ A removed machine has to be given a new identity before it can join again. That 
 
 On macOS this replaces the agent. On Linux it rewrites the unit; run the `sudo` lines it prints.
 
+## Set up the factory
+
+A project's factory claims the `factory:ready` issues of its repo and builds each one on a machine of the fleet. [P2-factory.md](specs/P2-factory.md) says how. A machine takes a run only when it holds a token for the project's GitHub login and has the `factory-build` skill. A machine without them still runs manual sessions.
+
+Run the commands below with the same `FOUNDRY_HOME` you gave `install`, as `<home>/current/foundryd …`.
+
+### GitHub tokens and the default login
+
+Store a token for each GitHub login the machine may act as. The command reads one line from stdin and never prints it:
+
+```sh
+foundryd secret set github:<login>
+```
+
+A run pushes branches, which may change a workflow file, and writes issues, labels, comments and pull requests. A classic token with the `repo` and `workflow` scopes covers that, and so does the token of a `gh` login, which has both. Write the login in the case GitHub shows it, because the factory looks the token up by its exact name. No restart is needed.
+
+Then name the machine's default login:
+
+```sh
+foundryd github default <login>
+```
+
+The default is read once, when a project's factory is turned on while this machine is the acting coordinator. It becomes that project's login. Set it on every machine that can be coordinator.
+
+A token never leaves the machine that holds it. The factory hides every token and gateway key the machine holds from the comments it posts, the messages it sends a session and the events it records.
+
+### The `factory-build` skill
+
+Each run is a Claude Code session that starts with `/factory-build`. The daemon looks for `~/.claude/skills/factory-build/SKILL.md` under the service user's home every 5 seconds, and places no run on a machine where it is missing.
+
+The skill's source is `~/EA/skills/factory-build`. Install the version changed for Foundry, which reads its brief from the file named on its command line and leaves the GitHub login to Foundry ([Before P2 starts](specs/P2-factory.md#before-p2-starts)). An older copy picks a `gh` login of its own. On a machine with the skills hub, its installer links it into `~/.agents/skills/`, which `~/.claude/skills` links to:
+
+```sh
+~/EA/skills/factory-build/install.sh
+test -f ~/.claude/skills/factory-build/SKILL.md && echo installed
+```
+
+On any other machine, copy the folder to `~/.claude/skills/factory-build/`. If the service sets `CLAUDE_CONFIG_DIR`, Claude Code reads skills from `$CLAUDE_CONFIG_DIR/skills/` but the daemon still checks `~/.claude/skills/`, so put the skill in both.
+
+### Turn a project's factory on
+
+The project's repo URL must be `https://github.com/<owner>/<repo>`, because the factory reaches GitHub only over HTTPS. The repo's default branch must hold a `.dw/config.yml` with a `factory` block (`instructors`, `base`, `provision`, `gate`). A file that does not load leaves the project idle with an attention item.
+
+The UI has no factory switch yet, so use the daemon's API on any machine of the fleet. Find the project's id:
+
+```sh
+curl -s http://127.0.0.1:7433/api/factory
+```
+
+Each entry of `projects` has its `id`, `name` and `factory` setting. Turn it on:
+
+```sh
+curl -s -X POST http://127.0.0.1:7433/api/projects/<project id>/factory \
+  -H 'Content-Type: application/json' -d '{"on": true, "paused": false}'
+```
+
+With no `login`, the project takes the acting coordinator's default login. Add `"login": "<login>"` to name another. The answer is `{"factory": {...}}` with the login it took. A `422` says why it refused, for example a repo URL that is not on `https://github.com/`, or no login named and no default on the coordinator.
+
+A project that is on acts as its login, so every later edit names it. To pause its claims:
+
+```sh
+curl -s -X POST http://127.0.0.1:7433/api/projects/<project id>/factory \
+  -H 'Content-Type: application/json' -d '{"on": true, "paused": true, "login": "<login>"}'
+```
+
+To turn it off, send `{"on": false, "paused": false}`. Use the port you gave `install` if it is not 7433.
+
+### Move a repo from the runner to Foundry
+
+The Paradev runner (`original-solutions/factory-on-paradev`) builds every factory repo until it moves. The runner and Foundry never watch the same repo. Before the first repo moves, P1's acceptance run has passed and every machine runs a P2 release.
+
+Foundry goes first, and builds itself until 10 runs have reached `pr-open` or `stuck` and no factory bug is open. Then factory-paradev-spike, spec-reader, clockwork, factory-on-paradev and people-hub move one at a time, each after the last moved repo has 5 clean runs.
+
+To move one repo:
+
+1. Stop the runner claiming: `factory-runner claims pause`.
+2. Wait until no issue of the repo is in `factory:triage` or `factory:building`. `factory-runner status` lists the runner's runs.
+3. Take the repo out of `repos:` in the runner's config, `~/.config/factory-runner/config.yml`, and restart the runner with `launchctl kickstart -k gui/$(id -u)/io.github.original-solutions.factory-runner`.
+4. Let the runner claim for its other repos again: `factory-runner claims resume`.
+5. Turn the project's factory on in Foundry, as above.
+
+Foundry leaves an issue alone when its newest claim comment is the runner's. An issue the runner left in `pr-open` gets no feedback round from Foundry. Label it `factory:ready` again and Foundry starts a run that carries on from its pull request's branch.
+
+The way back is per repo. Turn the project's factory off in Foundry, put the repo back in the runner's `repos:` and restart the runner. While Foundry cannot build foundry, the runner builds the fix.
+
+When every repo has moved, the runner stays stopped, still installed, for a week. Then `retro` compares the two, and the runner is uninstalled.
+
+### Compare Foundry with the runner
+
+The runner's `retro` reads Foundry's runs from an export. Write every run the machine holds into a folder:
+
+```sh
+foundryd factory export ~/foundry-runs
+```
+
+It writes `runs/<owner>__<repo>__<issue>__<attempt>.jsonl` there, in the runner's own format. Every machine is sent the fleet's factory records, so any machine that is linked to the others will do. Then run `retro` over the export for the week the runner was stopped, and over the runner's own data:
+
+```sh
+factory-runner retro --data-dir ~/foundry-runs --since <first day> --until <day after the last>
+factory-runner retro --data-dir ~/.config/factory-runner --since <date>
+```
+
+For the runner, pick `--since` so its window holds its last 30 runs. `retro` prints the number of runs in the window on its first line. It reads merged pull requests' reviews with `gh`, so run it where `gh` can read the repos. Foundry passes when its `reached pr-open without a person` is no lower than the runner's and its `stuck` is no higher.
+
 ## Updates
 
 A running service looks for a newer release tag every 10 minutes. On each pushed `vX.Y.Z` tag, the release workflow (`.github/workflows/release.yml`) publishes `foundryd-<arch>-<os>.tar.gz`, named from `std::env::consts::ARCH` and `OS` (`aarch64`, `x86_64`, `macos`, `linux`). Beside each archive it publishes `foundryd-<arch>-<os>.tar.gz.sig`, an Ed25519 signature made with the key in the repository secret `RELEASE_SIGNING_KEY`. It publishes nothing when the tag is not `v` followed by the version in the root `Cargo.toml`, or when that key does not match the public key built into `foundryd` (`RELEASE_KEY` in `crates/foundryd/src/update.rs`). It creates the release itself and fails when one already exists for the tag, so a release's assets are never replaced: new binaries ship under a new tag. Push the tag; do not make the release in the GitHub UI first.
