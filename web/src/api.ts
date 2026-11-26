@@ -49,6 +49,10 @@ export interface SharedSettings {
   priority: string[];
   projects: Project[];
   limits: Record<string, Limits>;
+  /** The fleet's factory settings, when the daemon sends them. */
+  factory?: FactorySettings;
+  /** Each project's factory setting by project id; a project not listed has its factory off. */
+  project_factory?: Record<string, ProjectFactory>;
 }
 /** What placement keeps a machine under. `min_free_disk` is bytes. */
 export interface Limits {
@@ -65,7 +69,87 @@ export interface Project {
 export type UiMessage =
   | { type: "state"; protocol: number; records: AnyRecord[]; settings: SharedSettings; online?: string[] }
   | { type: "record"; protocol: number; record: AnyRecord }
-  | { type: "settings"; protocol: number; settings: SharedSettings };
+  | { type: "settings"; protocol: number; settings: SharedSettings }
+  | { type: "factory_status"; protocol: number; status: FactoryStatus };
+
+/** The fleet's factory settings. */
+export interface FactorySettings {
+  paused: boolean;
+  poll_seconds: number;
+  feedback_seconds: number;
+  max_runs: number;
+  max_gates: number;
+  model: string;
+  effort: string;
+}
+/** One project's factory setting: on or off, the GitHub login it acts as, and whether its claims are paused. */
+export interface ProjectFactory {
+  on: boolean;
+  login: string;
+  paused: boolean;
+}
+/** Why a coordinator that does not hold a project's lease is idle. */
+export type NotHolding = { kind: "no_token"; login: string } | { kind: "held_by"; machine: string; generation: number };
+/** An issue that waits, and why. `run` names the run a feedback round belongs to. */
+export interface FactoryWaiting {
+  issue: number;
+  title: string;
+  reason: string;
+  run?: string | null;
+}
+/** A run being built. */
+export interface LiveRun {
+  run: string;
+  title: string;
+  step: string;
+  machine: string;
+  gate_retries_used: number;
+  minutes_used: number;
+  workspaces: string[];
+  sessions: string[];
+}
+/** A run that stopped and waits for a person. */
+export interface HeldUp {
+  run: string;
+  kind: "stuck" | "needs_info";
+  reason: string;
+}
+/** A run that ended. */
+export interface FinishedRun {
+  run: string;
+  title: string;
+  outcome: "pr-open" | "stuck" | "needs-info";
+  pr_end: "merged" | "closed" | null;
+  pr_url: string | null;
+}
+/** An issue another factory claimed. */
+export interface ForeignClaim {
+  issue: number;
+  title: string;
+  state: string;
+}
+/** What a project's lease holder last said about its factory. */
+export interface FactoryStatus {
+  project: string;
+  pass: number;
+  holds: boolean;
+  generation: number;
+  not_holding: NotHolding | null;
+  idle: string | null;
+  owner_ignored: boolean;
+  ready: FactoryWaiting[];
+  feedback_waiting: FactoryWaiting[];
+  runs: LiveRun[];
+  held_up: HeldUp[];
+  gate_infra: string[];
+  finished: FinishedRun[];
+  foreign: ForeignClaim[];
+}
+/** What `GET /api/factory` answers: the settings, and each project with the status believed of it. */
+export interface FactoryOverview {
+  settings: FactorySettings;
+  projects: { id: string; name: string; factory: ProjectFactory; writer: string | null; status: FactoryStatus | null }[];
+}
 
 /** What holds an archive up. */
 export interface Blockers {
@@ -344,4 +428,29 @@ export async function sendFile(id: string, file: File): Promise<string> {
   const { status, json } = await answered(response);
   if (status !== 201) throw refused(status, json);
   return String(json.path);
+}
+
+/** Reads the Factory view's overview. */
+export async function factoryOverview(): Promise<FactoryOverview> {
+  return (await get("/api/factory")) as unknown as FactoryOverview;
+}
+
+/** Asks the lease holder to stop a run; the daemon's message, or its refusal as an `ApiError`. */
+export async function stopRun(run: string): Promise<string> {
+  const { status, json } = await post(`/api/factory/runs/${encodeURIComponent(run)}/stop`);
+  if (status !== 200) throw refused(status, json);
+  return typeof json.message === "string" ? json.message : "Stop recorded.";
+}
+
+/** Saves the fleet's factory settings, every field; the settings as the daemon holds them. */
+export async function saveFactorySettings(settings: FactorySettings): Promise<FactorySettings> {
+  const { status, json } = await post("/api/factory/settings", settings);
+  if (status !== 200) throw refused(status, json);
+  return json.settings as FactorySettings;
+}
+
+/** Saves a project's factory setting, whole; a blank login names none. */
+export async function setProjectFactory(project: string, factory: { on: boolean; paused: boolean; login: string | null }): Promise<void> {
+  const { status, json } = await post(`/api/projects/${project}/factory`, factory);
+  if (status !== 200) throw refused(status, json);
 }

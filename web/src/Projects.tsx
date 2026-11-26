@@ -1,6 +1,8 @@
 import { useMutation } from "@tanstack/react-query";
 import { useRef, useState, type FormEvent } from "react";
 import { post, refused, type Project } from "./api";
+import { useProjectFactory } from "./factory";
+import { ProjectFactoryControls } from "./FactorySettings";
 import { button, dangerButton, field, Modal, primaryButton } from "./Modal";
 
 /**
@@ -37,7 +39,9 @@ function newId(): string {
  * once it arrives in the settings, on every machine. A refused add keeps what was typed and says
  * why under the form; a refused remove says why beside its project. An add sent again with
  * nothing retyped goes under the same id, so an add whose answer came too late is not made twice.
- * Closing the dialog clears what was typed and every refusal. `onAdded` is given each new
+ * Each project also has its factory controls: a switch, the GitHub login it acts as and a pause,
+ * as the settings last sent them (read from the factory context, so opening the dialog fetches
+ * nothing); a refused change says why beside the row. Closing the dialog clears what was typed and every refusal. `onAdded` is given each new
  * project's id.
  */
 export function Projects({
@@ -51,6 +55,7 @@ export function Projects({
   projects: Project[];
   onAdded: (id: string) => void;
 }) {
+  const factories = useProjectFactory();
   const [name, setName] = useState("");
   const [repo, setRepo] = useState("");
   /** The id the typed project is added under, until it is added or the typing changes. */
@@ -139,6 +144,7 @@ export function Projects({
                   </button>
                 )}
               </div>
+              <ProjectFactoryControls project={p} factory={factories?.[p.id] ?? { on: false, login: "", paused: false }} />
               {remove.isError && remove.variables === p.id && (
                 <p role="alert" className="mt-1 text-xs text-red-400">
                   {remove.error.message}

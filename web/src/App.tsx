@@ -2,6 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import { createRootRoute, createRoute, createRouter, useNavigate, useParams, useRouterState } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { Board } from "./Board";
+import { Factory } from "./Factory";
+import { FactoryContext } from "./factory";
 import { ChangesPanel } from "./ChangesPanel";
 import { LinkBanner, Unreachable } from "./Connection";
 import { useCreateWorkspace } from "./Composer";
@@ -61,6 +63,10 @@ import { WaitingList } from "./placement/WaitingList";
  * ten minutes from the samples this page has seen, its free memory and disk, its terminals by
  * state and its workspaces.
  *
+ * The Factory view (`/factory`, from the rail's factory link) shows the fleet's factory settings,
+ * and for each project its lease holder and generation or why it is idle, the ready queue, live
+ * runs with a Stop that asks first, and the last finished runs. It takes the place of the board.
+ *
  * A workspace is made one way, from a task box: the first run's, the board's top line, or the
  * New task dialog (the sidebar's button, or the palette with what was typed as the task). It is landed in: once its session shows up, its terminal opens, its setup shell a tab beside it.
  *
@@ -112,6 +118,7 @@ function Layout() {
   const state = remembering ? { records: memory.records, settings: memory.settings, synced: true } : sent;
   const { terminalId } = useParams({ strict: false });
   const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
+  const onFactory = useRouterState({ select: (s) => s.location.pathname === "/factory" });
   const briefs = useBriefs(state.records);
   const { data: here } = useQuery(machineQuery);
   const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
@@ -262,14 +269,15 @@ function Layout() {
   const workspaces = machines.flatMap((m) => m.workspaces);
   // A fleet with no workspaces opens on the first-run page, kept while its create is under way or
   // its workspace was made but its session failed, so what happened stays on screen.
-  const firstRun = !terminalId && !onMachines && state.synced && (workspaces.length === 0 || launch.create.isPending || (launch.made && launch.create.isError));
-  const board = !terminalId && !onMachines && !firstRun;
+  const firstRun = !terminalId && !onMachines && !onFactory && state.synced && (workspaces.length === 0 || launch.create.isPending || (launch.made && launch.create.isError));
+  const board = !terminalId && !onMachines && !onFactory && !firstRun;
 
   // On a narrow screen the sidebar is a drawer over whatever is shown: the board, the machines view
   // or a terminal. Collapsed to the rail, it is only the drawer, and the rail takes its place.
   const place = rail ? "fixed inset-0 z-30 flex md:hidden" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
   const sidebar = !rail || drawer;
   return (
+    <FactoryContext.Provider value={state.synced ? (state.settings.project_factory ?? {}) : undefined}>
     <TerminalActions
       machines={machines}
       current={terminalId}
@@ -373,6 +381,7 @@ function Layout() {
               {/* Hidden while empty, so it never lies over a terminal. */}
               <div {...frozen} className="absolute inset-0 empty:hidden">
                 {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={started} onMenu={() => setDrawer(true)} />}
+                {!terminalId && onFactory && state.synced && <Factory statuses={state.factory} settings={state.settings} machines={machines} />}
                 {/* The board, the timeline and the machines are one element, so their shared head is never remounted. */}
                 {((board && state.synced) || (!terminalId && onMachines)) && (
                   <Board
@@ -443,6 +452,7 @@ function Layout() {
         {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
       </div>
     </TerminalActions>
+    </FactoryContext.Provider>
   );
 }
 
@@ -458,7 +468,8 @@ const rootRoute = createRootRoute({ component: Layout });
 const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: "/" });
 const terminalRoute = createRoute({ getParentRoute: () => rootRoute, path: "/terminals/$terminalId" });
 const machinesRoute = createRoute({ getParentRoute: () => rootRoute, path: "/machines" });
+const factoryRoute = createRoute({ getParentRoute: () => rootRoute, path: "/factory" });
 
-export const routeTree = rootRoute.addChildren([indexRoute, terminalRoute, machinesRoute]);
+export const routeTree = rootRoute.addChildren([indexRoute, terminalRoute, machinesRoute, factoryRoute]);
 export const router = createRouter({ routeTree });
 
