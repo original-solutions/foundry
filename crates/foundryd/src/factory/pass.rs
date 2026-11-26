@@ -5407,4 +5407,34 @@ mod tests {
             );
         }
     }
+
+    mod a_run_placed_when_the_pass_begins {
+        use super::*;
+
+        /// A run of issue 3 is placed on the builder (two sessions), its session not started.
+        /// A claim of issue 5 is carried on, and then the next ready issue is claimed: the
+        /// builder holds one session for run 3 and one is free for issue 6, however many
+        /// times the pass sets the book from the ledger.
+        #[test]
+        fn is_reserved_on_its_machine_once_however_often_the_pass_counts_it() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 5);
+            rig.shared.limits.insert(builder_machine(), limits(2));
+            rig.hub.issue(3, &["factory:triage"]);
+            rig.run_in(3, 1, State::Triage);
+            let carried = RunId::new(REPO, 5, 1).unwrap();
+            rig.hub.issue(5, &["factory:triage"]);
+            rig.hub
+                .edit(5, |issue| issue.assignees = vec![LOGIN.into()]);
+            rig.hub.comment_as(
+                5,
+                LOGIN,
+                &crate::factory::github::claim_comment(&carried, &me()),
+            );
+            rig.hub.ready(6);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(rig.claimed_issues(), vec![6], "{report:?}");
+        }
+    }
 }
