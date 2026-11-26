@@ -1600,9 +1600,16 @@ fn carry_on(
 ) -> Result<FeedbackStep, RunError> {
     let issue = run.issue();
     let n = round.n;
-    // A round decided with its label not moved yet holds its slot from now on.
+    // A round decided with its label not moved yet takes a slot with the move, so it needs
+    // one free as a round that is not decided yet does: with none, nothing is written and the
+    // issue stays `pr-open`. One that has moved holds its slot already.
     if seen.state == Some(State::PrOpen) {
-        slots.runs_free = slots.runs_free.saturating_sub(1);
+        if slots.runs_free == 0 {
+            return Ok(FeedbackStep::Waiting {
+                reason: NO_SLOT.into(),
+            });
+        }
+        slots.runs_free -= 1;
     }
     let stopping = round_seen(seen, Some(round));
     let mut at = progress_from(run, CauseStep::Forward, &stopping, State::Building);
