@@ -115,9 +115,16 @@ pub fn github_repo(url: &str) -> Option<String> {
     (plain(owner) && plain(name)).then(|| format!("{owner}/{name}"))
 }
 
-/// The projects whose factory is on and whose repo is on GitHub, with a login.
+/// The projects whose factory is on and whose repo is on GitHub, with a login. A repo that
+/// more than one of them names is watched from none of them: the lease is one ref of the repo,
+/// and two passes over the same runs would claim the same issues twice.
 pub fn watched(settings: &SharedSettings) -> Vec<Watched> {
-    let mut watched = Vec::new();
+    watched_and_shared(settings).0
+}
+
+/// [`watched`], with the projects left out because another one names their repo.
+fn watched_and_shared(settings: &SharedSettings) -> (Vec<Watched>, BTreeSet<ProjectId>) {
+    let mut found = Vec::new();
     for project in &settings.projects {
         let Some(factory) = settings.project_factory.get(&project.id) else {
             continue;
@@ -129,13 +136,21 @@ pub fn watched(settings: &SharedSettings) -> Vec<Watched> {
             tracing::warn!(project = %project.id, "factory: the project's repo is not a GitHub repo, so its factory does not run");
             continue;
         };
-        watched.push(Watched {
+        found.push(Watched {
             project: project.id,
             repo,
             login: factory.login.clone(),
         });
     }
-    watched
+    // Repos are compared as a run id folds them: GitHub names are case-insensitive.
+    let folded = |watched: &Watched| watched.repo.to_ascii_lowercase();
+    let mut count: BTreeMap<String, usize> = BTreeMap::new();
+    for watched in &found {
+        *count.entry(folded(watched)).or_default() += 1;
+    }
+    let (alone, shared): (Vec<Watched>, Vec<Watched>) =
+        found.into_iter().partition(|w| count[&folded(w)] == 1);
+    (alone, shared.into_iter().map(|w| w.project).collect())
 }
 
 /// A project's lease, as the service uses it.
@@ -218,13 +233,24 @@ impl<H: Host> Factory<H> {
     pub async fn serve(self) {
         let mut running: BTreeMap<ProjectId, Running> = BTreeMap::new();
         let offline = Arc::new(Mutex::new(Offline::default()));
+        // The projects last said to share a repo, so the line is written when it changes.
+        let mut said_shared = BTreeSet::new();
         loop {
             let looked = self.clock.now();
             let acting = PROTOCOL >= FACTORY_SINCE && self.host.acting().await;
             let want = if acting {
                 let store = self.store.clone();
                 match tokio::task::spawn_blocking(move || lock(&store).settings()).await {
-                    Ok(Ok(settings)) => Some(watched(&settings)),
+                    Ok(Ok(settings)) => {
+                        let (watched, shared) = watched_and_shared(&settings);
+                        if shared != said_shared {
+                            if !shared.is_empty() {
+                                tracing::warn!(projects = ?shared, "factory: projects that name one repo are watched from none of them");
+                            }
+                            said_shared = shared;
+                        }
+                        Some(watched)
+                    }
                     Ok(Err(error)) => {
                         tracing::warn!("factory: the settings could not be read: {error}");
                         None
@@ -879,7 +905,13 @@ mod tests {
             settings.projects.push(Project {
                 id: project(*n),
                 name: format!("p{n}"),
-                repo: "https://github.com/rawphp/softfac".into(),
+                // One repo each, as the fake GitHub's own for its login: projects that name
+                // one repo are watched from none.
+                repo: if *login == LOGIN {
+                    "https://github.com/rawphp/softfac".into()
+                } else {
+                    format!("https://github.com/rawphp/softfac{n}")
+                },
             });
             settings.project_factory.insert(
                 project(*n),
