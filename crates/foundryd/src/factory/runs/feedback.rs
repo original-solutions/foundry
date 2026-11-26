@@ -3511,6 +3511,13 @@ mod tests {
         }
 
         #[test]
+        fn a_project_whose_repo_is_spelled_in_another_case_still_has_its_round_decided() {
+            let mut world = World::reviewed();
+            world.rig.project.repo = "RawPHP/SoftFac".into();
+            assert!(matches!(world.go(), FeedbackStep::Decided { round: 1, .. }));
+        }
+
+        #[test]
         fn a_run_of_another_repo_is_left_alone_and_nothing_is_touched() {
             let world = World::reviewed();
             let other = RunId::new("acme/widgets", 8, 1).unwrap();
