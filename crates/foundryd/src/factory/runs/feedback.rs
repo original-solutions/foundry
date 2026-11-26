@@ -918,7 +918,7 @@ pub fn round_pending(events: &[RunEvent]) -> bool {
 }
 
 /// What the ledger records of the newest round.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Round {
     n: u32,
     branch: String,
@@ -926,7 +926,6 @@ struct Round {
     /// The body of the first message.
     message: String,
     machine: Option<MachineId>,
-    gave_up: Vec<MachineId>,
     /// The workspace the archive is of, as written: an id.
     archiving: Option<String>,
     archive_asked: bool,
@@ -980,8 +979,7 @@ impl Round {
                 round.archiving = Some(rest.to_owned());
             } else if numbered(step, ARCHIVE_ASKED, n).is_some() {
                 round.archive_asked = true;
-            } else if let Some(rest) = numbered(step, MACHINE_GIVEN_UP, n) {
-                round.gave_up.extend(parse_machine(rest));
+            } else if numbered(step, MACHINE_GIVEN_UP, n).is_some() {
                 round.machine = None;
                 round.requested = false;
                 round.workspace = None;
@@ -1447,11 +1445,11 @@ fn finish_stuck(
 
 // ----- a round under way -----
 
-/// The label and the earlier workspace of a round decided: the machine, the move to
-/// `building`, the decision recorded again after it, and the archive of the earlier workspace.
-/// Each is recorded before it is done and skipped when recorded. Gives back the step that asked
-/// something, or `None` when there is nothing more to do before the workspace.
-#[allow(clippy::too_many_arguments)]
+/// The label and the earlier workspace of a round decided: the move to `building`, the
+/// decision recorded again after it, and the archive of the earlier workspace. Each is
+/// recorded before it is done and skipped when recorded. Gives back whether it did any of
+/// them in this pass (`true`: the pass ends there), or `false` when there is nothing more to
+/// do before the workspace, or the round has no machine yet.
 fn decision_phase(
     ctx: &RunContext<'_>,
     run: &RunId,
@@ -1662,7 +1660,7 @@ fn carry_on(
     };
     let placed = Round {
         machine: Some(machine),
-        ..clone_round(round)
+        ..round.clone()
     };
     at.machine = Some(machine.to_string());
     if decision_phase(ctx, run, events, seen, &placed, last, &mut at)? {
@@ -1836,23 +1834,6 @@ fn carry_on(
             stuck(ctx, run, &mut at, STUCK_LAUNCH, stop)
         }
         Err(error) => Err(error),
-    }
-}
-
-fn clone_round(round: &Round) -> Round {
-    Round {
-        n: round.n,
-        branch: round.branch.clone(),
-        items: round.items.clone(),
-        message: round.message.clone(),
-        machine: round.machine,
-        gave_up: round.gave_up.clone(),
-        archiving: round.archiving.clone(),
-        archive_asked: round.archive_asked,
-        requested: round.requested,
-        workspace: round.workspace,
-        sending: round.sending,
-        launches: round.launches,
     }
 }
 
@@ -4681,8 +4662,14 @@ mod tests {
     mod feedback_the_budgets_start_again {
         use super::*;
 
+        /// What `building::time_limit` measures from starts again at the round's move to
+        /// `building`: the worked time and the running stint, which are what this checks.
+        /// `time_limit` itself is not called: it takes "now" from the wall clock
+        /// (`ledger::system_ms`) and `time_limit_at`, which is given it, is private to
+        /// `building`, while the ledger of a test is stamped from a fixed start, so no call to
+        /// it can say a run is within its limit.
         #[test]
-        fn the_time_limit_counts_from_the_relaunch() {
+        fn the_stint_the_time_limit_measures_starts_at_the_move_to_building() {
             let mut world = World::reviewed();
             world.round();
             let moved = world
