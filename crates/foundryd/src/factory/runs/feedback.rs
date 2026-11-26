@@ -3303,6 +3303,9 @@ mod tests {
 
         #[test]
         fn a_round_with_every_run_slot_held_waits_in_pr_open_and_adds_nothing_to_worked_time() {
+            // The read that found the feedback is the one step written for the wait (a found
+            // read: `feedback-read <generation> <ms> found`); nothing else is, and the wait
+            // adds nothing to the time worked.
             let world = World::reviewed();
             world.pad(100);
             let before = world.count();
@@ -3315,8 +3318,10 @@ mod tests {
                     reason: NO_SLOT.into()
                 }
             );
-            // Nothing is written to the ledger or GitHub, and no worker is asked.
-            assert_eq!(world.count(), before);
+            // Only the read's step is written to the ledger, nothing to GitHub, and no worker
+            // is asked.
+            assert_eq!(world.count(), before + 1);
+            assert_eq!(world.steps_of("feedback-read"), ["feedback-read 1 0 found"]);
             assert!(world.writes().is_empty());
             assert!(world.rig.worker.calls().is_empty());
             assert!(world.decisions().is_empty());
@@ -3337,6 +3342,108 @@ mod tests {
             // The feedback is read again when a slot is free, and the round starts then.
             assert!(matches!(world.go(), FeedbackStep::Decided { items: 1, .. }));
             assert_eq!(world.rig.sim.labels(), ["factory:building"]);
+        }
+
+        #[test]
+        fn a_waiting_round_reads_github_once_every_feedback_seconds_and_is_still_reported_waiting()
+        {
+            let world = World::reviewed();
+            let worked = world.seen().worked_ms;
+            let mut none_free = slots(0);
+            let mut reserved = Reserved::default();
+            let waiting = FeedbackStep::Waiting {
+                reason: NO_SLOT.into(),
+            };
+            // The first pass reads, finds the review, and cannot start the round.
+            assert_eq!(
+                world.try_pass(&mut none_free, &mut reserved).unwrap(),
+                waiting
+            );
+            assert_eq!(world.hub.reads(), first_reads(&world));
+            assert_eq!(world.steps_of("feedback-read"), ["feedback-read 1 0 found"]);
+            // The passes before `feedback_seconds` are over ask GitHub nothing, write nothing and
+            // say the same.
+            world.hub.forget_reads();
+            let (calls, count) = (world.hub.counted(), world.count());
+            for _ in 0..9 {
+                world.wait(Duration::from_secs(60));
+                assert_eq!(
+                    world.try_pass(&mut none_free, &mut reserved).unwrap(),
+                    waiting
+                );
+            }
+            assert_eq!(world.hub.counted(), calls);
+            assert!(world.hub.reads().is_empty());
+            assert_eq!(world.count(), count);
+            assert!(world.writes().is_empty());
+            assert!(world.rig.worker.calls().is_empty());
+            // At `feedback_seconds` it reads again: from the same floor, as a found read is no
+            // clean one.
+            world.wait(Duration::from_secs(60));
+            assert_eq!(
+                world.try_pass(&mut none_free, &mut reserved).unwrap(),
+                waiting
+            );
+            assert_eq!(world.hub.reads(), first_reads(&world));
+            assert_eq!(
+                world.steps_of("feedback-read"),
+                ["feedback-read 1 0 found", "feedback-read 1 600000 found"]
+            );
+            // The wait is no work.
+            let seen = world.seen();
+            assert_eq!(seen.state, Some(State::PrOpen));
+            assert_eq!(seen.worked_ms, worked);
+            assert_eq!(seen.working_since, None);
+        }
+
+        #[test]
+        fn a_waiting_round_starts_on_the_first_pass_a_slot_is_free_before_the_next_read_is_due() {
+            let world = World::reviewed();
+            let mut none_free = slots(0);
+            let mut reserved = Reserved::default();
+            assert!(matches!(
+                world.try_pass(&mut none_free, &mut reserved).unwrap(),
+                FeedbackStep::Waiting { .. }
+            ));
+            world.hub.forget_reads();
+            world.wait(Duration::from_secs(60));
+            let reads = first_reads(&world);
+            // A slot is free: the feedback is read now, though no read is due, and decided.
+            let step = world.go();
+            assert_eq!(
+                step,
+                FeedbackStep::Decided {
+                    round: 1,
+                    pr: 12,
+                    items: 1
+                }
+            );
+            assert_eq!(world.hub.reads(), reads);
+            assert_eq!(world.rig.sim.labels(), ["factory:building"]);
+        }
+
+        #[test]
+        fn a_round_waiting_for_a_machine_reads_once_per_window_and_starts_when_one_can_take_it() {
+            let mut world = World::reviewed();
+            // The only machine is at its limit of sessions.
+            world.rig.view = fleet_with(4).build();
+            let FeedbackStep::Waiting { reason } = world.go() else {
+                panic!("expected a wait");
+            };
+            assert!(reason.starts_with("mac:"), "{reason}");
+            assert_eq!(world.steps_of("feedback-read"), ["feedback-read 1 0 found"]);
+            world.hub.forget_reads();
+            let (calls, count) = (world.hub.counted(), world.count());
+            world.wait(Duration::from_secs(60));
+            assert_eq!(world.go(), FeedbackStep::Waiting { reason });
+            assert_eq!(world.hub.counted(), calls);
+            assert_eq!(world.count(), count);
+            // The machine has room: the next pass reads and decides.
+            world.rig.view = fleet().build();
+            world.wait(Duration::from_secs(60));
+            let reads = first_reads(&world);
+            assert!(matches!(world.go(), FeedbackStep::Decided { items: 1, .. }));
+            assert_eq!(world.hub.reads(), reads);
         }
 
         #[test]
