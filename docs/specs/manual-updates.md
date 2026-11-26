@@ -2,7 +2,7 @@
 
 Product: Foundry. A change to P1's updates.
 
-Status: drafted 2026-11-26 from a brainstorm the same day, revised after three council rounds. Nothing here is built.
+Status: ready 2026-11-26. Drafted from a brainstorm the same day, revised over four council rounds until every seat (Claude, Gemini, Grok, Sol) said ready at 26b41ac. Nothing here is built.
 
 ## Why
 
