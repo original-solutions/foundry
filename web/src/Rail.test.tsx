@@ -27,6 +27,11 @@ const handlers = () => ({ onExpand: vi.fn(), onJump: vi.fn(), onCreate: vi.fn() 
 afterEach(() => localStorage.clear());
 
 describe("Rail", () => {
+  it("links to the factory beside the board", async () => {
+    await renderApp(<Rail machines={machines()} onExpand={() => {}} onJump={() => {}} onCreate={() => {}} />);
+    expect(screen.getByRole("link", { name: "The factory" }).getAttribute("href")).toBe("/factory");
+  });
+
   it("shows every workspace as its terminals' states, each a link named by workspace, terminal and state, the open one marked", async () => {
     await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
 

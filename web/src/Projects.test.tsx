@@ -1,6 +1,7 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useState, type ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { FactoryContext } from "./factory";
 import { Projects } from "./Projects";
 import { json, mockFetch, renderApp } from "./test-utils";
 
@@ -220,5 +221,29 @@ describe("Projects", () => {
     expect(nameField().value).toBe("");
     expect(repoField().value).toBe("");
     expect(within(dialog()).queryByRole("alert")).toBeNull();
+  });
+
+  it("shows each row's factory switch, login and pause as the context holds them, and sends the whole value on a change", async () => {
+    const calls = mockFetch(json(200, { factory: { on: true, login: "bot", paused: true } }));
+    await renderApp(
+      <FactoryContext.Provider value={{ p1: { on: true, login: "bot", paused: false } }}>
+        <Projects open onOpenChange={() => {}} projects={projects} onAdded={() => {}} />
+      </FactoryContext.Provider>,
+    );
+    const first = row("demo");
+    expect(within(first).getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("true");
+    expect((within(first).getByLabelText("GitHub login for demo") as HTMLInputElement).value).toBe("bot");
+    expect(within(row("foundry")).getByRole("switch", { name: "Factory for foundry" }).getAttribute("aria-checked")).toBe("false");
+
+    fireEvent.click(within(first).getByLabelText("Pause claims for demo"));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toEqual({ url: "/api/projects/p1/factory", method: "POST", body: { on: true, paused: true, login: "bot" } });
+  });
+
+  it("shows the factory controls with their defaults when nothing provides the settings, and fetches nothing on open", async () => {
+    const calls = mockFetch();
+    await show();
+    expect(within(row("demo")).getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("false");
+    expect(calls).toHaveLength(0);
   });
 });

@@ -725,6 +725,49 @@ describe("App", () => {
     expect(screen.queryByText("unknown")).toBeNull();
   });
 
+  const factoryOverview = (status: unknown = null) =>
+    json(200, {
+      settings: { paused: false, poll_seconds: 30, feedback_seconds: 300, max_runs: 2, max_gates: 3, model: "opus", effort: "high" },
+      projects: [{ id: "p1", name: "demo", factory: { on: true, login: "bot", paused: false }, writer: null, status }],
+    });
+  const heldStatus = (generation: number) => ({
+    project: "p1",
+    pass: 1,
+    holds: true,
+    generation,
+    not_holding: null,
+    idle: null,
+    owner_ignored: false,
+    ready: [],
+    feedback_waiting: [],
+    runs: [],
+    held_up: [],
+    gate_infra: [],
+    finished: [],
+    foreign: [],
+  });
+
+  it("shows the Factory view at /factory in place of the board, and a factory_status reaches it", async () => {
+    mockActions(factoryOverview(), factoryOverview(), factoryOverview());
+    await open("/factory", live);
+    expect(await screen.findByRole("heading", { name: "Factory" })).toBeDefined();
+    expect(await screen.findByText("No status yet")).toBeDefined();
+    expect(screen.queryByRole("group", { name: "fix login" })).toBeNull();
+
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: heldStatus(9) })));
+    expect(await screen.findByText(/Holds the lease at generation 9/)).toBeDefined();
+  });
+
+  it("keeps the board working after a factory_status or a message it does not know", async () => {
+    mockActions();
+    await open("/", live);
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: heldStatus(2) })));
+    act(() => events.deliver(JSON.stringify({ type: "something_new", protocol: 6 })));
+    expect(await screen.findByText("fix login")).toBeDefined();
+  });
+
   it("starts a new shell from the palette and opens it", async () => {
     const calls = mockActions(json(201, { id: "t9" }));
     const router = await open("/", live);
