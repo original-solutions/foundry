@@ -5,6 +5,9 @@ import type { FactorySettings } from "./api";
 import { FleetSettings, ProjectFactoryControls } from "./FactorySettings";
 import { json, mockFetch, renderApp } from "./test-utils";
 
+/** What the daemon puts in place of each string of an answer when its secret store cannot be read (`secrets::HIDDEN_UNREADABLE`). */
+const HIDDEN = "[hidden: the secret store could not be read]";
+
 afterEach(() => vi.unstubAllGlobals());
 
 const current: FactorySettings = { paused: false, poll_seconds: 30, feedback_seconds: 300, max_runs: 2, max_gates: 3, model: "opus", effort: "high" };
@@ -100,13 +103,16 @@ describe("FleetSettings", () => {
     expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("haiku");
   });
 
-  it("keeps the submitted model when the daemon answers its placeholder for one it could not read", async () => {
-    mockFetch(json(200, { settings: { ...current, model: "[hidden: the secret store could not be read]" } }));
+  it("keeps the submitted model and effort when the daemon answers its placeholder for strings it could not read", async () => {
+    // The daemon hides every string of an answer at once when its secret store cannot be read.
+    mockFetch(json(200, { settings: { ...current, model: HIDDEN, effort: HIDDEN } }));
     await renderApp(<FleetSettings settings={current} />);
     type("Model", "sonnet");
+    type("Effort", "medium");
     save();
     await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
     expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("sonnet");
+    expect((screen.getByLabelText("Effort") as HTMLInputElement).value).toBe("medium");
   });
 
   it("shows the daemon's refusal", async () => {
@@ -273,7 +279,6 @@ describe("ProjectFactoryControls", () => {
     expect(pause().checked).toBe(false);
   });
 
-  const HIDDEN = "[hidden: the secret store could not be read]";
   type Setting = { on: boolean; login: string; paused: boolean };
   /** The controls under a harness that moves their props, and handles on what they show. */
   function controls(first: Setting) {
@@ -362,9 +367,11 @@ describe("ProjectFactoryControls", () => {
     await waitFor(() => expect(calls).toHaveLength(1));
     await c.ready();
     expect(c.box().value).toBe("bot");
+    // Only strings are hidden: the switch the daemon confirmed stays on, so the next change keeps it.
+    expect(c.toggle().getAttribute("aria-checked")).toBe("true");
     fireEvent.click(c.pause());
     await waitFor(() => expect(calls).toHaveLength(2));
-    expect(calls[1].body).toMatchObject({ login: "bot" });
+    expect(calls[1].body).toEqual({ on: true, paused: true, login: "bot" });
   });
 
   it("shows a refusal beside the row", async () => {
