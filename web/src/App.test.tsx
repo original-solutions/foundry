@@ -752,7 +752,7 @@ describe("App", () => {
     await open("/factory", live);
     expect(await screen.findByRole("heading", { name: "Factory" })).toBeDefined();
     expect(await screen.findByText("No status yet")).toBeDefined();
-    expect(screen.queryByRole("group", { name: "fix login" })).toBeNull();
+    expect(screen.queryByRole("radiogroup", { name: "View" })).toBeNull();
 
     const events = sockets("/api/events").at(-1)!;
     act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: heldStatus(9) })));
@@ -765,7 +765,7 @@ describe("App", () => {
     const events = sockets("/api/events").at(-1)!;
     act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: heldStatus(2) })));
     act(() => events.deliver(JSON.stringify({ type: "something_new", protocol: 6 })));
-    expect(await screen.findByText("fix login")).toBeDefined();
+    expect(await screen.findByRole("radiogroup", { name: "View" })).toBeDefined();
   });
 
   it("starts a new shell from the palette and opens it", async () => {
