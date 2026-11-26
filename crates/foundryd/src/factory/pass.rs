@@ -15,14 +15,19 @@
 //!    on issues in `triage` or `building` that have no confirmed run, and the runs the fleet's
 //!    workspace names (`fac/<N>-<attempt>`) name on such issues, before any event. A run with
 //!    no event is carried on by `start::advance`, which reads the claim comment (the takeover).
-//! 4. An issue in `triage` or `building` whose newest claim comment is not Foundry's, or that
-//!    has none, and that no run of Foundry's holds, is a foreign claim: listed, and left alone.
+//! 4. An issue in `triage` or `building` whose newest claim comment by the project's login is
+//!    not Foundry's (the runner's marker, or a Foundry marker that does not parse), and that no
+//!    run of Foundry's holds, is a foreign claim: listed, and left alone. An issue with no claim
+//!    comment of the login and no workspace of a run is neither: it is left alone and not
+//!    listed, since nothing claimed it (a marker in another login's comment counts for nothing).
 //! 5. Every run is advanced through tasks 22 to 28, routed as each step's module says the pass
 //!    must ([`work_run`]): a stop asked for first, the gate's runs to the gate, the time limit,
 //!    the resume before the start and the build, the reconcile before the build, the build
-//!    and its forward, and the gate in the same pass as a pull request is reported. Runs in
-//!    `pr-open`, and runs a feedback round owns, have their feedback step after the others and
-//!    before the claims, with the pass's slots and reservations.
+//!    and its forward, and the gate in the same pass as a pull request is reported. A run whose
+//!    end the reconcile is winding up is touched by no other step that pass. Runs in `pr-open`,
+//!    and runs a feedback round owns, have their feedback step after the claims (step 6), as
+//!    the runner's `prOpenRuns` comes after its claim, so a claim of an issue put back to
+//!    `ready` ends its older `pr-open` run first.
 //! 6. Ready issues are claimed, oldest first (by number, as the runner orders them), while a run
 //!    slot is free, claims are not paused and `placing::place_run` has a machine. An issue
 //!    labelled `postponed`, one whose older run is gating, and one blocked by an open issue
@@ -40,9 +45,11 @@
 //! pass goes on.
 //!
 //! The run and gate slots are the fleet's (`max_runs`, `max_gates`), and the projects' passes
-//! run at once, each on its own thread. [`Book`] is what they share: each project publishes the
-//! slots its runs hold and the machines it has placed runs on whose sessions the machines'
-//! samples do not count yet, and a pass counts every other project's before it claims.
+//! run at once, each on its own thread. [`Book`] is what they share: each project's entry holds
+//! the slots its runs hold and the machines it placed runs on whose sessions the machines'
+//! samples do not count yet. A claim, a gate and a feedback round take their slot in the book,
+//! under its lock, only while the fleet's count is under its limit, and give it back when they
+//! did not spend it, so two passes never both take the last slot.
 //!
 //! Where it differs from the runner:
 //!
@@ -63,6 +70,20 @@
 //! - A config is read again only when the default branch's head moved; a read that fails is a
 //!   tracker error and ends the pass. The runner's "last good copy" of a config and a login
 //!   whose re-read blipped is the copy [`Memo`] keeps for an unmoved head.
+//! - A tracker error ends the project's pass (the plan's rule), where the runner noted it and
+//!   went on to the next issue or repo. These runner cases are ported under their names with
+//!   the plan's outcome, the pass ended and the next pass going on:
+//!   `an issue whose blockers cannot be read is not claimed and the pass goes on`, `an issue
+//!   whose depends on cannot be read is not claimed and the pass goes on`, `triage issues that
+//!   cannot be listed are an error and the others go on` and `a repo whose ready issues cannot
+//!   be listed is an error and the others go on` (the others are the other projects, whose
+//!   passes run apart: the service's test
+//!   `a_tracker_error_in_one_project_ends_its_pass_and_the_next_project_still_runs`). `a failed
+//!   start is an error line and the next issue is tried` keeps the runner's outcome for a
+//!   worker's failure, which is the run's, not the pass's.
+//! - The issue of a stuck run that keeps a workspace is read by the finished-run sweep, every
+//!   [`STUCK_READ_EVERY`]; an unfinished stuck path is reconciled every pass, so a path cut
+//!   short is finished at once.
 //!
 //! Runner cases of `pass.test.ts` that have no Rust test of the same name, by group, with the
 //! reason. The cases not listed are ported under their names.
@@ -86,7 +107,23 @@
 //!   Foundry keeps the copy of an unmoved head, has one login per project and counts failed
 //!   passes, not skipped repos.
 //! - `which repo gets a free slot`: one project per pass; the fleet's slots are shared through
-//!   [`Book`] and taken in the order the passes reach them.
+//!   [`Book`] and taken in the order the passes reach them (`the_book::two_projects_never_both_take_the_last_run_slot`).
+//! - The cases about printed lines with nothing behind them in Foundry: `a cut ready listing is
+//!   said once and the issues read are still claimed`, `a cut triage listing is said once`, `a
+//!   pass that lists no repo's ready issues writes no ready_listed`, `with the pause a pass with
+//!   nothing ready still says it once`, `a claimed issue that went stuck says so and names the
+//!   run` and `a triage run that went stuck says so and names the run` (a launch that goes
+//!   stuck is `start`'s, task 22).
+//! - `a repo whose tracker login cannot be read is logged and skipped, and the others still
+//!   run`: a project's login is a shared setting, not read from GitHub; a login with no token
+//!   is the "no token" status (`the_lease::a_project_with_no_token_writes_no_token_and_touches_nothing_on_github`).
+//! - `a ledger that cannot be listed is an error and nothing is claimed` and `a run whose file
+//!   cannot be read is an error line and counts as active`: the ledger is the store, which the
+//!   fakes cannot make fail. A store error ends the pass (`Ended::Failed`), and a run whose
+//!   events cannot be read is noted and holds a slot by `holds_slot`.
+//! - `a start that finds a gate running says so and is no error`: the pass does not claim an
+//!   issue whose older run is gating (`a_ready_issue_whose_older_run_is_gating`), so `start`
+//!   never meets the gate there.
 //! - `several machines on one repo` and `a repo whose factory.owner is another machine`: one
 //!   coordinator acts, by the lease (F9: `factory.owner` is ignored and the status says so,
 //!   `a_repo_that_sets_factory_owner_is_claimed_from_and_the_status_says_it_is_ignored`).
@@ -132,8 +169,8 @@ use crate::store::{Applied, Store, StoreError};
 /// Passes that fail in a row before the status says the factory is idle.
 pub const IDLE_AFTER_FAILURES: u32 = 3;
 
-/// How often the issue of a stuck run that keeps a workspace is read by the reconcile: the
-/// runner's `STUCK_READ_EVERY_MS`.
+/// How often the finished runs are swept by the reconcile, which reads the issue of a stuck run
+/// that keeps a workspace: the runner's `STUCK_READ_EVERY_MS`.
 pub const STUCK_READ_EVERY: Duration = Duration::from_secs(10 * 60);
 
 /// The label that parks a ready issue: matched in any case, as the whole name.
@@ -186,8 +223,8 @@ pub struct Memo {
     last: Option<PassResults>,
     /// The machines online at the previous pass; `None` before the first.
     online: Option<BTreeSet<MachineId>>,
-    /// When the reconcile last read each stuck run, on the clock.
-    stuck_read: BTreeMap<RunId, Duration>,
+    /// An orphan's archive failed: the next pass looks for orphans again.
+    orphans_owed: bool,
     /// When the finished runs were last swept, on the clock.
     swept: Option<Duration>,
 }
@@ -216,9 +253,24 @@ pub struct PassReport {
 }
 
 /// The fleet's slots and reservations, shared by every project's pass.
+///
+/// Each project's entry is what its runs hold: set from its ledger at the start and the end of
+/// each pass ([`Book::begin`], [`Book::finish`]), and raised in between, under the book's lock,
+/// by each slot a claim, a gate or a feedback round takes ([`Book::take_run`],
+/// [`Book::take_gate`]): a slot is taken only while the whole fleet's count is under its
+/// limit, so two projects' passes never both take the last one. A pass holds a [`Ticket`];
+/// once its project is forgotten (turned off, or this machine stops acting) the ticket is
+/// stale and nothing it does changes the book.
 #[derive(Debug, Default)]
 pub struct Book {
-    held: Mutex<BTreeMap<ProjectId, Held>>,
+    state: Mutex<BookState>,
+}
+
+#[derive(Debug, Default)]
+struct BookState {
+    held: BTreeMap<ProjectId, Held>,
+    /// Raised by every [`Book::forget`], so a pass begun before it changes nothing after it.
+    epochs: BTreeMap<ProjectId, u64>,
 }
 
 /// What one project holds of the fleet.
@@ -230,29 +282,120 @@ struct Held {
     placed: Vec<MachineId>,
 }
 
+/// One pass's hold on its project's entry in the [`Book`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ticket {
+    project: ProjectId,
+    epoch: u64,
+}
+
+impl BookState {
+    fn current(&self, ticket: Ticket) -> bool {
+        self.epochs.get(&ticket.project).copied().unwrap_or(0) == ticket.epoch
+    }
+
+    fn total(&self, of: impl Fn(&Held) -> u32) -> u32 {
+        self.held
+            .values()
+            .fold(0u32, |sum, held| sum.saturating_add(of(held)))
+    }
+}
+
 impl Book {
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<ProjectId, Held>> {
-        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> std::sync::MutexGuard<'_, BookState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// What every project but `project` holds.
-    fn others(&self, project: ProjectId) -> Held {
-        let mut all = Held::default();
-        for (_, held) in self.lock().iter().filter(|(p, _)| **p != project) {
-            all.runs = all.runs.saturating_add(held.runs);
-            all.gates = all.gates.saturating_add(held.gates);
-            all.placed.extend(held.placed.iter().copied());
+    /// A pass of `project` begins, holding `held`: its entry is set, and the pass's ticket and
+    /// the machines every other project placed runs on are answered.
+    fn begin(&self, project: ProjectId, held: Held) -> (Ticket, Vec<MachineId>) {
+        let mut state = self.lock();
+        let epoch = state.epochs.get(&project).copied().unwrap_or(0);
+        state.held.insert(project, held);
+        let others = state
+            .held
+            .iter()
+            .filter(|(p, _)| **p != project)
+            .flat_map(|(_, held)| held.placed.iter().copied())
+            .collect();
+        (Ticket { project, epoch }, others)
+    }
+
+    /// The pass ends, its project holding `held`.
+    fn finish(&self, ticket: Ticket, held: Held) {
+        let mut state = self.lock();
+        if state.current(ticket) {
+            state.held.insert(ticket.project, held);
         }
-        all
     }
 
-    fn publish(&self, project: ProjectId, held: Held) {
-        self.lock().insert(project, held);
+    /// Takes one of the fleet's `max` run slots for the ticket's project, when one is free.
+    fn take_run(&self, ticket: Ticket, max: u32) -> bool {
+        let mut state = self.lock();
+        if !state.current(ticket) || state.total(|h| h.runs) >= max {
+            return false;
+        }
+        let held = state.held.entry(ticket.project).or_default();
+        held.runs = held.runs.saturating_add(1);
+        true
     }
 
-    /// The project no longer runs here: it holds nothing of the fleet.
+    /// How many of the fleet's `max` run slots are free now.
+    fn runs_free(&self, max: u32) -> u32 {
+        max.saturating_sub(self.lock().total(|h| h.runs))
+    }
+
+    /// Gives back a run slot taken and not spent.
+    fn give_run(&self, ticket: Ticket) {
+        let mut state = self.lock();
+        if state.current(ticket)
+            && let Some(held) = state.held.get_mut(&ticket.project)
+        {
+            held.runs = held.runs.saturating_sub(1);
+        }
+    }
+
+    /// Takes one of the fleet's `max` gate slots, when one is free.
+    fn take_gate(&self, ticket: Ticket, max: u32) -> bool {
+        let mut state = self.lock();
+        if !state.current(ticket) || state.total(|h| h.gates) >= max {
+            return false;
+        }
+        let held = state.held.entry(ticket.project).or_default();
+        held.gates = held.gates.saturating_add(1);
+        true
+    }
+
+    /// Gives back a gate slot taken and not spent.
+    fn give_gate(&self, ticket: Ticket) {
+        let mut state = self.lock();
+        if state.current(ticket)
+            && let Some(held) = state.held.get_mut(&ticket.project)
+        {
+            held.gates = held.gates.saturating_sub(1);
+        }
+    }
+
+    /// A run of the ticket's project was placed on `machine` this pass.
+    fn place(&self, ticket: Ticket, machine: MachineId) {
+        let mut state = self.lock();
+        if state.current(ticket) {
+            state
+                .held
+                .entry(ticket.project)
+                .or_default()
+                .placed
+                .push(machine);
+        }
+    }
+
+    /// The project no longer runs here: it holds nothing of the fleet, and a pass of it still
+    /// under way changes nothing here.
     pub fn forget(&self, project: ProjectId) {
-        self.lock().remove(&project);
+        let mut state = self.lock();
+        state.held.remove(&project);
+        let epoch = state.epochs.entry(project).or_insert(0);
+        *epoch = epoch.saturating_add(1);
     }
 }
 
@@ -310,6 +453,9 @@ pub fn run(world: &World<'_>, memo: &mut Memo) -> PassReport {
     };
     // 2. The lease.
     let Ok(generation) = world.guard.check() else {
+        // Only the passes that hold the lease count toward the idle reason.
+        memo.failures = 0;
+        memo.failed = None;
         not_holding(world, &mut report, pass);
         return report;
     };
@@ -323,7 +469,7 @@ pub fn run(world: &World<'_>, memo: &mut Memo) -> PassReport {
             let mut results = PassResults::new(project);
             results.pass = pass;
             results.generation = generation;
-            results.idle = Some(idle);
+            results.idle = Some(world.tracker.hide(&idle));
             memo.last = Some(results.clone());
             write(world, &mut report, status::build(results));
             return report;
@@ -352,6 +498,7 @@ pub fn run(world: &World<'_>, memo: &mut Memo) -> PassReport {
         report,
         memo,
         titles: BTreeMap::new(),
+        ticket: None,
     };
     match one.go() {
         Ok(()) => {
@@ -566,6 +713,19 @@ struct Pass<'a, 'w> {
     memo: &'a mut Memo,
     /// Each issue's title, from the listings read.
     titles: BTreeMap<u64, String>,
+    /// The pass's hold on the book, once it has begun there.
+    ticket: Option<Ticket>,
+}
+
+/// Whose claim an issue in `triage` or `building` carries.
+enum Found {
+    Ours(RunId),
+    Foreign,
+    Nothing,
+}
+
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 /// One unfinished run with what its events say.
@@ -623,54 +783,49 @@ impl<'a, 'w> Pass<'a, 'w> {
         Ok(known)
     }
 
+    /// What this project's runs hold of the fleet, by their events.
+    fn holding(known: &[Known]) -> Held {
+        let infos: Vec<RunInfo> = known.iter().map(|k| k.info.clone()).collect();
+        Held {
+            runs: count(infos.iter().filter(|info| holds_slot(info)).count()),
+            gates: count(
+                known
+                    .iter()
+                    .filter(|k| gating::gate_running(&k.events))
+                    .count(),
+            ),
+            placed: known
+                .iter()
+                .filter(|k| {
+                    k.info.confirmed
+                        && !k.info.session
+                        && matches!(k.info.state, None | Some(State::Triage))
+                })
+                .filter_map(|k| k.seen.machine.as_deref().and_then(machine_id))
+                .collect(),
+        }
+    }
+
     fn go(&mut self) -> Result<(), Ended> {
         let world = self.world;
         let repo = world.project.repo.clone();
         let project = world.project.id;
         let known = self.known()?;
-        // The fleet's slots: what this project's runs hold, and every other project's.
-        let gates = known
-            .iter()
-            .filter(|k| gating::gate_running(&k.events))
-            .count();
-        let infos: Vec<RunInfo> = known.iter().map(|k| k.info.clone()).collect();
-        let fleet = &self.settings.fleet;
-        let others = world.book.others(project);
-        let own = placing::slots(&infos, gates, fleet);
-        let mut slots = Slots {
-            runs_free: own.runs_free.saturating_sub(others.runs),
-            gates_free: own.gates_free.saturating_sub(others.gates),
-        };
+        // The fleet's slots: this project's runs hold what their events say, and every other
+        // project's entry in the book holds theirs.
+        let held = Self::holding(&known);
         let mut reserved = Reserved::default();
-        for machine in &others.placed {
+        for machine in &held.placed {
             reserved.hold(*machine);
         }
-        let mut placed = Vec::new();
-        for k in &known {
-            if k.info.confirmed
-                && !k.info.session
-                && matches!(k.info.state, None | Some(State::Triage))
-                && let Some(machine) = k.seen.machine.as_deref().and_then(machine_id)
-            {
-                reserved.hold(machine);
-                placed.push(machine);
-            }
+        let (ticket, others) = world.book.begin(project, held);
+        self.ticket = Some(ticket);
+        for machine in others {
+            reserved.hold(machine);
         }
-        let held = |slots: &Slots, placed: &[MachineId]| Held {
-            runs: fleet
-                .max_runs
-                .saturating_sub(others.runs)
-                .saturating_sub(slots.runs_free),
-            gates: fleet
-                .max_gates
-                .saturating_sub(others.gates)
-                .saturating_sub(slots.gates_free),
-            placed: placed.to_vec(),
-        };
-        world.book.publish(project, held(&slots, &placed));
 
         // 3 and 4. The claims on issues in `triage` and `building` that no run of the ledger
-        // holds: Foundry's are carried on, any other is foreign.
+        // holds: Foundry's are carried on, another factory's are foreign.
         let mut carry = Vec::new();
         for state in [State::Triage, State::Building] {
             let listing = world.tracker.list_issues(&repo, state)?;
@@ -682,9 +837,10 @@ impl<'a, 'w> Pass<'a, 'w> {
                 if ours {
                     continue;
                 }
-                match self.found_claim(&issue, state)? {
-                    Some(run) => carry.push(run),
-                    None => self.foreign(&issue, state),
+                match self.found_claim(&issue)? {
+                    Found::Ours(run) => carry.push(run),
+                    Found::Foreign => self.foreign(&issue, state),
+                    Found::Nothing => {}
                 }
             }
         }
@@ -697,7 +853,8 @@ impl<'a, 'w> Pass<'a, 'w> {
             self.note(&run, said);
         }
 
-        // 5. Every run, then the feedback steps.
+        // 5. Every run; the feedback steps come after the claims, as the runner's `prOpenRuns`
+        // does, so a claim of an issue put back to `ready` ends its older `pr-open` run first.
         let mut later = Vec::new();
         for k in &known {
             let run = &k.info.id;
@@ -716,7 +873,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                 later.push(k);
                 continue;
             }
-            let said = match self.work_run(k, &mut slots, &mut reserved) {
+            let said = match self.work_run(k, &mut reserved) {
                 Ok(said) => said,
                 Err(error) => ending(error)?,
             };
@@ -725,18 +882,16 @@ impl<'a, 'w> Pass<'a, 'w> {
                 later.push(k);
             }
         }
+
+        // 6. The claims.
+        self.claims(&known, &mut reserved)?;
         for k in later {
-            let said = match self.feedback(k, &mut slots, &mut reserved) {
+            let said = match self.feedback(k, &mut reserved) {
                 Ok(said) => said,
                 Err(error) => ending(error)?,
             };
             self.note(&k.info.id, said);
         }
-        world.book.publish(project, held(&slots, &placed));
-
-        // 6. The claims.
-        self.claims(&known, &mut slots, &mut reserved, &mut placed)?;
-        world.book.publish(project, held(&slots, &placed));
 
         // 7. The sweeps: orphans for a machine heard from again, and finished runs.
         self.sweep()?;
@@ -744,34 +899,19 @@ impl<'a, 'w> Pass<'a, 'w> {
         // 8. What the status says.
         self.results_of()?;
         let after = self.known()?;
-        let infos: Vec<RunInfo> = after.iter().map(|k| k.info.clone()).collect();
-        let gates = after
-            .iter()
-            .filter(|k| gating::gate_running(&k.events))
-            .count();
-        let own = placing::slots(&infos, gates, fleet);
-        world.book.publish(
-            project,
-            Held {
-                runs: fleet.max_runs.saturating_sub(own.runs_free),
-                gates: fleet.max_gates.saturating_sub(own.gates_free),
-                placed: after
-                    .iter()
-                    .filter(|k| {
-                        k.info.confirmed
-                            && !k.info.session
-                            && matches!(k.info.state, None | Some(State::Triage))
-                    })
-                    .filter_map(|k| k.seen.machine.as_deref().and_then(machine_id))
-                    .collect(),
-            },
-        );
+        world.book.finish(ticket, Self::holding(&after));
         Ok(())
     }
 
-    /// The run Foundry's newest claim comment names on `issue`, or one the fleet's workspace
-    /// names when the issue has no claim comment; `None` for another factory's claim.
-    fn found_claim(&mut self, issue: &IssueSummary, _state: State) -> Result<Option<RunId>, Ended> {
+    fn ticket(&self) -> Ticket {
+        self.ticket
+            .expect("a pass that holds the lease has begun in the book")
+    }
+
+    /// Whose claim `issue` carries: a run of Foundry's, named by Foundry's newest claim
+    /// comment or, with no claim comment at all, by the fleet's workspace names; another
+    /// factory's, or another login's comment is none; or nothing at all.
+    fn found_claim(&mut self, issue: &IssueSummary) -> Result<Found, Ended> {
         let world = self.world;
         let repo = &world.project.repo;
         let comments = world.tracker.issue_comments(repo, issue.number)?;
@@ -779,9 +919,9 @@ impl<'a, 'w> Pass<'a, 'w> {
             Some(Claim::Foundry { run, .. })
                 if run.repo().eq_ignore_ascii_case(repo) && run.issue() == issue.number =>
             {
-                Ok(Some(run))
+                Ok(Found::Ours(run))
             }
-            Some(_) => Ok(None),
+            Some(_) => Ok(Found::Foreign),
             None => {
                 let next = self.ledger.next_attempt(repo, issue.number)?;
                 for attempt in (1..=next).rev() {
@@ -790,11 +930,12 @@ impl<'a, 'w> Pass<'a, 'w> {
                         .view
                         .workspace_named(world.project.id, &name)
                         .is_some()
+                        && let Ok(run) = RunId::new(repo, issue.number, attempt)
                     {
-                        return Ok(RunId::new(repo, issue.number, attempt).ok());
+                        return Ok(Found::Ours(run));
                     }
                 }
-                Ok(None)
+                Ok(Found::Nothing)
             }
         }
     }
@@ -814,24 +955,19 @@ impl<'a, 'w> Pass<'a, 'w> {
     }
 
     /// One run through its steps, routed as each step's module says.
-    fn work_run(
-        &mut self,
-        k: &Known,
-        slots: &mut Slots,
-        reserved: &mut Reserved,
-    ) -> Result<String, RunError> {
+    fn work_run(&mut self, k: &Known, reserved: &mut Reserved) -> Result<String, RunError> {
         let world = self.world;
         let run = &k.info.id;
         let state = k.info.state;
         let config = run_config(self.config, k.info.base.as_deref());
         let ctx = context(self.world, self.ledger, self.settings, &config);
         if gating::gate_running(&k.events) {
-            return self.gate(&ctx, run, slots);
+            return self.gate(&ctx, run);
         }
         if k.seen.stop_requested && matches!(state, Some(State::Building | State::Stuck)) {
             match stop::advance(&ctx, run)? {
                 StopStep::Skipped { .. } => {}
-                StopStep::GateHolds => return self.gate(&ctx, run, slots),
+                StopStep::GateHolds => return self.gate(&ctx, run),
                 StopStep::Stuck { .. } => return Ok("stuck: stopped by hand".into()),
                 other => return Ok(format!("stop: {other:?}")),
             }
@@ -869,14 +1005,12 @@ impl<'a, 'w> Pass<'a, 'w> {
                 other => return Ok(format!("resume: {other:?}")),
             }
         }
-        if !matches!(state, None | Some(State::Triage | State::NeedsInfo))
-            && self.reconcile_due(run, state)
-        {
+        if !matches!(state, None | Some(State::Triage | State::NeedsInfo)) {
             match stop::reconcile(&ctx, run)? {
                 ReconcileStep::Unchanged
                 | ReconcileStep::Skipped { .. }
-                | ReconcileStep::Archived { .. }
-                | ReconcileStep::Waiting { .. } => {}
+                | ReconcileStep::Archived { .. } => {}
+                // A run whose end is being wound up is touched by no other step.
                 other => return Ok(format!("reconcile: {other:?}")),
             }
         }
@@ -891,7 +1025,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                 let step = building::advance(&ctx, run)?;
                 let mut said = format!("build: {step:?}");
                 if let BuildStep::ReadyForGate { .. } = step {
-                    said = format!("{said}; {}", self.gate(&ctx, run, slots)?);
+                    said = format!("{said}; {}", self.gate(&ctx, run)?);
                 }
                 let forwarded = feedback::forward(&ctx, run)?;
                 if forwarded.comments > 0 || forwarded.body_edit {
@@ -906,32 +1040,21 @@ impl<'a, 'w> Pass<'a, 'w> {
         }
     }
 
-    /// A stuck run's issue is read no more often than [`STUCK_READ_EVERY`]; any other run's
-    /// every pass.
-    fn reconcile_due(&mut self, run: &RunId, state: Option<State>) -> bool {
-        if state != Some(State::Stuck) {
-            return true;
-        }
-        let now = self.world.clock.now();
-        let due = self
-            .memo
-            .stuck_read
-            .get(run)
-            .is_none_or(|at| now.saturating_sub(*at) >= STUCK_READ_EVERY);
-        if due {
-            self.memo.stuck_read.insert(run.clone(), now);
-        }
-        due
-    }
-
     /// The gate step of `run`, with what it says.
-    fn gate(
-        &mut self,
-        ctx: &RunContext<'_>,
-        run: &RunId,
-        slots: &mut Slots,
-    ) -> Result<String, RunError> {
-        let step = gating::advance(ctx, run, self.world.shared, slots)?;
+    /// A gate slot of the fleet is taken for the step, and given back when it placed no gate.
+    fn gate(&mut self, ctx: &RunContext<'_>, run: &RunId) -> Result<String, RunError> {
+        let book = self.world.book;
+        let ticket = self.ticket();
+        let taken = book.take_gate(ticket, self.settings.fleet.max_gates);
+        let mut slots = Slots {
+            runs_free: 0,
+            gates_free: u32::from(taken),
+        };
+        let step = gating::advance(ctx, run, self.world.shared, &mut slots);
+        if taken && slots.gates_free > 0 {
+            book.give_gate(ticket);
+        }
+        let step = step?;
         if let GateStep::BackingOff { .. } = step {
             self.results.gate_infra.push(run.clone());
         }
@@ -939,12 +1062,8 @@ impl<'a, 'w> Pass<'a, 'w> {
     }
 
     /// The feedback step of a run in `pr-open`, or one a round owns.
-    fn feedback(
-        &mut self,
-        k: &Known,
-        slots: &mut Slots,
-        reserved: &mut Reserved,
-    ) -> Result<String, RunError> {
+    /// A run slot of the fleet is taken for the step, and given back when no round took it.
+    fn feedback(&mut self, k: &Known, reserved: &mut Reserved) -> Result<String, RunError> {
         let run = &k.info.id;
         let config = run_config(self.config, k.info.base.as_deref());
         let ctx = context(self.world, self.ledger, self.settings, &config);
@@ -952,12 +1071,22 @@ impl<'a, 'w> Pass<'a, 'w> {
             match stop::reconcile(&ctx, run)? {
                 ReconcileStep::Unchanged
                 | ReconcileStep::Skipped { .. }
-                | ReconcileStep::Archived { .. }
-                | ReconcileStep::Waiting { .. } => {}
+                | ReconcileStep::Archived { .. } => {}
                 other => return Ok(format!("reconcile: {other:?}")),
             }
         }
-        let step = feedback::advance(&ctx, run, self.world.shared, slots, reserved)?;
+        let book = self.world.book;
+        let ticket = self.ticket();
+        let taken = book.take_run(ticket, self.settings.fleet.max_runs);
+        let mut slots = Slots {
+            runs_free: u32::from(taken),
+            gates_free: 0,
+        };
+        let step = feedback::advance(&ctx, run, self.world.shared, &mut slots, reserved);
+        if taken && slots.runs_free > 0 {
+            book.give_run(ticket);
+        }
+        let step = step?;
         if let FeedbackStep::Waiting { reason } = &step {
             let waiting = Waiting {
                 issue: run.issue(),
@@ -972,13 +1101,10 @@ impl<'a, 'w> Pass<'a, 'w> {
 
     /// Step 6: ready issues claimed, oldest first, while a slot is free and placement has a
     /// machine.
-    fn claims(
-        &mut self,
-        known: &[Known],
-        slots: &mut Slots,
-        reserved: &mut Reserved,
-        placed: &mut Vec<MachineId>,
-    ) -> Result<(), Ended> {
+    fn claims(&mut self, known: &[Known], reserved: &mut Reserved) -> Result<(), Ended> {
+        let book = self.world.book;
+        let ticket = self.ticket();
+        let max = self.settings.fleet.max_runs;
         let world = self.world;
         let repo = world.project.repo.clone();
         let listing = world.tracker.list_issues(&repo, State::Ready)?;
@@ -1031,26 +1157,34 @@ impl<'a, 'w> Pass<'a, 'w> {
                         && !k.info.session
                 })
                 .count();
-            if slots.runs_free == 0 && freed == 0 {
+            // Read before the blockers, so an issue the limit holds back costs no read.
+            if freed == 0 && book.runs_free(max) == 0 {
                 wait(self, NO_SLOT.into());
                 continue;
             }
             let linked = world.tracker.open_blockers(&repo, n)?;
             let blocked = if linked.is_empty() {
                 let text = world.tracker.text_blockers(&repo, n)?;
-                (!text.is_empty()).then(|| {
-                    format!(
-                        "{} (from Depends on, add the GitHub link)",
-                        blocked_by(&repo, &text)
-                    )
-                })
+                (!text.is_empty()).then(|| blocked_by(&repo, &text, FROM_TEXT))
             } else {
-                Some(blocked_by(&repo, &linked))
+                Some(blocked_by(&repo, &linked, ""))
             };
             if let Some(blocked) = blocked {
                 wait(self, blocked);
                 continue;
             }
+            // The slot is taken now, under the book's lock: another project's pass may have
+            // taken the last one since it was read.
+            let taken = freed == 0;
+            if taken && !book.take_run(ticket, max) {
+                wait(self, NO_SLOT.into());
+                continue;
+            }
+            let give_back = |book: &Book| {
+                if taken {
+                    book.give_run(ticket);
+                }
+            };
             let before = reserved.clone();
             let machine = match placing::place_run(
                 world.view,
@@ -1060,6 +1194,7 @@ impl<'a, 'w> Pass<'a, 'w> {
             ) {
                 Ok(machine) => machine,
                 Err(reasons) => {
+                    give_back(book);
                     let reason = format!("no machine can take it now: {}", reasons.join("; "));
                     no_machine = Some(reason.clone());
                     wait(self, reason);
@@ -1071,6 +1206,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     *reserved = before;
+                    give_back(book);
                     let said = ending(error)?;
                     wait(self, said);
                     continue;
@@ -1079,10 +1215,7 @@ impl<'a, 'w> Pass<'a, 'w> {
             match outcome {
                 ClaimOutcome::Claimed { run } => {
                     self.report.claimed.push(run.clone());
-                    if freed == 0 {
-                        slots.runs_free = slots.runs_free.saturating_sub(1);
-                    }
-                    placed.push(machine);
+                    book.place(ticket, machine);
                     let ctx = self.ctx(self.config);
                     let said = match start::advance(&ctx, &run) {
                         Ok(step) => match step {
@@ -1095,10 +1228,12 @@ impl<'a, 'w> Pass<'a, 'w> {
                 }
                 ClaimOutcome::Skipped { reason } => {
                     *reserved = before;
+                    give_back(book);
                     wait(self, reason);
                 }
                 ClaimOutcome::Refused { .. } | ClaimOutcome::Abandoned { .. } => {
                     *reserved = before;
+                    give_back(book);
                 }
             }
         }
@@ -1111,10 +1246,11 @@ impl<'a, 'w> Pass<'a, 'w> {
         let world = self.world;
         let now = world.clock.now();
         let online = world.view_online();
-        let heard_again = match &self.memo.online {
-            None => true,
-            Some(before) => online.iter().any(|machine| !before.contains(machine)),
-        };
+        let heard_again = self.memo.orphans_owed
+            || match &self.memo.online {
+                None => true,
+                Some(before) => online.iter().any(|machine| !before.contains(machine)),
+            };
         let sweep_due = self
             .memo
             .swept
@@ -1131,6 +1267,7 @@ impl<'a, 'w> Pass<'a, 'w> {
         if sweep_due {
             self.memo.swept = Some(now);
         }
+        let mut owed = false;
         for run in runs {
             let events = self.ledger.read(&run)?;
             let seen = read_progress(&events);
@@ -1158,11 +1295,15 @@ impl<'a, 'w> Pass<'a, 'w> {
                     match world.worker.archive(workspace) {
                         Ok(()) => self.report.archived.push(workspace),
                         Err(error) => {
-                            self.note(&run, format!("an orphan was not archived: {error}"))
+                            owed = true;
+                            self.note(&run, format!("an orphan was not archived: {error}"));
                         }
                     }
                 }
             }
+        }
+        if heard_again {
+            self.memo.orphans_owed = owed;
         }
         Ok(())
     }
@@ -1261,15 +1402,18 @@ fn machine_id(text: &str) -> Option<MachineId> {
     uuid::Uuid::parse_str(text).ok().map(MachineId)
 }
 
-/// "blocked by #2, other/repo#3".
-fn blocked_by(repo: &str, blockers: &[super::github::Blocker]) -> String {
+/// What a blocker the `## Depends on` text names carries after it.
+const FROM_TEXT: &str = " (from Depends on, add the GitHub link)";
+
+/// "blocked by #2, other/repo#3", each blocker followed by `suffix`, as the runner says it.
+fn blocked_by(repo: &str, blockers: &[super::github::Blocker], suffix: &str) -> String {
     let named: Vec<String> = blockers
         .iter()
         .map(|blocker| {
             if blocker.repo.eq_ignore_ascii_case(repo) {
-                format!("#{}", blocker.number)
+                format!("#{}{suffix}", blocker.number)
             } else {
-                format!("{}#{}", blocker.repo, blocker.number)
+                format!("{}#{}{suffix}", blocker.repo, blocker.number)
             }
         })
         .collect();
@@ -1305,6 +1449,8 @@ pub(crate) mod testing {
         pub(crate) closed: bool,
         /// Open issues a dependency link says block it.
         pub(crate) linked: Vec<u64>,
+        /// Open issues of other repos a dependency link says block it.
+        pub(crate) linked_in: Vec<(String, u64)>,
     }
 
     #[derive(Default)]
@@ -1379,6 +1525,7 @@ pub(crate) mod testing {
                     assignees: vec![],
                     closed: false,
                     linked: vec![],
+                    linked_in: vec![],
                 },
             );
             self
@@ -1543,6 +1690,10 @@ pub(crate) mod testing {
                     }
                     Ok(String::new())
                 }
+                (Some("api"), Some(path)) if path.starts_with("repos/") && !path.starts_with(&format!("repos/{REPO}")) => {
+                    // An issue of another repo, named by a Depends on: open.
+                    Ok(json!({"state": "open"}).to_string())
+                }
                 (Some("api"), Some(path)) => {
                     let rest = path.strip_prefix(&format!("repos/{REPO}")).unwrap_or(path);
                     if rest.is_empty() {
@@ -1572,10 +1723,13 @@ pub(crate) mod testing {
                         }
                         ["issues", n, "dependencies", "blocked_by"] => {
                             let n: u64 = n.parse().unwrap_or(0);
-                            let rows: Vec<Value> = state.issues[&n]
+                            let issue = &state.issues[&n];
+                            let rows: Vec<Value> = issue
                                 .linked
                                 .iter()
-                                .map(|b| json!({"number": b, "state": "open", "repository_url": format!("https://api.github.com/repos/{REPO}")}))
+                                .map(|b| (REPO.to_owned(), *b))
+                                .chain(issue.linked_in.iter().cloned())
+                                .map(|(repo, b)| json!({"number": b, "state": "open", "repository_url": format!("https://api.github.com/repos/{repo}")}))
                                 .collect();
                             Ok(Value::Array(rows).to_string())
                         }
@@ -2073,11 +2227,64 @@ mod tests {
         fn a_guard_that_fails_in_the_middle_of_a_pass_stops_every_further_change() {
             // Every cut point, from the first check to past the last: no change on GitHub or of
             // a worker is made once the guard has failed, and the pass says the lease was lost.
+            let orphaned = |rig: &mut Rig| {
+                // A finished run whose workspace a machine heard from again still holds.
+                let run = rig.run_in(4, 1, State::Building);
+                rig.ledger
+                    .write(
+                        &run,
+                        &Event::Finished {
+                            outcome: crate::factory::ledger::events::Outcome::PrOpen,
+                            total_ms: 0,
+                            gate_attempts: 0,
+                            review_cycles: None,
+                            pr_url: None,
+                            pr_end: None,
+                        },
+                        &Cause::new(CauseStep::Start, "test"),
+                    )
+                    .unwrap();
+                rig.view = FleetView::builder()
+                    .online(me())
+                    .online(builder_machine())
+                    .sample(sample(builder_machine(), 0))
+                    .held(
+                        builder_machine(),
+                        MachineHeld {
+                            logins: vec![LOGIN.into()],
+                            skill: true,
+                        },
+                    )
+                    .workspace(Record {
+                        owner: builder_machine(),
+                        version: 1,
+                        deleted: false,
+                        body: Workspace {
+                            id: WorkspaceId(uuid::Uuid::from_u128(0x44)),
+                            project: project_id(),
+                            name: "fac/4-1".into(),
+                            branch: "fac/4-1".into(),
+                            base: "main".into(),
+                            setup: None,
+                        },
+                    })
+                    .build();
+            };
             let mut whole = Rig::new();
             for n in [5, 6, 7] {
                 whole.hub.ready(n);
             }
+            orphaned(&mut whole);
             whole.pass();
+            assert!(
+                whole
+                    .worker
+                    .inner
+                    .calls()
+                    .iter()
+                    .any(|call| matches!(call, Call::Archive { .. })),
+                "the whole pass archives the orphan"
+            );
             let writes = whole.hub.writes().len();
             assert!(writes > 0);
             for checks in 0..=writes + 20 {
@@ -2085,6 +2292,7 @@ mod tests {
                 for n in [5, 6, 7] {
                     rig.hub.ready(n);
                 }
+                orphaned(&mut rig);
                 rig.guard_for(checks);
                 let report = rig.pass();
                 assert!(
@@ -2163,7 +2371,7 @@ mod tests {
         fn a_run_in_any_watched_repo_uses_a_slot() {
             let mut rig = Rig::new();
             rig.fleet_settings(|f| f.max_runs = 1);
-            rig.book.publish(
+            rig.book.begin(
                 other_project(),
                 Held {
                     runs: 1,
@@ -2452,7 +2660,8 @@ mod tests {
                 &crate::factory::github::claim_comment(&run, &builder_machine()),
             );
             let report = rig.pass();
-            assert_eq!(report.foreign.len(), 1);
+            // No claim of the login is on the issue, so it is neither ours nor foreign.
+            assert!(report.foreign.is_empty());
             assert!(rig.ledger.read(&run).unwrap().is_empty());
             assert!(rig.creates().is_empty());
         }
@@ -2545,7 +2754,8 @@ mod tests {
         }
 
         #[test]
-        fn an_issue_whose_blockers_cannot_be_read_ends_the_pass_and_is_claimed_on_the_next() {
+        fn an_issue_whose_blockers_cannot_be_read_is_not_claimed_and_the_pass_goes_on() {
+            // The plan's rule: a tracker error ends the project's pass, which goes on next pass.
             let mut rig = Rig::new();
             rig.hub.ready(5);
             rig.hub.fail("dependencies", 1);
@@ -2666,8 +2876,14 @@ mod tests {
                 report.runs.iter().any(|(r, _)| *r == run),
                 "the run is worked: {report:?}"
             );
-            // The run's workspace is looked for again, and asked for once more only by name.
-            assert!(rig.creates().len() >= before);
+            assert!(
+                report
+                    .runs
+                    .iter()
+                    .any(|(r, said)| *r == run && said.starts_with("start:")),
+                "its start step ran: {report:?}"
+            );
+            let _ = before;
         }
     }
 
@@ -2889,6 +3105,478 @@ mod tests {
             );
             assert_eq!(status.ready.len(), 1);
             assert_eq!(status.ready[0].issue, 6);
+        }
+    }
+    // ----- runner cases ported in the second cycle -----
+
+    mod claiming_new_issues_more {
+        use super::*;
+
+        #[test]
+        fn a_building_run_whose_pull_request_waits_for_the_gate_uses_no_slot() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            rig.hub.issue(3, &["factory:building"]);
+            let run = rig.run_in(3, 1, State::Building);
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::PrOpened {
+                        pr: 12,
+                        url: format!("https://github.com/{REPO}/pull/12"),
+                    },
+                    &Cause::new(CauseStep::Advance, "test"),
+                )
+                .unwrap();
+            rig.hub.ready(5);
+            rig.pass();
+            assert_eq!(rig.claimed_issues(), vec![5]);
+        }
+
+        #[test]
+        fn a_failed_start_is_an_error_line_and_the_next_issue_is_tried() {
+            let mut rig = Rig::new();
+            rig.hub.ready(5);
+            rig.hub.ready(6);
+            rig.worker
+                .inner
+                .on_create(Err(WorkerError::Failed("disk full".into())));
+            let report = rig.pass();
+            assert_eq!(rig.claimed_issues(), vec![5, 6]);
+            let first = RunId::new(REPO, 5, 1).unwrap();
+            assert!(
+                report
+                    .runs
+                    .iter()
+                    .any(|(r, said)| *r == first && said.contains("claimed")),
+                "{report:?}"
+            );
+        }
+    }
+
+    mod claims_that_have_no_run_in_the_ledger_more {
+        use super::*;
+
+        fn claimed_on_github(rig: &Rig, issue: u64, attempt: u32) -> RunId {
+            let run = RunId::new(REPO, issue, attempt).unwrap();
+            rig.hub.issue(issue, &["factory:triage"]);
+            rig.hub.edit(issue, |i| i.assignees = vec![LOGIN.into()]);
+            rig.hub.comment_as(
+                issue,
+                LOGIN,
+                &crate::factory::github::claim_comment(&run, &builder_machine()),
+            );
+            run
+        }
+
+        fn names(rig: &Rig) -> Vec<String> {
+            rig.creates().iter().map(|c| c.name.clone()).collect()
+        }
+
+        #[test]
+        fn a_triage_issue_that_has_an_unfinished_run_is_resumed_by_the_run_step_alone() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:triage"]);
+            rig.hub.edit(5, |i| i.assignees = vec![LOGIN.into()]);
+            let run = rig.run_in(5, 1, State::Triage);
+            let report = rig.pass();
+            let said: Vec<&String> = report
+                .runs
+                .iter()
+                .filter(|(r, _)| *r == run)
+                .map(|(_, s)| s)
+                .collect();
+            assert_eq!(said.len(), 1, "{report:?}");
+            assert!(said[0].starts_with("start:"), "{report:?}");
+            assert_eq!(names(&rig), vec!["fac/5-1".to_string()]);
+        }
+
+        #[test]
+        fn a_triage_issue_whose_only_run_is_not_confirmed_is_resumed_again() {
+            let mut rig = Rig::new();
+            let run = claimed_on_github(&rig, 5, 1);
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::Claimed {
+                        machine: builder_machine().to_string(),
+                        github_user: LOGIN.into(),
+                    },
+                    &Cause::new(CauseStep::Start, "test"),
+                )
+                .unwrap();
+            let report = rig.pass();
+            assert!(
+                report
+                    .runs
+                    .iter()
+                    .any(|(r, said)| *r == run && said.starts_with("carried on")),
+                "{report:?}"
+            );
+        }
+
+        #[test]
+        fn a_run_that_is_not_confirmed_takes_no_slot() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            let run = RunId::new(REPO, 3, 1).unwrap();
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::Claimed {
+                        machine: builder_machine().to_string(),
+                        github_user: LOGIN.into(),
+                    },
+                    &Cause::new(CauseStep::Start, "test"),
+                )
+                .unwrap();
+            rig.hub.ready(5);
+            rig.pass();
+            assert_eq!(rig.claimed_issues(), vec![5]);
+        }
+
+        #[test]
+        fn a_triage_issue_with_no_run_is_resumed_even_when_every_slot_is_taken() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 0);
+            claimed_on_github(&rig, 5, 1);
+            rig.pass();
+            assert_eq!(names(&rig), vec!["fac/5-1".to_string()]);
+        }
+
+        #[test]
+        fn a_triage_issue_is_resumed_before_new_issues_are_claimed() {
+            let mut rig = Rig::new();
+            claimed_on_github(&rig, 5, 1);
+            rig.hub.ready(3);
+            rig.pass();
+            assert_eq!(
+                names(&rig),
+                vec!["fac/5-1".to_string(), "fac/3-1".to_string()]
+            );
+        }
+
+        #[test]
+        fn a_triage_issue_that_start_leaves_alone_or_fails_on_is_said_so() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:triage"]);
+            let run = RunId::new(REPO, 5, 1).unwrap();
+            // A workspace names the run and no claim comment does: start leaves it alone.
+            rig.view = FleetView::builder()
+                .online(me())
+                .workspace(Record {
+                    owner: builder_machine(),
+                    version: 1,
+                    deleted: false,
+                    body: Workspace {
+                        id: WorkspaceId(uuid::Uuid::from_u128(0x77)),
+                        project: project_id(),
+                        name: "fac/5-1".into(),
+                        branch: "fac/5-1".into(),
+                        base: "main".into(),
+                        setup: None,
+                    },
+                })
+                .build();
+            let report = rig.pass();
+            assert!(
+                report
+                    .runs
+                    .iter()
+                    .any(|(r, said)| *r == run && said.contains("Skipped")),
+                "{report:?}"
+            );
+            assert!(report.foreign.is_empty());
+        }
+
+        #[test]
+        fn triage_issues_that_cannot_be_listed_are_an_error_and_the_others_go_on() {
+            // The plan's rule: the error ends the project's pass, and the next pass goes on.
+            let mut rig = Rig::new();
+            claimed_on_github(&rig, 5, 1);
+            rig.hub.fail("factory:triage", 1);
+            let report = rig.pass();
+            assert!(report.failed.is_some());
+            assert!(rig.creates().is_empty());
+            rig.pass();
+            assert_eq!(names(&rig), vec!["fac/5-1".to_string()]);
+        }
+
+        #[test]
+        fn a_repo_whose_config_is_broken_has_its_triage_issues_left_alone() {
+            let mut rig = Rig::new();
+            rig.hub.lock().config = "factory: [not, a, map]\n".into();
+            claimed_on_github(&rig, 5, 1);
+            rig.pass();
+            assert!(rig.creates().is_empty());
+            assert!(
+                !rig.hub
+                    .calls()
+                    .iter()
+                    .any(|args| args.iter().any(|a| a.contains("/comments")))
+            );
+        }
+    }
+
+    mod issues_labelled_postponed_more {
+        use super::*;
+
+        #[test]
+        fn the_same_issue_without_the_label_is_claimed() {
+            let mut rig = Rig::new();
+            rig.hub.ready(5);
+            rig.pass();
+            assert_eq!(rig.claimed_issues(), vec![5]);
+        }
+
+        #[test]
+        fn a_building_run_on_an_issue_that_is_now_postponed_goes_on_as_before() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:building", "postponed"]);
+            rig.hub.edit(5, |i| i.assignees = vec![LOGIN.into()]);
+            let run = rig.run_in(5, 1, State::Building);
+            let report = rig.pass();
+            // The run is worked as any building run: the label holds back claims only.
+            let said: Vec<&String> = report
+                .runs
+                .iter()
+                .filter(|(r, _)| *r == run)
+                .map(|(_, s)| s)
+                .collect();
+            assert_eq!(said.len(), 1, "{report:?}");
+            assert!(!said[0].contains("postponed"), "{report:?}");
+        }
+
+        #[test]
+        fn while_claims_are_paused_a_postponed_issue_gets_no_line_and_no_event_of_its_own() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.paused = true);
+            rig.hub.issue(5, &["factory:ready", "postponed"]);
+            let report = rig.pass();
+            assert_eq!(
+                waiting_reason(&report, 5).as_deref(),
+                Some("claims are paused for the fleet")
+            );
+        }
+    }
+
+    mod issues_blocked_by_an_open_issue_more {
+        use super::*;
+
+        fn dependency_reads(rig: &Rig, issue: u64) -> usize {
+            rig.hub
+                .calls()
+                .iter()
+                .filter(|args| {
+                    args.iter()
+                        .any(|a| a.contains(&format!("issues/{issue}/dependencies")))
+                })
+                .count()
+        }
+
+        #[test]
+        fn several_blockers_are_joined_and_one_in_another_repo_names_its_repo() {
+            let mut rig = Rig::new();
+            rig.hub.ready(5);
+            rig.hub.issue(2, &[]);
+            rig.hub.issue(3, &[]);
+            rig.hub.edit(5, |i| {
+                i.linked = vec![2, 3];
+                i.linked_in = vec![("other/repo".into(), 9)];
+            });
+            let report = rig.pass();
+            assert_eq!(
+                waiting_reason(&report, 5).as_deref(),
+                Some("blocked by #2, #3, other/repo#9")
+            );
+        }
+
+        #[test]
+        fn blockers_are_read_only_until_the_last_slot_is_taken() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            rig.hub.ready(5);
+            rig.hub.ready(6);
+            rig.pass();
+            assert_eq!(dependency_reads(&rig, 5), 1);
+            assert_eq!(dependency_reads(&rig, 6), 0);
+        }
+
+        #[test]
+        fn blockers_are_read_only_when_an_issue_is_about_to_be_claimed() {
+            let mut rig = Rig::new();
+            rig.project_settings(|p| p.paused = true);
+            rig.hub.ready(5);
+            rig.pass();
+            assert_eq!(dependency_reads(&rig, 5), 0);
+        }
+    }
+
+    mod issues_whose_depends_on_text_names_an_open_issue_more {
+        use super::*;
+
+        #[test]
+        fn each_blocker_from_the_text_carries_the_suffix_and_one_in_another_repo_names_its_repo() {
+            let mut rig = Rig::new();
+            rig.hub.ready(5);
+            rig.hub.issue(2, &[]);
+            rig.hub.edit(5, |i| {
+                i.body = "Do it.\n\n## Depends on\n\n- #2\n- other/repo#3\n".into()
+            });
+            let report = rig.pass();
+            assert_eq!(
+                waiting_reason(&report, 5).as_deref(),
+                Some(
+                    "blocked by #2 (from Depends on, add the GitHub link), other/repo#3 (from \
+                     Depends on, add the GitHub link)"
+                )
+            );
+        }
+
+        #[test]
+        fn an_issue_whose_depends_on_cannot_be_read_is_not_claimed_and_the_pass_goes_on() {
+            // The plan's rule: a tracker error ends the project's pass, which goes on next pass.
+            let mut rig = Rig::new();
+            rig.hub.ready(5);
+            rig.hub.fail("--json body", 1);
+            let report = rig.pass();
+            assert!(report.failed.is_some());
+            assert!(rig.claimed_issues().is_empty());
+            rig.pass();
+            assert_eq!(rig.claimed_issues(), vec![5]);
+        }
+    }
+
+    mod the_hand_pause_more {
+        use super::*;
+
+        #[test]
+        fn with_the_pause_an_untracked_claim_is_still_handled() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.paused = true);
+            let run = RunId::new(REPO, 5, 1).unwrap();
+            rig.hub.issue(5, &["factory:triage"]);
+            rig.hub.edit(5, |i| i.assignees = vec![LOGIN.into()]);
+            rig.hub.comment_as(
+                5,
+                LOGIN,
+                &crate::factory::github::claim_comment(&run, &builder_machine()),
+            );
+            rig.pass();
+            assert_eq!(
+                rig.creates()
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>(),
+                vec!["fac/5-1".to_string()]
+            );
+        }
+
+        #[test]
+        fn without_the_pause_the_same_ready_issue_is_claimed_and_nothing_is_said_of_a_pause() {
+            let mut rig = Rig::new();
+            rig.hub.ready(5);
+            let report = rig.pass();
+            assert_eq!(rig.claimed_issues(), vec![5]);
+            assert!(report.waiting.iter().all(|w| !w.reason.contains("paused")));
+        }
+    }
+
+    mod the_book {
+        use super::*;
+
+        fn held(runs: u32) -> Held {
+            Held {
+                runs,
+                gates: 0,
+                placed: vec![],
+            }
+        }
+
+        #[test]
+        fn two_projects_never_both_take_the_last_run_slot() {
+            let book = Book::default();
+            let (a, _) = book.begin(project_id(), held(1));
+            let (b, _) = book.begin(other_project(), held(1));
+            assert!(book.take_run(a, 3));
+            assert!(!book.take_run(b, 3), "the fleet holds 3 of 3");
+            book.give_run(a);
+            assert!(book.take_run(b, 3));
+        }
+
+        #[test]
+        fn a_pass_of_a_project_forgotten_since_it_began_changes_nothing() {
+            let book = Book::default();
+            let (ticket, _) = book.begin(project_id(), held(1));
+            book.forget(project_id());
+            book.finish(ticket, held(3));
+            assert!(!book.take_run(ticket, 3));
+            book.place(ticket, builder_machine());
+            let (_, others) = book.begin(other_project(), held(0));
+            assert!(others.is_empty());
+            assert_eq!(book.runs_free(3), 3);
+        }
+
+        #[test]
+        fn an_orphan_whose_archive_failed_is_tried_again_next_pass() {
+            let mut rig = Rig::new();
+            let run = rig.run_in(4, 1, State::Building);
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::Finished {
+                        outcome: crate::factory::ledger::events::Outcome::PrOpen,
+                        total_ms: 0,
+                        gate_attempts: 0,
+                        review_cycles: None,
+                        pr_url: None,
+                        pr_end: None,
+                    },
+                    &Cause::new(CauseStep::Start, "test"),
+                )
+                .unwrap();
+            let orphan = WorkspaceId(uuid::Uuid::from_u128(0x44));
+            rig.view = FleetView::builder()
+                .online(me())
+                .online(builder_machine())
+                .workspace(Record {
+                    owner: builder_machine(),
+                    version: 1,
+                    deleted: false,
+                    body: Workspace {
+                        id: orphan,
+                        project: project_id(),
+                        name: "fac/4-1".into(),
+                        branch: "fac/4-1".into(),
+                        base: "main".into(),
+                        setup: None,
+                    },
+                })
+                .build();
+            // The finished run's sweep and the orphan's archive both meet the link down.
+            for _ in 0..2 {
+                rig.worker
+                    .inner
+                    .on_archive(Err(WorkerError::Unreachable("the link went down".into())));
+            }
+            let first = rig.pass();
+            assert!(first.archived.is_empty());
+            let second = rig.pass();
+            assert_eq!(second.archived, vec![orphan]);
+        }
+
+        #[test]
+        fn a_config_that_does_not_load_has_the_known_secrets_hidden_in_its_idle_reason() {
+            let mut rig = Rig::new();
+            rig.tracker = Hiding::new(
+                rig.hub.clone(),
+                Arc::new(|text: &str| text.replace("s3cr3t", "***")),
+            );
+            rig.hub.lock().config = format!("{CONFIG}  autonomy: s3cr3t\n");
+            rig.pass();
+            let idle = rig.status().idle.unwrap_or_default();
+            assert!(!idle.is_empty());
+            assert!(!idle.contains("s3cr3t"), "{idle}");
         }
     }
 }

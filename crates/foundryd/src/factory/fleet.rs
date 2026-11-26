@@ -178,16 +178,92 @@ fn message_json(message: &Message) -> Value {
     serde_json::json!({ "line": message.line, "body": message.body })
 }
 
+/// A call to a worker route: its path and its body, with the fields the route takes.
+#[derive(Debug, PartialEq)]
+struct Request {
+    path: String,
+    body: Option<Value>,
+}
+
+fn create_request(machine: MachineId, request: &CreateWorkspace) -> Request {
+    Request {
+        path: "/api/factory/workspaces".into(),
+        body: Some(serde_json::json!({
+            "machine": machine,
+            "project": request.project,
+            "name": request.name,
+            "checkout": request.checkout,
+            "setup": request.setup,
+            "tag": request.tag,
+        })),
+    }
+}
+
+fn start_request(workspace: WorkspaceId, start: &FactoryStart, first: &Message) -> Request {
+    Request {
+        path: format!("/api/workspaces/{workspace}/factory/session"),
+        body: Some(serde_json::json!({
+            "project": start.project,
+            "login": start.login,
+            "model": start.model,
+            "effort": start.effort,
+            "message": message_json(first),
+        })),
+    }
+}
+
+fn send_request(session: SessionId, message: &Message, only_if_prompts: Option<u64>) -> Request {
+    Request {
+        path: format!("/api/sessions/{session}/factory/message"),
+        body: Some(serde_json::json!({
+            "message": message_json(message),
+            "only_if_prompts": only_if_prompts,
+        })),
+    }
+}
+
+fn turn_request(session: SessionId, n: u64) -> Request {
+    Request {
+        path: format!("/api/sessions/{session}/factory/turn"),
+        body: Some(serde_json::json!({ "turn": n })),
+    }
+}
+
+fn tail_request(terminal: TerminalId) -> Request {
+    Request {
+        path: format!("/api/terminals/{terminal}/tail"),
+        body: None,
+    }
+}
+
+fn end_request(workspace: WorkspaceId) -> Request {
+    Request {
+        path: format!("/api/workspaces/{workspace}/factory/end"),
+        body: None,
+    }
+}
+
+/// P1's archive route, forced, as a carried call to the workspace's owner sends it.
+fn archive_request(workspace: WorkspaceId) -> Request {
+    Request {
+        path: format!("/api/workspaces/{workspace}/archive"),
+        body: Some(serde_json::json!({ "force": true })),
+    }
+}
+
 impl FleetWorker {
     /// A `POST` of `body` to the worker route `path`, answered by its owner.
-    fn call(&self, path: &str, body: Option<Value>) -> Result<Answer, CallError> {
-        let bytes = body.map(|b| b.to_string().into_bytes()).unwrap_or_default();
+    fn call(&self, request: Request) -> Result<Answer, CallError> {
+        let bytes = request
+            .body
+            .map(|b| b.to_string().into_bytes())
+            .unwrap_or_default();
         self.runtime
-            .block_on(api::factory::call(&self.api, path, &bytes))
+            .block_on(api::factory::call(&self.api, &request.path, &bytes))
     }
 
-    fn answered(&self, path: &str, body: Option<Value>) -> Result<Answer, WorkerError> {
-        self.call(path, body).map_err(|error| not_answered(&error))
+    fn answered(&self, request: Request) -> Result<Answer, WorkerError> {
+        self.call(request).map_err(|error| not_answered(&error))
     }
 }
 
@@ -197,15 +273,7 @@ impl Worker for FleetWorker {
         machine: MachineId,
         request: CreateWorkspace,
     ) -> Result<WorkspaceId, WorkerError> {
-        let body = serde_json::json!({
-            "machine": machine,
-            "project": request.project,
-            "name": request.name,
-            "checkout": request.checkout,
-            "setup": request.setup,
-            "tag": request.tag,
-        });
-        let answer = self.answered("/api/factory/workspaces", Some(body))?;
+        let answer = self.answered(create_request(machine, &request))?;
         created_id(&answer).map(WorkspaceId)
     }
 
@@ -215,17 +283,7 @@ impl Worker for FleetWorker {
         start: FactoryStart,
         first: Message,
     ) -> Result<SessionId, WorkerError> {
-        let body = serde_json::json!({
-            "project": start.project,
-            "login": start.login,
-            "model": start.model,
-            "effort": start.effort,
-            "message": message_json(&first),
-        });
-        let answer = self.answered(
-            &format!("/api/workspaces/{workspace}/factory/session"),
-            Some(body),
-        )?;
+        let answer = self.answered(start_request(workspace, &start, &first))?;
         created_id(&answer).map(SessionId)
     }
 
@@ -235,26 +293,16 @@ impl Worker for FleetWorker {
         message: Message,
         only_if_prompts: Option<u64>,
     ) -> Result<u64, SendRefused> {
-        let body = serde_json::json!({
-            "message": message_json(&message),
-            "only_if_prompts": only_if_prompts,
-        });
-        sent(self.call(
-            &format!("/api/sessions/{session}/factory/message"),
-            Some(body),
-        ))
+        sent(self.call(send_request(session, &message, only_if_prompts)))
     }
 
     fn turn(&self, session: SessionId, n: u64) -> Result<TurnText, WorkerError> {
-        let answer = self.answered(
-            &format!("/api/sessions/{session}/factory/turn"),
-            Some(serde_json::json!({ "turn": n })),
-        )?;
+        let answer = self.answered(turn_request(session, n))?;
         turn_read(&answer)
     }
 
     fn tail(&self, terminal: TerminalId) -> Result<String, WorkerError> {
-        let answer = self.answered(&format!("/api/terminals/{terminal}/tail"), None)?;
+        let answer = self.answered(tail_request(terminal))?;
         if !success(&answer) {
             return Err(WorkerError::Failed(reason(&answer)));
         }
@@ -267,7 +315,7 @@ impl Worker for FleetWorker {
     }
 
     fn end_sessions(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
-        let answer = self.answered(&format!("/api/workspaces/{workspace}/factory/end"), None)?;
+        let answer = self.answered(end_request(workspace))?;
         done(&answer)
     }
 
@@ -297,13 +345,15 @@ impl Worker for FleetWorker {
                     .await
                     .map_err(|e| WorkerError::Failed(redact(&e.to_string()))),
                 Some(owner) => {
+                    let request = archive_request(workspace);
+                    let body = request.body.map(|b| b.to_string()).unwrap_or_default();
                     let answer = api
                         .peers
                         .call(
                             owner,
-                            &format!("/api/workspaces/{workspace}/archive"),
+                            &request.path,
                             Some("application/json"),
-                            br#"{"force":true}"#,
+                            body.as_bytes(),
                         )
                         .await
                         .map_err(|error| not_answered(&error))?;
@@ -473,5 +523,96 @@ mod tests {
             "fetch https://user:hunter2@github.com/o/r failed",
         ));
         assert!(!said.contains("hunter2"), "{said}");
+    }
+    #[test]
+    fn each_call_names_its_worker_route_and_the_fields_the_route_takes() {
+        use crate::workspaces::{Checkout, FactoryTag, Setup};
+        let id = uuid::Uuid::from_u128(0x55);
+        let machine = MachineId(uuid::Uuid::from_u128(0x2));
+        let keys = |request: &Request| -> Vec<String> {
+            let mut keys: Vec<String> = request
+                .body
+                .as_ref()
+                .and_then(Value::as_object)
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            keys.sort();
+            keys
+        };
+        let create = create_request(
+            machine,
+            &CreateWorkspace {
+                project: foundry_proto::ids::ProjectId(id),
+                name: "fac/5-1".into(),
+                checkout: Checkout::Commit {
+                    sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                },
+                setup: Setup::None,
+                tag: FactoryTag {
+                    project: foundry_proto::ids::ProjectId(id),
+                    run: "rawphp__softfac__5__1".into(),
+                },
+            },
+        );
+        assert_eq!(create.path, "/api/factory/workspaces");
+        assert_eq!(
+            keys(&create),
+            ["checkout", "machine", "name", "project", "setup", "tag"]
+        );
+        assert_eq!(
+            create.body.as_ref().unwrap()["machine"],
+            machine.to_string()
+        );
+        let message = Message {
+            line: "/factory-build o/r#5 {body}".into(),
+            body: Some("brief".into()),
+        };
+        let start = start_request(
+            WorkspaceId(id),
+            &FactoryStart {
+                project: foundry_proto::ids::ProjectId(id),
+                login: "bot".into(),
+                model: "opus".into(),
+                effort: "high".into(),
+            },
+            &message,
+        );
+        assert_eq!(start.path, format!("/api/workspaces/{id}/factory/session"));
+        assert_eq!(
+            keys(&start),
+            ["effort", "login", "message", "model", "project"]
+        );
+        assert_eq!(
+            start.body.as_ref().unwrap()["message"],
+            serde_json::json!({"line": message.line, "body": "brief"})
+        );
+        let send = send_request(SessionId(id), &message, Some(3));
+        assert_eq!(send.path, format!("/api/sessions/{id}/factory/message"));
+        assert_eq!(keys(&send), ["message", "only_if_prompts"]);
+        assert_eq!(send.body.as_ref().unwrap()["only_if_prompts"], 3);
+        let turn = turn_request(SessionId(id), 4);
+        assert_eq!(turn.path, format!("/api/sessions/{id}/factory/turn"));
+        assert_eq!(turn.body, Some(serde_json::json!({"turn": 4})));
+        assert_eq!(
+            tail_request(TerminalId(id)),
+            Request {
+                path: format!("/api/terminals/{id}/tail"),
+                body: None
+            }
+        );
+        assert_eq!(
+            end_request(WorkspaceId(id)),
+            Request {
+                path: format!("/api/workspaces/{id}/factory/end"),
+                body: None
+            }
+        );
+        assert_eq!(
+            archive_request(WorkspaceId(id)),
+            Request {
+                path: format!("/api/workspaces/{id}/archive"),
+                body: Some(serde_json::json!({"force": true}))
+            }
+        );
     }
 }

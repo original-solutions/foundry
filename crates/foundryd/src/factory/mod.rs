@@ -171,6 +171,9 @@ pub trait Host: Send + Sync + 'static {
     fn acting(&self) -> Answering<'_, bool>;
     /// GitHub as `login`, with the machine's hider; `None` when no token is held for it.
     fn tracker(&self, login: &str) -> Option<Arc<dyn Commenting>>;
+    /// A fingerprint of the token held for `login` now, never the token: a lease made with
+    /// another one, or with none, is made again. `None` when none is held.
+    fn token_mark(&self, login: &str) -> Option<u64>;
     /// The lease of `watched`.
     fn lease(&self, watched: &Watched) -> Arc<dyn Leasing>;
     /// The worker that calls the fleet.
@@ -217,25 +220,31 @@ impl<H: Host> Factory<H> {
         loop {
             let looked = self.clock.now();
             let acting = PROTOCOL >= FACTORY_SINCE && self.host.acting().await;
-            let store = self.store.clone();
-            let read = tokio::task::spawn_blocking(move || lock(&store).settings()).await;
-            let want = match read {
-                Ok(Ok(settings)) if acting => Some(watched(&settings)),
-                Ok(Ok(_)) => Some(Vec::new()),
-                Ok(Err(error)) => {
-                    tracing::warn!("factory: the settings could not be read: {error}");
-                    None
+            let want = if acting {
+                let store = self.store.clone();
+                match tokio::task::spawn_blocking(move || lock(&store).settings()).await {
+                    Ok(Ok(settings)) => Some(watched(&settings)),
+                    Ok(Err(error)) => {
+                        tracing::warn!("factory: the settings could not be read: {error}");
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!("factory: the settings read did not finish: {error}");
+                        None
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!("factory: the settings read did not finish: {error}");
-                    None
-                }
+            } else {
+                // A machine that does not act stops at once, whatever the store says.
+                Some(Vec::new())
             };
             if let Some(want) = want {
                 running.retain(|project, run| {
-                    // A lease made with no token is made again once the machine holds one.
-                    let keep = want.contains(&run.watched)
-                        && (run.token || self.host.tracker(&run.watched.login).is_none());
+                    // A lease made with another token than the one held now, or with none, or
+                    // whose token could not be given to git, is made again.
+                    let mark = self.host.token_mark(&run.watched.login);
+                    let unusable =
+                        mark.is_some() && matches!(*lock(&run.state), Some(LeaseState::NoToken));
+                    let keep = want.contains(&run.watched) && mark == run.mark && !unusable;
                     if !keep {
                         run.lease.release();
                         self.book.forget(*project);
@@ -256,8 +265,8 @@ impl<H: Host> Factory<H> {
 
     /// Starts the lease task and the pass task of `watched`.
     fn start(&self, watched: Watched, offline: Arc<Mutex<Offline>>) -> Running {
+        let mark = self.host.token_mark(&watched.login);
         let lease = self.host.lease(&watched);
-        let token = self.host.tracker(&watched.login).is_some();
         let state: Arc<Mutex<Option<LeaseState>>> = Arc::default();
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(lease_task(
@@ -279,12 +288,13 @@ impl<H: Host> Factory<H> {
             },
             watched.clone(),
             lease.clone(),
-            state,
+            state.clone(),
         ));
         Running {
             watched,
             lease,
-            token,
+            mark,
+            state,
             _tasks: tasks,
         }
     }
@@ -294,8 +304,10 @@ impl<H: Host> Factory<H> {
 struct Running {
     watched: Watched,
     lease: Arc<dyn Leasing>,
-    /// The machine held a token for the login when the lease was made.
-    token: bool,
+    /// The fingerprint of the token the lease was made with.
+    mark: Option<u64>,
+    /// What the lease's newest tick said.
+    state: Arc<Mutex<Option<LeaseState>>>,
     _tasks: tokio::task::JoinSet<()>,
 }
 
@@ -560,6 +572,18 @@ impl Host for Daemon {
         Some(Arc::new(github::Hiding::new(Arc::new(gh), self.hide())))
     }
 
+    fn token_mark(&self, login: &str) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let token = crate::secrets::github_token(&*self.secrets, login).ok()??;
+        let token = token.trim();
+        if token.is_empty() {
+            return None;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        token.hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
     fn lease(&self, watched: &Watched) -> Arc<dyn Leasing> {
         let auth = match crate::git_auth::GitAuth::for_login(
             &*self.secrets,
@@ -759,6 +783,10 @@ mod tests {
     struct FakeHost {
         acting: AtomicBool,
         trackers: Mutex<BTreeMap<String, Arc<dyn Commenting>>>,
+        /// The token mark of each login; a login with a tracker and none here is marked 1.
+        marks: Mutex<BTreeMap<String, u64>>,
+        /// Every lease made, in order.
+        made: Mutex<Vec<(ProjectId, Arc<FakeLease>)>>,
         leases: Mutex<BTreeMap<ProjectId, Arc<FakeLease>>>,
         worker: Arc<FakeWorker>,
     }
@@ -771,11 +799,23 @@ mod tests {
         fn tracker(&self, login: &str) -> Option<Arc<dyn Commenting>> {
             self.trackers.lock().unwrap().get(login).cloned()
         }
+        fn token_mark(&self, login: &str) -> Option<u64> {
+            let held = self.trackers.lock().unwrap().contains_key(login);
+            held.then(|| self.marks.lock().unwrap().get(login).copied().unwrap_or(1))
+        }
         fn lease(&self, watched: &Watched) -> Arc<dyn Leasing> {
             let lease = Arc::new(FakeLease {
-                state: LeaseState::Held { generation: 1 },
+                state: if self.token_mark(&watched.login).is_some() {
+                    LeaseState::Held { generation: 1 }
+                } else {
+                    LeaseState::NoToken
+                },
                 released: AtomicBool::new(false),
             });
+            self.made
+                .lock()
+                .unwrap()
+                .push((watched.project, lease.clone()));
             self.leases
                 .lock()
                 .unwrap()
@@ -868,6 +908,8 @@ mod tests {
         let host = Arc::new(FakeHost {
             acting: AtomicBool::new(true),
             trackers: Mutex::new(BTreeMap::new()),
+            marks: Mutex::new(BTreeMap::new()),
+            made: Mutex::new(Vec::new()),
             leases: Mutex::new(BTreeMap::new()),
             worker: Arc::new(FakeWorker::new()),
         });
@@ -938,6 +980,8 @@ mod tests {
         let host = Arc::new(FakeHost {
             acting: AtomicBool::new(true),
             trackers: Mutex::new(BTreeMap::new()),
+            marks: Mutex::new(BTreeMap::new()),
+            made: Mutex::new(Vec::new()),
             leases: Mutex::new(BTreeMap::new()),
             worker: Arc::new(FakeWorker::new()),
         });
@@ -993,6 +1037,8 @@ mod tests {
         let host = Arc::new(FakeHost {
             acting: AtomicBool::new(true),
             trackers: Mutex::new(BTreeMap::new()),
+            marks: Mutex::new(BTreeMap::new()),
+            made: Mutex::new(Vec::new()),
             leases: Mutex::new(BTreeMap::new()),
             worker: Arc::new(FakeWorker::new()),
         });
@@ -1023,6 +1069,111 @@ mod tests {
         })
         .await
         .unwrap();
+        running.abort();
+    }
+    fn fake_host() -> Arc<FakeHost> {
+        Arc::new(FakeHost {
+            acting: AtomicBool::new(true),
+            trackers: Mutex::new(BTreeMap::new()),
+            marks: Mutex::new(BTreeMap::new()),
+            made: Mutex::new(Vec::new()),
+            leases: Mutex::new(BTreeMap::new()),
+            worker: Arc::new(FakeWorker::new()),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lease_is_made_again_when_its_token_is_replaced_or_removed() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN)]))
+            .unwrap();
+        let host = fake_host();
+        host.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let made = |host: &Arc<FakeHost>| host.made.lock().unwrap().len();
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || wait_for("the first lease", || made(&host2) == 1))
+            .await
+            .unwrap();
+        // The token is replaced: the old lease is released and a new one made.
+        host.marks.lock().unwrap().insert(LOGIN.into(), 2);
+        clock.advance(SCAN);
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || wait_for("a second lease", || made(&host2) == 2))
+            .await
+            .unwrap();
+        assert!(
+            host.made.lock().unwrap()[0]
+                .1
+                .released
+                .load(Ordering::SeqCst)
+        );
+        // The token is removed: the lease is released and the new one runs no git.
+        host.trackers.lock().unwrap().remove(LOGIN);
+        clock.advance(SCAN);
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || wait_for("a third lease", || made(&host2) == 3))
+            .await
+            .unwrap();
+        let leases = host.made.lock().unwrap();
+        assert!(leases[1].1.released.load(Ordering::SeqCst));
+        assert_eq!(leases[2].1.state, LeaseState::NoToken);
+        drop(leases);
+        running.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tracker_error_in_one_project_ends_its_pass_and_the_next_project_still_runs() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, "failing-bot"), (2, LOGIN)]))
+            .unwrap();
+        let failing = Hub::new();
+        failing.fail("repos/", 1000);
+        let quick = Hub::new();
+        quick.ready(5);
+        let host = fake_host();
+        host.trackers.lock().unwrap().insert(
+            "failing-bot".into(),
+            Arc::new(Hiding::new(failing, shown())),
+        );
+        host.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(quick, shown())));
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host, freshness, clock);
+        let running = tokio::spawn(service.serve());
+        let store2 = store.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("both projects wrote a status", || {
+                status_of(&store2, project(1)).is_some() && status_of(&store2, project(2)).is_some()
+            });
+        })
+        .await
+        .unwrap();
+        let quick_status = status_of(&store, project(2)).unwrap();
+        assert!(quick_status.holds);
+        assert_eq!(
+            quick_status
+                .ready
+                .iter()
+                .map(|w| w.issue)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
         running.abort();
     }
 }
