@@ -3670,4 +3670,76 @@ mod tests {
             assert!(!idle.contains("s3cr3t"), "{idle}");
         }
     }
+    mod the_book_and_the_lease {
+        use super::*;
+
+        /// Holds the lease, and on its first check has the service stop the project: the
+        /// project is forgotten in the book, as `serve` does after it releases the lease.
+        struct ForgetsOnCheck {
+            book: Arc<Book>,
+            forgot: AtomicBool,
+        }
+
+        impl Guard for ForgetsOnCheck {
+            fn check(&self) -> Result<u64, LeaseLost> {
+                if !self.forgot.swap(true, Ordering::SeqCst) {
+                    self.book.forget(project_id());
+                }
+                Ok(1)
+            }
+        }
+
+        #[test]
+        fn a_project_stopped_after_its_pass_checked_the_lease_is_not_written_back_to_the_book() {
+            let mut rig = Rig::new();
+            rig.run_in(3, 1, State::Building);
+            rig.hub.issue(3, &["factory:building"]);
+            let book = Arc::new(Book::default());
+            let guard = ForgetsOnCheck {
+                book: book.clone(),
+                forgot: AtomicBool::new(false),
+            };
+            let world = World {
+                project: &rig.project,
+                lease: &rig.lease,
+                guard: &guard,
+                tracker: &rig.tracker,
+                worker: &rig.worker,
+                view: &rig.view,
+                ledger: &rig.ledger,
+                store: &rig.store,
+                me: me(),
+                shared: &rig.shared,
+                book: &book,
+                clock: &rig.clock,
+            };
+            let report = run(&world, &mut rig.memo);
+            assert!(report.lease_lost, "{report:?}");
+            assert_eq!(book.runs_free(3), 3, "the stopped project holds nothing");
+        }
+
+        #[test]
+        fn a_pass_that_does_not_hold_the_lease_starts_the_count_of_failed_passes_again() {
+            let mut rig = Rig::new();
+            rig.hub.fail("git/ref/heads/main", 2);
+            rig.pass();
+            rig.pass();
+            // A pass that reads GitHub well and does not hold the lease.
+            rig.lease = LeaseState::HeldBy {
+                machine: builder_machine(),
+                generation: 4,
+            };
+            rig.guard = Box::new(Lost);
+            rig.pass();
+            rig.lease = LeaseState::Held { generation: 5 };
+            rig.guard = Box::new(AlwaysHeld(5));
+            rig.hub.fail("git/ref/heads/main", 1);
+            rig.pass();
+            assert_eq!(
+                rig.status().idle,
+                None,
+                "one failed pass since the not-holding one"
+            );
+        }
+    }
 }
