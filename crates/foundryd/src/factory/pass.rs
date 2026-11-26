@@ -2639,8 +2639,32 @@ mod tests {
                 LOGIN,
                 &crate::factory::github::claim_comment(&run, &builder_machine()),
             );
+            // The claim's build workspace, with its setup terminal, is on the machine the comment
+            // names: a record with no setup would have the create asked again.
+            rig.view = FleetView::builder()
+                .online(me())
+                .online(builder_machine())
+                .workspace(Record {
+                    owner: builder_machine(),
+                    version: 1,
+                    deleted: false,
+                    body: Workspace {
+                        id: WorkspaceId(uuid::Uuid::from_u128(0x77)),
+                        project: project_id(),
+                        name: "fac/5-1".into(),
+                        branch: "fac/5-1".into(),
+                        base: "main".into(),
+                        setup: Some(TerminalId(uuid::Uuid::from_u128(0x78))),
+                    },
+                })
+                .build();
             rig.pass();
             assert!(!rig.ledger.read(&run).unwrap().is_empty());
+            assert!(
+                rig.creates().iter().all(|c| c.name != "fac/5-1"),
+                "no second workspace: {:?}",
+                rig.creates()
+            );
         }
     }
 
