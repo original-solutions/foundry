@@ -4728,6 +4728,23 @@ mod tests {
         }
 
         #[test]
+        fn a_pass_after_a_run_finishes_reads_the_events_of_that_run_and_not_the_seen_ones() {
+            let mut rig = Rig::new();
+            // Four runs of fifteen events each, seen by the first pass.
+            for issue in 1..=4 {
+                finished_run(&rig, issue, 10);
+            }
+            rig.pass();
+            finished_run(&rig, 5, 0);
+            let read = Store::run_rows_read;
+            let before = read();
+            rig.pass();
+            // The runs' ids and the new run's events, fewer than the seen runs' sixty events.
+            assert!(read() - before < 4 * 15, "{} rows", read() - before);
+            assert_eq!(rig.status().finished.len(), 5);
+        }
+
+        #[test]
         fn a_run_that_finishes_later_joins_the_kept_ones_at_the_front() {
             let mut rig = Rig::new();
             finished_run(&rig, 1, 0);

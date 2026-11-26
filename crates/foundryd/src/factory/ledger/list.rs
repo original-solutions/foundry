@@ -1141,12 +1141,15 @@ mod tests {
         let ledger = run_at(&store, &softfac(7), T0, Some(State::Building), false, true);
         unreadable_run(dir.path(), &softfac(6));
         run_at(&store, &softfac(8), T0, Some(State::Building), false, true);
+        run_at(&store, &softfac(9), T0, Some(State::Building), false, true);
         let whole = summaries_of(&store, "rawphp/softfac");
-        let seven = whole.into_iter().find(|run| run.id == softfac(7)).unwrap();
+        let of = |issue| whole.iter().find(|run| run.id == softfac(issue)).cloned();
+        let (seven, eight) = (of(7).unwrap(), of(8).unwrap());
         assert_eq!(
-            ledger.run_summaries(&BTreeSet::from([softfac(7), softfac(6)])),
+            ledger.run_summaries(&BTreeSet::from([softfac(8), softfac(7), softfac(6)])),
             [
                 seven,
+                eight,
                 RunSummary {
                     unreadable: true,
                     ..summary(softfac(6))
