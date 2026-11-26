@@ -1449,9 +1449,6 @@ impl<'a, 'w> Pass<'a, 'w> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .runs_of(&repo)?;
-        if sweep_due {
-            self.memo.swept = Some(now);
-        }
         let mut owed = false;
         for run in runs {
             // A run finished is known by the memo, or asked of the store with no row read.
@@ -1511,6 +1508,10 @@ impl<'a, 'w> Pass<'a, 'w> {
                     }
                 }
             }
+        }
+        // Only a sweep that went through every run is done: one that ended part way is due again.
+        if sweep_due {
+            self.memo.swept = Some(now);
         }
         if heard_again {
             self.memo.orphans_owed = owed;
