@@ -29,6 +29,11 @@
 //! no pass until its old pass has returned. A project whose repo is not a GitHub repo is not
 //! run, and says so in the log.
 //!
+//! [`Leases`] is the handle the factory routes read: each project this machine runs, with its
+//! lease and what its newest tick said. A project is put in it when its tasks start and taken
+//! out when its lease is released or its tasks are dropped, so a Stop carried here acts only
+//! under a lease this machine still ticks ([`Leased::holding`]).
+//!
 //! [`Host`] is what the service needs of the daemon, so it is tested with fakes; [`Daemon`] is
 //! the real one.
 
@@ -247,6 +252,78 @@ impl Leasing for Lease {
     }
 }
 
+/// One project's lease as [`Leases`] holds it.
+#[derive(Clone)]
+pub struct Leased {
+    /// The project's repo, `owner/name`.
+    pub repo: String,
+    pub lease: Arc<dyn Leasing>,
+    /// What the lease's newest tick said; `None` before its first.
+    pub state: Arc<Mutex<Option<LeaseState>>>,
+}
+
+impl Leased {
+    /// The guard to act under and the generation it answers, while the newest tick held the
+    /// lease and the guard passes now. `None` otherwise: a machine that does not hold the lease
+    /// writes nothing of the project.
+    pub fn holding(&self) -> Option<(Arc<dyn Guard>, u64)> {
+        if !matches!(*lock(&self.state), Some(LeaseState::Held { .. })) {
+            return None;
+        }
+        let guard = self.lease.guard();
+        let generation = guard.check().ok()?;
+        Some((guard, generation))
+    }
+}
+
+/// The leases of the projects this machine runs, by project, shared by the service and the
+/// factory routes. The daemon makes one for its life.
+#[derive(Default)]
+pub struct Leases {
+    held: Mutex<BTreeMap<ProjectId, Leased>>,
+}
+
+impl Leases {
+    /// The lease of `project`, while this machine runs it.
+    #[cfg(test)]
+    pub(crate) fn of(&self, project: ProjectId) -> Option<Leased> {
+        lock(&self.held).get(&project).cloned()
+    }
+
+    /// The project this machine runs on `repo`, `owner/name` in any case, as a run id folds
+    /// it, and its lease. Projects that name one repo are run from none of them, so there is at
+    /// most one.
+    pub fn of_repo(&self, repo: &str) -> Option<(ProjectId, Leased)> {
+        lock(&self.held)
+            .iter()
+            .find(|(_, leased)| leased.repo.eq_ignore_ascii_case(repo))
+            .map(|(project, leased)| (*project, leased.clone()))
+    }
+
+    /// The projects held.
+    #[cfg(test)]
+    pub(crate) fn projects(&self) -> Vec<ProjectId> {
+        lock(&self.held).keys().copied().collect()
+    }
+
+    /// Holds `leased` as `project`'s lease, in place of any before it. The service does this
+    /// for each project it starts; the routes' tests do it for a lease of their own.
+    pub(crate) fn put(&self, project: ProjectId, leased: Leased) {
+        lock(&self.held).insert(project, leased);
+    }
+
+    /// Lets go of `project`'s lease when it is still `lease`: a lease made again since stays.
+    fn clear(&self, project: ProjectId, lease: &Arc<dyn Leasing>) {
+        let mut held = lock(&self.held);
+        if held
+            .get(&project)
+            .is_some_and(|leased| Arc::ptr_eq(&leased.lease, lease))
+        {
+            held.remove(&project);
+        }
+    }
+}
+
 /// A future the host answers with.
 pub type Answering<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -279,6 +356,7 @@ pub struct Factory<H: Host> {
     freshness: Arc<Freshness>,
     clock: Arc<dyn Clock>,
     book: Arc<pass::Book>,
+    leases: Arc<Leases>,
 }
 
 impl<H: Host> Factory<H> {
@@ -297,7 +375,14 @@ impl<H: Host> Factory<H> {
             freshness,
             clock,
             book: Arc::default(),
+            leases: Arc::default(),
         }
+    }
+
+    /// The same service, keeping each project it runs in `leases`.
+    pub fn with_leases(mut self, leases: Arc<Leases>) -> Self {
+        self.leases = leases;
+        self
     }
 
     /// Runs the service for ever.
@@ -413,6 +498,7 @@ impl<H: Host> Factory<H> {
                     let keep = want.contains(&run.watched) && same;
                     if !keep {
                         run.lease.release();
+                        self.leases.clear(*project, &run.lease);
                         // A project still watched (its token changed) starts again below,
                         // and its entry is seeded from its ledger there: its sessions go on.
                         if !want.iter().any(|w| w.project == *project) {
@@ -513,17 +599,27 @@ impl<H: Host> Factory<H> {
             state.clone(),
             alone,
         ));
+        self.leases.put(
+            watched.project,
+            Leased {
+                repo: watched.repo.clone(),
+                lease: lease.clone(),
+                state: state.clone(),
+            },
+        );
         Running {
             watched,
             lease,
             mark,
             state,
+            leases: self.leases.clone(),
             _tasks: tasks,
         }
     }
 }
 
-/// A project the service runs: dropping it stops its tasks.
+/// A project the service runs: dropping it stops its tasks and takes its lease out of
+/// [`Leases`].
 struct Running {
     watched: Watched,
     lease: Arc<dyn Leasing>,
@@ -531,7 +627,14 @@ struct Running {
     mark: Option<u64>,
     /// What the lease's newest tick said.
     state: Arc<Mutex<Option<LeaseState>>>,
+    leases: Arc<Leases>,
     _tasks: tokio::task::JoinSet<()>,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.leases.clear(self.watched.project, &self.lease);
+    }
 }
 
 /// What a project's pass task shares with the service.
@@ -1002,7 +1105,8 @@ impl Host for Daemon {
 }
 
 impl Factory<Daemon> {
-    /// The daemon's factory service, for ever: see the module's words.
+    /// The daemon's factory service, for ever, keeping each project it runs in `leases`: see
+    /// the module's words.
     pub async fn run(
         api: Api,
         coordinator: Arc<Coordinator>,
@@ -1010,6 +1114,7 @@ impl Factory<Daemon> {
         freshness: Arc<Freshness>,
         clock: Arc<dyn Clock>,
         home: PathBuf,
+        leases: Arc<Leases>,
     ) {
         let (store, me) = (api.store.clone(), api.peers.me());
         let host = Arc::new(Daemon {
@@ -1021,8 +1126,35 @@ impl Factory<Daemon> {
             runtime: tokio::runtime::Handle::current(),
         });
         Factory::new(store, me, host, freshness, clock)
+            .with_leases(leases)
             .serve()
             .await;
+    }
+}
+
+/// Test doubles of the leases handle, shared by its tests and the factory routes' tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::Arc;
+
+    use super::Leasing;
+    use super::lease::LeaseState;
+    use super::worker::Guard;
+
+    /// A lease whose every tick says `state` and whose guard is `guard`.
+    pub(crate) struct Fixed {
+        pub(crate) state: LeaseState,
+        pub(crate) guard: Arc<dyn Guard>,
+    }
+
+    impl Leasing for Fixed {
+        fn tick(&self, _: u64) -> LeaseState {
+            self.state.clone()
+        }
+        fn guard(&self) -> Arc<dyn Guard> {
+            self.guard.clone()
+        }
+        fn release(&self) {}
     }
 }
 
@@ -3155,5 +3287,198 @@ mod tests {
         let last = last.unwrap();
         assert!(!last.holds, "{last:?}");
         assert!(last.pass >= in_flight, "{} < {in_flight}", last.pass);
+    }
+
+    // ----- the leases handle the factory routes read -----
+
+    use super::testing::Fixed;
+
+    fn leased(state: Option<LeaseState>, guard: Arc<dyn Guard>) -> Leased {
+        let lease: Arc<dyn Leasing> = Arc::new(Fixed {
+            state: state.clone().unwrap_or(LeaseState::NoToken),
+            guard,
+        });
+        Leased {
+            repo: "rawphp/softfac".into(),
+            lease,
+            state: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    #[test]
+    fn a_lease_holds_for_a_stop_only_when_its_newest_tick_held_and_its_guard_passes() {
+        let held = Some(LeaseState::Held { generation: 4 });
+        let (guard, generation) = leased(held.clone(), Arc::new(AlwaysHeld(4)))
+            .holding()
+            .expect("a tick that held and a guard that passes");
+        assert_eq!(generation, 4);
+        assert_eq!(guard.check().unwrap(), 4);
+        // The guard's generation is the one acted at.
+        let (_, generation) = leased(held.clone(), Arc::new(AlwaysHeld(5)))
+            .holding()
+            .unwrap();
+        assert_eq!(generation, 5);
+        let other = MachineId(uuid::Uuid::from_u128(0x2));
+        for state in [
+            None,
+            Some(LeaseState::NoToken),
+            Some(LeaseState::HeldBy {
+                machine: other,
+                generation: 4,
+            }),
+            Some(LeaseState::Unknown {
+                reason: "the lease ref could not be read",
+            }),
+        ] {
+            assert!(
+                leased(state.clone(), Arc::new(AlwaysHeld(4)))
+                    .holding()
+                    .is_none(),
+                "{state:?}"
+            );
+        }
+        assert!(
+            leased(held, Arc::new(crate::factory::worker::Lost))
+                .holding()
+                .is_none(),
+            "a guard that fails holds nothing"
+        );
+    }
+
+    #[test]
+    fn the_handle_finds_a_lease_by_its_project_or_its_repo_and_clears_only_its_own() {
+        let leases = Leases::default();
+        let first = leased(None, Arc::new(AlwaysHeld(1)));
+        leases.put(project(1), first.clone());
+        assert!(leases.of(project(1)).is_some());
+        assert!(leases.of(project(2)).is_none());
+        let (found, _) = leases.of_repo("rawphp/softfac").unwrap();
+        assert_eq!(found, project(1));
+        assert!(leases.of_repo("rawphp/other").is_none());
+        // A run id folds its repo as GitHub does; the URL a project names need not.
+        let capitals = Leased {
+            repo: "RawPHP/Capitals".into(),
+            ..leased(None, Arc::new(AlwaysHeld(1)))
+        };
+        leases.put(project(3), capitals.clone());
+        assert_eq!(leases.of_repo("rawphp/capitals").unwrap().0, project(3));
+        leases.clear(project(3), &capitals.lease);
+        // A lease made again for the project replaces the first, and the first's clear leaves
+        // the new one in place.
+        let second = leased(None, Arc::new(AlwaysHeld(2)));
+        leases.put(project(1), second.clone());
+        leases.clear(project(1), &first.lease);
+        let kept = leases.of(project(1)).expect("the new lease is kept");
+        assert!(Arc::ptr_eq(&kept.lease, &second.lease));
+        leases.clear(project(1), &second.lease);
+        assert!(leases.of(project(1)).is_none());
+        assert!(leases.projects().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_handle_holds_each_project_the_service_runs_and_lets_go_as_each_stops() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN), (2, "other-bot")]))
+            .unwrap();
+        let host = fake_host();
+        for login in [LOGIN, "other-bot"] {
+            host.trackers
+                .lock()
+                .unwrap()
+                .insert(login.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        }
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let leases = Arc::new(Leases::default());
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone())
+            .with_leases(leases.clone());
+        let running = tokio::spawn(service.serve());
+        let leases2 = leases.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("both projects' leases hold in the handle", || {
+                [project(1), project(2)].iter().all(|project| {
+                    leases2
+                        .of(*project)
+                        .and_then(|leased| leased.holding())
+                        .is_some_and(|(_, generation)| generation == 1)
+                })
+            })
+        })
+        .await
+        .unwrap();
+        let (found, leased) = leases.of_repo("rawphp/softfac").unwrap();
+        assert_eq!(found, project(1));
+        let made = host.leases.lock().unwrap()[&project(1)].clone();
+        let made: Arc<dyn Leasing> = made;
+        assert!(
+            Arc::ptr_eq(&leased.lease, &made),
+            "the lease the service ticks"
+        );
+
+        let mut off = settings_with(&[(1, LOGIN), (2, "other-bot")]);
+        off.seq = 2;
+        off.project_factory.get_mut(&project(2)).unwrap().on = false;
+        store.lock().unwrap().apply_settings(off).unwrap();
+        clock.advance(SCAN);
+        let leases2 = leases.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the turned-off project leaves the handle", || {
+                leases2.of(project(2)).is_none()
+            })
+        })
+        .await
+        .unwrap();
+        assert!(leases.of(project(1)).is_some(), "the other project stays");
+
+        host.acting.store(false, Ordering::SeqCst);
+        clock.advance(SCAN);
+        let leases2 = leases.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for(
+                "a machine that stops acting holds no lease in the handle",
+                || leases2.projects().is_empty(),
+            )
+        })
+        .await
+        .unwrap();
+        running.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_that_ends_leaves_no_lease_in_the_handle() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN)]))
+            .unwrap();
+        let host = fake_host();
+        host.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let leases = Arc::new(Leases::default());
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone())
+            .with_leases(leases.clone());
+        let running = tokio::spawn(service.serve());
+        let leases2 = leases.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the project's lease is in the handle", || {
+                leases2.of(project(1)).is_some()
+            })
+        })
+        .await
+        .unwrap();
+        running.abort();
+        let _ = running.await;
+        assert!(
+            leases.projects().is_empty(),
+            "a dropped Running clears its lease"
+        );
     }
 }

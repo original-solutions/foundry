@@ -302,6 +302,9 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     // Refused in the API, behind the layer that carries a start for another machine's
     // workspace there: shells, sync and that machine's sessions still work.
     api.sessions_refused = missing.map(|missing| missing.said);
+    api.secrets = Some(secrets.clone());
+    // The leases of the projects the factory runs here, which the factory routes read.
+    let leases = Arc::new(crate::factory::Leases::default());
     let gateway_reader = Arc::new(gateway::Reader::new(
         std::env::var("FOUNDRY_GATEWAY_URL").ok(),
         secrets.clone(),
@@ -339,6 +342,14 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_priority_routes = api::machine_priority::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
+    let factory_routes = api::factory::view_router(api::factory::View {
+        store: store.clone(),
+        peers: peers.clone(),
+        coordinator: coordinator.clone(),
+        secrets: secrets.clone(),
+        leases: leases.clone(),
+    })
+    .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let app = api::router(api)
         .merge(sessions.router())
         .merge(attention_routes)
@@ -349,6 +360,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .merge(machine_limit_routes)
         .merge(machine_remove_routes)
         .merge(machine_priority_routes)
+        .merge(factory_routes)
         .merge(ws::keyed_router(peers.clone(), keys.clone()));
 
     let mut terminate =
@@ -403,6 +415,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
             freshness.clone(),
             clock.clone(),
             home.clone(),
+            leases,
         ),
     ));
     services.spawn(named(
