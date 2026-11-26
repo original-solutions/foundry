@@ -6149,7 +6149,12 @@ mod tests {
                 "the store could not be read".into(),
             )));
             let before = event_count(&rig, &run);
-            assert!(advance(&rig.ctx(), &run).is_err());
+            let error = advance(&rig.ctx(), &run).unwrap_err();
+            assert!(
+                matches!(error, RunError::Worker(WorkerError::Failed(_))),
+                "{error}"
+            );
+            assert_eq!(rig.worker.calls(), vec![probe(1)]);
             assert_eq!(event_count(&rig, &run), before);
             assert!(interruptions(&rig, &run).is_empty());
             assert!(archive_calls(&rig).is_empty());
