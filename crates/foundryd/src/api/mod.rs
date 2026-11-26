@@ -18,8 +18,9 @@
 //!   whole state is sent again, then the statuses still believed, so the UI drops what it
 //!   held. Its strings have the known secrets hidden ([`Api::secrets`]); a status is not sent
 //!   while the secret store cannot be read, and is tried again after a wait that doubles from
-//!   a second to half a minute, with one warning when it starts. No run event is ever sent, on
-//!   this socket or in `GET /api/state`: those are P1's records.
+//!   a second to half a minute, which bounds the reads of the store and the warnings they log.
+//!   No run event is ever sent, on this socket or in `GET /api/state`: those are P1's
+//!   records.
 //! - `GET /api/terminals/{id}`, a WebSocket: see [`terminals`].
 //! - `GET /api/machine`: `{id}`, the machine that serves the UI, see [`machine`].
 //! - `GET /api/machines`: `{me, machines: [{id, name, online}]}`, this machine's id and each
@@ -608,8 +609,8 @@ struct Believed {
     /// the statuses were last read: `None` before the first read.
     read_at: Option<(BTreeMap<MachineId, u64>, u64, BTreeSet<MachineId>)>,
     statuses: BTreeMap<ProjectId, foundry_proto::factory::FactoryStatus>,
-    /// While the secret store cannot be read: when to try again, and how long the last wait
-    /// was, doubled each time up to [`UNREADABLE_WAIT_MOST`].
+    /// While a status cannot be hidden: when to try again, and how long the last wait was
+    /// ([`next_wait`]).
     unreadable: Option<(tokio::time::Instant, Duration)>,
 }
 
@@ -677,14 +678,9 @@ async fn send_factory(
             protocol: PROTOCOL,
             status: status.clone(),
         };
-        let text = match hidden_text(api, &message).await {
-            Ok(text) => text,
-            Err(Unsent::Unreadable) => {
-                hidden_all = false;
-                continue;
-            }
-            // Logged; a status that cannot be written is not tried again until it changes.
-            Err(Unsent::Unwritable) => continue,
+        let Some(text) = hidden_text(api, &message).await else {
+            hidden_all = false;
+            continue;
         };
         if socket.send(ws::Message::Text(text.into())).await.is_err() {
             return Ok(Factory::Closed);
@@ -697,36 +693,32 @@ async fn send_factory(
         }
     } else {
         believed.read_at = None;
-        let wait = match believed.unreadable {
-            None => {
-                tracing::warn!(
-                    "api: factory statuses are not sent while the secret store cannot be read"
-                );
-                UNREADABLE_WAIT
-            }
-            Some((_, wait)) => (wait * 2).min(UNREADABLE_WAIT_MOST),
-        };
+        let last = believed.unreadable.map(|(_, wait)| wait);
+        if last.is_none() {
+            tracing::warn!("api: factory statuses are not sent while they cannot be hidden");
+        }
+        let wait = next_wait(last);
         believed.unreadable = Some((tokio::time::Instant::now() + wait, wait));
     }
     Ok(Factory::Sent)
 }
 
-/// Why [`hidden_text`] gave no text.
-enum Unsent {
-    /// The secret store could not be read: tried again later.
-    Unreadable,
-    /// The message could not be written as JSON, which is logged.
-    Unwritable,
+/// How long to wait before a status that could not be hidden is tried again, after a wait of
+/// `last`, or none: [`UNREADABLE_WAIT`] at first, then twice the last, at most
+/// [`UNREADABLE_WAIT_MOST`].
+fn next_wait(last: Option<Duration>) -> Duration {
+    last.map_or(UNREADABLE_WAIT, |last| (last * 2).min(UNREADABLE_WAIT_MOST))
 }
 
 /// `message` as JSON text, every string in it hidden with the known secrets of
-/// [`Api::secrets`], or only the passwords of URLs without one; or why there is none.
-async fn hidden_text(api: &Api, message: &UiMessage) -> Result<String, Unsent> {
+/// [`Api::secrets`], or only the passwords of URLs without one. `None` when the secret store
+/// cannot be read, or the message cannot be written, which is logged.
+async fn hidden_text(api: &Api, message: &UiMessage) -> Option<String> {
     let mut value = match serde_json::to_value(message) {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!("api: an event cannot be sent: {error}");
-            return Err(Unsent::Unwritable);
+            return None;
         }
     };
     let secrets = api.secrets.clone();
@@ -741,11 +733,11 @@ async fn hidden_text(api: &Api, message: &UiMessage) -> Result<String, Unsent> {
     })
     .await;
     match hidden {
-        Ok(Ok(text)) => Ok(text),
-        Ok(Err(factory::Unreadable)) => Err(Unsent::Unreadable),
+        Ok(Ok(text)) => Some(text),
+        Ok(Err(factory::Unreadable)) => None,
         Err(error) => {
             tracing::warn!("api: an event cannot be sent: {error}");
-            Err(Unsent::Unwritable)
+            None
         }
     }
 }

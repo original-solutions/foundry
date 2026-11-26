@@ -74,12 +74,14 @@
 //!   sent through the coordinator, `200 {factory}`. `login` may be left out, `null` or blank,
 //!   which names none. Turning a project on is `422` unless its repo URL starts
 //!   `https://github.com/` and names a repo: SSH and other hosts are out of scope. A login is
-//!   letters, digits and `-`. A project on with no login named takes the acting coordinator's
-//!   default login at that moment ([`secrets::github_default`]), and is `422` when it names
-//!   none: only the acting coordinator's secret store holds it, so such a request is carried
-//!   there and made there, and one carried to a machine that no longer acts is `503`, never
-//!   carried on. Any other edit goes through [`Coordinator::edit`], which sends it to whichever
-//!   machine acts.
+//!   letters, digits and `-`. Turning a project on with no login named takes the acting
+//!   coordinator's default login at that moment (`foundryd github default`), and is `422` when
+//!   it names none, `503` when its secret store cannot be read. Only that machine's secret
+//!   store holds it, so such a request is carried there and decided there, against its own
+//!   copy; one carried to a machine that no longer acts is `503`, never carried on. A project
+//!   that is on acts as its login, so an edit that keeps it on and names none is `422`, and
+//!   changes nothing. Any other edit goes through [`Coordinator::edit`], which sends it to
+//!   whichever machine acts.
 //!
 //! Both edits are values sent whole, as P1's edits are, so an edit never merges a field with a
 //! copy that may be older: the last one numbered wins, as with any shared setting.
@@ -648,6 +650,9 @@ pub(super) fn believed_statuses(
 /// character that is no gap and in no secret, so no secret is matched across two strings.
 pub(super) const JOINT: &str = "\n\u{E000}\n";
 
+/// The character between the line breaks of [`JOINT`].
+pub(super) const JOINT_MARK: char = '\u{E000}';
+
 /// The secret store could not be read, so nothing that was to be hidden may be shown.
 #[derive(Debug)]
 pub(super) struct Unreadable;
@@ -692,7 +697,7 @@ pub(super) fn hide_strings(
     };
     // A string with the joint's middle in it is hidden on its own: one that ended with the
     // joint's start would split back at the wrong place.
-    if !texts.iter().any(|text| text.contains('\u{E000}')) {
+    if !texts.iter().any(|text| text.contains(JOINT_MARK)) {
         let joined = texts
             .iter()
             .map(|text| text.as_str())
@@ -1085,42 +1090,71 @@ async fn project_factory(
     let Some(held_project) = settings.projects.iter().find(|p| p.id == project) else {
         return Err(ApiError::NotFound(format!("no project {project} here")));
     };
+    let refused_url = || {
+        unprocessable(format!(
+            "the factory of {:?} cannot be turned on: its repo URL does not start \
+             {GITHUB_HTTPS} and name a repo there, and a factory reaches GitHub only over HTTPS",
+            held_project.name
+        ))
+    };
     let held_on = settings
         .project_factory
         .get(&project)
         .is_some_and(|factory| factory.on);
-    if edit.on && !held_on && !on_github(&held_project.repo) {
-        return Err(unprocessable(format!(
-            "the factory of {:?} cannot be turned on: its repo URL does not start \
-             {GITHUB_HTTPS} and name a repo there, and a factory reaches GitHub only over HTTPS",
-            held_project.name
-        )));
-    }
-    let mut factory = ProjectFactory {
-        on: edit.on,
-        login: named.unwrap_or_default(),
-        paused: edit.paused,
-    };
-    if factory.on && factory.login.is_empty() {
-        // The login is the acting coordinator's default at this moment (F4), which only that
-        // machine's secret store holds: the edit is made there.
-        let path = format!("/api/projects/{project}/factory");
-        if let Some(answer) = view.at_coordinator(&headers, &path, &body).await? {
-            return Ok(answer);
+    let login = match named {
+        Some(login) => {
+            if edit.on && !held_on && !on_github(&held_project.repo) {
+                return Err(refused_url());
+            }
+            login
         }
-        let secrets = view.secrets.clone();
-        match blocking(move || secrets::github_default(&*secrets)).await? {
-            Some(login) => factory.login = login,
-            None => {
-                return Err(unprocessable(
-                    "no login was named and the coordinator names no default login: name the \
-                     project's login, or set the coordinator's default with `foundryd github \
-                     default <login>`"
-                        .to_owned(),
-                ));
+        None if !edit.on => String::new(),
+        None => {
+            // On with no login: only a turn-on takes one, the acting coordinator's default at
+            // that moment (F4), which only that machine's secret store holds. So the edit is
+            // decided there, against the copy it is numbered against.
+            let path = format!("/api/projects/{project}/factory");
+            if let Some(answer) = view.at_coordinator(&headers, &path, &body).await? {
+                return Ok(answer);
+            }
+            if held_on {
+                return Err(unprocessable(format!(
+                    "the factory of {:?} is on, and acts as its login: an edit of it names the \
+                     login, as GET /api/factory gives it",
+                    held_project.name
+                )));
+            }
+            if !on_github(&held_project.repo) {
+                return Err(refused_url());
+            }
+            view.readable().await?;
+            let secrets = view.secrets.clone();
+            match blocking(move || secrets.get(secrets::GITHUB_DEFAULT)).await? {
+                Ok(Some(login)) if secrets::is_login(&login) => login,
+                Ok(_) => {
+                    return Err(unprocessable(
+                        "no login was named and the coordinator names no default login: name \
+                         the project's login, or set the coordinator's default with `foundryd \
+                         github default <login>`"
+                            .to_owned(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(ApiError::Rejected(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "the coordinator's secret store could not be read, so its default login \
+                         is not known and nothing was done"
+                            .to_owned(),
+                    ));
+                }
             }
         }
-    }
+    };
+    let factory = ProjectFactory {
+        on: edit.on,
+        login,
+        paused: edit.paused,
+    };
     view.readable().await?;
     view.edit(Edit::SetProjectFactory {
         project,
