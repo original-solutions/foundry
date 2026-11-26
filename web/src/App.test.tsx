@@ -800,6 +800,22 @@ describe("App", () => {
     expect((within(dialog).getByLabelText("Pause claims for demo") as HTMLInputElement).checked).toBe(false);
   });
 
+  it("offers no factory controls from the fleet this browser remembers, only once the daemon's own settings arrive", async () => {
+    mockActions();
+    const remembered = settings({ project_factory: { p1: { on: true, login: "bot", paused: false } } });
+    keep({ records: live.records, settings: remembered, synced: true }, Date.now() - 180_000);
+    const events = await before("/");
+    fireEvent.focus(screen.getByRole("textbox", { name: "New task" }));
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    const dialog = await screen.findByRole("dialog", { name: "Projects" });
+    expect(within(dialog).queryByRole("switch", { name: "Factory for demo" })).toBeNull();
+    expect(within(dialog).queryByLabelText("Pause claims for demo")).toBeNull();
+
+    act(() => events.open());
+    act(() => events.deliver(JSON.stringify({ ...live, settings: settings({ seq: 2, project_factory: { p1: { on: false, login: "bot", paused: false } } }) })));
+    await waitFor(() => expect(within(dialog).getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("false"));
+  });
+
   it("starts a new shell from the palette and opens it", async () => {
     const calls = mockActions(json(201, { id: "t9" }));
     const router = await open("/", live);

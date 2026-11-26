@@ -278,7 +278,8 @@ function Layout() {
   const place = rail ? "fixed inset-0 z-30 flex md:hidden" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
   const sidebar = !rail || drawer;
   return (
-    <FactoryContext.Provider value={state.synced ? (state.settings.project_factory ?? {}) : undefined}>
+    // Only the daemon's own settings: a change built from the remembered fleet could overwrite a newer one.
+    <FactoryContext.Provider value={sent.synced ? (sent.settings.project_factory ?? {}) : undefined}>
       <TerminalActions
         machines={machines}
         current={terminalId}
