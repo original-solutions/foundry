@@ -354,7 +354,8 @@ mod tests {
             format!("/api/terminals/{id}"),
             format!("/elsewhere/workspaces/{id}/shells"),
             "/api/factory".to_owned(),
-            format!("/api/factory/runs/{id}/stop"),
+            "/api/factory/settings".to_owned(),
+            format!("/api/factory/runs/{id}"),
             format!("/api/workspaces/{id}/factory"),
             format!("/api/workspaces/{id}/factory/archive"),
             format!("/api/sessions/{id}/trail"),
@@ -386,6 +387,28 @@ mod tests {
         ] {
             assert!(carries(&path), "{path}");
             assert!(worker(&path).is_none(), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_factory_views_carried_routes_are_taken_from_a_peer_and_carried_by_their_handlers() {
+        let project = uuid::Uuid::new_v4();
+        for path in [
+            "/api/factory/runs/rawphp__softfac__8__1/stop".to_owned(),
+            format!("/api/projects/{project}/factory"),
+        ] {
+            assert!(carries(&path), "{path} is taken from a peer");
+            assert!(matches!(target(&path), Some(Target::View)), "{path}");
+            assert!(worker(&path).is_none(), "{path}");
+        }
+        for path in [
+            "/api/factory/runs/not-a-run/stop".to_owned(),
+            "/api/factory/runs/rawphp__softfac__8__1".to_owned(),
+            "/api/projects/not-an-id/factory".to_owned(),
+            format!("/api/projects/{project}/remove"),
+            format!("/api/projects/{project}/factory/more"),
+        ] {
+            assert!(!carries(&path), "{path}");
         }
     }
 

@@ -1051,3 +1051,295 @@ async fn close_terminal(
     api.terminals.close(id).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
+
+/// The events socket's factory statuses, against a real store and socket.
+#[cfg(test)]
+mod factory_events {
+    use std::time::Duration;
+
+    use foundry_proto::factory::{FactoryBody, FactoryRecord, FactoryStatus, RunId};
+    use foundry_proto::messages::UiMessage;
+    use futures::StreamExt as _;
+    use futures::future::BoxFuture;
+    use tempfile::TempDir;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::*;
+    use crate::factory::ledger::Ledger;
+    use crate::factory::ledger::events::{Cause, CauseStep, Event};
+    use crate::secrets::{MemorySecrets, Secrets};
+    use crate::sessions::{self, Gateway};
+    use crate::sync::{Conn, Dialer};
+
+    const WAIT: Duration = Duration::from_secs(20);
+    const TOKEN: &str = "ghp_events0test0token0that0must0never0show";
+
+    type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    struct NoDial;
+
+    impl Dialer for NoDial {
+        fn dial(
+            &self,
+            _: &foundry_proto::settings::Machine,
+        ) -> BoxFuture<'static, std::io::Result<Conn>> {
+            Box::pin(async { Err(std::io::Error::other("no peers in these tests")) })
+        }
+    }
+
+    /// One machine's API, alone, on a loopback port, with a secret store that holds [`TOKEN`].
+    struct Served {
+        me: MachineId,
+        store: Arc<Mutex<Store>>,
+        addr: SocketAddr,
+        server: tokio::task::JoinHandle<()>,
+        _dir: TempDir,
+    }
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    fn project() -> ProjectId {
+        ProjectId(uuid::Uuid::from_u128(0x51))
+    }
+
+    fn run() -> RunId {
+        RunId::new("rawphp/softfac", 8, 1).unwrap()
+    }
+
+    async fn serve() -> Served {
+        let dir = tempfile::tempdir().unwrap();
+        let me = MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(dir.path().join("foundry.db")).unwrap(),
+        ));
+        {
+            let mut store = store.lock().unwrap();
+            let mut settings = store.settings().unwrap();
+            settings.seq += 1;
+            settings.priority = vec![me];
+            store.apply_settings(settings).unwrap();
+        }
+        let terminals = Arc::new(Terminals::new(
+            me,
+            store.clone(),
+            dir.path(),
+            dir.path().join("no-holder"),
+        ));
+        let workspaces = Arc::new(Workspaces::new(
+            me,
+            store.clone(),
+            dir.path(),
+            terminals.clone(),
+        ));
+        let sessions = Arc::new(Sessions::new(
+            me,
+            store.clone(),
+            terminals.clone(),
+            dir.path(),
+            sessions::Config {
+                claude: vec!["claude".into()],
+                claude_json: dir.path().join(".claude.json"),
+                hook_port: 9,
+                gateway: Gateway {
+                    base_url: "http://127.0.0.1:9/gateway".into(),
+                    key: "gw-key".into(),
+                },
+            },
+        ));
+        let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
+        let mut api = Api::new(
+            store.clone(),
+            peers,
+            terminals,
+            workspaces,
+            sessions,
+            Vec::new(),
+        );
+        let secrets = Arc::new(MemorySecrets::default());
+        secrets.set("github:softfac-bot", TOKEN).unwrap();
+        api.secrets = Some(secrets);
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(api)).await.unwrap();
+        });
+        Served {
+            me,
+            store,
+            addr,
+            server,
+            _dir: dir,
+        }
+    }
+
+    fn holding(pass: u64, idle: Option<String>) -> FactoryStatus {
+        FactoryStatus {
+            project: project(),
+            pass,
+            holds: true,
+            generation: 1,
+            not_holding: None,
+            idle,
+            owner_ignored: false,
+            ready: Vec::new(),
+            feedback_waiting: Vec::new(),
+            runs: Vec::new(),
+            held_up: Vec::new(),
+            gate_infra: Vec::new(),
+            finished: Vec::new(),
+            foreign: Vec::new(),
+        }
+    }
+
+    impl Served {
+        /// Writes `status` as `owner`'s status record, at a version above any `owner` has.
+        fn write_status(&self, owner: MachineId, status: FactoryStatus) {
+            let mut store = self.store.lock().unwrap();
+            let version = if owner == self.me {
+                store.own_next_factory_version().unwrap()
+            } else {
+                store.highest_factory_version(owner).unwrap().unwrap_or(0) + 1
+            };
+            let record = FactoryRecord {
+                owner,
+                version,
+                body: FactoryBody::Status(status),
+            };
+            store.apply_factory(&record, owner).unwrap();
+        }
+
+        fn write_event(&self) {
+            Ledger::new(
+                self.store.clone(),
+                self.me,
+                1,
+                Arc::new(|text: &str| text.to_owned()),
+            )
+            .write(
+                &run(),
+                &Event::StopRequested {
+                    by: "operator".into(),
+                },
+                &Cause::new(CauseStep::Operator, "stop-requested"),
+            )
+            .unwrap();
+        }
+
+        async fn events(&self) -> Socket {
+            let url = format!("ws://{}/api/events", self.addr);
+            let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            let first = next_text(&mut socket).await;
+            assert!(
+                matches!(
+                    serde_json::from_str::<UiMessage>(&first).unwrap(),
+                    UiMessage::State { .. }
+                ),
+                "{first}"
+            );
+            assert!(!first.contains(&run().to_string()), "{first}");
+            socket
+        }
+    }
+
+    async fn next_text(socket: &mut Socket) -> String {
+        loop {
+            let frame = tokio::time::timeout(WAIT, socket.next())
+                .await
+                .expect("a frame in time")
+                .unwrap()
+                .unwrap();
+            if let Message::Text(text) = frame {
+                return text.as_str().to_owned();
+            }
+        }
+    }
+
+    /// Every text frame that arrives within `span`.
+    async fn texts_within(socket: &mut Socket, span: Duration) -> Vec<String> {
+        let mut texts = Vec::new();
+        let end = tokio::time::Instant::now() + span;
+        while let Ok(Some(frame)) = tokio::time::timeout_at(end, socket.next()).await {
+            if let Message::Text(text) = frame.unwrap() {
+                texts.push(text.as_str().to_owned());
+            }
+        }
+        texts
+    }
+
+    /// The next frame, which must be a factory status.
+    async fn next_status(socket: &mut Socket) -> (String, FactoryStatus) {
+        let text = next_text(socket).await;
+        match serde_json::from_str::<UiMessage>(&text).unwrap() {
+            UiMessage::FactoryStatus { status, .. } => (text, status),
+            other => panic!("not a factory status: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_events_socket_sends_a_believed_status_as_it_changes_and_never_a_run_event() {
+        let served = serve().await;
+        let mut socket = served.events().await;
+
+        served.write_status(served.me, holding(1, Some(format!("gh said {TOKEN}"))));
+        let (text, status) = next_status(&mut socket).await;
+        assert!(!text.contains(TOKEN), "{text}");
+        assert_eq!(status.pass, 1);
+        assert_eq!(status.idle.as_deref(), Some("gh said ***"));
+
+        served.write_event();
+        let texts = texts_within(&mut socket, Duration::from_secs(1)).await;
+        assert!(texts.is_empty(), "a run event sends nothing: {texts:?}");
+
+        // A status that changes nothing believed sends nothing: one from a writer not heard.
+        served.write_status(MachineId::random(), holding(7, None));
+        let texts = texts_within(&mut socket, Duration::from_secs(1)).await;
+        assert!(texts.is_empty(), "{texts:?}");
+
+        served.write_status(served.me, holding(2, None));
+        let (_, status) = next_status(&mut socket).await;
+        assert_eq!(status, holding(2, None));
+        let texts = texts_within(&mut socket, Duration::from_secs(1)).await;
+        assert!(texts.is_empty(), "each change is sent once: {texts:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_socket_opened_after_a_status_was_written_is_sent_it_after_the_state() {
+        let served = serve().await;
+        served.write_status(served.me, holding(3, None));
+        served.write_event();
+        let mut socket = served.events().await;
+        let (_, status) = next_status(&mut socket).await;
+        assert_eq!(status, holding(3, None));
+        let texts = texts_within(&mut socket, Duration::from_secs(1)).await;
+        assert!(texts.is_empty(), "{texts:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_state_holds_no_run_event() {
+        let served = serve().await;
+        served.write_event();
+        served.write_status(served.me, holding(1, None));
+        let mut stream = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+        let request = format!(
+            "GET /api/state HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            served.addr
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+            .await
+            .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!response.contains(&run().to_string()), "{response}");
+        assert!(!response.contains("stop_requested"), "{response}");
+    }
+}

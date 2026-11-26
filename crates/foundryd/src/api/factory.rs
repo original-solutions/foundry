@@ -696,3 +696,831 @@ mod tests {
         assert_eq!(last_bytes("short", TAIL_LIMIT), "short");
     }
 }
+
+/// The Factory view's routes, served for one or more machines on loopback ports over peers
+/// linked in memory, and called the way the UI calls them.
+#[cfg(test)]
+mod view_tests {
+    use std::collections::BTreeMap;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use foundry_proto::factory::{
+        FactoryBody, FactoryRecord, FactorySettings, FactoryStatus, NotHolding, ProjectFactory,
+        RunId,
+    };
+    use foundry_proto::ids::{MachineId, ProjectId};
+    use foundry_proto::settings::{Machine, Project, SharedSettings};
+    use futures::future::BoxFuture;
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::task::JoinHandle;
+
+    use super::{View, view_router};
+    use crate::coordinator::Coordinator;
+    use crate::factory::lease::LeaseState;
+    use crate::factory::ledger::Ledger;
+    use crate::factory::ledger::events::{Cause, CauseStep, Event};
+    use crate::factory::lifecycle::State;
+    use crate::factory::runs::stop::{already_requested_message, requested_message};
+    use crate::factory::worker::{AlwaysHeld, Guard};
+    use crate::factory::{Leased, Leases, Leasing};
+    use crate::secrets::{GITHUB_DEFAULT, MemorySecrets, Secrets};
+    use crate::store::Store;
+    use crate::sync::call::CARRIED;
+    use crate::sync::{Conn, Dialer, Peers};
+
+    const WAIT: Duration = Duration::from_secs(20);
+    const REPO: &str = "rawphp/softfac";
+    const TOKEN: &str = "ghp_view0test0token0that0must0never0show";
+
+    /// The peers of every machine of a test, by id, which each machine's dialer links to.
+    #[derive(Default)]
+    struct Net(Mutex<BTreeMap<MachineId, Peers>>);
+
+    struct NetDial(Arc<Net>);
+
+    impl Dialer for NetDial {
+        fn dial(&self, peer: &Machine) -> BoxFuture<'static, std::io::Result<Conn>> {
+            let target = self.0.0.lock().unwrap().get(&peer.id).cloned();
+            Box::pin(async move {
+                let target = target.ok_or_else(|| std::io::Error::other("no such machine"))?;
+                let (ours, theirs) = Conn::pair();
+                tokio::spawn(async move { target.accept(theirs).await });
+                Ok(ours)
+            })
+        }
+    }
+
+    /// One machine: its store, peers, coordinator, secret store and leases, with the view's
+    /// routes served on a loopback port that its peers also carry calls to.
+    struct Served {
+        me: MachineId,
+        store: Arc<Mutex<Store>>,
+        peers: Peers,
+        secrets: Arc<MemorySecrets>,
+        leases: Arc<Leases>,
+        addr: SocketAddr,
+        tasks: Vec<JoinHandle<()>>,
+        _dir: TempDir,
+    }
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            for task in &self.tasks {
+                task.abort();
+            }
+        }
+    }
+
+    fn project_id() -> ProjectId {
+        ProjectId(uuid::Uuid::from_u128(0x77))
+    }
+
+    fn run_id() -> RunId {
+        RunId::new(REPO, 8, 1).unwrap()
+    }
+
+    /// `n` machines that list each other, the first acting, holding a project on `repo` whose
+    /// factory is `factory`, linked and each heard by the others.
+    async fn fleet(n: usize, repo: &str, factory: Option<ProjectFactory>) -> Vec<Served> {
+        let ids: Vec<MachineId> = (0..n).map(|_| MachineId::random()).collect();
+        let mut settings = SharedSettings {
+            seq: 1,
+            machines: ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| Machine {
+                    id: *id,
+                    name: format!("machine-{i}"),
+                    address: format!("100.64.0.{}", i + 1),
+                    key: String::new(),
+                })
+                .collect(),
+            priority: ids.clone(),
+            ..SharedSettings::default()
+        };
+        settings.projects.push(Project {
+            id: project_id(),
+            name: "softfac".into(),
+            repo: repo.into(),
+        });
+        if let Some(factory) = factory {
+            settings.project_factory.insert(project_id(), factory);
+        }
+        let net = Arc::new(Net::default());
+        let mut fleet = Vec::new();
+        for me in &ids {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+            store.apply_settings(settings.clone()).unwrap();
+            let store = Arc::new(Mutex::new(store));
+            let peers = Peers::new(*me, store.clone(), Arc::new(NetDial(net.clone())));
+            let coordinator = Arc::new(Coordinator::new(*me, store.clone(), peers.clone()));
+            peers.coordinate(coordinator.clone());
+            let secrets = Arc::new(MemorySecrets::default());
+            secrets.set("github:softfac-bot", TOKEN).unwrap();
+            let leases = Arc::new(Leases::default());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            peers.serve_calls(addr);
+            let app = view_router(View {
+                store: store.clone(),
+                peers: peers.clone(),
+                coordinator: coordinator.clone(),
+                secrets: secrets.clone(),
+                leases: leases.clone(),
+            });
+            let mut tasks = vec![tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            })];
+            let running = peers.clone();
+            tasks.push(tokio::spawn(async move { running.run().await }));
+            // Held for the daemon's life: the peers hold it weakly.
+            let keep = coordinator.clone();
+            tasks.push(tokio::spawn(async move {
+                let _coordinator = keep;
+                std::future::pending::<()>().await;
+            }));
+            net.0.lock().unwrap().insert(*me, peers.clone());
+            fleet.push(Served {
+                me: *me,
+                store,
+                peers,
+                secrets,
+                leases,
+                addr,
+                tasks,
+                _dir: dir,
+            });
+        }
+        for machine in &fleet {
+            until(|| ids.iter().all(|id| machine.peers.online().contains(id))).await;
+        }
+        fleet
+    }
+
+    async fn until(mut done: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "not in time");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    impl Served {
+        /// `(status, body)` of `method path`, with `body` as JSON when there is one, and the
+        /// headers `extra`.
+        async fn send(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<Value>,
+            extra: &[(&str, &str)],
+        ) -> (u16, String) {
+            let mut stream = tokio::net::TcpStream::connect(self.addr).await.unwrap();
+            let body = body.map(|b| b.to_string()).unwrap_or_default();
+            let headers: String = extra
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect();
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n{headers}\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                self.addr,
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(WAIT, stream.read_to_end(&mut response))
+                .await
+                .expect("the routes answer in time")
+                .unwrap();
+            let response = String::from_utf8(response).unwrap();
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+            // A chunked body is read as its one chunk, which is all these answers have.
+            let body = if head
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked")
+            {
+                body.split_once("\r\n")
+                    .map(|(_, rest)| rest.rsplit_once("\r\n0\r\n").map_or(rest, |(b, _)| b))
+                    .unwrap_or(body)
+                    .trim_end_matches("\r\n")
+                    .to_owned()
+            } else {
+                body.to_owned()
+            };
+            (status, body)
+        }
+
+        async fn get(&self, path: &str) -> (u16, Value) {
+            let (status, body) = self.send("GET", path, None, &[]).await;
+            (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+        }
+
+        async fn post(&self, path: &str, body: Option<Value>) -> (u16, Value) {
+            let (status, body) = self.send("POST", path, body, &[]).await;
+            (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+        }
+
+        fn settings(&self) -> SharedSettings {
+            self.store.lock().unwrap().settings().unwrap()
+        }
+
+        /// Writes `status` as this machine's own status record.
+        fn write_status(&self, status: FactoryStatus) {
+            let mut store = self.store.lock().unwrap();
+            let version = store.own_next_factory_version().unwrap();
+            let record = FactoryRecord {
+                owner: self.me,
+                version,
+                body: FactoryBody::Status(status),
+            };
+            store.apply_factory(&record, self.me).unwrap();
+        }
+
+        fn statuses(&self) -> Vec<(MachineId, FactoryStatus)> {
+            self.store.lock().unwrap().statuses(project_id()).unwrap()
+        }
+
+        /// This machine's ledger at `generation`, hiding nothing, as a writer that did not
+        /// hide would leave it.
+        fn ledger(&self, generation: u64) -> Ledger {
+            Ledger::new(
+                self.store.clone(),
+                self.me,
+                generation,
+                Arc::new(|text: &str| text.to_owned()),
+            )
+        }
+
+        /// Puts a lease of the project in this machine's handle, whose newest tick said
+        /// `state` and whose guard is `guard`.
+        fn hold(&self, state: LeaseState, guard: Arc<dyn Guard>) {
+            let lease: Arc<dyn Leasing> = Arc::new(Fixed {
+                state: state.clone(),
+                guard,
+            });
+            self.leases.put(
+                project_id(),
+                Leased {
+                    repo: REPO.into(),
+                    lease,
+                    state: Arc::new(Mutex::new(Some(state))),
+                },
+            );
+        }
+    }
+
+    struct Fixed {
+        state: LeaseState,
+        guard: Arc<dyn Guard>,
+    }
+
+    impl Leasing for Fixed {
+        fn tick(&self, _: u64) -> LeaseState {
+            self.state.clone()
+        }
+        fn guard(&self) -> Arc<dyn Guard> {
+            self.guard.clone()
+        }
+        fn release(&self) {}
+    }
+
+    fn on() -> Option<ProjectFactory> {
+        Some(ProjectFactory {
+            on: true,
+            login: "softfac-bot".into(),
+            paused: false,
+        })
+    }
+
+    fn holding(generation: u64, pass: u64) -> FactoryStatus {
+        FactoryStatus {
+            project: project_id(),
+            pass,
+            holds: true,
+            generation,
+            not_holding: None,
+            idle: None,
+            owner_ignored: false,
+            ready: Vec::new(),
+            feedback_waiting: Vec::new(),
+            runs: Vec::new(),
+            held_up: Vec::new(),
+            gate_infra: Vec::new(),
+            finished: Vec::new(),
+            foreign: Vec::new(),
+        }
+    }
+
+    fn not_holding(holder: MachineId, generation: u64) -> FactoryStatus {
+        FactoryStatus {
+            holds: false,
+            not_holding: Some(NotHolding::HeldBy {
+                machine: holder,
+                generation,
+            }),
+            ..holding(generation, 1)
+        }
+    }
+
+    /// Writes a building run of the project in `machine`'s ledger at `generation`.
+    fn building_run(machine: &Served, generation: u64) {
+        let ledger = machine.ledger(generation);
+        let cause = Cause::new(CauseStep::Pass, "claimed");
+        for event in [
+            Event::Claimed {
+                machine: "machine-0".into(),
+                github_user: "softfac-bot".into(),
+            },
+            Event::StateChanged {
+                from: State::Ready,
+                to: State::Triage,
+            },
+            Event::StateChanged {
+                from: State::Triage,
+                to: State::Building,
+            },
+        ] {
+            ledger.write(&run_id(), &event, &cause).unwrap();
+        }
+    }
+
+    fn stop_path() -> String {
+        format!("/api/factory/runs/{}/stop", run_id())
+    }
+
+    fn stops_held(machine: &Served) -> usize {
+        machine
+            .store
+            .lock()
+            .unwrap()
+            .run_events(&run_id())
+            .unwrap()
+            .iter()
+            .filter(|event| event.event == "stop_requested")
+            .count()
+    }
+
+    // ----- GET /api/factory -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_view_on_a_machine_that_is_not_the_coordinator_gives_the_holders_status() {
+        let fleet = fleet(2, &format!("https://github.com/{REPO}"), on()).await;
+        let (coordinator, other) = (&fleet[0], &fleet[1]);
+        // The second machine holds the lease; the coordinator's own status says so.
+        other.write_status(holding(3, 9));
+        coordinator.write_status(not_holding(other.me, 3));
+        until(|| coordinator.statuses().len() == 2 && other.statuses().len() == 2).await;
+
+        for asked in [coordinator, other] {
+            let (status, view) = asked.get("/api/factory").await;
+            assert_eq!(status, 200, "{view}");
+            assert_eq!(
+                view["settings"],
+                serde_json::to_value(FactorySettings::default()).unwrap(),
+                "the fleet's settings, default while unset"
+            );
+            let projects = view["projects"].as_array().unwrap();
+            assert_eq!(projects.len(), 1, "{view}");
+            let project = &projects[0];
+            assert_eq!(project["id"], json!(project_id()));
+            assert_eq!(project["factory"], serde_json::to_value(on()).unwrap());
+            assert_eq!(project["writer"], json!(other.me), "{view}");
+            assert_eq!(
+                project["status"],
+                serde_json::to_value(holding(3, 9)).unwrap(),
+                "{view}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_view_believes_the_coordinator_when_no_online_writer_holds() {
+        let fleet = fleet(1, &format!("https://github.com/{REPO}"), on()).await;
+        let alone = &fleet[0];
+        // A holder that is not heard from is not believed.
+        let gone = MachineId::random();
+        {
+            let mut store = alone.store.lock().unwrap();
+            let record = FactoryRecord {
+                owner: gone,
+                version: 1,
+                body: FactoryBody::Status(holding(5, 40)),
+            };
+            store.apply_factory(&record, gone).unwrap();
+        }
+        let (_, view) = alone.get("/api/factory").await;
+        assert_eq!(view["projects"][0]["status"], Value::Null, "{view}");
+        assert_eq!(view["projects"][0]["writer"], Value::Null, "{view}");
+        let said = FactoryStatus {
+            holds: false,
+            not_holding: Some(NotHolding::NoToken {
+                login: "softfac-bot".into(),
+            }),
+            ..holding(5, 2)
+        };
+        alone.write_status(said.clone());
+        let (_, view) = alone.get("/api/factory").await;
+        assert_eq!(view["projects"][0]["writer"], json!(alone.me), "{view}");
+        assert_eq!(
+            view["projects"][0]["status"],
+            serde_json::to_value(said).unwrap()
+        );
+    }
+
+    // ----- GET /api/factory/runs/{id} -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_runs_events_come_in_order_and_an_unknown_run_is_not_found() {
+        let fleet = fleet(1, &format!("https://github.com/{REPO}"), on()).await;
+        let alone = &fleet[0];
+        building_run(alone, 2);
+        alone
+            .ledger(1)
+            .write(
+                &run_id(),
+                &Event::StepChanged {
+                    step: "earlier".into(),
+                },
+                &Cause::new(CauseStep::Pass, "test"),
+            )
+            .unwrap();
+        let (status, run) = alone.get(&format!("/api/factory/runs/{}", run_id())).await;
+        assert_eq!(status, 200, "{run}");
+        assert_eq!(run["run"], json!(run_id().to_string()));
+        let names: Vec<&str> = run["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["step_changed", "claimed", "state_changed", "state_changed"],
+            "generation 1 before generation 2"
+        );
+        let unknown = RunId::new(REPO, 9, 1).unwrap();
+        let (status, _) = alone.get(&format!("/api/factory/runs/{unknown}")).await;
+        assert_eq!(status, 404);
+        let (status, said) = alone.get("/api/factory/runs/not-a-run").await;
+        assert_eq!(status, 404, "{said}");
+    }
+
+    // ----- POST /api/factory/runs/{id}/stop -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_sent_to_a_machine_that_is_not_the_holder_reaches_the_holder() {
+        let fleet = fleet(2, &format!("https://github.com/{REPO}"), on()).await;
+        let (holder, other) = (&fleet[0], &fleet[1]);
+        holder.hold(LeaseState::Held { generation: 3 }, Arc::new(AlwaysHeld(3)));
+        holder.write_status(holding(3, 4));
+        building_run(holder, 3);
+        until(|| other.statuses().len() == 1).await;
+
+        let (status, answer) = other.post(&stop_path(), None).await;
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(answer["stopped"], json!(true), "{answer}");
+        assert_eq!(answer["already"], json!(false), "{answer}");
+        assert_eq!(
+            answer["message"],
+            json!(requested_message(&run_id().to_string()))
+        );
+        let events = holder.store.lock().unwrap().run_events(&run_id()).unwrap();
+        let stop = events.last().unwrap();
+        assert_eq!(stop.event, "stop_requested");
+        assert_eq!(stop.generation, 3, "written at the holder's generation");
+        assert_eq!(
+            stops_held(other),
+            0,
+            "the machine asked writes nothing itself"
+        );
+
+        let (status, answer) = other.post(&stop_path(), None).await;
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(answer["already"], json!(true), "{answer}");
+        assert_eq!(
+            answer["message"],
+            json!(already_requested_message(&run_id().to_string()))
+        );
+        assert_eq!(stops_held(holder), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_on_the_holder_itself_is_written_there() {
+        let fleet = fleet(1, &format!("https://github.com/{REPO}"), on()).await;
+        let holder = &fleet[0];
+        holder.hold(LeaseState::Held { generation: 2 }, Arc::new(AlwaysHeld(2)));
+        building_run(holder, 2);
+        let (status, answer) = holder.post(&stop_path(), None).await;
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(stops_held(holder), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_where_no_lease_is_held_is_refused_with_the_reason_and_writes_nothing() {
+        let fleet = fleet(2, &format!("https://github.com/{REPO}"), on()).await;
+        let (first, second) = (&fleet[0], &fleet[1]);
+        building_run(first, 1);
+        // No machine is believed to hold the lease.
+        let (status, answer) = second.post(&stop_path(), None).await;
+        assert_eq!(status, 409, "{answer}");
+        assert!(
+            answer["error"].as_str().unwrap().contains("lease"),
+            "{answer}"
+        );
+        // A carried stop is answered where it lands, and never carried on.
+        second.write_status(holding(1, 1));
+        until(|| first.statuses().len() == 1).await;
+        let (status, body) = first
+            .send("POST", &stop_path(), None, &[(CARRIED, "1")])
+            .await;
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("lease"), "{body}");
+        // A lease whose tick did not hold, or whose guard fails, holds nothing.
+        first.hold(
+            LeaseState::HeldBy {
+                machine: second.me,
+                generation: 1,
+            },
+            Arc::new(AlwaysHeld(1)),
+        );
+        let (status, _) = first
+            .send("POST", &stop_path(), None, &[(CARRIED, "1")])
+            .await;
+        assert_eq!(status, 409);
+        first.hold(
+            LeaseState::Held { generation: 1 },
+            Arc::new(crate::factory::worker::Lost),
+        );
+        let (status, _) = first
+            .send("POST", &stop_path(), None, &[(CARRIED, "1")])
+            .await;
+        assert_eq!(status, 409);
+        assert_eq!(stops_held(first), 0);
+        assert_eq!(stops_held(second), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_of_a_run_that_is_not_building_or_has_no_ledger_is_refused() {
+        let fleet = fleet(1, &format!("https://github.com/{REPO}"), on()).await;
+        let holder = &fleet[0];
+        holder.hold(LeaseState::Held { generation: 1 }, Arc::new(AlwaysHeld(1)));
+        let (status, answer) = holder.post(&stop_path(), None).await;
+        assert_eq!(status, 404, "no ledger: {answer}");
+        holder
+            .ledger(1)
+            .write(
+                &run_id(),
+                &Event::Claimed {
+                    machine: "machine-0".into(),
+                    github_user: "softfac-bot".into(),
+                },
+                &Cause::new(CauseStep::Pass, "claimed"),
+            )
+            .unwrap();
+        let (status, answer) = holder.post(&stop_path(), None).await;
+        assert_eq!(status, 409, "{answer}");
+        assert!(
+            answer["error"]
+                .as_str()
+                .unwrap()
+                .contains("is not building"),
+            "{answer}"
+        );
+        let (status, _) = holder.post("/api/factory/runs/nonsense/stop", None).await;
+        assert_eq!(status, 404);
+        assert_eq!(stops_held(holder), 0);
+    }
+
+    // ----- POST /api/projects/{id}/factory -----
+
+    fn project_path() -> String {
+        format!("/api/projects/{}/factory", project_id())
+    }
+
+    fn factory_of(machine: &Served) -> Option<ProjectFactory> {
+        machine
+            .settings()
+            .project_factory
+            .get(&project_id())
+            .cloned()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn turning_on_a_project_whose_repo_is_not_on_github_over_https_is_422_with_the_reason() {
+        for repo in [
+            "git@github.com:rawphp/softfac.git",
+            "ssh://git@github.com/rawphp/softfac.git",
+            "https://gitlab.com/rawphp/softfac",
+            "http://github.com/rawphp/softfac",
+        ] {
+            let fleet = fleet(1, repo, None).await;
+            let alone = &fleet[0];
+            let (status, answer) = alone
+                .post(
+                    &project_path(),
+                    Some(json!({ "on": true, "login": "softfac-bot" })),
+                )
+                .await;
+            assert_eq!(status, 422, "{repo}: {answer}");
+            let said = answer["error"].as_str().unwrap();
+            assert!(said.contains("https://github.com/"), "{said}");
+            assert_eq!(factory_of(alone), None, "{repo}: nothing was sent");
+            // Off, or a pause, is no turning on.
+            let (status, answer) = alone
+                .post(&project_path(), Some(json!({ "paused": true })))
+                .await;
+            assert_eq!(status, 200, "{repo}: {answer}");
+            assert_eq!(
+                factory_of(alone),
+                Some(ProjectFactory {
+                    on: false,
+                    login: String::new(),
+                    paused: true,
+                })
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn turning_on_with_no_login_takes_the_acting_coordinators_default() {
+        let fleet = fleet(2, &format!("https://github.com/{REPO}"), None).await;
+        let (coordinator, other) = (&fleet[0], &fleet[1]);
+        coordinator
+            .secrets
+            .set(GITHUB_DEFAULT, "coord-bot")
+            .unwrap();
+        other.secrets.set(GITHUB_DEFAULT, "other-bot").unwrap();
+        let (status, answer) = other
+            .post(&project_path(), Some(json!({ "on": true })))
+            .await;
+        assert_eq!(status, 200, "{answer}");
+        let wanted = ProjectFactory {
+            on: true,
+            login: "coord-bot".into(),
+            paused: false,
+        };
+        assert_eq!(answer["factory"], serde_json::to_value(&wanted).unwrap());
+        until(|| factory_of(other).as_ref() == Some(&wanted)).await;
+        assert_eq!(factory_of(coordinator), Some(wanted));
+
+        // A login named is written as named, and an edit that names none keeps it.
+        let (status, answer) = other
+            .post(&project_path(), Some(json!({ "login": "named-bot" })))
+            .await;
+        assert_eq!(status, 200, "{answer}");
+        let (status, answer) = coordinator
+            .post(&project_path(), Some(json!({ "paused": true })))
+            .await;
+        assert_eq!(status, 200, "{answer}");
+        let wanted = ProjectFactory {
+            on: true,
+            login: "named-bot".into(),
+            paused: true,
+        };
+        until(|| factory_of(other).as_ref() == Some(&wanted)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn turning_on_with_no_login_where_the_coordinator_has_no_default_is_refused() {
+        let fleet = fleet(2, &format!("https://github.com/{REPO}"), None).await;
+        let (coordinator, other) = (&fleet[0], &fleet[1]);
+        // Only a machine that is not the coordinator names a default: it is not used.
+        other.secrets.set(GITHUB_DEFAULT, "other-bot").unwrap();
+        let (status, answer) = other
+            .post(&project_path(), Some(json!({ "on": true })))
+            .await;
+        assert_eq!(status, 422, "{answer}");
+        assert!(
+            answer["error"].as_str().unwrap().contains("login"),
+            "{answer}"
+        );
+        assert_eq!(factory_of(coordinator), None);
+        assert_eq!(factory_of(other), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_project_edit_that_is_not_what_the_route_takes_is_refused() {
+        let fleet = fleet(1, &format!("https://github.com/{REPO}"), None).await;
+        let alone = &fleet[0];
+        for (body, status) in [
+            (json!({ "on": true, "login": "bad/login" }), 422),
+            (json!({ "on": true, "login": "x".repeat(40) }), 422),
+            (json!({ "on": "yes" }), 422),
+            (json!({ "colour": "red" }), 422),
+            (json!(["on"]), 422),
+        ] {
+            let (said, answer) = alone.post(&project_path(), Some(body.clone())).await;
+            assert_eq!(said, status, "{body}: {answer}");
+        }
+        let (status, _) = alone.send("POST", &project_path(), None, &[]).await;
+        assert_eq!(status, 400, "no JSON");
+        let unknown = ProjectId(uuid::Uuid::from_u128(0x99));
+        let (status, _) = alone
+            .post(
+                &format!("/api/projects/{unknown}/factory"),
+                Some(json!({ "on": false })),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(factory_of(alone), None);
+    }
+
+    // ----- POST /api/factory/settings -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_fleets_settings_go_through_the_coordinator_and_a_value_out_of_range_is_refused() {
+        let fleet = fleet(2, &format!("https://github.com/{REPO}"), None).await;
+        let (coordinator, other) = (&fleet[0], &fleet[1]);
+        let (status, answer) = other
+            .post(
+                "/api/factory/settings",
+                Some(json!({ "paused": true, "max_runs": 5 })),
+            )
+            .await;
+        assert_eq!(status, 200, "{answer}");
+        let wanted = FactorySettings {
+            paused: true,
+            max_runs: 5,
+            ..FactorySettings::default()
+        };
+        assert_eq!(answer["settings"], serde_json::to_value(&wanted).unwrap());
+        until(|| coordinator.settings().factory.as_ref() == Some(&wanted)).await;
+        // Another edit keeps what it does not name.
+        let (status, _) = coordinator
+            .post("/api/factory/settings", Some(json!({ "poll_seconds": 15 })))
+            .await;
+        assert_eq!(status, 200);
+        let wanted = FactorySettings {
+            poll_seconds: 15,
+            ..wanted
+        };
+        until(|| other.settings().factory.as_ref() == Some(&wanted)).await;
+
+        for body in [
+            json!({ "poll_seconds": 5 }),
+            json!({ "poll_seconds": 61 }),
+            json!({ "max_runs": -1 }),
+            json!({ "model": "-x" }),
+            json!({ "effort": "two words" }),
+            json!({ "colour": "red" }),
+        ] {
+            let (status, answer) = other
+                .post("/api/factory/settings", Some(body.clone()))
+                .await;
+            assert_eq!(status, 422, "{body}: {answer}");
+        }
+        let (_, answer) = other
+            .post("/api/factory/settings", Some(json!({ "poll_seconds": 5 })))
+            .await;
+        let said = answer["error"].as_str().unwrap();
+        assert!(said.contains("10") && said.contains("60"), "{said}");
+        assert_eq!(other.settings().factory, Some(wanted));
+    }
+
+    // ----- secrets -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_answer_holds_a_token() {
+        let fleet = fleet(2, &format!("https://github.com/{REPO}"), on()).await;
+        let (holder, other) = (&fleet[0], &fleet[1]);
+        other.secrets.set("github:softfac-bot", TOKEN).unwrap();
+        // A writer that did not hide what it wrote.
+        holder.write_status(FactoryStatus {
+            idle: Some(format!("gh said: bad credentials {TOKEN}")),
+            ..holding(1, 1)
+        });
+        holder.hold(LeaseState::Held { generation: 1 }, Arc::new(AlwaysHeld(1)));
+        building_run(holder, 1);
+        holder
+            .ledger(1)
+            .write(
+                &run_id(),
+                &Event::StepChanged {
+                    step: format!("pushing with {TOKEN}"),
+                },
+                &Cause::new(CauseStep::Pass, "test"),
+            )
+            .unwrap();
+        until(|| other.statuses().len() == 1).await;
+        for machine in [holder, other] {
+            let answers = [
+                machine.send("GET", "/api/factory", None, &[]).await,
+                machine
+                    .send("GET", &format!("/api/factory/runs/{}", run_id()), None, &[])
+                    .await,
+            ];
+            for (status, body) in answers {
+                assert_eq!(status, 200, "{body}");
+                assert!(!body.contains(TOKEN), "{body}");
+                assert!(body.contains("***"), "{body}");
+            }
+        }
+    }
+}

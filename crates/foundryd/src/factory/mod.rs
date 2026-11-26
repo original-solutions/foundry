@@ -3156,4 +3156,203 @@ mod tests {
         assert!(!last.holds, "{last:?}");
         assert!(last.pass >= in_flight, "{} < {in_flight}", last.pass);
     }
+
+    // ----- the leases handle the factory routes read -----
+
+    /// A lease whose every tick says `state` and whose guard is `guard`.
+    struct Fixed {
+        state: LeaseState,
+        guard: Arc<dyn Guard>,
+    }
+
+    impl Leasing for Fixed {
+        fn tick(&self, _: u64) -> LeaseState {
+            self.state.clone()
+        }
+        fn guard(&self) -> Arc<dyn Guard> {
+            self.guard.clone()
+        }
+        fn release(&self) {}
+    }
+
+    fn leased(state: Option<LeaseState>, guard: Arc<dyn Guard>) -> Leased {
+        let lease: Arc<dyn Leasing> = Arc::new(Fixed {
+            state: state.clone().unwrap_or(LeaseState::NoToken),
+            guard,
+        });
+        Leased {
+            repo: "rawphp/softfac".into(),
+            lease,
+            state: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    #[test]
+    fn a_lease_holds_for_a_stop_only_when_its_newest_tick_held_and_its_guard_passes() {
+        let held = Some(LeaseState::Held { generation: 4 });
+        let (guard, generation) = leased(held.clone(), Arc::new(AlwaysHeld(4)))
+            .holding()
+            .expect("a tick that held and a guard that passes");
+        assert_eq!(generation, 4);
+        assert_eq!(guard.check().unwrap(), 4);
+        // The guard's generation is the one acted at.
+        let (_, generation) = leased(held.clone(), Arc::new(AlwaysHeld(5)))
+            .holding()
+            .unwrap();
+        assert_eq!(generation, 5);
+        let other = MachineId(uuid::Uuid::from_u128(0x2));
+        for state in [
+            None,
+            Some(LeaseState::NoToken),
+            Some(LeaseState::HeldBy {
+                machine: other,
+                generation: 4,
+            }),
+            Some(LeaseState::Unknown {
+                reason: "the lease ref could not be read",
+            }),
+        ] {
+            assert!(
+                leased(state.clone(), Arc::new(AlwaysHeld(4)))
+                    .holding()
+                    .is_none(),
+                "{state:?}"
+            );
+        }
+        assert!(
+            leased(held, Arc::new(crate::factory::worker::Lost))
+                .holding()
+                .is_none(),
+            "a guard that fails holds nothing"
+        );
+    }
+
+    #[test]
+    fn the_handle_finds_a_lease_by_its_project_or_its_repo_and_clears_only_its_own() {
+        let leases = Leases::default();
+        let first = leased(None, Arc::new(AlwaysHeld(1)));
+        leases.put(project(1), first.clone());
+        assert!(leases.of(project(1)).is_some());
+        assert!(leases.of(project(2)).is_none());
+        let (found, _) = leases.of_repo("rawphp/softfac").unwrap();
+        assert_eq!(found, project(1));
+        assert!(leases.of_repo("rawphp/other").is_none());
+        // A lease made again for the project replaces the first, and the first's clear leaves
+        // the new one in place.
+        let second = leased(None, Arc::new(AlwaysHeld(2)));
+        leases.put(project(1), second.clone());
+        leases.clear(project(1), &first.lease);
+        let kept = leases.of(project(1)).expect("the new lease is kept");
+        assert!(Arc::ptr_eq(&kept.lease, &second.lease));
+        leases.clear(project(1), &second.lease);
+        assert!(leases.of(project(1)).is_none());
+        assert!(leases.projects().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_handle_holds_each_project_the_service_runs_and_lets_go_as_each_stops() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN), (2, "other-bot")]))
+            .unwrap();
+        let host = fake_host();
+        for login in [LOGIN, "other-bot"] {
+            host.trackers
+                .lock()
+                .unwrap()
+                .insert(login.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        }
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let leases = Arc::new(Leases::default());
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone())
+            .with_leases(leases.clone());
+        let running = tokio::spawn(service.serve());
+        let leases2 = leases.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("both projects' leases hold in the handle", || {
+                [project(1), project(2)].iter().all(|project| {
+                    leases2
+                        .of(*project)
+                        .and_then(|leased| leased.holding())
+                        .is_some_and(|(_, generation)| generation == 1)
+                })
+            })
+        })
+        .await
+        .unwrap();
+        let (found, leased) = leases.of_repo("rawphp/softfac").unwrap();
+        assert_eq!(found, project(1));
+        let made = host.leases.lock().unwrap()[&project(1)].clone();
+        let made: Arc<dyn Leasing> = made;
+        assert!(
+            Arc::ptr_eq(&leased.lease, &made),
+            "the lease the service ticks"
+        );
+
+        let mut off = settings_with(&[(1, LOGIN), (2, "other-bot")]);
+        off.seq = 2;
+        off.project_factory.get_mut(&project(2)).unwrap().on = false;
+        store.lock().unwrap().apply_settings(off).unwrap();
+        clock.advance(SCAN);
+        let leases2 = leases.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the turned-off project leaves the handle", || {
+                leases2.of(project(2)).is_none()
+            })
+        })
+        .await
+        .unwrap();
+        assert!(leases.of(project(1)).is_some(), "the other project stays");
+
+        host.acting.store(false, Ordering::SeqCst);
+        clock.advance(SCAN);
+        let leases2 = leases.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for(
+                "a machine that stops acting holds no lease in the handle",
+                || leases2.projects().is_empty(),
+            )
+        })
+        .await
+        .unwrap();
+        running.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_that_ends_leaves_no_lease_in_the_handle() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN)]))
+            .unwrap();
+        let host = fake_host();
+        host.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let leases = Arc::new(Leases::default());
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone())
+            .with_leases(leases.clone());
+        let running = tokio::spawn(service.serve());
+        let leases2 = leases.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the project's lease is in the handle", || {
+                leases2.of(project(1)).is_some()
+            })
+        })
+        .await
+        .unwrap();
+        running.abort();
+        let _ = running.await;
+        assert!(
+            leases.projects().is_empty(),
+            "a dropped Running clears its lease"
+        );
+    }
 }
