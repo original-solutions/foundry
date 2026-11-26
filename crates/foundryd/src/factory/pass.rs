@@ -2907,7 +2907,7 @@ mod tests {
     mod following_a_building_run {
         use super::*;
 
-        fn building_with_report(rig: &mut Rig) -> RunId {
+        pub(super) fn building_with_report(rig: &mut Rig) -> RunId {
             let run = rig.run_in(5, 1, State::Building);
             let workspace = WorkspaceId(uuid::Uuid::from_u128(0x55));
             let session = SessionId(uuid::Uuid::from_u128(0x56));
@@ -3145,11 +3145,10 @@ mod tests {
             assert_eq!(rig.claimed_issues(), vec![5, 6]);
             let first = RunId::new(REPO, 5, 1).unwrap();
             assert!(
-                report
-                    .runs
-                    .iter()
-                    .any(|(r, said)| *r == first && said.contains("claimed")),
-                "{report:?}"
+                report.runs.iter().any(|(r, said)| *r == first
+                    && said.contains("claimed")
+                    && said.contains("disk full")),
+                "the worker's error is on the run's line: {report:?}"
             );
         }
     }
@@ -3482,6 +3481,32 @@ mod tests {
         }
     }
 
+    mod a_run_whose_end_is_wound_up {
+        use super::*;
+
+        #[test]
+        fn a_run_whose_reconcile_waits_on_a_machine_gets_no_other_step() {
+            let mut rig = Rig::new();
+            let run = super::following_a_building_run::building_with_report(&mut rig);
+            // A person closed the issue; the archive of the run's workspace meets the link down.
+            rig.hub.edit(5, |issue| issue.closed = true);
+            for _ in 0..4 {
+                rig.worker
+                    .inner
+                    .on_archive(Err(WorkerError::Unreachable("the link went down".into())));
+            }
+            let report = rig.pass();
+            let said: Vec<&String> = report
+                .runs
+                .iter()
+                .filter(|(r, _)| *r == run)
+                .map(|(_, s)| s)
+                .collect();
+            assert_eq!(said.len(), 1, "{report:?}");
+            assert!(said[0].starts_with("reconcile: Waiting"), "{report:?}");
+        }
+    }
+
     mod the_book {
         use super::*;
 
@@ -3496,8 +3521,10 @@ mod tests {
         #[test]
         fn two_projects_never_both_take_the_last_run_slot() {
             let book = Book::default();
-            let (a, _) = book.begin(project_id(), held(1));
-            let (b, _) = book.begin(other_project(), held(1));
+            let a = book.ticket(project_id());
+            let b = book.ticket(other_project());
+            book.begin(a, held(1)).unwrap();
+            book.begin(b, held(1)).unwrap();
             assert!(book.take_run(a, 3));
             assert!(!book.take_run(b, 3), "the fleet holds 3 of 3");
             book.give_run(a);
@@ -3507,14 +3534,44 @@ mod tests {
         #[test]
         fn a_pass_of_a_project_forgotten_since_it_began_changes_nothing() {
             let book = Book::default();
-            let (ticket, _) = book.begin(project_id(), held(1));
+            let ticket = book.ticket(project_id());
+            book.begin(ticket, held(1)).unwrap();
             book.forget(project_id());
             book.finish(ticket, held(3));
             assert!(!book.take_run(ticket, 3));
             book.place(ticket, builder_machine());
-            let (_, others) = book.begin(other_project(), held(0));
+            let others = book.begin(book.ticket(other_project()), held(0)).unwrap();
             assert!(others.is_empty());
             assert_eq!(book.runs_free(3), 3);
+        }
+
+        #[test]
+        fn a_project_forgotten_between_its_pass_s_ticket_and_its_begin_is_not_written_back() {
+            let book = Book::default();
+            let ticket = book.ticket(project_id());
+            book.forget(project_id());
+            assert!(book.begin(ticket, held(3)).is_none());
+            assert_eq!(book.runs_free(3), 3);
+        }
+
+        #[test]
+        fn only_the_passes_that_hold_the_lease_count_toward_idle() {
+            let mut rig = Rig::new();
+            rig.lease = LeaseState::HeldBy {
+                machine: builder_machine(),
+                generation: 4,
+            };
+            rig.guard = Box::new(Lost);
+            rig.hub.fail("git/ref/heads/main", 4);
+            for _ in 0..3 {
+                rig.pass();
+            }
+            rig.lease = LeaseState::Held { generation: 5 };
+            rig.guard = Box::new(AlwaysHeld(5));
+            rig.pass();
+            let status = rig.status();
+            assert!(status.holds);
+            assert_eq!(status.idle, None, "one failed pass that held the lease");
         }
 
         #[test]

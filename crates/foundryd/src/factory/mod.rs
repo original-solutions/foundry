@@ -785,6 +785,8 @@ mod tests {
         trackers: Mutex<BTreeMap<String, Arc<dyn Commenting>>>,
         /// The token mark of each login; a login with a tracker and none here is marked 1.
         marks: Mutex<BTreeMap<String, u64>>,
+        /// The secret store cannot be read.
+        unreadable: AtomicBool,
         /// Every lease made, in order.
         made: Mutex<Vec<(ProjectId, Arc<FakeLease>)>>,
         leases: Mutex<BTreeMap<ProjectId, Arc<FakeLease>>>,
@@ -799,13 +801,16 @@ mod tests {
         fn tracker(&self, login: &str) -> Option<Arc<dyn Commenting>> {
             self.trackers.lock().unwrap().get(login).cloned()
         }
-        fn token_mark(&self, login: &str) -> Option<u64> {
+        fn token_mark(&self, login: &str) -> Result<Option<u64>, String> {
+            if self.unreadable.load(Ordering::SeqCst) {
+                return Err("the secret store cannot be read".into());
+            }
             let held = self.trackers.lock().unwrap().contains_key(login);
-            held.then(|| self.marks.lock().unwrap().get(login).copied().unwrap_or(1))
+            Ok(held.then(|| self.marks.lock().unwrap().get(login).copied().unwrap_or(1)))
         }
         fn lease(&self, watched: &Watched) -> Arc<dyn Leasing> {
             let lease = Arc::new(FakeLease {
-                state: if self.token_mark(&watched.login).is_some() {
+                state: if self.token_mark(&watched.login).ok().flatten().is_some() {
                     LeaseState::Held { generation: 1 }
                 } else {
                     LeaseState::NoToken
@@ -909,6 +914,7 @@ mod tests {
             acting: AtomicBool::new(true),
             trackers: Mutex::new(BTreeMap::new()),
             marks: Mutex::new(BTreeMap::new()),
+            unreadable: AtomicBool::new(false),
             made: Mutex::new(Vec::new()),
             leases: Mutex::new(BTreeMap::new()),
             worker: Arc::new(FakeWorker::new()),
@@ -981,6 +987,7 @@ mod tests {
             acting: AtomicBool::new(true),
             trackers: Mutex::new(BTreeMap::new()),
             marks: Mutex::new(BTreeMap::new()),
+            unreadable: AtomicBool::new(false),
             made: Mutex::new(Vec::new()),
             leases: Mutex::new(BTreeMap::new()),
             worker: Arc::new(FakeWorker::new()),
@@ -1038,6 +1045,7 @@ mod tests {
             acting: AtomicBool::new(true),
             trackers: Mutex::new(BTreeMap::new()),
             marks: Mutex::new(BTreeMap::new()),
+            unreadable: AtomicBool::new(false),
             made: Mutex::new(Vec::new()),
             leases: Mutex::new(BTreeMap::new()),
             worker: Arc::new(FakeWorker::new()),
@@ -1076,6 +1084,7 @@ mod tests {
             acting: AtomicBool::new(true),
             trackers: Mutex::new(BTreeMap::new()),
             marks: Mutex::new(BTreeMap::new()),
+            unreadable: AtomicBool::new(false),
             made: Mutex::new(Vec::new()),
             leases: Mutex::new(BTreeMap::new()),
             worker: Arc::new(FakeWorker::new()),
@@ -1174,6 +1183,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![5]
         );
+        running.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_secret_store_that_cannot_be_read_leaves_the_lease_as_it_is() {
+        let (_dir, store) = open_store();
+        store
+            .lock()
+            .unwrap()
+            .apply_settings(settings_with(&[(1, LOGIN)]))
+            .unwrap();
+        let host = fake_host();
+        host.trackers
+            .lock()
+            .unwrap()
+            .insert(LOGIN.into(), Arc::new(Hiding::new(Hub::new(), shown())));
+        let clock = Arc::new(FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock.clone());
+        let running = tokio::spawn(service.serve());
+        let host2 = host.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the first lease", || host2.made.lock().unwrap().len() == 1)
+        })
+        .await
+        .unwrap();
+        host.unreadable.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            clock.advance(SCAN);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        let leases = host.made.lock().unwrap();
+        assert_eq!(leases.len(), 1, "no lease was made again");
+        assert!(!leases[0].1.released.load(Ordering::SeqCst));
+        drop(leases);
         running.abort();
     }
 }
