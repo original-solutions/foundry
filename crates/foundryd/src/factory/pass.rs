@@ -2124,13 +2124,16 @@ mod tests {
         }
     }
 
+    /// What a test runs after an archive call, with the workspace archived.
+    type ArchiveHook = Box<dyn Fn(WorkspaceId) + Send + Sync>;
+
     /// The fake worker, with every call made after the guard first failed recorded as late.
     struct Watched {
         inner: FakeWorker,
         lost: Arc<AtomicBool>,
         late: Mutex<Vec<String>>,
         /// Run after each archive call, with the workspace archived.
-        after_archive: Mutex<Option<Box<dyn Fn(WorkspaceId) + Send + Sync>>>,
+        after_archive: Mutex<Option<ArchiveHook>>,
     }
 
     impl Watched {
