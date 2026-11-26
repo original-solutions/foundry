@@ -4399,4 +4399,234 @@ mod tests {
             assert!(swept <= plain + reconcile + 3, "{plain} {swept}");
         }
     }
+
+    mod feedback_and_the_fleets_slots {
+        use super::*;
+
+        /// A tracker that says how many run slots the fleet has free while the feedback of a
+        /// pull request is read, and finds none.
+        struct Watching {
+            inner: Arc<crate::factory::pass::testing::Hub>,
+            book: Arc<Book>,
+            free_during_reads: Mutex<Vec<u32>>,
+            /// What the read finds.
+            found: Vec<crate::factory::github::Feedback>,
+        }
+
+        impl crate::factory::github::Tracker for Watching {
+            fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
+                // The hub does not know a pull request's draft state.
+                if args.first().map(String::as_str) == Some("pr")
+                    && args.get(1).map(String::as_str) == Some("ready")
+                {
+                    return Ok(String::new());
+                }
+                self.inner.gh(args)
+            }
+
+            fn pull_request(
+                &self,
+                _: &str,
+                number: u64,
+            ) -> Result<Option<crate::factory::github::PullRequest>, TrackerError> {
+                Ok(Some(crate::factory::github::PullRequest {
+                    number,
+                    is_draft: false,
+                    open: true,
+                    merged: false,
+                    head_ref: "fac/3-1".into(),
+                    cross_repository: false,
+                    base_ref: "main".into(),
+                    head_sha: SHA.into(),
+                    mergeable: crate::factory::github::Mergeable::Mergeable,
+                    created_at: "2026-10-29T05:50:00Z".into(),
+                }))
+            }
+
+            fn pr_feedback(
+                &self,
+                _: &str,
+                _: u64,
+                _: &str,
+                _: &str,
+                _: &[String],
+            ) -> Result<Vec<crate::factory::github::Feedback>, TrackerError> {
+                let free = self.book.runs_free(1);
+                self.free_during_reads.lock().unwrap().push(free);
+                Ok(self.found.clone())
+            }
+
+            fn activity_since(
+                &self,
+                _: &str,
+                _: u64,
+                _: &str,
+                _: &[String],
+            ) -> Result<crate::factory::github::Activity, TrackerError> {
+                Ok(crate::factory::github::Activity {
+                    comments: Vec::new(),
+                    body_edit: None,
+                    dropped: Vec::new(),
+                })
+            }
+        }
+
+        impl Commenting for Watching {
+            fn hide(&self, text: &str) -> String {
+                text.to_owned()
+            }
+        }
+
+        /// A run of issue 3 whose pull request is open and whose session ran.
+        fn in_pr_open(rig: &Rig) -> RunId {
+            let run = rig.run_in(3, 1, State::Building);
+            let cause = Cause::new(CauseStep::Start, "test");
+            let write = |event: Event| rig.ledger.write(&run, &event, &cause).unwrap();
+            write(Event::SessionLaunched {
+                thread_id: "t-1".into(),
+                worktree: Some(WorkspaceId(uuid::Uuid::from_u128(0x44)).to_string()),
+                branch: Some("fac/3-1".into()),
+                model_instance: None,
+                model: None,
+                model_options: None,
+                resumed_from: None,
+                base: Some("main".into()),
+                title: Some("Issue 3".into()),
+            });
+            write(Event::PrOpened {
+                pr: 12,
+                url: format!("https://github.com/{REPO}/pull/12"),
+            });
+            write(Event::StateChanged {
+                from: State::Building,
+                to: State::PrOpen,
+            });
+            rig.hub.issue(3, &["factory:pr-open"]);
+            run
+        }
+
+        #[test]
+        fn a_read_that_finds_nothing_holds_no_slot_while_it_waits_on_github() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            in_pr_open(&rig);
+            let book = Arc::new(Book::default());
+            let watching = Arc::new(Watching {
+                inner: rig.hub.clone(),
+                book: book.clone(),
+                free_during_reads: Mutex::new(Vec::new()),
+                found: Vec::new(),
+            });
+            let world = World {
+                project: &rig.project,
+                lease: &rig.lease,
+                guard: rig.guard.as_ref(),
+                tracker: &*watching,
+                worker: &rig.worker,
+                view: &rig.view,
+                ledger: &rig.ledger,
+                store: &rig.store,
+                me: me(),
+                shared: &rig.shared,
+                book: &book,
+                clock: &rig.clock,
+            };
+            let report = run(&world, &mut rig.memo);
+            assert_eq!(report.failed, None, "{report:?}");
+            let free = watching.free_during_reads.lock().unwrap().clone();
+            assert!(!free.is_empty(), "the feedback was read: {report:?}");
+            assert!(
+                free.iter().all(|free| *free == 1),
+                "the one slot was taken during a read that started no round: {free:?}"
+            );
+            assert_eq!(book.runs_free(1), 1);
+        }
+
+        fn review() -> crate::factory::github::Feedback {
+            crate::factory::github::Feedback {
+                id: "pr-comment:9".into(),
+                author: "tom".into(),
+                kind: crate::factory::github::FeedbackKind::PrComment,
+                created_at: "2099-01-01T00:00:00Z".into(),
+                body: "please rename it".into(),
+                inline: Vec::new(),
+                inline_unread: 0,
+            }
+        }
+
+        /// One pass of `rig` over a tracker that finds `found`, with `book` as the fleet's.
+        fn pass_finding(
+            rig: &mut Rig,
+            book: &Arc<Book>,
+            found: Vec<crate::factory::github::Feedback>,
+        ) -> PassReport {
+            let watching = Arc::new(Watching {
+                inner: rig.hub.clone(),
+                book: book.clone(),
+                free_during_reads: Mutex::new(Vec::new()),
+                found,
+            });
+            let world = World {
+                project: &rig.project,
+                lease: &rig.lease,
+                guard: rig.guard.as_ref(),
+                tracker: &*watching,
+                worker: &rig.worker,
+                view: &rig.view,
+                ledger: &rig.ledger,
+                store: &rig.store,
+                me: me(),
+                shared: &rig.shared,
+                book,
+                clock: &rig.clock,
+            };
+            run(&world, &mut rig.memo)
+        }
+
+        #[test]
+        fn feedback_that_is_found_with_a_slot_free_starts_its_round_and_the_run_holds_the_slot() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            let run = in_pr_open(&rig);
+            let book = Arc::new(Book::default());
+            let report = pass_finding(&mut rig, &book, vec![review()]);
+            assert_eq!(report.failed, None, "{report:?}");
+            let said = report
+                .runs
+                .iter()
+                .filter(|(r, _)| *r == run)
+                .map(|(_, said)| said.clone())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(said.contains("Decided"), "{said}");
+            assert_eq!(book.runs_free(1), 0, "the round holds the one slot");
+        }
+
+        #[test]
+        fn feedback_that_is_found_with_no_slot_free_waits_and_takes_nothing() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            in_pr_open(&rig);
+            let book = Arc::new(Book::default());
+            let other = book.ticket(other_project());
+            book.begin(
+                other,
+                Held {
+                    runs: 1,
+                    gates: 0,
+                    placed: vec![],
+                },
+            );
+            let report = pass_finding(&mut rig, &book, vec![review()]);
+            assert_eq!(report.failed, None, "{report:?}");
+            let waiting = &rig.status().feedback_waiting;
+            assert_eq!(waiting.len(), 1, "{report:?}");
+            assert_eq!(waiting[0].reason, NO_SLOT);
+            assert_eq!(
+                book.runs_free(1),
+                0,
+                "only the other project's slot is held"
+            );
+        }
+    }
 }
