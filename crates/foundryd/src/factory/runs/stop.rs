@@ -31,8 +31,11 @@
 //!   all three skip such a run ("stop owns it"). It answers [`StopStep::GateHolds`] while a
 //!   gate is in flight or a pass is recorded and not yet finished, and writes nothing: the
 //!   run is then `gating::advance`'s, which sticks it itself (it must be called for such a
-//!   run though `building` skips it), and the stop is dropped once the run is `pr-open`
+//!   run though `building` skips it), and the line is not acted on while the run is `pr-open`
 //!   ([`StopStep::Skipped`] `not-building`), as the runner's `work_runs` and `prOpenRuns` do.
+//!   It is not cleared: the runner never clears `stopRequested` either (`progress.ts`), and a
+//!   later feedback round that moves the run back to `building` is stopped by it, as the
+//!   runner's is (`building.ts` sticks a building run that carries it).
 //!   A pass that finds [`StopStep::Stuck`] says "stopped by hand"; wake the loop after a
 //!   [`request`] that answered `Recorded`.
 //! - Call [`reconcile`] for every run of the project that is not `triage` or `needs-info`,
@@ -138,6 +141,9 @@
 //!   `request_stop::records_a_stop_for_a_building_run_once` (there is no file to leave), and
 //!   `refuses a finished run and a run with no state yet` as `writes_nothing_to_a_run_that_finished`
 //!   and `writes_nothing_to_a_run_with_no_state_yet`.
+//! - `control.test.ts`'s `refuses a run that left building with a stale stop line, instead of
+//!   answering already` is ported as `refuses_a_pr_open_run_with_a_stale_stop_line_as_not_building`
+//!   (the same test as `leaveStopRequest`'s case above, through [`request`]).
 //! - `control.ts`'s claims pause and resume, `showRun` and `parseId` (and `stopRun`'s
 //!   `not-found` and `invalid` answers: a route has a `RunId`): settings and ledger reads, other
 //!   tasks'.
