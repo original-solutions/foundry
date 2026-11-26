@@ -1023,7 +1023,7 @@ mod tests {
             1,
             Arc::new(|text: &str| text.to_owned()),
         );
-        let run = foundry_proto::factory::RunId::new("rawphp/softfac", 3, 1).unwrap();
+        let run = foundry_proto::factory::RunId::new("rawphp/softfac1", 3, 1).unwrap();
         let cause = Cause::new(CauseStep::Start, "test");
         let step = Event::StepChanged {
             step: "approved 2026-10-04T10:00:00Z".into(),
