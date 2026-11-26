@@ -559,7 +559,8 @@ fn code_of(doc: &str) -> Vec<&str> {
 }
 
 /// Each `foundryd` command the code of `doc` runs, as the words after the binary's name: at
-/// most two, and none that is a flag. A binary is named `foundryd` or by a path ending in it.
+/// most two, each starting with a letter, so a flag, a placeholder or an argument such as an
+/// address ends it. A binary is named `foundryd` or by a path ending in it.
 fn named_commands(doc: &str) -> Vec<Vec<String>> {
     let mut named = Vec::new();
     for line in code_of(doc).into_iter().flat_map(str::lines) {
@@ -571,11 +572,7 @@ fn named_commands(doc: &str) -> Vec<Vec<String>> {
             let command: Vec<String> = words[at + 1..]
                 .iter()
                 .take(2)
-                .take_while(|word| {
-                    word.chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-                        && !word.starts_with('-')
-                })
+                .take_while(|word| word.starts_with(|c: char| c.is_ascii_alphabetic()))
                 .map(|word| (*word).to_owned())
                 .collect();
             if !command.is_empty() {
@@ -592,19 +589,20 @@ fn install_doc_names_only_commands_foundryd_help_lists() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/install.md"),
     )
     .unwrap();
-    let named = named_commands(&doc);
     // The commands a machine is set up for the factory with, and the export `retro` reads.
+    let code = code_of(&doc).join("\n");
     for command in [
-        ["secret", "set"],
-        ["github", "default"],
-        ["factory", "export"],
+        "foundryd secret set github:<login>",
+        "foundryd github default <login>",
+        "foundryd factory export",
     ] {
         assert!(
-            named.iter().any(|words| words == &command),
-            "docs/install.md never runs `foundryd {}`",
-            command.join(" ")
+            code.contains(command),
+            "docs/install.md never runs `{command}`"
         );
     }
+
+    let named = named_commands(&doc);
 
     let top = listed_commands(&[]);
     for words in &named {
