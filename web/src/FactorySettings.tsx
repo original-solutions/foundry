@@ -1,8 +1,11 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { saveFactorySettings, setProjectFactory, type FactorySettings, type Project, type ProjectFactory } from "./api";
 import { checkSettings, factoryKey, type NumericSetting } from "./factory";
 import { button, field, inlineField, primaryButton } from "./Modal";
+
+/** What the daemon gives in place of a model, effort or login it could not read safely. */
+const HIDDEN = "[hidden: the secret store could not be read]";
 
 /** The form's fields as text, so a half-typed number is kept as typed. */
 function texts(s: FactorySettings) {
@@ -46,9 +49,10 @@ export function FleetSettings({ settings }: { settings: FactorySettings }) {
 
   const save = useMutation({
     mutationFn: ({ next }: { next: FactorySettings; sent: Texts }) => saveFactorySettings(next),
-    onSuccess: (saved, { sent }) => {
+    onSuccess: (answer, { sent }) => {
       // What the daemon holds now, so a number typed as "05" does not leave the form changed for good;
-      // but typing since the send is kept.
+      // but typing since the send is kept, and so is a word the daemon could not show.
+      const saved = { ...answer, model: answer.model === HIDDEN ? sent.model : answer.model, effort: answer.effort === HIDDEN ? sent.effort : answer.effort };
       setValues((now) => (JSON.stringify(now) === JSON.stringify(sent) ? texts(saved) : now));
       setClean(saved);
       return client.invalidateQueries({ queryKey: factoryKey });
@@ -116,6 +120,9 @@ export function FleetSettings({ settings }: { settings: FactorySettings }) {
   );
 }
 
+/** A project's factory setting as a key that does not depend on the order of a JSON object's fields. */
+const keyOf = (f: ProjectFactory) => `${f.on}|${f.paused}|${f.login}`;
+
 /**
  * One project's factory setting beside its row: a switch, the GitHub login it acts as (blank takes
  * the coordinator's default when turned on) with a Save login button once the typed login
@@ -128,15 +135,17 @@ export function ProjectFactoryControls({ project, factory }: { project: Project;
   const client = useQueryClient();
   const [typed, setTyped] = useState<string>();
   /**
-   * The daemon's answer to the last accepted change, with the setting the props held when the
-   * first change of the chain was sent (`base`) and the answers before it (`seen`), as JSON. Settings
-   * that have not caught up come as a new object holding the same setting, so the props are
-   * compared by content. It is dropped once the props hold the answer, or a setting that is
-   * neither the base nor an earlier answer.
+   * The daemon's answer to the last accepted change, and the keys of every setting the props may
+   * pass through on their way to it: what they held when each change was sent or answered, and the
+   * answers before. It is dropped once the props hold the answer, or a setting not among those.
    */
-  const [answered, setAnswered] = useState<{ value: ProjectFactory; base: string; seen: string[] }>();
-  const now = JSON.stringify(factory);
-  if (answered && (now === JSON.stringify(answered.value) || (now !== answered.base && !answered.seen.includes(now)))) setAnswered(undefined);
+  const [answered, setAnswered] = useState<{ value: ProjectFactory; seen: string[] }>();
+  const key = keyOf(factory);
+  const props = useRef(key);
+  useEffect(() => {
+    props.current = key;
+  }, [key]);
+  if (answered && (key === keyOf(answered.value) || !answered.seen.includes(key))) setAnswered(undefined);
   const held = answered?.value ?? factory;
   const shown = typed ?? held.login;
   const send = useMutation({
@@ -144,13 +153,16 @@ export function ProjectFactoryControls({ project, factory }: { project: Project;
     onSuccess: (answer, { base, savingLogin, sentTyped }) => {
       // Typing is cleared when it is what was sent or the daemon now holds it; typing since stays.
       setTyped((t) => (t === undefined || (savingLogin && t === sentTyped) || t.trim() === answer.login ? undefined : t));
-      setAnswered((prev) => (prev ? { value: answer, base: prev.base, seen: [...prev.seen, JSON.stringify(prev.value)] } : { value: answer, base, seen: [] }));
+      // A login the daemon could not read is no setting to show: let the settings catch up instead.
+      setAnswered((prev) =>
+        answer.login === HIDDEN ? undefined : { value: answer, seen: [...new Set([...(prev?.seen ?? []), base, props.current, ...(prev ? [keyOf(prev.value)] : [])])] },
+      );
       return client.invalidateQueries({ queryKey: factoryKey });
     },
   });
   const change = (edit: Partial<ProjectFactory>, savingLogin = false) => {
     const next = { on: held.on, paused: held.paused, login: held.login, ...edit };
-    send.mutate({ next: { on: next.on, paused: next.paused, login: next.login.trim() === "" ? null : next.login.trim() }, base: now, savingLogin, sentTyped: typed });
+    send.mutate({ next: { on: next.on, paused: next.paused, login: next.login.trim() === "" ? null : next.login.trim() }, base: key, savingLogin, sentTyped: typed });
   };
 
   return (
