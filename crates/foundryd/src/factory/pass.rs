@@ -1462,8 +1462,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                     .store
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .run_has_event(&run, names::FINISHED)
-                    .unwrap_or(false);
+                    .run_has_event(&run, names::FINISHED)?;
             if sweep_due && finished {
                 let ctx = self.ctx(self.config);
                 match stop::reconcile(&ctx, &run) {
@@ -1471,8 +1470,11 @@ impl<'a, 'w> Pass<'a, 'w> {
                         self.report.archived.extend(workspaces);
                     }
                     Ok(_) => {}
-                    // A finished run whose events this build cannot read is the run's own.
-                    Err(RunError::Store(_)) => self.note(&run, UNREADABLE_SWEPT),
+                    // A finished run whose events this build cannot read (a row that does not
+                    // decode) is the run's own. Any other store error ends the pass, as it did.
+                    Err(RunError::Store(StoreError::Json(_))) => {
+                        self.note(&run, UNREADABLE_SWEPT);
+                    }
                     Err(error) => {
                         let said = ending(error)?;
                         self.note(&run, said);
@@ -1484,9 +1486,15 @@ impl<'a, 'w> Pass<'a, 'w> {
             }
             // A run whose events this build cannot read (a newer build's) is noted, and the
             // sweep goes on: it must not end every pass of the project.
-            let Ok(events) = self.ledger.read(&run) else {
-                self.note(&run, UNREADABLE_SWEPT);
-                continue;
+            let events = match self.ledger.read(&run) {
+                Ok(events) => events,
+                Err(StoreError::Json(_)) => {
+                    self.note(&run, UNREADABLE_SWEPT);
+                    continue;
+                }
+                // The store failed for a reason that is not the build's: the pass ends, and the
+                // next one sweeps again.
+                Err(error) => return Err(error.into()),
             };
             for workspace in resume::orphans(world.view, world.project.id, &run, &events) {
                 if self.report.archived.contains(&workspace) {
