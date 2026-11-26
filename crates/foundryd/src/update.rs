@@ -1,4 +1,4 @@
-//! Makes newer release tags ready to install, and rolls back a version that does not stay up.
+//! Makes newer release tags ready to install, and rolls back a trial that does not stay up.
 //!
 //! The data directory holds `versions/<version>/{foundryd,foundry-holder}`, `current` (a
 //! relative link to one of them, which the service runs) and `update.json`. The check every
@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
@@ -226,7 +228,8 @@ fn unrunnable(error: &io::Error) -> bool {
         .any(|errno| code == *errno as i32)
 }
 
-/// A version that was installed and has not yet shown it stays up.
+/// A version a trial record in `update.json` names, which has not yet shown it stays up.
+/// Nothing in this module writes one now; a record an older release left is still honoured.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trial {
     /// The version on trial, like `0.2.0`.
@@ -271,8 +274,8 @@ fn current_names_trial(home: &Path, state: &State) -> bool {
         .is_some_and(|trial| current_version(home).as_deref() == Some(trial.version.as_str()))
 }
 
-/// True when `state` holds a trial whose version `current` does not name, as a crash between an
-/// install's two writes leaves.
+/// True when `state` holds a trial whose version `current` does not name, as a crash between the
+/// two writes of an install that records a trial leaves.
 fn stranded(home: &Path, state: &State) -> bool {
     state.trial.is_some() && !current_names_trial(home, state)
 }
@@ -643,6 +646,7 @@ pub(crate) fn stage_version(
     let stage = home
         .join("versions")
         .join(format!(".staging-{version}-{}", std::process::id()));
+    sweep_stages(home);
     let filled = (|| {
         let _ = fs::remove_dir_all(&stage);
         fs::create_dir_all(&stage).map_err(io_error("cannot make the staging directory"))?;
@@ -654,6 +658,31 @@ pub(crate) fn stage_version(
         Err(error) => {
             let _ = fs::remove_dir_all(&stage);
             Err(error)
+        }
+    }
+}
+
+/// Removes every stage under `versions/` whose process has exited, and every stage an older
+/// release named without a pid, so a process killed mid-stage leaves nothing for good. A stage
+/// of a live process is its own and is left alone.
+fn sweep_stages(home: &Path) {
+    let Ok(entries) = fs::read_dir(home.join("versions")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(".staging-")) else {
+            continue;
+        };
+        let owner = rest
+            .rsplit_once('-')
+            .and_then(|(_, pid)| pid.parse::<i32>().ok());
+        let dead = match owner {
+            Some(pid) => kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH),
+            None => true,
+        };
+        if dead {
+            let _ = fs::remove_dir_all(entry.path());
         }
     }
 }
@@ -726,8 +755,8 @@ fn make_ready(
         .and_then(|_lock| {
             let mut held = state(home).map_err(io_error("cannot read the update state"))?;
             let waits = |why: String| io_error(format!("{tag} waits"))(io::Error::other(why));
-            // Checked again under the lock: an install may have moved `current` or started a
-            // trial while the release was downloaded, and what it did must stand.
+            // Checked again under the lock: an install may have moved `current` while the
+            // release was downloaded, and what it did must stand.
             if current_version(home).as_deref() != Some(running) {
                 return Err(waits(format!(
                     "current no longer names {running}: a hand install moved it"
