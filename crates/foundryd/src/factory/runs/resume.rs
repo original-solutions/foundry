@@ -2457,8 +2457,10 @@ mod tests {
             ws: WorkspaceId,
         ) -> SessionId {
             fail_the_session(rig, thread, ws);
+            let step = pass(rig, run);
             assert!(
-                matches!(pass(rig, run), ResumeStep::Archiving { resumes, .. } if resumes == k)
+                matches!(step, ResumeStep::Archiving { resumes, .. } if resumes == k),
+                "resume {k}: {step:?}"
             );
             rig.view = archived();
             assert_eq!(
@@ -2557,6 +2559,127 @@ mod tests {
                 .find(|e| e.event == "stuck")
                 .unwrap();
             assert_eq!(stuck.cause.unwrap()["reason"], "thread-gone");
+        }
+
+        /// The round's workspace, its session and its name, as `feedback` makes them.
+        fn round_workspace(n: u32) -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(0xe00 + u128::from(n)))
+        }
+
+        fn round_session(n: u32) -> SessionId {
+            SessionId(uuid::Uuid::from_u128(0xf00 + u128::from(n)))
+        }
+
+        /// A run in `pr-open`: feedback round `n` moved it back to `building` and
+        /// started its session, with the lines `feedback` writes for it.
+        fn a_feedback_round(rig: &mut Rig, run: &RunId, n: u32) -> SessionId {
+            let relaunching = || Event::FeedbackRelaunching {
+                n,
+                branch: BRANCH.into(),
+                items: vec![format!("comment-{n}")],
+                message: "Address the review.".into(),
+            };
+            rig.write(run, relaunching());
+            rig.step(run, &format!("feedback-machine {n} {}", m2()));
+            rig.moved(run, State::PrOpen, State::Building);
+            rig.write(run, relaunching());
+            rig.step(run, &format!("feedback-requested {n} fac/8-1-f{n}"));
+            rig.step(
+                run,
+                &format!("feedback-workspace {n} {}", round_workspace(n)),
+            );
+            rig.step(run, &format!("feedback-sending {n}"));
+            rig.write(
+                run,
+                Event::SessionLaunched {
+                    thread_id: round_session(n).to_string(),
+                    worktree: Some(round_workspace(n).to_string()),
+                    branch: Some(BRANCH.into()),
+                    model_instance: None,
+                    model: Some("opus".into()),
+                    model_options: None,
+                    resumed_from: Some(ResumedFrom {
+                        run: run.to_string(),
+                        branch: BRANCH.into(),
+                    }),
+                    base: Some("main".into()),
+                    title: Some("Make it faster".into()),
+                },
+            );
+            round_session(n)
+        }
+
+        /// Acceptance (task 28): a feedback round starts `interruption_resumes` again. A run
+        /// that used both of its resumes before `pr-open` is resumed, not stuck, on the first
+        /// interruption of the round's session, and its resume workspace is named one past the
+        /// run's highest (`-r3`), so no name is reused.
+        #[test]
+        fn a_feedback_round_starts_the_resumes_again() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            let first = resume_once(&mut rig, &run, 1, session(), old());
+            resume_once(
+                &mut rig,
+                &run,
+                2,
+                first,
+                WorkspaceId(uuid::Uuid::from_u128(0xc01)),
+            );
+            rig.moved(&run, State::Building, State::PrOpen);
+            let thread = a_feedback_round(&mut rig, &run, 1);
+            let next = resume_once(&mut rig, &run, 3, thread, round_workspace(1));
+            let names: Vec<String> = create_calls(&rig)
+                .into_iter()
+                .filter_map(|call| match call {
+                    Call::Create { request, .. } => Some(request.name),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names, vec!["fac/8-1-r1", "fac/8-1-r2", "fac/8-1-r3"]);
+            assert!(!rig.finished(&run));
+            // The round has one resume left of its two, and then the cap ends it.
+            let next = resume_once(
+                &mut rig,
+                &run,
+                4,
+                next,
+                WorkspaceId(uuid::Uuid::from_u128(0xc03)),
+            );
+            fail_the_session(&mut rig, next, WorkspaceId(uuid::Uuid::from_u128(0xc04)));
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Stuck {
+                    reason: "the session run ended as failed".into()
+                }
+            );
+            let resumes: Vec<u64> = interruptions(&rig, &run)
+                .iter()
+                .map(|line| line["resumes"].as_u64().unwrap())
+                .collect();
+            assert_eq!(resumes, vec![1, 2, 3, 4]);
+        }
+
+        /// Only the newest round's interruptions count: two rounds each get the whole cap, and a
+        /// cap of zero still ends the round's first interruption stuck.
+        #[test]
+        fn only_the_interruptions_after_the_newest_round_count() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            rig.config.limits.interruption_resumes = 1;
+            resume_once(&mut rig, &run, 1, session(), old());
+            rig.moved(&run, State::Building, State::PrOpen);
+            let thread = a_feedback_round(&mut rig, &run, 1);
+            resume_once(&mut rig, &run, 2, thread, round_workspace(1));
+            rig.moved(&run, State::Building, State::PrOpen);
+            let thread = a_feedback_round(&mut rig, &run, 2);
+            resume_once(&mut rig, &run, 3, thread, round_workspace(2));
+            assert!(!rig.finished(&run));
+
+            let (mut rig, run) = failed_with_turns_unasked();
+            rig.config.limits.interruption_resumes = 0;
+            rig.moved(&run, State::Building, State::PrOpen);
+            let thread = a_feedback_round(&mut rig, &run, 1);
+            fail_the_session(&mut rig, thread, round_workspace(1));
+            assert!(matches!(pass(&rig, &run), ResumeStep::Stuck { .. }));
+            assert!(interruptions(&rig, &run).is_empty());
         }
     }
 
