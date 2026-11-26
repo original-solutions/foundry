@@ -1233,4 +1233,20 @@ mod tests {
         drop(leases);
         running.abort();
     }
+
+    #[test]
+    fn a_token_git_would_refuse_has_no_mark_so_its_lease_is_not_remade_every_scan() {
+        let secrets = crate::secrets::MemorySecrets::default();
+        secrets.set("github:bot", " ghp_ok ").unwrap();
+        secrets.set("github:blank", "  ").unwrap();
+        secrets.set("github:pasted", "ghp_a\rb").unwrap();
+        let mark = |login: &str| token_mark_in(&secrets, login).unwrap();
+        assert!(mark("bot").is_some());
+        assert_eq!(mark("blank"), None);
+        assert_eq!(mark("pasted"), None);
+        assert_eq!(mark("nobody"), None);
+        // The mark follows the token as git would take it: the trimmed text.
+        secrets.set("github:other", "ghp_ok").unwrap();
+        assert_eq!(mark("other"), mark("bot"));
+    }
 }
