@@ -48,28 +48,79 @@
 //! setup terminal, which is never a session's, has a tail. A turn's message is kept with the
 //! known secrets hidden. A setup or gate terminal holds no token, and its tail, like every error,
 //! has the passwords of URLs hidden by [`redact`] before it is cut.
+//!
+//! The Factory view's routes ([`view_router`]) are the UI's, on every machine, and each answer
+//! is drawn from this machine's store, so it is the same wherever it is asked:
+//!
+//! - `GET /api/factory`: `{settings, projects: [{id, name, factory, writer, status}]}`, the
+//!   fleet's factory settings (their defaults while unset), and for each project its factory
+//!   setting (off while unset) and the status believed of it ([`status::believed`]) with the
+//!   machine that wrote it, `null` when none is believed.
+//! - `GET /api/factory/runs/{id}`: `{run, events}`, the run's events in order, by lease
+//!   generation then the writer's factory version. A run with none is `404`.
+//! - `POST /api/factory/runs/{id}/stop`: asks the lease holder to stop a building run. A machine
+//!   whose [`Leases`] holds the run's project under a lease it still holds
+//!   ([`Leased::holding`]) records it with [`stop::request`] at that lease's generation, `200
+//!   {stopped, already, message}`, and the run goes stuck on the holder's next pass; a run that
+//!   is not building is `409` with the runner's words, and one with no ledger `404`. Any other
+//!   machine carries it to the machine whose believed status holds the lease, and answers as it
+//!   answers. A stop carried here that finds no lease held, or asked where no holder is
+//!   believed, is `409` with the reason, and nothing is written.
+//! - `POST /api/factory/settings` with any of the fleet settings' fields: the held settings with
+//!   those fields changed, sent through the coordinator as every shared setting is, `200
+//!   {settings}`. A field it does not have, or a value out of range (`poll_seconds` from 10 to
+//!   60) or that Claude Code would not take as one word (`model`, `effort`), is `422`.
+//! - `POST /api/projects/{id}/factory` with any of `{on, login, paused}`: the project's factory
+//!   setting with those changed, sent through the coordinator, `200 {factory}`. Turning a
+//!   project on, or keeping it on, is `422` unless its repo URL starts `https://github.com/`
+//!   and names a repo: SSH and other hosts are out of scope. A login is letters, digits and
+//!   `-`; one named is written as named, and an edit that names none keeps the one held. A
+//!   project that is on with no login takes the acting coordinator's default login
+//!   ([`secrets::github_default`]): the request is carried to the acting coordinator, which
+//!   fills it from its own secret store before the edit is numbered, and is `422` when it names
+//!   none. A carried request that finds this machine no longer acting is `503`, never carried
+//!   on.
+//!
+//! Every string these answers hold is passed through [`secrets::hide_known`] first, so a token
+//! a writer left unhidden in a status or a run event is not shown.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Request, State};
-use axum::http::{StatusCode, Uri, header};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
+use foundry_proto::factory::{FactorySettings, FactoryStatus, ProjectFactory, RunId};
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
+use foundry_proto::settings::{Edit, SharedSettings};
 use foundry_proto::state::SessionState;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
 
 use super::carry::{self, Owner, Worker};
-use super::{Api, ApiError, created, error, no_route, on_store, unprocessable};
+use super::{
+    Api, ApiError, created, edit_status, error, no_route, on_store, parse_id, unprocessable,
+};
+use crate::coordinator::Coordinator;
+use crate::factory::ledger::Ledger;
 use crate::factory::messages::{BODY_LIMIT, LINE_LIMIT, Message};
+use crate::factory::runs::RunError;
+use crate::factory::runs::stop::{self, StopAnswer};
+use crate::factory::worker::Guard;
+use crate::factory::{Leased, Leases, github_repo, status};
 use crate::git_auth::NoToken;
-use crate::secrets::redact;
+use crate::secrets::{self, Secrets, redact};
 use crate::sessions::SessionError;
 use crate::sessions::factory::{FactoryStart, SendRefused};
 use crate::sessions::turns::TurnText;
+use crate::store::{Store, StoreError};
+use crate::sync::Peers;
 use crate::sync::call::{Answer, CARRIED, CallError};
 use crate::workspaces::{Checkout, FactoryTag, Setup, WorkspaceError};
 
@@ -536,6 +587,410 @@ fn last_bytes(text: &str, max: usize) -> &str {
         at += 1;
     }
     &text[at..]
+}
+
+// --- the Factory view ---
+
+/// The start every repo URL a factory may be turned on for has.
+pub const GITHUB_HTTPS: &str = "https://github.com/";
+
+/// What the Factory view's routes act on: this machine's store and peers, the coordinator that
+/// sends each settings edit, the secret store that holds the default login and the secrets to
+/// hide, and the leases of the projects this machine runs.
+#[derive(Clone)]
+pub struct View {
+    pub store: Arc<Mutex<Store>>,
+    pub peers: Peers,
+    pub coordinator: Arc<Coordinator>,
+    pub secrets: Arc<dyn Secrets>,
+    pub leases: Arc<Leases>,
+}
+
+/// The Factory view's routes. The caller guards them as it guards the rest of the API.
+pub fn view_router(view: View) -> Router {
+    Router::new()
+        .route("/api/factory", get(overview))
+        .route("/api/factory/runs/{id}", get(run_events))
+        .route("/api/factory/runs/{id}/stop", post(stop_run))
+        .route("/api/factory/settings", post(fleet_settings))
+        .route("/api/projects/{id}/factory", post(project_factory))
+        .with_state(Arc::new(view))
+}
+
+/// The status believed of each project of `settings`, with the machine that wrote it, read from
+/// `store`, with `online` the machines heard from: see [`status::believed`]. A project none is
+/// believed of is left out.
+pub(super) fn believed_statuses(
+    store: &Store,
+    settings: &SharedSettings,
+    online: &BTreeSet<MachineId>,
+) -> Result<BTreeMap<ProjectId, (MachineId, FactoryStatus)>, StoreError> {
+    let acting = crate::coordinator::acting(&settings.priority, online);
+    let mut believed = BTreeMap::new();
+    for project in &settings.projects {
+        let statuses = store.statuses(project.id)?;
+        if let Some((writer, status)) = status::believed(&statuses, online, acting) {
+            believed.insert(project.id, (writer, status.clone()));
+        }
+    }
+    Ok(believed)
+}
+
+/// Every string in `value` passed through `hide`; the keys of its objects stay as they are.
+pub(super) fn hide_strings(value: &mut Value, hide: &dyn Fn(&str) -> String) {
+    match value {
+        Value::String(text) => {
+            if !text.is_empty() {
+                *text = hide(text);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                hide_strings(item, hide);
+            }
+        }
+        Value::Object(fields) => {
+            for field in fields.values_mut() {
+                hide_strings(field, hide);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// Runs `work` on the blocking pool, as a read of the secret store may block.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(work).await.map_err(|e| {
+        ApiError::Rejected(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the work did not finish: {e}"),
+        )
+    })
+}
+
+impl View {
+    /// `value` with every string in it hidden as [`secrets::hide_known`] hides it.
+    async fn hidden(&self, mut value: Value) -> Result<Value, ApiError> {
+        let secrets = self.secrets.clone();
+        blocking(move || {
+            hide_strings(&mut value, &|text| secrets::hide_known(text, &*secrets));
+            value
+        })
+        .await
+    }
+
+    /// `value` hidden, as a `200` JSON answer.
+    async fn answer(&self, value: Value) -> Result<Response, ApiError> {
+        Ok(Json(self.hidden(value).await?).into_response())
+    }
+
+    /// `text` with the known secrets hidden.
+    async fn hide(&self, text: String) -> String {
+        let secrets = self.secrets.clone();
+        blocking(move || secrets::hide_known(&text, &*secrets))
+            .await
+            .unwrap_or_else(|_| secrets::HIDDEN_UNREADABLE.to_owned())
+    }
+
+    /// Sends `edit` through the coordinator, answering a failure as every shared-settings route
+    /// does.
+    async fn edit(&self, edit: Edit) -> Result<(), ApiError> {
+        match self.coordinator.edit(edit).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(ApiError::Rejected(edit_status(&e), e.to_string())),
+        }
+    }
+}
+
+/// `value` as JSON, or the server error that says it could not be.
+fn to_json(value: &impl serde::Serialize) -> Result<Value, ApiError> {
+    serde_json::to_value(value).map_err(|e| {
+        ApiError::Rejected(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the answer could not be written: {e}"),
+        )
+    })
+}
+
+async fn overview(State(view): State<Arc<View>>) -> Result<Response, ApiError> {
+    let online = view.peers.online();
+    let (settings, believed) = on_store(&view.store, move |store| {
+        let settings = store.settings()?;
+        let believed = believed_statuses(store, &settings, &online)?;
+        Ok((settings, believed))
+    })
+    .await?;
+    let mut projects = Vec::new();
+    for project in &settings.projects {
+        let factory = settings
+            .project_factory
+            .get(&project.id)
+            .cloned()
+            .unwrap_or_default();
+        let (writer, status) = match believed.get(&project.id) {
+            Some((writer, status)) => (Some(*writer), Some(status)),
+            None => (None, None),
+        };
+        projects.push(serde_json::json!({
+            "id": project.id,
+            "name": project.name,
+            "factory": to_json(&factory)?,
+            "writer": writer,
+            "status": to_json(&status)?,
+        }));
+    }
+    let fleet = settings.factory.clone().unwrap_or_default();
+    view.answer(serde_json::json!({ "settings": to_json(&fleet)?, "projects": projects }))
+        .await
+}
+
+/// The run a path names, or `404` for one that is no run id.
+fn run_named(id: &str) -> Result<RunId, ApiError> {
+    id.parse()
+        .map_err(|_| ApiError::NotFound(format!("no run {id:?} here")))
+}
+
+async fn run_events(
+    State(view): State<Arc<View>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let run = run_named(&id)?;
+    let read = run.clone();
+    let events = on_store(&view.store, move |store| store.run_events(&read)).await?;
+    if events.is_empty() {
+        return Err(ApiError::NotFound(format!("no run {run} here")));
+    }
+    view.answer(serde_json::json!({ "run": run.to_string(), "events": to_json(&events)? }))
+        .await
+}
+
+fn conflict(message: String) -> ApiError {
+    ApiError::Rejected(StatusCode::CONFLICT, message)
+}
+
+async fn stop_run(
+    State(view): State<Arc<View>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let run = run_named(&id)?;
+    let held = view
+        .leases
+        .of_repo(run.repo())
+        .and_then(|(_, leased): (ProjectId, Leased)| leased.holding());
+    if let Some((guard, generation)) = held {
+        return stop_here(&view, run, guard, generation).await;
+    }
+    let repo = run.repo().to_owned();
+    // A carried stop is answered where it landed, and never carried on.
+    if headers.contains_key(CARRIED) {
+        return Err(conflict(format!(
+            "this machine does not hold the lease of {repo}, so the stop was not written: only \
+             the lease holder writes it"
+        )));
+    }
+    let (me, online) = (view.peers.me(), view.peers.online());
+    let wanted = repo.clone();
+    let holder = on_store(&view.store, move |store| {
+        let settings = store.settings()?;
+        let believed = believed_statuses(store, &settings, &online)?;
+        Ok(settings
+            .projects
+            .iter()
+            .filter(|project| github_repo(&project.repo).as_deref() == Some(wanted.as_str()))
+            .filter_map(|project| believed.get(&project.id))
+            .find(|(_, status)| status.holds)
+            .map(|(writer, _)| *writer))
+    })
+    .await?;
+    match holder {
+        Some(holder) if holder != me => {
+            let path = format!("/api/factory/runs/{run}/stop");
+            Ok(match view.peers.call(holder, &path, None, &[]).await {
+                Ok(answer) => carry::answered(answer),
+                Err(refused) => carry::not_carried(&refused),
+            })
+        }
+        Some(_) => Err(conflict(format!(
+            "this machine's status says it holds the lease of {repo}, but it no longer does, \
+             so the stop was not written; try again once the lease is held"
+        ))),
+        None => Err(conflict(format!(
+            "no machine is known to hold the lease of {repo}, so the stop was not written; try \
+             again once its factory holds its lease"
+        ))),
+    }
+}
+
+/// Records a stop of `run` on this machine, which holds its project's lease under `guard` at
+/// `generation`.
+async fn stop_here(
+    view: &View,
+    run: RunId,
+    guard: Arc<dyn Guard>,
+    generation: u64,
+) -> Result<Response, ApiError> {
+    let secrets = view.secrets.clone();
+    let hide: crate::factory::ledger::Hide =
+        Arc::new(move |text: &str| secrets::hide_known(text, &*secrets));
+    let ledger = Ledger::new(view.store.clone(), view.peers.me(), generation, hide);
+    let id = run.to_string();
+    let asked = blocking(move || stop::request(&ledger, &*guard, &run)).await?;
+    match asked {
+        Ok(request) => match request.answer(&id) {
+            StopAnswer::Stopped { already, message } => {
+                view.answer(serde_json::json!({
+                    "stopped": true,
+                    "already": already,
+                    "message": message,
+                }))
+                .await
+            }
+            StopAnswer::Refused { message } => Err(conflict(view.hide(message).await)),
+        },
+        Err(RunError::Invalid(said)) => Err(ApiError::NotFound(view.hide(said).await)),
+        Err(RunError::LeaseLost(lost)) => Err(conflict(
+            view.hide(format!(
+                "the lease was lost before the stop was written, so it was not: {lost}"
+            ))
+            .await,
+        )),
+        Err(e) => Err(ApiError::Rejected(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            view.hide(format!("the stop could not be recorded: {e}"))
+                .await,
+        )),
+    }
+}
+
+/// `held` as JSON, with the fields of `changes` put over it: `422` for a field `held` does not
+/// have.
+fn changed(held: Value, changes: Map<String, Value>, what: &str) -> Result<Value, ApiError> {
+    let Value::Object(mut fields) = held else {
+        return Err(ApiError::Rejected(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the held {what} are not an object"),
+        ));
+    };
+    for (name, value) in changes {
+        if !fields.contains_key(&name) {
+            return Err(unprocessable(format!("{what} have no field {name:?}")));
+        }
+        fields.insert(name, value);
+    }
+    Ok(Value::Object(fields))
+}
+
+async fn fleet_settings(State(view): State<Arc<View>>, body: Bytes) -> Result<Response, ApiError> {
+    let changes: Map<String, Value> = read(&body)?;
+    let held = on_store(&view.store, |store| store.settings())
+        .await?
+        .factory
+        .unwrap_or_default();
+    let merged = changed(to_json(&held)?, changes, "the factory settings")?;
+    let settings: FactorySettings = serde_json::from_value(merged)
+        .map_err(|e| unprocessable(format!("the factory settings are not taken: {e}")))?;
+    one_word("a model", &settings.model)?;
+    one_word("an effort", &settings.effort)?;
+    view.edit(Edit::SetFactory {
+        settings: settings.clone(),
+    })
+    .await?;
+    view.answer(serde_json::json!({ "settings": to_json(&settings)? }))
+        .await
+}
+
+/// Whether a project on `repo` may have its factory on: an `https://github.com/` URL that
+/// names a repo.
+fn on_github(repo: &str) -> bool {
+    repo.starts_with(GITHUB_HTTPS) && github_repo(repo).is_some()
+}
+
+async fn project_factory(
+    State(view): State<Arc<View>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let project = parse_id(&id, "project", ProjectId)?;
+    let mut changes: Map<String, Value> = read(&body)?;
+    let named = match changes.remove("login") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(login)) => Some(login.trim().to_owned()).filter(|l| !l.is_empty()),
+        Some(_) => return Err(unprocessable("a login is text".to_owned())),
+    };
+    if let Some(login) = &named
+        && !secrets::is_login(login)
+    {
+        return Err(unprocessable(format!("a login is {}", secrets::LOGIN_RULE)));
+    }
+    let settings = on_store(&view.store, |store| store.settings()).await?;
+    let Some(held_project) = settings.projects.iter().find(|p| p.id == project) else {
+        return Err(ApiError::NotFound(format!("no project {project} here")));
+    };
+    let held = settings
+        .project_factory
+        .get(&project)
+        .cloned()
+        .unwrap_or_default();
+    let merged = changed(to_json(&held)?, changes, "a project's factory settings")?;
+    let mut factory: ProjectFactory = serde_json::from_value(merged)
+        .map_err(|e| unprocessable(format!("the project's factory setting is not taken: {e}")))?;
+    if let Some(login) = named {
+        factory.login = login;
+    }
+    if factory.on && !on_github(&held_project.repo) {
+        return Err(unprocessable(format!(
+            "the factory of {:?} cannot be on: its repo URL does not start {GITHUB_HTTPS} and \
+             name a repo there, and a factory reaches GitHub only over HTTPS",
+            held_project.name
+        )));
+    }
+    if factory.on && factory.login.is_empty() {
+        let acting = view.coordinator.acting().await?;
+        if acting != view.peers.me() {
+            if headers.contains_key(CARRIED) {
+                return Err(ApiError::Rejected(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "this machine no longer acts as coordinator, so it does not fill in the \
+                     default login; send the edit again"
+                        .to_owned(),
+                ));
+            }
+            let path = format!("/api/projects/{project}/factory");
+            return Ok(
+                match view
+                    .peers
+                    .call(acting, &path, Some("application/json"), &body)
+                    .await
+                {
+                    Ok(answer) => carry::answered(answer),
+                    Err(refused) => carry::not_carried(&refused),
+                },
+            );
+        }
+        let secrets = view.secrets.clone();
+        match blocking(move || secrets::github_default(&*secrets)).await? {
+            Some(login) => factory.login = login,
+            None => {
+                return Err(unprocessable(
+                    "no login was named and the coordinator names no default login: name the \
+                     project's login, or set the coordinator's default with `foundryd github \
+                     default <login>`"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    view.edit(Edit::SetProjectFactory {
+        project,
+        factory: factory.clone(),
+    })
+    .await?;
+    view.answer(serde_json::json!({ "factory": to_json(&factory)? }))
+        .await
 }
 
 #[cfg(test)]

@@ -9,6 +9,13 @@
 //!   several times between two reads is sent once, at its newest version. A record this build
 //!   cannot read, one a newer build wrote before a rollback, leaves out its owner's changes up
 //!   to it, with a warning, and the socket goes on.
+//!
+//!   After each state, a [`UiMessage::FactoryStatus`] for each project with a status believed
+//!   of it ([`factory`]'s `GET /api/factory` believes the same one), and another each time the
+//!   status believed of a project changes: the factory records, the machines heard from and
+//!   the settings are looked at every [`EVENTS_EVERY`], and only a change of one of them reads
+//!   the statuses again. Its strings have the known secrets hidden ([`Api::secrets`]). No run
+//!   event is ever sent, on this socket or in `GET /api/state`: those are P1's records.
 //! - `GET /api/terminals/{id}`, a WebSocket: see [`terminals`].
 //! - `GET /api/machine`: `{id}`, the machine that serves the UI, see [`machine`].
 //! - `GET /api/machines`: `{me, machines: [{id, name, online}]}`, this machine's id and each
@@ -99,7 +106,7 @@ use tokio::net::TcpListener;
 
 use crate::coordinator::CoordinatorError;
 use crate::placement::{self, Queue, Want};
-use crate::secrets::redact;
+use crate::secrets::{Secrets, redact};
 use crate::sessions::{SessionError, Sessions};
 use crate::store::{Store, StoreError};
 use crate::sync::Peers;
@@ -148,6 +155,9 @@ pub struct Api {
     pub sessions_refused: Option<String>,
     /// The creates waiting for a machine to qualify, which [`placement::run`] places.
     pub placements: Arc<Queue>,
+    /// The secret store whose known secrets the events socket hides in the factory statuses
+    /// it sends. `None` until the daemon sets it, which hides only the passwords of URLs.
+    pub secrets: Option<Arc<dyn Secrets>>,
 }
 
 impl Api {
@@ -169,6 +179,7 @@ impl Api {
             sessions_refused: None,
             placements,
             names,
+            secrets: None,
         }
     }
 }
@@ -576,12 +587,101 @@ async fn events(
     }))
 }
 
-/// What the events socket has sent: the highest version per owner, the settings' `seq` and
-/// which machines were online.
+/// What the events socket has sent: the highest version per owner, the settings' `seq`,
+/// which machines were online, and the factory status believed of each project, with the
+/// factory versions it was read at.
 struct Sent {
     versions: BTreeMap<MachineId, u64>,
     seq: u64,
     online: BTreeSet<MachineId>,
+    factory: Believed,
+}
+
+/// The factory statuses the events socket has sent, and what they were read from.
+#[derive(Default)]
+struct Believed {
+    /// The factory versions per owner, the settings' `seq` and the machines heard from when
+    /// the statuses were last read: `None` before the first read.
+    read_at: Option<(BTreeMap<MachineId, u64>, u64, BTreeSet<MachineId>)>,
+    statuses: BTreeMap<ProjectId, foundry_proto::factory::FactoryStatus>,
+}
+
+/// Sends a [`UiMessage::FactoryStatus`] for each project whose believed status is not the one
+/// `believed` says was sent, when the factory records, the settings or the machines heard from
+/// changed since the last read. Says whether every send went.
+async fn send_factory(
+    api: &Api,
+    socket: &mut WebSocket,
+    believed: &mut Believed,
+) -> Result<bool, StoreError> {
+    let online = api.peers.online();
+    let heard = online.clone();
+    let (versions, settings) = on_store(&api.store, |store| {
+        Ok((store.factory_versions()?, store.settings()?))
+    })
+    .await?;
+    let now = (versions, settings.seq, online);
+    if believed.read_at.as_ref() == Some(&now) {
+        return Ok(true);
+    }
+    let read = on_store(&api.store, move |store| {
+        factory::believed_statuses(store, &settings, &heard)
+    })
+    .await?;
+    // A status that could not be written leaves the read to be made again on the next tick.
+    believed.read_at = Some(now);
+    believed
+        .statuses
+        .retain(|project, _| read.contains_key(project));
+    for (project, (_, status)) in read {
+        if believed.statuses.get(&project) == Some(&status) {
+            continue;
+        }
+        let message = UiMessage::FactoryStatus {
+            protocol: PROTOCOL,
+            status: status.clone(),
+        };
+        let Some(text) = hidden_text(api, &message).await else {
+            believed.read_at = None;
+            continue;
+        };
+        if socket.send(ws::Message::Text(text.into())).await.is_err() {
+            return Ok(false);
+        }
+        believed.statuses.insert(project, status);
+    }
+    Ok(true)
+}
+
+/// `message` as JSON text, every string in it hidden with the known secrets of
+/// [`Api::secrets`], or only the passwords of URLs without one. `None`, logged, when it cannot
+/// be written.
+async fn hidden_text(api: &Api, message: &UiMessage) -> Option<String> {
+    let mut value = match serde_json::to_value(message) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("api: an event cannot be sent: {error}");
+            return None;
+        }
+    };
+    let secrets = api.secrets.clone();
+    let hidden = tokio::task::spawn_blocking(move || {
+        match &secrets {
+            Some(secrets) => factory::hide_strings(&mut value, &|text| {
+                crate::secrets::hide_known(text, &**secrets)
+            }),
+            None => factory::hide_strings(&mut value, &|text| redact(text)),
+        }
+        value.to_string()
+    })
+    .await;
+    match hidden {
+        Ok(text) => Some(text),
+        Err(error) => {
+            tracing::warn!("api: an event cannot be sent: {error}");
+            None
+        }
+    }
 }
 
 /// Sends the state, then every change, until the UI goes or a send fails.
@@ -649,10 +749,14 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
                 return Ok(());
             }
         }
+        if !send_factory(api, &mut socket, &mut sent.factory).await? {
+            return Ok(());
+        }
     }
 }
 
-/// Sends the full state and says what it covered, or `None` when the UI has gone.
+/// Sends the full state, then the factory status believed of each project, and says what it
+/// covered, or `None` when the UI has gone.
 async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, StoreError> {
     let online = api.peers.online();
     let (state, versions) = full_state_for(api, &online).await?;
@@ -660,10 +764,18 @@ async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, S
         UiMessage::State { settings, .. } => settings.seq,
         _ => 0,
     };
-    Ok(send(socket, &state).await.then_some(Sent {
+    if !send(socket, &state).await {
+        return Ok(None);
+    }
+    let mut factory = Believed::default();
+    if !send_factory(api, socket, &mut factory).await? {
+        return Ok(None);
+    }
+    Ok(Some(Sent {
         versions,
         seq,
         online,
+        factory,
     }))
 }
 
@@ -1123,6 +1235,11 @@ mod factory_events {
             let mut settings = store.settings().unwrap();
             settings.seq += 1;
             settings.priority = vec![me];
+            settings.projects.push(foundry_proto::settings::Project {
+                id: project(),
+                name: "softfac".into(),
+                repo: "https://github.com/rawphp/softfac".into(),
+            });
             store.apply_settings(settings).unwrap();
         }
         let terminals = Arc::new(Terminals::new(
