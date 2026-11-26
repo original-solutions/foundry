@@ -253,6 +253,8 @@ mod tests {
                 free_disk: 120_500_000_000,
                 sessions,
                 update_refused: None,
+                version: None,
+                update_ready: None,
             },
         })
     }

@@ -2975,6 +2975,8 @@ impl Daemon {
                 free_disk: DISK,
                 sessions,
                 update_refused: None,
+                version: None,
+                update_ready: None,
             },
         });
         assert_eq!(

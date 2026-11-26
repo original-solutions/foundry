@@ -73,6 +73,8 @@ fn sample(owner: MachineId, version: u64) -> AnyRecord {
             free_disk: 1 << 35,
             sessions: 2,
             update_refused: None,
+            version: None,
+            update_ready: None,
         },
     })
 }

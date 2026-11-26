@@ -1225,6 +1225,8 @@ mod tests {
                 free_disk,
                 sessions: 0,
                 update_refused: refused.map(str::to_owned),
+                version: None,
+                update_ready: None,
             };
             let record = self.record(owner, false, body);
             self.put(AnyRecord::MachineSample(record));
@@ -1492,6 +1494,8 @@ mod tests {
             free_disk: 100 * GB,
             sessions: 9,
             update_refused: None,
+            version: None,
+            update_ready: None,
         };
         let record = world.record(peer, false, body);
         world.put(AnyRecord::MachineSample(record));
