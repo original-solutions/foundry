@@ -320,8 +320,9 @@ impl<H: Host> Factory<H> {
     pub async fn serve(self) {
         let mut running: BTreeMap<ProjectId, Running> = BTreeMap::new();
         let offline = Arc::new(Mutex::new(Offline::default()));
-        // What each project left out for sharing a repo was last told, so the log line and the
-        // status are written when that changes, not every scan.
+        // What each project left out for sharing a repo was last told, so the log line is
+        // written when that changes, not every scan. The status is checked against the store
+        // every scan.
         let mut said_shared: BTreeMap<ProjectId, String> = BTreeMap::new();
         loop {
             let looked = self.clock.now();

@@ -238,6 +238,8 @@ pub struct Memo {
     orphans_owed: bool,
     /// When the finished runs were last swept, on the clock.
     swept: Option<Duration>,
+    /// A due sweep began and has not gone through every run: the next pass is its one retry.
+    sweep_unfinished: bool,
     /// The runs seen finished, by run id: a finished run's summary never changes, so its
     /// events are read once. `None` for one this build cannot show.
     finished: BTreeMap<RunId, Option<Done>>,
@@ -1443,6 +1445,16 @@ impl<'a, 'w> Pass<'a, 'w> {
         if !heard_again && !sweep_due {
             return Ok(());
         }
+        if sweep_due {
+            if self.memo.sweep_unfinished {
+                // The retry of a sweep that ended part way: should it end part way too, the
+                // next sweep waits for STUCK_READ_EVERY, so one run cannot fail every pass.
+                self.memo.swept = Some(now);
+                self.memo.sweep_unfinished = false;
+            } else {
+                self.memo.sweep_unfinished = true;
+            }
+        }
         let repo = world.project.repo.clone();
         let runs = world
             .store
@@ -1509,9 +1521,11 @@ impl<'a, 'w> Pass<'a, 'w> {
                 }
             }
         }
-        // Only a sweep that went through every run is done: one that ended part way is due again.
+        // Only a sweep that went through every run is done: one that ended part way is due
+        // again at the next pass, once.
         if sweep_due {
             self.memo.swept = Some(now);
+            self.memo.sweep_unfinished = false;
         }
         if heard_again {
             self.memo.orphans_owed = owed;
