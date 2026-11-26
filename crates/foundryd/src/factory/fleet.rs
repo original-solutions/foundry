@@ -13,8 +13,9 @@
 //! not known here yet, is [`WorkerError::Unreachable`], which a run asks again next pass; a
 //! machine that answered with a refusal is [`WorkerError::Failed`], with the reason the answer
 //! gives. A turn not written yet while its session runs (`404`) is unreachable for now; one
-//! that will never be written (`410`) is failed, which is what the resume step reads as an
-//! interruption. No answer holds a token, and every reason is passed through
+//! that will never be written (`410`) is [`WorkerError::NotWritten`], which is what the resume
+//! step reads as an interruption. Any other refusal of a turn read, a `5xx` included, is failed.
+//! No answer holds a token, and every reason is passed through
 //! [`redact`](crate::secrets::redact) before it is kept.
 
 use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
@@ -143,10 +144,14 @@ fn sent(answer: Result<Answer, CallError>) -> Result<u64, SendRefused> {
 }
 
 /// What a turn read's answer says. `404` is a turn not written yet while its session runs: asked
-/// again. `410`, a turn that will never be written, and any other refusal are failed.
+/// again. `410` is a turn that will never be written. Any other refusal, a `5xx` included, is
+/// failed.
 fn turn_read(answer: &Answer) -> Result<TurnText, WorkerError> {
     if answer.status == 404 {
         return Err(WorkerError::Unreachable(reason(answer)));
+    }
+    if answer.status == 410 {
+        return Err(WorkerError::NotWritten(reason(answer)));
     }
     if !success(answer) {
         return Err(WorkerError::Failed(reason(answer)));
@@ -513,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_not_written_yet_is_asked_again_and_one_never_written_is_failed() {
+    fn a_turn_not_written_yet_is_asked_again_and_only_a_gone_one_is_not_written() {
         let read = turn_read(&answer(
             200,
             r#"{"message":"FACTORY-DONE: x","question":null}"#,
@@ -531,8 +536,15 @@ mod tests {
         ));
         assert_eq!(
             turn_read(&answer(410, r#"{"error":"will not be written"}"#)),
-            Err(WorkerError::Failed("will not be written".into()))
+            Err(WorkerError::NotWritten("will not be written".into()))
         );
+        for status in [500, 502, 503] {
+            assert_eq!(
+                turn_read(&answer(status, r#"{"error":"store"}"#)),
+                Err(WorkerError::Failed("store".into())),
+                "{status}"
+            );
+        }
     }
 
     #[test]

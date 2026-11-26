@@ -48,6 +48,10 @@ pub enum WorkerError {
     /// The machine answered, and the call failed.
     #[error("the call failed: {0}")]
     Failed(String),
+    /// The owner said the turn will never be written: its session ended before writing it. Only
+    /// [`Worker::turn`] answers it.
+    #[error("the turn will not be written: {0}")]
+    NotWritten(String),
 }
 
 /// What a run asks of the fleet. Every call is made after [`Guard::check`] passes.
@@ -78,7 +82,10 @@ pub trait Worker: Send + Sync {
         only_if_prompts: Option<u64>,
     ) -> Result<u64, SendRefused>;
 
-    /// The final message and the waiting question of turn `n` of `session`.
+    /// The final message and the waiting question of turn `n` of `session`. This is the only call
+    /// that answers [`WorkerError::NotWritten`], when the owner says the turn will never be
+    /// written; any other failure of the call is [`WorkerError::Failed`] or
+    /// [`WorkerError::Unreachable`].
     fn turn(&self, session: SessionId, n: u64) -> Result<TurnText, WorkerError>;
 
     /// The output of `terminal`, from its end.
@@ -1718,5 +1725,22 @@ mod tests {
         assert_eq!(view.unreachable_for(a), Duration::ZERO);
         assert_eq!(view.unreachable_for(b), Duration::from_secs(40));
         assert_eq!(view.unreachable_for(c), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_fake_worker_answers_a_turn_never_written_and_then_the_default() {
+        let worker = FakeWorker::new();
+        worker.on_turn(Err(WorkerError::NotWritten("gone".into())));
+        assert_eq!(
+            worker.turn(SessionId(id(1)), 1),
+            Err(WorkerError::NotWritten("gone".into()))
+        );
+        assert_eq!(
+            worker.turn(SessionId(id(1)), 2),
+            Ok(TurnText {
+                message: String::new(),
+                question: None
+            })
+        );
     }
 }

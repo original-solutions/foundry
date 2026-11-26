@@ -80,7 +80,8 @@
 //!   a session that finished or failed with no unread turn shown is first asked of the worker
 //!   for the turn after the newest read. A turn the worker answers is written and not shown yet,
 //!   so nothing is decided until it shows (`building` reads it then); one the worker says was
-//!   never written is the interruption.
+//!   never written (`NotWritten`) is the interruption; any other error of the call decides
+//!   nothing, and the next pass asks again.
 //! - Before a resumed session starts, the issue text is checked again against the approval the
 //!   ledger recorded, as the runner's `textStop` does: a text changed by someone who is not an
 //!   instructor, or whose edits cannot be judged, ends the run stuck and starts nothing. The
@@ -1049,13 +1050,14 @@ fn ended(
                 // A turn record syncs apart from its session's, and can be written after the
                 // session ended: the turn after the newest read is asked of the worker. One it
                 // answers is written and not shown yet, so nothing is decided until it shows. One
-                // it says was never written means the process ended before a result line.
+                // it says was never written means the process ended before a result line. Any
+                // other error decides nothing: the next pass asks again.
                 None => {
                     let next = seen.turn_read.map_or(1, |read| read + 1);
                     ctx.held()?;
                     match ctx.worker.turn(session, next) {
                         Ok(_) => return Ok(None),
-                        Err(WorkerError::Failed(_)) => None,
+                        Err(WorkerError::NotWritten(_)) => None,
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -2181,7 +2183,7 @@ mod tests {
     /// The worker says the next turn asked for was never written: a session whose process ended
     /// with no turn after the newest read, as a pass that decides asks.
     fn never_written(rig: &Rig) {
-        rig.worker.on_turn(Err(WorkerError::Failed(
+        rig.worker.on_turn(Err(WorkerError::NotWritten(
             "the turn will not be written".into(),
         )));
     }
@@ -6123,7 +6125,7 @@ mod tests {
                 }]
             );
             // The worker says turn 3 was never written: the process ended before a result line.
-            rig.worker.on_turn(Err(WorkerError::Failed(
+            rig.worker.on_turn(Err(WorkerError::NotWritten(
                 "turn 3 will not be written".into(),
             )));
             pass_one(&rig, &run);
@@ -6138,6 +6140,27 @@ mod tests {
             assert!(advance(&rig.ctx(), &run).is_err());
             assert_eq!(event_count(&rig, &run), before);
             assert!(archive_calls(&rig).is_empty());
+        }
+
+        #[test]
+        fn a_turn_call_that_failed_decides_nothing_and_a_later_not_written_decides() {
+            let (rig, run) = failed_with_turns_unasked();
+            rig.worker.on_turn(Err(WorkerError::Failed(
+                "the store could not be read".into(),
+            )));
+            let before = event_count(&rig, &run);
+            let error = advance(&rig.ctx(), &run).unwrap_err();
+            assert!(
+                matches!(error, RunError::Worker(WorkerError::Failed(_))),
+                "{error}"
+            );
+            assert_eq!(rig.worker.calls(), vec![probe(1)]);
+            assert_eq!(event_count(&rig, &run), before);
+            assert!(interruptions(&rig, &run).is_empty());
+            assert!(archive_calls(&rig).is_empty());
+            never_written(&rig);
+            pass_one(&rig, &run);
+            assert!(!interruptions(&rig, &run).is_empty());
         }
 
         // f6 (a): a resend the worker refuses is left for the next pass, with no error.
