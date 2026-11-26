@@ -23,13 +23,12 @@
 //!   names its branch.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use foundry_proto::factory::{RunEvent, RunId};
 use foundry_proto::ids::{MachineId, WorkspaceId};
 use serde_json::Value;
 
-use super::gating::GATE_REQUESTED;
-use super::resume::UNREACHABLE_FOR;
 use super::{RunContext, RunError};
 use crate::factory::gate;
 use crate::factory::github::read::{CheckState, CheckStatus};
@@ -127,6 +126,9 @@ pub const BODY_EDIT_DROPPED: &str = "body-edit-dropped";
 pub const BODY_EDIT_FORWARDED: &str = "body-edit-forwarded";
 /// The ledger step written once the issue was told that an instructor's comment was not forwarded: `comment-dropped <id>`.
 pub const COMMENT_DROPPED: &str = "comment-dropped";
+/// The step written before a gate workspace is asked for, recording the commit gated:
+/// `gate-requested <attempt> <k> <head> <base tip> <machine>`.
+pub const GATE_REQUESTED: &str = "gate-requested ";
 /// The ledger step written before a failed attempt is sent: `gate-sending <attempt> <ordinal>`.
 pub const GATE_SENDING: &str = "gate-sending";
 /// The ledger step that records the decision that an attempt passed: `gate-passed <sha> <n>`.
@@ -1466,6 +1468,12 @@ pub(super) fn resume_name(run: &RunId, k: u32) -> String {
 pub(super) fn feedback_name(run: &RunId, n: u32) -> String {
     format!("{}-f{n}", build_name(run))
 }
+
+/// How long a machine is unreachable before what it holds is given up on: 15 minutes, on the
+/// sleep-counting clock that [`FleetView::unreachable_for`] reads.
+///
+/// [`FleetView::unreachable_for`]: crate::factory::worker::FleetView::unreachable_for
+pub const UNREACHABLE_FOR: Duration = Duration::from_secs(15 * 60);
 
 /// A workspace of a run that the fleet shows.
 #[derive(Clone, Debug)]

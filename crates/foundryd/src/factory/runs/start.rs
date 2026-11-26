@@ -40,8 +40,8 @@ use serde::Deserialize;
 use super::progress::{
     APPROVAL_RECHECKED, APPROVAL_WITHDRAWN, APPROVED, LAUNCH_BASE, LAUNCH_ENDING_SESSIONS,
     LAUNCH_MODEL, LAUNCH_PULL_REQUEST, LAUNCH_RESENDING, LAUNCH_RESUMING, LAUNCH_SENDING,
-    LAUNCH_SENDING_RESUMED, Seen, TIME_LIMIT, WORKSPACE_CREATED, WORKSPACE_REQUESTED, build_name,
-    read_progress,
+    LAUNCH_SENDING_RESUMED, Seen, TIME_LIMIT, UNCONFIRMED_CODE, WORKSPACE_CREATED,
+    WORKSPACE_REQUESTED, build_name, read_progress,
 };
 use super::{
     Closing, Progress, RunContext, RunError, Stop, abandon, as_posted, end_own_merge,
@@ -719,7 +719,7 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StartStep, RunError>
             ctx,
             issue,
             &mut at,
-            "approval-unconfirmed",
+            UNCONFIRMED_CODE,
             Stop::new(messages::CANNOT_CONFIRM),
             None,
         )?;

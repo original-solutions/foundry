@@ -84,7 +84,7 @@
 //! <id>` recorded before the call and `reconcile-archived <id>` after, and only then `end_run`,
 //! `abandon` or `end_own_merge` writes the summary line. A workspace already answered is not
 //! asked again, and a pass cut short carries on. A machine the fleet shows unreachable for as
-//! long as `resume::UNREACHABLE_FOR` (15 minutes; a gate's for `gate::MACHINE_GONE_AFTER`, 5)
+//! long as `progress::UNREACHABLE_FOR` (15 minutes; a gate's for `gate::MACHINE_GONE_AFTER`, 5)
 //! is recorded left (`reconcile-left <id> its machine is gone`) with no call; one that does not
 //! answer a call yet is waited for. A failure of a call is an error with the run not finished,
 //! and the next pass carries on.
@@ -1829,7 +1829,7 @@ mod tests {
         #[test]
         fn asks_nothing_of_a_machine_unreachable_for_fifteen_minutes() {
             let (mut rig, run) = requested();
-            rig.view = cut_off(&rig, crate::factory::runs::resume::UNREACHABLE_FOR);
+            rig.view = cut_off(&rig, crate::factory::runs::progress::UNREACHABLE_FOR);
             assert_eq!(
                 pass(&rig, &run),
                 StopStep::Stuck {
@@ -2610,7 +2610,7 @@ mod tests {
                 let (mut rig, run) = pr_open_run();
                 with_feedback_workspace(
                     &mut rig,
-                    Some(crate::factory::runs::resume::UNREACHABLE_FOR),
+                    Some(crate::factory::runs::progress::UNREACHABLE_FOR),
                 );
                 rig.sim.set_pull(12, pull("MERGED"));
                 assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
@@ -3155,7 +3155,7 @@ mod tests {
             fn is_not_asked_of_a_machine_given_up_on_and_waits_for_one_that_does_not_answer() {
                 let (mut rig, run) = stuck_run();
                 rig.sim.set_labels(&["factory:ready"]);
-                rig.view = cut_off(&rig, crate::factory::runs::resume::UNREACHABLE_FOR);
+                rig.view = cut_off(&rig, crate::factory::runs::progress::UNREACHABLE_FOR);
                 assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
                 assert_eq!(archives(&rig), 0);
                 rig.view = cut_off(&rig, Duration::from_secs(60));

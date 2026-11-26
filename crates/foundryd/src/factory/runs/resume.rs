@@ -245,7 +245,6 @@
 //! - `is not resumed once a relaunch is decided, and nothing is written`
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use foundry_proto::factory::{RunEvent, RunId};
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, WorkspaceId};
@@ -254,8 +253,9 @@ use foundry_proto::state::{SessionState, TerminalState};
 use serde_json::Value;
 
 use super::progress::{
-    STUCK_DETAIL, STUCK_STOP, Seen, WORKSPACE_CREATED, WORKSPACE_REQUESTED, build_name,
-    feedback_name, highest, numbered, pending_relaunch, read_progress, resume_name, step_text,
+    STUCK_DETAIL, STUCK_STOP, Seen, TEXT_CODE, UNREACHABLE_FOR, UNVERIFIED_CODE, WORKSPACE_CREATED,
+    WORKSPACE_REQUESTED, build_name, feedback_name, highest, numbered, pending_relaunch,
+    read_progress, resume_name, step_text,
 };
 use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
 use super::{
@@ -278,10 +278,6 @@ use crate::factory::text;
 use crate::factory::worker::{CreateWorkspace, FleetView, WorkerError};
 use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
 use crate::workspaces::{Checkout, FactoryTag, Setup};
-
-/// How long a machine is unreachable before what it holds is given up on: 15 minutes, on the
-/// sleep-counting clock that [`FleetView::unreachable_for`] reads.
-pub const UNREACHABLE_FOR: Duration = Duration::from_secs(15 * 60);
 
 /// The public reason of a run whose session's machine stayed unreachable.
 pub const MACHINE_UNREACHABLE: &str = "the session's machine has been unreachable for 15 minutes";
@@ -849,8 +845,6 @@ const STUCK_MACHINE: &str = "machine-unreachable";
 const STUCK_UNCONFIRMED: &str = "resume-approval-unconfirmed";
 const STUCK_LAUNCH: &str = "resume-launch-failed";
 const STUCK_SETUP: &str = "resume-setup-failed";
-const STUCK_TEXT: &str = "text-changed-during-build";
-const STUCK_UNVERIFIED: &str = "edits-unverifiable";
 const OWN_STUCK_CODES: [&str; 8] = [
     STUCK_GONE,
     STUCK_ENDED,
@@ -858,8 +852,8 @@ const OWN_STUCK_CODES: [&str; 8] = [
     STUCK_UNCONFIRMED,
     STUCK_LAUNCH,
     STUCK_SETUP,
-    STUCK_TEXT,
-    STUCK_UNVERIFIED,
+    TEXT_CODE,
+    UNVERIFIED_CODE,
 ];
 
 /// The machine that owns the run's newest workspace: its record's owner, else the claim's
@@ -1577,11 +1571,11 @@ fn carry_on(
         TextCheck::Unchanged => {}
         TextCheck::Changed => {
             let stop = Stop::new(CHANGED_DURING_BUILD);
-            return stuck(ctx, run, at, STUCK_TEXT, stop);
+            return stuck(ctx, run, at, TEXT_CODE, stop);
         }
         TextCheck::Unjudged => {
             let stop = Stop::new(CANNOT_VERIFY_DURING_BUILD);
-            return stuck(ctx, run, at, STUCK_UNVERIFIED, stop);
+            return stuck(ctx, run, at, UNVERIFIED_CODE, stop);
         }
     }
     let first = launch_message(ctx, run, seen, branch);

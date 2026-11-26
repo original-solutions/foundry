@@ -78,7 +78,7 @@
 //!
 //!    The build and the gate workspaces follow one rule, the gate's with the spec's 5 minutes
 //!    for an unreachable gate machine (`gate::MACHINE_GONE_AFTER`) and the build's with its
-//!    15 minutes (`resume::UNREACHABLE_FOR`). "Not a live workspace" counts as archived. A
+//!    15 minutes (`progress::UNREACHABLE_FOR`). "Not a live workspace" counts as archived. A
 //!    machine the view shows unreachable for its time is gone: the workspace is recorded left
 //!    (`gate-left <k> <id> its machine is gone`, `build-left its machine is gone`) with no
 //!    call. An "unreachable" answer is not an error and not a refusal: the pass waits
@@ -133,7 +133,7 @@
 //!    ended while the pass can still be undone; a failure that must go back to a session
 //!    already recorded ended in the round is stuck (`session-ended`) and not sent. The end of
 //!    the session follows the build workspace's rule of 5: on a gone build machine, or after
-//!    `resume::UNREACHABLE_FOR` of "unreachable" answers on the sleep-counting clock
+//!    `progress::UNREACHABLE_FOR` of "unreachable" answers on the sleep-counting clock
 //!    (`build-session-waiting <generation> <ms>`), it is recorded `build-session-left <why>`
 //!    with no end, and on an exit path (stuck, stop, an ended run) an "unreachable" answer is
 //!    recorded left at once. Then the
@@ -303,9 +303,9 @@ use foundry_proto::settings::SharedSettings;
 use foundry_proto::state::{SessionState, TerminalState};
 
 use super::progress::{
-    CHECKS_TIMED_OUT, GATE_PASSED, GATE_SENDING, PassRecord, Seen, read_progress, step_text,
+    CHECKS_TIMED_OUT, GATE_PASSED, GATE_REQUESTED, GATE_SENDING, PassRecord, Seen, UNREACHABLE_FOR,
+    read_progress, step_text,
 };
-use super::resume::UNREACHABLE_FOR;
 use super::{
     ActionPayload, Closing, Progress, RunContext, RunError, SendPayload, Stop, StuckStop, abandon,
     apply_actions, closed_issue, end_own_merge, end_run, go_stuck, progress_from, recorded_reason,
@@ -328,9 +328,6 @@ use crate::factory::text::{is_commit_id, sanitize};
 use crate::factory::worker::WorkerError;
 use crate::sessions::factory::BODY_PATH;
 
-/// The step written before a gate workspace is asked for, recording the commit gated:
-/// `gate-requested <attempt> <k> <head> <base tip> <machine>`.
-pub const GATE_REQUESTED: &str = "gate-requested ";
 /// The step written once the worker has answered the create: `gate-created <k> <workspace id>`.
 pub const GATE_CREATED: &str = "gate-created ";
 /// The step that records a gate's verdict: `gate-ended <k> <exit code>`. The setup terminal's
@@ -1046,7 +1043,7 @@ impl Gate<'_, '_> {
             })
     }
 
-    /// Whether the view shows the build machine unreachable for `resume::UNREACHABLE_FOR`.
+    /// Whether the view shows the build machine unreachable for `progress::UNREACHABLE_FOR`.
     fn build_machine_gone(&self, seen: &Seen, workspace: WorkspaceId) -> bool {
         self.build_machine(seen, workspace)
             .is_some_and(|machine| self.ctx.view.unreachable_for(machine) >= UNREACHABLE_FOR)
@@ -1055,7 +1052,7 @@ impl Gate<'_, '_> {
     /// The build session ended, once, by the build workspace's rule (`archive_build`): on a
     /// gone machine it is recorded left (`build-session-left <why>`) with no call, and an
     /// "unreachable" answer is waited out on the sleep-counting clock
-    /// (`build-session-waiting <generation> <ms>`) for `resume::UNREACHABLE_FOR`, then
+    /// (`build-session-waiting <generation> <ms>`) for `progress::UNREACHABLE_FOR`, then
     /// recorded left. On an exit path (`exit`: the run ends or goes stuck) an "unreachable"
     /// answer is recorded left at once, as a gate's archive is. `false` while it is waited
     /// out.
@@ -1095,7 +1092,7 @@ impl Gate<'_, '_> {
     }
 
     /// The build workspace archived by force, by the rule of `archive_gate` with the build
-    /// machine's 15 minutes (`resume::UNREACHABLE_FOR`): `Some` is the step the pass ends
+    /// machine's 15 minutes (`progress::UNREACHABLE_FOR`): `Some` is the step the pass ends
     /// with instead, `NotReady` while an "unreachable" answer is waited out.
     fn archive_build(&self) -> Result<Option<GateStep>, RunError> {
         let (seen, log) = self.fresh()?;
@@ -7833,7 +7830,7 @@ mod tests {
             let (mut rig, run, _hub) = at_pr_open();
             rig.view = FleetView::builder()
                 .session(session_record(SessionState::Idle))
-                .unreachable(builder(), crate::factory::runs::resume::UNREACHABLE_FOR)
+                .unreachable(builder(), crate::factory::runs::progress::UNREACHABLE_FOR)
                 .build();
             assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
             assert_eq!(archived(&rig), vec![]);
@@ -7855,7 +7852,7 @@ mod tests {
                 .session(session_record(SessionState::Idle))
                 .unreachable(
                     builder(),
-                    crate::factory::runs::resume::UNREACHABLE_FOR - Duration::from_secs(1),
+                    crate::factory::runs::progress::UNREACHABLE_FOR - Duration::from_secs(1),
                 )
                 .build();
             assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
@@ -8071,7 +8068,7 @@ mod tests {
                 &run,
                 1,
                 0,
-                crate::factory::runs::resume::UNREACHABLE_FOR,
+                crate::factory::runs::progress::UNREACHABLE_FOR,
             );
             assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
             assert!(!hub.lock().pulls[&12].draft);

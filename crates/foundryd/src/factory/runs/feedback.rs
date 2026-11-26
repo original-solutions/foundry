@@ -288,10 +288,10 @@ use serde_json::Value;
 
 use super::progress::{
     BODY_EDIT_DROPPED, BODY_EDIT_FORWARDED, COMMENT_DROPPED, Fixes, Live, STUCK_DETAIL, STUCK_STOP,
-    Seen, feedback_name, live_workspaces, numbered, pending_relaunch, read_progress, step_text,
-    text_stop,
+    Seen, UNREACHABLE_FOR, feedback_name, live_workspaces, numbered, pending_relaunch,
+    read_progress, step_text, text_stop,
 };
-use super::resume::{BRANCH_REFUSED, UNREACHABLE_FOR};
+use super::resume::BRANCH_REFUSED;
 use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
 use super::{
     ActionPayload, Closing, ForwardPayload, Progress, RunContext, RunError, Stop, StuckStop,
