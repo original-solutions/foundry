@@ -8,7 +8,7 @@ export interface FleetState {
   synced: boolean;
   /** Every machine the daemon serving the page hears, itself included, when its state carries it. */
   online?: string[];
-  /** The newest status believed of each project's factory, by project id, as the socket sent it. */
+  /** The last status the socket sent for each project's factory, by project id. */
   factory?: Record<string, FactoryStatus>;
 }
 

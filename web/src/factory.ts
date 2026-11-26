@@ -12,10 +12,11 @@ export function useProjectFactory(): Record<string, ProjectFactory> | undefined 
   return useContext(FactoryContext);
 }
 
-type Numeric = "poll_seconds" | "feedback_seconds" | "max_runs" | "max_gates";
+/** The settings that are whole numbers. */
+export type NumericSetting = "poll_seconds" | "feedback_seconds" | "max_runs" | "max_gates";
 
 /** The whole numbers the daemon takes for each number setting: the poll's range is the spec's, the rest are as wide as the daemon's integers. */
-export const SETTING_RANGES: Record<Numeric, { min: number; max: number }> = {
+export const SETTING_RANGES: Record<NumericSetting, { min: number; max: number }> = {
   poll_seconds: { min: 10, max: 60 },
   feedback_seconds: { min: 0, max: Number.MAX_SAFE_INTEGER },
   max_runs: { min: 0, max: 4294967295 },
@@ -24,7 +25,7 @@ export const SETTING_RANGES: Record<Numeric, { min: number; max: number }> = {
 
 /** The first thing wrong with `values`, as a message that names the field and what is allowed, or `null` when all is well. */
 export function checkSettings(values: FactorySettings): string | null {
-  for (const name of Object.keys(SETTING_RANGES) as Numeric[]) {
+  for (const name of Object.keys(SETTING_RANGES) as NumericSetting[]) {
     const { min, max } = SETTING_RANGES[name];
     const value = values[name];
     if (!Number.isInteger(value) || value < min || value > max) return `${name} must be a whole number from ${min} to ${max}`;
@@ -37,9 +38,11 @@ export function checkSettings(values: FactorySettings): string | null {
 }
 
 /** A run id taken apart, as the daemon's `RunId` parses it. */
-export interface RunParts {
+export interface Repo {
   owner: string;
   repo: string;
+}
+export interface RunParts extends Repo {
   issue: number;
   attempt: number;
 }
@@ -70,7 +73,7 @@ export function issueUrl(of: { owner: string; repo: string; issue: number }): st
 }
 
 /** The GitHub owner and repo a project's repo URL names, when it is an https one; any user or hidden password is ignored. */
-export function githubRepo(url: string): { owner: string; repo: string } | undefined {
+export function githubRepo(url: string): Repo | undefined {
   const match = /^https:\/\/(?:[^@/]*@)?github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url.trim());
   return match ? { owner: match[1], repo: match[2] } : undefined;
 }

@@ -2,18 +2,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { factoryOverview, stopRun, type FactoryStatus, type FactoryWaiting, type FinishedRun, type HeldUp, type LiveRun, type SharedSettings } from "./api";
-import { factoryKey, githubRepo, issueUrl, parseRun, projectLine } from "./factory";
+import { factoryKey, githubRepo, issueUrl, parseRun, projectLine, type Repo } from "./factory";
 import { FleetSettings } from "./FactorySettings";
 import { rows, type MachineView } from "./fleet";
 import { button, dangerButton } from "./Modal";
 
 /** How many finished runs a project shows. */
 const FINISHED_SHOWN = 20;
-
-interface Repo {
-  owner: string;
-  repo: string;
-}
 
 /** `#N`, a link to the issue when its repo is known. */
 function Issue({ number, repo }: { number: number; repo?: Repo }) {
@@ -23,11 +18,6 @@ function Issue({ number, repo }: { number: number; repo?: Repo }) {
       #{number}
     </a>
   );
-}
-
-/** The repo a run id names. */
-function repoOfRun(run: string): Repo | undefined {
-  return parseRun(run);
 }
 
 function List({ label, children }: { label: string; children: ReactNode }) {
@@ -47,7 +37,7 @@ function Waiting({ items, label, repo }: { items: FactoryWaiting[]; label: strin
     <List label={label}>
       {items.map((w) => (
         <li key={`${w.issue}:${w.run ?? ""}`}>
-          <Issue number={w.issue} repo={(w.run ? repoOfRun(w.run) : undefined) ?? repo} /> {w.title} <span className="text-neutral-500">— {w.reason}</span>
+          <Issue number={w.issue} repo={(w.run ? parseRun(w.run) : undefined) ?? repo} /> {w.title} <span className="text-neutral-500">— {w.reason}</span>
         </li>
       ))}
     </List>
@@ -183,15 +173,6 @@ function Body({ status, repo, machines, name }: { status: FactoryStatus; repo?: 
           ))}
         </List>
       )}
-      {status.foreign.length > 0 && (
-        <List label="Claimed by another factory">
-          {status.foreign.map((claim) => (
-            <li key={claim.issue}>
-              <Issue number={claim.issue} repo={repo} /> {claim.title} <span className="text-neutral-500">— {claim.state}</span>
-            </li>
-          ))}
-        </List>
-      )}
       {status.finished.length > 0 && (
         <List label="Finished">
           {status.finished.slice(0, FINISHED_SHOWN).map((item) => (
@@ -213,15 +194,22 @@ function Body({ status, repo, machines, name }: { status: FactoryStatus; repo?: 
  */
 export function Factory({ statuses, settings, machines }: { statuses: Record<string, FactoryStatus> | undefined; settings: SharedSettings; machines: MachineView[] }) {
   const client = useQueryClient();
-  const { data: overview, error } = useQuery({
-    queryKey: factoryKey,
-    queryFn: factoryOverview,
-  });
+  const { data: overview, error } = useQuery({ queryKey: factoryKey, queryFn: factoryOverview, retry: false });
   const seen = useRef({ statuses, seq: settings.seq });
+  const held = useRef(overview);
+  useEffect(() => {
+    held.current = overview;
+  }, [overview]);
   useEffect(() => {
     if (seen.current.statuses === statuses && seen.current.seq === settings.seq) return;
+    const seqMoved = seen.current.seq !== settings.seq;
     seen.current = { statuses, seq: settings.seq };
-    void client.invalidateQueries({ queryKey: factoryKey });
+    // A status only makes the overview's writer stale when it holds, or holds at another generation, than the status the overview has.
+    const writerStale = Object.values(statuses ?? {}).some((s) => {
+      const believed = held.current?.projects.find((p) => p.id === s.project)?.status;
+      return held.current !== undefined && (!believed || believed.holds !== s.holds || believed.generation !== s.generation);
+    });
+    if (seqMoved || writerStale) void client.invalidateQueries({ queryKey: factoryKey });
   }, [client, statuses, settings.seq]);
 
   const name = (id: string) => machines.find((m) => m.id === id)?.name ?? settings.machines.find((m) => m.id === id)?.name ?? id;

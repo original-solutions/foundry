@@ -41,8 +41,8 @@ function newId(): string {
  * nothing retyped goes under the same id, so an add whose answer came too late is not made twice.
  * Each project also has its factory controls: a switch, the GitHub login it acts as and a pause,
  * as the settings last sent them (read from the factory context, so opening the dialog fetches
- * nothing); a refused change says why beside the row. Closing the dialog clears what was typed and every refusal. `onAdded` is given each new
- * project's id.
+ * nothing); a refused change says why beside the row. Closing the dialog clears what was typed and
+ * every refusal. `onAdded` is given each new project's id.
  */
 export function Projects({
   open,
