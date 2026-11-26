@@ -662,9 +662,10 @@ pub(crate) fn stage_version(
     }
 }
 
-/// Removes every stage under `versions/` whose process has exited, and every stage an older
-/// release named without a pid, so a process killed mid-stage leaves nothing for good. A stage
-/// of a live process is its own and is left alone.
+/// Removes every stage under `versions/` whose process has exited, so a process killed
+/// mid-stage leaves nothing for good. A stage of a live process is its own and is left alone,
+/// and so is one an older release named without a pid: its name says nothing of whether the
+/// process filling it is alive.
 fn sweep_stages(home: &Path) {
     let Ok(entries) = fs::read_dir(home.join("versions")) else {
         return;
@@ -674,13 +675,10 @@ fn sweep_stages(home: &Path) {
         let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(".staging-")) else {
             continue;
         };
-        let owner = rest
+        let dead = rest
             .rsplit_once('-')
-            .and_then(|(_, pid)| pid.parse::<i32>().ok());
-        let dead = match owner {
-            Some(pid) => kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH),
-            None => true,
-        };
+            .and_then(|(_, pid)| pid.parse::<i32>().ok())
+            .is_some_and(|pid| kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH));
         if dead {
             let _ = fs::remove_dir_all(entry.path());
         }
