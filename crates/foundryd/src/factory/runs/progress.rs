@@ -96,7 +96,7 @@ pub const QUESTIONS_COMMENTING: &str = "questions-commenting";
 /// The step written before the sessions of the build workspace are ended ahead of a second start
 /// of a launch that was sent and has no session recorded.
 pub const LAUNCH_ENDING_SESSIONS: &str = "launch-ending-sessions";
-/// The ledger step that says the issue text was checked again after the launch.
+/// The ledger step that says the issue text was checked again before the launch was sent.
 pub const APPROVAL_RECHECKED: &str = "approval-rechecked";
 /// The ledger step written before the reminder is sent: `result-line-reminding <k>`, `k` the ordinal of the run that ended.
 pub const RESULT_LINE_REMINDING: &str = "result-line-reminding";
@@ -310,7 +310,7 @@ pub struct Seen {
     /// The model id in a `launch-model <model>` step: the model the first launch call was decided
     /// on, when it is not the project's.
     pub launch_model: Option<String>,
-    /// The `approval-rechecked` step: the issue text was checked again after the launch.
+    /// The `approval-rechecked` step: the issue text was checked again before the launch was sent.
     pub rechecked: bool,
     /// The `approval-withdrawn` step: the approval was taken back before the session started and
     /// the run is being ended, which a later pass carries on.
