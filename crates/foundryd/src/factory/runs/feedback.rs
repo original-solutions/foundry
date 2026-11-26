@@ -3819,11 +3819,13 @@ mod tests {
             assert!(world.try_go().is_err(), "a lost lease writes nothing");
             assert!(world.decisions().is_empty());
             world.rig.guard = Box::new(HeldFor::new(3));
-            // The lease is lost after the decision, the machine and the move are recorded.
-            let first = world.try_go();
-            let _ = first;
+            // The lease is lost right after the decision is recorded: the read's step and the
+            // decision are on the ledger, the machine's step and the move are not.
+            assert!(world.try_go().is_err(), "the cut pass fails");
+            assert_eq!(world.decisions().len(), 1);
+            assert!(world.steps_of("feedback-machine").is_empty());
+            assert_eq!(world.seen().state, Some(State::PrOpen));
             world.rig.guard = Box::new(crate::factory::worker::AlwaysHeld(1));
-            let before = world.decisions().len();
             let steps = drive(&mut world);
             assert!(
                 matches!(steps.last(), Some(Ok(FeedbackStep::Started { .. }))),
@@ -3831,13 +3833,109 @@ mod tests {
             );
             assert_eq!(world.starts().len(), 1);
             assert_eq!(world.launches().len(), 2, "the build's and the round's");
-            assert!(world.decisions().len() >= before);
             assert!(
                 world
                     .decisions()
                     .iter()
                     .all(|decision| decision["items"] == json!(["review:11"]))
             );
+        }
+
+        /// What a round cut anywhere comes to once the passes go on with a good lease: one
+        /// session, started with the round's message in the round's workspace, the label
+        /// `building`.
+        fn assert_settles_to_one_session(world: &mut World, label: &str) {
+            let steps = drive(world);
+            assert_eq!(world.starts().len(), 1, "{label}: {steps:?}");
+            let Call::StartSession {
+                workspace, first, ..
+            } = world.starts().remove(0)
+            else {
+                unreachable!()
+            };
+            assert_eq!(workspace, fresh(), "{label}");
+            let decided = world.decisions().pop().expect("a decision");
+            assert_eq!(
+                first.body.as_deref(),
+                decided["message"].as_str(),
+                "{label}"
+            );
+            let names: Vec<_> = world
+                .creates()
+                .into_iter()
+                .map(|call| match call {
+                    Call::Create { request, .. } => request.name,
+                    _ => unreachable!(),
+                })
+                .collect();
+            assert!(names.iter().all(|name| name == "fac/8-1-f1"), "{label}");
+            assert_eq!(world.launches().len(), 2, "{label}");
+            assert_eq!(world.rig.sim.labels(), ["factory:building"], "{label}");
+            assert!(!round_pending(&world.events()), "{label}");
+        }
+
+        #[test]
+        fn a_pass_cut_at_any_lease_check_leaves_a_round_the_next_pass_carries_on() {
+            let mut cut_with_a_decision = 0;
+            for checks in 0..40 {
+                let mut world = healthy();
+                world.rig.guard = Box::new(HeldFor::new(checks));
+                let cut = world.try_go().is_err();
+                world.rig.guard = Box::new(crate::factory::worker::AlwaysHeld(1));
+                let label = format!("cut after {checks} checks");
+                if !world.decisions().is_empty() {
+                    // From the first decision line, a round is under way, whether or not the
+                    // move to `building` and the second decision line were written.
+                    assert!(round_pending(&world.events()), "{label}");
+                    cut_with_a_decision += usize::from(cut);
+                }
+                assert_settles_to_one_session(&mut world, &label);
+                if !cut {
+                    break;
+                }
+            }
+            assert!(cut_with_a_decision > 0, "a pass was cut after its decision");
+        }
+
+        #[test]
+        fn a_pass_cut_after_the_move_to_building_and_before_the_second_decision_leaves_the_round_pending()
+         {
+            let mut found = false;
+            for checks in 0..40 {
+                let mut world = healthy();
+                world.rig.guard = Box::new(HeldFor::new(checks));
+                let cut = world.try_go().is_err();
+                world.rig.guard = Box::new(crate::factory::worker::AlwaysHeld(1));
+                let names = world.rig.names(&world.run);
+                let ends_at_the_move = names.last().is_some_and(|name| name == "state_changed")
+                    && world.decisions().len() == 1
+                    && world.seen().state == Some(State::Building);
+                if ends_at_the_move {
+                    found = true;
+                    // The window: `Seen` holds no decision, the ledger still says a round is
+                    // under way, and the pass is to call `advance`, not `building`.
+                    assert!(
+                        crate::factory::runs::progress::pending_relaunch(&world.seen()).is_none()
+                    );
+                    assert!(round_pending(&world.events()));
+                    assert_settles_to_one_session(&mut world, "cut at the move");
+                    // The decision is written again, once.
+                    assert_eq!(world.decisions().len(), 2);
+                    break;
+                }
+                assert!(cut, "the pass finished without being cut at the move");
+            }
+            assert!(found, "no cut fell between the move and the second decision");
+        }
+
+        #[test]
+        fn a_round_that_has_launched_is_no_longer_pending() {
+            let mut world = healthy();
+            assert!(!round_pending(&world.events()));
+            assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+            assert!(round_pending(&world.events()));
+            drive(&mut world);
+            assert!(!round_pending(&world.events()));
         }
 
         #[test]
