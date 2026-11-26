@@ -2875,6 +2875,40 @@ mod tests {
                 assert!(rig.sim.writes().is_empty());
             }
 
+            const TEXT_STOP: &str = "stuck-stop {\"code\":\"text-changed-during-build\",\"stop\":{\"reason\":\"said so\"}}";
+
+            /// What finishing a begun text stop does: the move to stuck, the session ended in
+            /// `workspace` and kept, one stuck comment, with the words the stop recorded.
+            fn text_stop_finished(rig: &Rig, run: &RunId, workspace: WorkspaceId) {
+                assert_eq!(
+                    pass(rig, run),
+                    ReconcileStep::Stopped {
+                        reason: "said so".into()
+                    }
+                );
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                assert!(rig.finished(run));
+                assert_eq!(calls(rig), vec![Call::EndSessions { workspace }]);
+                assert_eq!(stuck_comments(rig), 1);
+            }
+
+            /// Pins the mutant that skips a begun shared stuck path whether or not a round is
+            /// pending: with no round at all, the stop is this step's to finish.
+            #[test]
+            fn a_text_stop_begun_with_no_feedback_round_is_finished() {
+                let (rig, run) = building_run();
+                rig.step(&run, TEXT_STOP);
+                text_stop_finished(&rig, &run, ws());
+            }
+
+            /// The same pin: a round whose session is launched is not pending.
+            #[test]
+            fn a_text_stop_begun_after_a_feedback_rounds_session_launched_is_finished() {
+                let (rig, run) = round_launched();
+                rig.step(&run, TEXT_STOP);
+                text_stop_finished(&rig, &run, fws());
+            }
+
             #[test]
             fn a_stuck_path_of_a_round_cut_after_its_move_to_stuck_is_left_to_feedback() {
                 for (code, skipped) in [
