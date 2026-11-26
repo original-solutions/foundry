@@ -6321,7 +6321,8 @@ mod tests {
     }
 
     /// #268: a turn probe that answers `Failed` without a break for longer than
-    /// [`TURN_FAILING_FOR`] decides the interruption as if the turn will not be written.
+    /// [`TURN_FAILING_FOR`] sends the run stuck for a person: no resume is spent, and nothing
+    /// more is asked of the owner, which refuses its calls the same way.
     mod a_turn_probe_that_keeps_failing {
         use std::sync::{Arc, Mutex};
 
@@ -6347,6 +6348,41 @@ mod tests {
             );
             assert!(interruptions(rig, run).is_empty());
             assert!(archive_calls(rig).is_empty());
+        }
+
+        /// The pass past the limit: the probe fails once more and the run goes stuck for a
+        /// person. No resume is spent, and the owner is asked for nothing but the probe: no
+        /// archive, no workspace, no sessions ended.
+        fn goes_stuck(rig: &Rig, run: &RunId) {
+            call_failed(rig);
+            assert_eq!(
+                pass(rig, run),
+                ResumeStep::Stuck {
+                    reason: TURN_UNREADABLE.into()
+                }
+            );
+            assert!(interruptions(rig, run).is_empty());
+            assert!(
+                rig.worker
+                    .calls()
+                    .iter()
+                    .all(|call| matches!(call, Call::Turn { .. })),
+                "{:?}",
+                rig.worker.calls()
+            );
+            assert!(rig.finished(run));
+            assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+            let stuck = rig
+                .events(run)
+                .into_iter()
+                .find(|e| e.event == "stuck")
+                .unwrap();
+            assert_eq!(stuck.cause.unwrap()["reason"], STUCK_TURN);
+            // The call's error is kept in the ledger, never in the comment.
+            assert!(stuck.data.to_string().contains("older Foundry"));
+            let comment = the_stuck_comment(rig);
+            assert!(comment.contains(TURN_UNREADABLE), "{comment}");
+            assert!(!comment.contains("older Foundry"), "{comment}");
         }
 
         fn minutes(rig: &Rig, n: u64) {
@@ -6387,19 +6423,92 @@ mod tests {
         }
 
         #[test]
-        fn a_probe_that_keeps_failing_past_the_limit_is_decided_as_never_written() {
+        fn a_probe_that_keeps_failing_past_the_limit_goes_stuck_for_a_person() {
             let (rig, run) = failed_with_turns_unasked();
             fails(&rig, &run);
             minutes(&rig, 14);
             fails(&rig, &run);
             minutes(&rig, 1);
-            call_failed(&rig);
+            goes_stuck(&rig, &run);
+            assert_eq!(rig.worker.calls(), vec![probe(1), probe(1), probe(1)]);
+            // The stuck run is not carried on: a later pass asks nothing.
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(rig.worker.calls().len(), 3);
+        }
+
+        #[test]
+        fn a_probe_short_of_the_limit_is_still_an_error() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 14);
+            fails(&rig, &run);
+            assert!(!rig.finished(&run));
+            assert!(rig.sim.comments().is_empty());
+        }
+
+        #[test]
+        fn a_never_written_answer_clears_the_record() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            never_written(&rig);
             pass_one(&rig, &run);
-            assert_eq!(interruptions(&rig, &run).len(), 1);
+            assert_eq!(records(&rig, &run), [failing(1, 1, 0), answered(1)]);
+        }
+
+        #[test]
+        fn the_fleet_showing_the_session_unreachable_breaks_the_failures() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            // The owner drops off the fleet for a minute: its session shows unreachable and
+            // the turn is not asked for.
+            rig.view = fleet(Some(SessionState::Unreachable))
+                .unreachable(m1(), secs(60))
+                .build();
+            let _ = advance(&rig.ctx(), &run);
+            assert_eq!(rig.worker.calls(), vec![probe(1)]);
+            assert_eq!(records(&rig, &run), [failing(1, 1, 0), answered(1)]);
+            // Back with the session failed: the count starts again from the next failure.
+            rig.view = failed();
+            minutes(&rig, 10);
+            fails(&rig, &run);
             assert_eq!(
-                rig.worker.calls(),
-                vec![probe(1), probe(1), probe(1), archived_call()]
+                records(&rig, &run),
+                [failing(1, 1, 0), answered(1), failing(1, 1, 1_200_000)]
             );
+        }
+
+        #[test]
+        fn a_failure_recorded_for_another_session_does_not_count() {
+            let (rig, run) = failed_with_turns_unasked();
+            let other = format!("{TURN_FAILING}{} 1 1 0", resumed_session());
+            rig.step(&run, &other);
+            minutes(&rig, 20);
+            fails(&rig, &run);
+            assert_eq!(records(&rig, &run), [other, failing(1, 1, 1_200_000)]);
+            assert!(!rig.finished(&run));
+        }
+
+        #[test]
+        fn a_stuck_path_cut_short_is_finished_asking_the_owner_nothing() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 15);
+            call_failed(&rig);
+            rig.sim.fail("could not finish this issue", 1);
+            assert!(advance(&rig.ctx(), &run).is_err());
+            assert!(!rig.finished(&run));
+            // The next pass finishes the path from the ledger, without asking the turn again.
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Stuck {
+                    reason: TURN_UNREADABLE.into()
+                }
+            );
+            assert!(rig.finished(&run));
+            assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+            assert_eq!(rig.worker.calls(), vec![probe(1), probe(1)]);
         }
 
         #[test]
@@ -6422,8 +6531,7 @@ mod tests {
             minutes(&rig, 14);
             fails(&rig, &run);
             minutes(&rig, 1);
-            call_failed(&rig);
-            pass_one(&rig, &run);
+            goes_stuck(&rig, &run);
         }
 
         #[test]
@@ -6467,8 +6575,7 @@ mod tests {
             minutes(&rig, 4);
             fails(&rig, &run);
             minutes(&rig, 1);
-            call_failed(&rig);
-            pass_one(&rig, &run);
+            goes_stuck(&rig, &run);
         }
 
         #[test]
@@ -6487,8 +6594,7 @@ mod tests {
             minutes(&rig, 14);
             fails(&rig, &run);
             minutes(&rig, 1);
-            call_failed(&rig);
-            pass_one(&rig, &run);
+            goes_stuck(&rig, &run);
         }
 
         #[test]
@@ -6505,8 +6611,7 @@ mod tests {
                 [failing(1, 1, 1_800_000), failing(1, 1, 300_000)]
             );
             minutes(&rig, 15);
-            call_failed(&rig);
-            pass_one(&rig, &run);
+            goes_stuck(&rig, &run);
         }
 
         #[test]
