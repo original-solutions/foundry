@@ -238,7 +238,7 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
         });
     }
     if at.state == State::Triage {
-        // `start` looks at the issue text again after the launch. A launch it has not done that
+        // `start` looks at the issue text again before the launch is sent. A launch it has not done that
         // for is left to it, so this cannot give the run its `building` label around the check.
         if !seen.rechecked {
             return Ok(BuildStep::Running);

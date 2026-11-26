@@ -1,7 +1,8 @@
 //! The command line: `--version` works, `join` names a bad port, `secret set` stores a gateway
-//! key or a GitHub token without printing it, `github default` stores a login, and
-//! `factory export` writes the runner's own run file back byte for byte. Every test that runs
-//! the binary uses a temporary data directory and skips the copy from the login keychain.
+//! key or a GitHub token without printing it, `github default` stores a login, `factory export`
+//! writes the runner's own run file back byte for byte, and `docs/install.md` runs only commands
+//! `foundryd --help` lists. Every test that runs the binary uses a temporary data directory and
+//! skips the copy from the login keychain.
 
 // A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would move
 // secrets out of the login keychain.
@@ -525,4 +526,99 @@ fn github_default_with_a_40_character_token_exits_1_and_does_not_print_it() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!printed.contains(token), "printed: {printed}");
+}
+
+/// The commands `foundryd <args> --help` lists, `help` among them; none for a command that has
+/// no subcommands.
+fn listed_commands(args: &[&str]) -> Vec<String> {
+    let mut args = args.to_vec();
+    args.push("--help");
+    let out = foundryd(&args);
+    assert!(out.status.success(), "{args:?}: {:?}", out.status);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip_while(|line| *line != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+        .collect()
+}
+
+/// The text of every code span and code block of the Markdown `doc`.
+fn code_of(doc: &str) -> Vec<&str> {
+    doc.split("```")
+        .enumerate()
+        .flat_map(|(n, part)| {
+            if n % 2 == 1 {
+                vec![part]
+            } else {
+                part.split('`').skip(1).step_by(2).collect()
+            }
+        })
+        .collect()
+}
+
+/// Each `foundryd` command the code of `doc` runs, as the words after the binary's name: at
+/// most two, each starting with a letter, so a flag, a placeholder or an argument such as an
+/// address ends it. A binary is named `foundryd` or by a path ending in it.
+fn named_commands(doc: &str) -> Vec<Vec<String>> {
+    let mut named = Vec::new();
+    for line in code_of(doc).into_iter().flat_map(str::lines) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        for (at, word) in words.iter().enumerate() {
+            if *word != "foundryd" && !word.ends_with("/foundryd") {
+                continue;
+            }
+            let command: Vec<String> = words[at + 1..]
+                .iter()
+                .take(2)
+                .take_while(|word| word.starts_with(|c: char| c.is_ascii_alphabetic()))
+                .map(|word| (*word).to_owned())
+                .collect();
+            if !command.is_empty() {
+                named.push(command);
+            }
+        }
+    }
+    named
+}
+
+#[test]
+fn install_doc_names_only_commands_foundryd_help_lists() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/install.md"),
+    )
+    .unwrap();
+    // The commands a machine is set up for the factory with, and the export `retro` reads.
+    let code = code_of(&doc).join("\n");
+    for command in [
+        "foundryd secret set github:<login>",
+        "foundryd github default <login>",
+        "foundryd factory export",
+    ] {
+        assert!(
+            code.contains(command),
+            "docs/install.md never runs `{command}`"
+        );
+    }
+
+    let named = named_commands(&doc);
+
+    let top = listed_commands(&[]);
+    for words in &named {
+        let command = &words[0];
+        assert!(
+            top.contains(command),
+            "docs/install.md runs `foundryd {}`, which `foundryd --help` does not list: {top:?}",
+            words.join(" ")
+        );
+        let under = listed_commands(&[command]);
+        if let (false, Some(sub)) = (under.is_empty(), words.get(1)) {
+            assert!(
+                under.contains(sub),
+                "docs/install.md runs `foundryd {command} {sub}`, which `foundryd {command} \
+                 --help` does not list: {under:?}"
+            );
+        }
+    }
 }
