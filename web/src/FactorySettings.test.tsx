@@ -73,6 +73,24 @@ describe("FleetSettings", () => {
     expect((screen.getByLabelText("Effort") as HTMLInputElement).value).toBe("low");
   });
 
+  it("lets the fields not being edited follow new settings, so a save sends them as they now are", async () => {
+    let set: (s: FactorySettings) => void = () => {};
+    function Harness() {
+      const [s, setS] = useState(current);
+      set = setS;
+      return <FleetSettings settings={s} />;
+    }
+    const calls = mockFetch(json(200, { settings: { ...current, model: "sonnet", max_runs: 4 } }));
+    await renderApp(<Harness />);
+    type("Max runs", "4");
+    act(() => set({ ...current, model: "sonnet", max_runs: 3 }));
+    expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("sonnet");
+    expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("4");
+    save();
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0].body).toEqual({ ...current, model: "sonnet", max_runs: 4 });
+  });
+
   it("is clean again after a save, whatever way a number was typed", async () => {
     let set: (s: FactorySettings) => void = () => {};
     function Harness() {

@@ -240,10 +240,22 @@ describe("Projects", () => {
     expect(calls[0]).toEqual({ url: "/api/projects/p1/factory", method: "POST", body: { on: true, paused: true, login: "bot" } });
   });
 
-  it("shows the factory controls with their defaults when nothing provides the settings, and fetches nothing on open", async () => {
+  it("offers no factory controls before the settings arrive, so nothing is sent from a guess, and fetches nothing on open", async () => {
     const calls = mockFetch();
     await show();
-    expect(within(row("demo")).getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("false");
+    expect(within(row("demo")).queryByRole("switch", { name: "Factory for demo" })).toBeNull();
+    expect(within(row("demo")).queryByLabelText("Pause claims for demo")).toBeNull();
+    expect(within(row("demo")).getByText(/factory setting shows once the daemon's settings arrive/i)).toBeDefined();
     expect(calls).toHaveLength(0);
+  });
+
+  it("shows a project the settings hold no factory setting for as off, once they arrive", async () => {
+    mockFetch();
+    await renderApp(
+      <FactoryContext.Provider value={{}}>
+        <Projects open onOpenChange={() => {}} projects={projects} onAdded={() => {}} />
+      </FactoryContext.Provider>,
+    );
+    expect(within(row("demo")).getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("false");
   });
 });

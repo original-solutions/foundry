@@ -44,7 +44,7 @@ function newId(): string {
  * nothing retyped goes under the same id, so an add whose answer came too late is not made twice.
  * Each project also has its factory controls: a switch, the GitHub login it acts as and a pause,
  * as the settings last sent them (read from the factory context, so opening the dialog fetches
- * nothing); a refused change says why beside the row. Closing the dialog clears what was typed and
+ * nothing), and only once the settings have arrived; a refused change says why beside the row. Closing the dialog clears what was typed and
  * every refusal. `onAdded` is given each new project's id.
  */
 export function Projects({
@@ -147,7 +147,12 @@ export function Projects({
                   </button>
                 )}
               </div>
-              <ProjectFactoryControls project={p} factory={factories?.[p.id] ?? FACTORY_OFF} />
+              {factories ? (
+                <ProjectFactoryControls project={p} factory={factories[p.id] ?? FACTORY_OFF} />
+              ) : (
+                // Before the settings arrive the factory setting is unknown: a change built from a guess would overwrite it.
+                <p className="mt-2 text-xs text-neutral-500">The factory setting shows once the daemon&apos;s settings arrive.</p>
+              )}
               {remove.isError && remove.variables === p.id && (
                 <p role="alert" className="mt-1 text-xs text-red-400">
                   {remove.error.message}

@@ -445,7 +445,8 @@ export async function factoryOverview(): Promise<FactoryOverview> {
 export async function stopRun(run: string): Promise<string> {
   const { status, json } = await post(`/api/factory/runs/${encodeURIComponent(run)}/stop`);
   if (status !== 200) throw refused(status, json);
-  return typeof json.message === "string" ? json.message : "Stop recorded.";
+  // A stop made before the secret store stopped being readable is answered with its strings hidden.
+  return typeof json.message === "string" && json.message !== HIDDEN ? json.message : "Stop recorded.";
 }
 
 /** Saves the fleet's factory settings, every field; the settings as the daemon holds them. */

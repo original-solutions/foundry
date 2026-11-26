@@ -18,6 +18,13 @@ function texts(s: FactorySettings) {
 }
 type Texts = ReturnType<typeof texts>;
 
+/** `kept` with each field `follows` picks taken from `next`. */
+function following<T extends object>(kept: T, next: T, follows: (key: keyof T) => boolean): T {
+  const out = { ...kept };
+  for (const key of Object.keys(next) as (keyof T)[]) if (follows(key)) out[key] = next[key];
+  return out;
+}
+
 /** A number as typed; blank or not a number is `NaN`, which the check refuses. */
 const num = (text: string) => (text.trim() === "" ? NaN : Number(text));
 
@@ -25,8 +32,8 @@ const num = (text: string) => (text.trim() === "" ? NaN : Number(text));
  * The fleet's factory settings as a form: pause claims, the model and effort a run's session
  * starts with, how many runs and gates at once, and how often it polls and waits for feedback.
  * Save checks every field against its allowed range first, and says what is wrong in the form
- * without sending; the daemon's own refusal shows there too. The fields follow `settings` as they
- * change, until something is typed.
+ * without sending; the daemon's own refusal shows there too. Each field follows `settings` as they
+ * change, until something is typed in it.
  */
 export function FleetSettings({ settings }: { settings: FactorySettings }) {
   const client = useQueryClient();
@@ -35,12 +42,14 @@ export function FleetSettings({ settings }: { settings: FactorySettings }) {
   const [seen, setSeen] = useState(settings);
   const [clean, setClean] = useState(settings);
   const [problem, setProblem] = useState<string | null>(null);
-  // Settings that changed under an untouched form are shown; under a form being edited they wait.
+  // Settings that changed are shown in every field not being edited, so a save sends those as they
+  // now are; a field being edited keeps what was typed.
   if (JSON.stringify(seen) !== JSON.stringify(settings)) {
-    if (JSON.stringify(values) === JSON.stringify(texts(clean))) {
-      setValues(texts(settings));
-      setClean(settings);
-    }
+    const was = texts(clean);
+    const now = texts(settings);
+    const follows = (key: keyof Texts) => values[key] === was[key] || values[key] === now[key];
+    setValues(following(values, now, follows));
+    setClean(following(clean, settings, follows));
     setSeen(settings);
   }
 

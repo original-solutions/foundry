@@ -11,6 +11,9 @@ import { json, mockFetch, renderApp } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
 
+/** What the daemon puts in place of each string of an answer when its secret store cannot be read (`secrets::HIDDEN_UNREADABLE`). */
+const HIDDEN = "[hidden: the secret store could not be read]";
+
 const RUN = "acme__foundry__12__1";
 const fleetSettings: FactorySettings = { paused: false, poll_seconds: 30, feedback_seconds: 300, max_runs: 2, max_gates: 3, model: "opus", effort: "high" };
 
@@ -150,6 +153,19 @@ describe("Factory", () => {
     const live = status({ runs: [{ run: RUN, title: "t", step: "s", machine: OTHER, gate_retries_used: 0, minutes_used: 0, workspaces: ["gone"], sessions: [] }] });
     const { project } = await show(overview({ status: live }), { p1: live });
     expect(within(project).getByText("workspace not here yet")).toBeDefined();
+  });
+
+  it("links a run with no session of its own to the first terminal its workspace lists", async () => {
+    const live = status({ runs: [{ run: RUN, title: "t", step: "s", machine: ME, gate_retries_used: 0, minutes_used: 0, workspaces: ["w1"], sessions: [] }] });
+    const { project } = await show(overview({ status: live }), { p1: live });
+    expect(within(project).getByRole("link", { name: "fac/12-1" }).getAttribute("href")).toBe("/terminals/t2");
+  });
+
+  it("names a run's workspace that has no terminal, without a link", async () => {
+    const live = status({ runs: [{ run: RUN, title: "t", step: "s", machine: ME, gate_retries_used: 0, minutes_used: 0, workspaces: ["w0"], sessions: [] }] });
+    const { project } = await show(overview({ status: live }), { p1: live });
+    expect(within(project).getByText("fac/12-0")).toBeDefined();
+    expect(within(project).queryByRole("link", { name: "fac/12-0" })).toBeNull();
   });
 
   it("shows an off factory, a project with no status, and each reason a holder is idle", async () => {
@@ -312,6 +328,28 @@ describe("Factory", () => {
       await waitFor(() => expect(stops(calls)).toHaveLength(1));
       expect(stops(calls)[0]).toMatchObject({ url: `/api/factory/runs/${encodeURIComponent(RUN)}/stop`, method: "POST" });
       expect(await within(project).findByText("Stop recorded for #12.")).toBeDefined();
+    });
+
+    it("sends once when Stop the run is pressed twice before the answer", async () => {
+      let answer: (r: Response) => void = () => {};
+      const later = new Promise<Response>((resolve) => (answer = resolve));
+      const { calls, project } = await show(overview({ status: live }), { p1: live }, [later as unknown as Response]);
+      fireEvent.click(within(project).getByRole("button", { name: "Stop #12" }));
+      const confirm = within(project).getByRole("button", { name: "Stop the run" });
+      fireEvent.click(confirm);
+      await waitFor(() => expect(stops(calls)).toHaveLength(1));
+      fireEvent.click(confirm);
+      await act(async () => answer(json(200, { stopped: true, already: false, message: "Stop recorded for #12." })));
+      expect(await within(project).findByText("Stop recorded for #12.")).toBeDefined();
+      expect(stops(calls)).toHaveLength(1);
+    });
+
+    it("says the stop was recorded, never the daemon's placeholder, when its answer could not be read", async () => {
+      const { project } = await show(overview({ status: live }), { p1: live }, [json(200, { stopped: true, already: false, message: HIDDEN })]);
+      fireEvent.click(within(project).getByRole("button", { name: "Stop #12" }));
+      fireEvent.click(within(project).getByRole("button", { name: "Stop the run" }));
+      expect(await within(project).findByText("Stop recorded.")).toBeDefined();
+      expect(within(project).queryByText(HIDDEN)).toBeNull();
     });
 
     it("shows the daemon's refusal", async () => {
