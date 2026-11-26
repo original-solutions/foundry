@@ -240,6 +240,9 @@ pub struct Memo {
     swept: Option<Duration>,
     /// A due sweep began and has not gone through every run: the next pass is its one retry.
     sweep_unfinished: bool,
+    /// The run whose reconcile ended the last sweep part way: the next sweep goes on from the
+    /// run after it, so a run that always fails does not keep the runs after it unswept.
+    sweep_after: Option<RunId>,
     /// The runs seen finished, by run id: a finished run's summary never changes, so its
     /// events are read once. `None` for one this build cannot show.
     finished: BTreeMap<RunId, Option<Done>>,
@@ -1462,17 +1465,21 @@ impl<'a, 'w> Pass<'a, 'w> {
             .unwrap_or_else(PoisonError::into_inner)
             .runs_of(&repo)?;
         let mut owed = false;
+        let after = self.memo.sweep_after.clone();
         for run in runs {
+            // A sweep that ended part way goes on from the run after the one it stopped at.
+            let in_sweep = sweep_due && after.as_ref().is_none_or(|after| run > *after);
             // A run finished is known by the memo, or asked of the store with no row read.
             // The pass reads a run's events itself only for its orphans: the reconcile reads
             // them for its own sake.
-            let finished = self.memo.finished.contains_key(&run)
-                || world
-                    .store
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .run_has_event(&run, names::FINISHED)?;
-            if sweep_due && finished {
+            let finished = in_sweep
+                && (self.memo.finished.contains_key(&run)
+                    || world
+                        .store
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .run_has_event(&run, names::FINISHED)?);
+            if finished {
                 let ctx = self.ctx(self.config);
                 match stop::reconcile(&ctx, &run) {
                     Ok(ReconcileStep::Archived { workspaces }) => {
@@ -1485,6 +1492,8 @@ impl<'a, 'w> Pass<'a, 'w> {
                         self.note(&run, UNREADABLE_SWEPT);
                     }
                     Err(error) => {
+                        // Should the error end the pass, the next sweep goes on after this run.
+                        self.memo.sweep_after = Some(run.clone());
                         let said = ending(error)?;
                         self.note(&run, said);
                     }
@@ -1526,6 +1535,7 @@ impl<'a, 'w> Pass<'a, 'w> {
         if sweep_due {
             self.memo.swept = Some(now);
             self.memo.sweep_unfinished = false;
+            self.memo.sweep_after = None;
         }
         if heard_again {
             self.memo.orphans_owed = owed;
