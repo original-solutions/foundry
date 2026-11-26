@@ -126,13 +126,18 @@ export function FleetSettings({ settings }: { settings: FactorySettings }) {
 export function ProjectFactoryControls({ project, factory }: { project: Project; factory: ProjectFactory }) {
   const client = useQueryClient();
   const [typed, setTyped] = useState<string>();
-  /** What the daemon answered to the last accepted change, with the props it was sent against; dropped once the props are another object. */
-  const [sent, setSent] = useState<{ value: ProjectFactory; base: ProjectFactory }>();
-  if (sent && sent.base !== factory) setSent(undefined);
+  /**
+   * What the daemon answered to the last accepted change, with the setting the props held when it
+   * was sent: dropped once the props hold another setting. Settings that have not caught up yet
+   * come as a new object holding the same setting, so they are compared by content.
+   */
+  const [sent, setSent] = useState<{ value: ProjectFactory; base: string }>();
+  const now = JSON.stringify(factory);
+  if (sent && sent.base !== now) setSent(undefined);
   const held = sent?.value ?? factory;
   const shown = typed ?? held.login;
   const send = useMutation({
-    mutationFn: ({ next }: { next: { on: boolean; paused: boolean; login: string | null }; base: ProjectFactory; login: boolean }) => setProjectFactory(project.id, next),
+    mutationFn: ({ next }: { next: { on: boolean; paused: boolean; login: string | null }; base: string; login: boolean }) => setProjectFactory(project.id, next),
     onSuccess: (answer, { base, login }) => {
       // Typing is cleared when it was what was saved, or the daemon now holds it; unsent typing stays.
       setTyped((t) => (login || t?.trim() === answer.login ? undefined : t));
@@ -142,7 +147,7 @@ export function ProjectFactoryControls({ project, factory }: { project: Project;
   });
   const change = (edit: Partial<ProjectFactory>, login = false) => {
     const next = { on: held.on, paused: held.paused, login: held.login, ...edit };
-    send.mutate({ next: { on: next.on, paused: next.paused, login: next.login.trim() === "" ? null : next.login.trim() }, base: factory, login });
+    send.mutate({ next: { on: next.on, paused: next.paused, login: next.login.trim() === "" ? null : next.login.trim() }, base: now, login });
   };
 
   return (

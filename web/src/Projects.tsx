@@ -5,7 +5,7 @@ import { useProjectFactory } from "./factory";
 import { ProjectFactoryControls } from "./FactorySettings";
 import { button, dangerButton, field, Modal, primaryButton } from "./Modal";
 
-/** A project with no factory setting: off. One object, so a control keeping what it sent is not told its props changed. */
+/** A project with no factory setting: off. */
 const FACTORY_OFF = { on: false, login: "", paused: false };
 
 /**
