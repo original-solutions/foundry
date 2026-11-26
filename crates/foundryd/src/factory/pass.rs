@@ -3565,6 +3565,265 @@ mod tests {
         }
     }
 
+    mod review_cycle_4_coverage {
+        use super::*;
+
+        /// A step line written to `run`'s ledger.
+        fn step(rig: &Rig, run: &RunId, text: &str) {
+            rig.ledger
+                .write(
+                    run,
+                    &Event::StepChanged { step: text.into() },
+                    &Cause::new(CauseStep::Start, "test"),
+                )
+                .unwrap();
+        }
+
+        /// The line the pass reported for `run`.
+        fn said(report: &PassReport, run: &RunId) -> Vec<String> {
+            report
+                .runs
+                .iter()
+                .filter(|(r, _)| r == run)
+                .map(|(_, said)| said.clone())
+                .collect()
+        }
+
+        #[test]
+        fn an_unfinished_stuck_run_is_reconciled_on_every_pass_before_the_stuck_sweep_is_due() {
+            let mut rig = Rig::new();
+            // A person moved the issue out of `factory:stuck`, and the path that took the run
+            // there was cut short: its decision is in the ledger and its own code finishes it.
+            rig.hub.issue(5, &["factory:building"]);
+            rig.hub.edit(5, |i| i.assignees = vec![LOGIN.into()]);
+            let run = rig.run_in(5, 1, State::Stuck);
+            step(
+                &rig,
+                &run,
+                "stuck-stop {\"code\":\"label-removed\",\"stop\":{\"reason\":\"a person moved it\"}}",
+            );
+            // The fake clock is at zero: STUCK_READ_EVERY has not passed since anything.
+            let report = rig.pass();
+            let lines = said(&report, &run);
+            assert!(
+                lines.iter().any(|l| l.starts_with("reconcile: Stopped")),
+                "{report:?}"
+            );
+        }
+
+        #[test]
+        fn a_triage_issue_that_start_fails_on_is_noted_against_its_run_and_the_pass_goes_on() {
+            let mut rig = Rig::new();
+            let run = RunId::new(REPO, 5, 1).unwrap();
+            rig.hub.issue(5, &["factory:triage"]);
+            rig.hub.edit(5, |i| i.assignees = vec![LOGIN.into()]);
+            rig.hub.comment_as(
+                5,
+                LOGIN,
+                &crate::factory::github::claim_comment(&run, &builder_machine()),
+            );
+            rig.hub.ready(6);
+            rig.worker
+                .inner
+                .on_create(Err(WorkerError::Failed("the worker broke".into())));
+            let report = rig.pass();
+            assert!(
+                report
+                    .runs
+                    .iter()
+                    .any(|(r, said)| *r == run && said.contains("the worker broke")),
+                "{report:?}"
+            );
+            // The error is the run's: the pass is not failed, goes on to the claims and holds.
+            assert!(report.failed.is_none(), "{report:?}");
+            assert!(rig.status().holds);
+            assert_eq!(rig.claimed_issues(), vec![6]);
+        }
+
+        /// GitHub as a feedback round reads it: the hub, with one review on the pull request.
+        struct Reviewed(Arc<Hub>);
+
+        impl crate::factory::github::Tracker for Reviewed {
+            fn gh(&self, args: &[String]) -> Result<String, crate::factory::github::TrackerError> {
+                // The hub does not know a pull request's draft toggle: it is taken as made.
+                if args.first().map(String::as_str) == Some("pr")
+                    && args.get(1).map(String::as_str) == Some("ready")
+                {
+                    return Ok(String::new());
+                }
+                self.0.gh(args)
+            }
+
+            fn pr_feedback(
+                &self,
+                _repo: &str,
+                _pr: u64,
+                _since: &str,
+                _floor: &str,
+                _instructors: &[String],
+            ) -> Result<
+                Vec<crate::factory::github::read::Feedback>,
+                crate::factory::github::TrackerError,
+            > {
+                use crate::factory::github::read::{Feedback, FeedbackKind};
+                Ok(vec![Feedback {
+                    id: "review:11".into(),
+                    author: "tom".into(),
+                    kind: FeedbackKind::Review {
+                        state: "CHANGES_REQUESTED".into(),
+                    },
+                    created_at: "2026-10-04T11:00:00Z".into(),
+                    body: "Please rename it.".into(),
+                    inline: vec![],
+                    inline_unread: 0,
+                }])
+            }
+
+            fn activity_since(
+                &self,
+                _repo: &str,
+                _issue: u64,
+                _since: &str,
+                _instructors: &[String],
+            ) -> Result<crate::factory::github::read::Activity, crate::factory::github::TrackerError>
+            {
+                Ok(crate::factory::github::read::Activity {
+                    comments: vec![],
+                    body_edit: None,
+                    dropped: vec![],
+                })
+            }
+        }
+
+        /// Issue `issue` has its run in `pr-open` with pull request 12, as the gate leaves it,
+        /// and an instructor's review is on the pull request.
+        fn reviewed_pr_open(rig: &mut Rig, issue: u64) -> RunId {
+            let run = RunId::new(REPO, issue, 1).unwrap();
+            let write = |event: Event| {
+                rig.ledger
+                    .write(&run, &event, &Cause::new(CauseStep::Start, "test"))
+                    .unwrap();
+            };
+            let note = |text: &str| write(Event::StepChanged { step: text.into() });
+            let moved = |from, to| write(Event::StateChanged { from, to });
+            note(&format!("approved {LABELED_AT}"));
+            write(Event::Claimed {
+                machine: builder_machine().to_string(),
+                github_user: LOGIN.into(),
+            });
+            moved(State::Ready, State::Triage);
+            note("launch-model opus");
+            note(&format!("workspace-requested fac/{issue}-1"));
+            let old = uuid::Uuid::from_u128(0xa0);
+            note(&format!("workspace-created {old}"));
+            note("approval-rechecked");
+            write(Event::SessionLaunched {
+                thread_id: uuid::Uuid::from_u128(0x5e5).to_string(),
+                worktree: Some(old.to_string()),
+                branch: Some(format!("fac/{issue}-1")),
+                model_instance: None,
+                model: Some("opus".into()),
+                model_options: None,
+                resumed_from: None,
+                base: Some("main".into()),
+                title: Some("Make it faster".into()),
+            });
+            moved(State::Triage, State::Building);
+            write(Event::PrOpened {
+                pr: 12,
+                url: "https://github.com/rawphp/softfac/pull/12".into(),
+            });
+            write(Event::GateCommand {
+                attempt: 1,
+                command: "cargo test".into(),
+                exit_code: 0,
+                duration_ms: 1000,
+            });
+            note(&format!("gate-passed {SHA} 1"));
+            for text in [
+                "build-session-ended",
+                "build-archiving",
+                "build-archived",
+                "gate-results-posted",
+            ] {
+                note(text);
+            }
+            moved(State::Building, State::PrOpen);
+            rig.hub.issue(issue, &["factory:pr-open"]);
+            rig.hub.edit(issue, |i| i.assignees = vec![LOGIN.into()]);
+            rig.hub.lock().pulls.insert(12, format!("fac/{issue}-1"));
+            run
+        }
+
+        impl crate::factory::github::Commenting for Reviewed {
+            fn hide(&self, text: &str) -> String {
+                text.to_owned()
+            }
+        }
+
+        /// [`Rig::pass`] with the review of [`Reviewed`] on the pull request.
+        fn pass_reviewed(rig: &mut Rig) -> PassReport {
+            let tracker = Reviewed(rig.hub.clone());
+            let world = World {
+                project: &rig.project,
+                lease: &rig.lease,
+                guard: rig.guard.as_ref(),
+                tracker: &tracker,
+                worker: &rig.worker,
+                view: &rig.view,
+                ledger: &rig.ledger,
+                store: &rig.store,
+                me: me(),
+                shared: &rig.shared,
+                book: &rig.book,
+                clock: &rig.clock,
+            };
+            run(&world, &mut rig.memo)
+        }
+
+        #[test]
+        fn a_round_that_is_due_takes_the_last_slot_before_a_ready_issue_is_claimed() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            let run = reviewed_pr_open(&mut rig, 8);
+            rig.hub.ready(5);
+            let report = pass_reviewed(&mut rig);
+            assert!(
+                said(&report, &run)
+                    .iter()
+                    .any(|l| l.starts_with("feedback: Decided")),
+                "the round starts: {report:?}"
+            );
+            assert!(rig.claimed_issues().is_empty(), "{report:?}");
+            assert_eq!(waiting_reason(&report, 5).as_deref(), Some(NO_SLOT));
+        }
+
+        #[test]
+        fn a_round_under_way_takes_no_run_slot_while_it_is_carried_on() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 2);
+            let run = reviewed_pr_open(&mut rig, 8);
+            let first = pass_reviewed(&mut rig);
+            assert!(
+                said(&first, &run)
+                    .iter()
+                    .any(|l| l.starts_with("feedback: Decided")),
+                "the round is decided: {first:?}"
+            );
+            // The round holds one of the two slots and is carried on; the other is free for
+            // the claim, which a second slot taken for the round would have refused.
+            rig.hub.ready(5);
+            let second = pass_reviewed(&mut rig);
+            assert!(
+                said(&second, &run)
+                    .iter()
+                    .any(|l| l.starts_with("feedback: Preparing")),
+                "{second:?}"
+            );
+            assert_eq!(rig.claimed_issues(), vec![5], "{second:?}");
+        }
+    }
+
     mod the_book {
         use super::*;
 
