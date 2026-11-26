@@ -1672,6 +1672,7 @@ mod tests {
         fn a_stop_after_a_resume_started_ending_its_sessions_ends_them_again() {
             let (rig, run) = resume_being_set_up(&[
                 format!("resume-workspace 1 {RESUME_WS}"),
+                "resume-sending 1".into(),
                 "resume-ending-sessions 1".into(),
             ]);
             assert!(matches!(pass(&rig, &run), StopStep::Stuck { .. }));
@@ -1681,6 +1682,50 @@ mod tests {
                     workspace: resume_ws()
                 }]
             );
+        }
+
+        #[test]
+        fn a_stop_after_a_resume_workspace_and_before_its_start_ends_nothing() {
+            let (rig, run) = resume_being_set_up(&[
+                "resume-requested 1 fac/8-1-r1".into(),
+                format!("resume-workspace 1 {RESUME_WS}"),
+            ]);
+            assert!(matches!(pass(&rig, &run), StopStep::Stuck { .. }));
+            assert!(calls(&rig).is_empty(), "{:?}", calls(&rig));
+            assert!(rig.finished(&run));
+        }
+
+        #[test]
+        fn a_machine_given_up_after_a_resume_workspace_is_not_the_stops_target() {
+            let (rig, run) = resume_being_set_up(&[
+                "resume-requested 1 fac/8-1-r1".into(),
+                format!("resume-workspace 1 {RESUME_WS}"),
+                "resume-sending 1".into(),
+                format!("resume-machine-given-up 1 {RESUME_WS}"),
+            ]);
+            assert!(matches!(pass(&rig, &run), StopStep::Stuck { .. }));
+            assert_eq!(calls(&rig), vec![Call::EndSessions { workspace: ws() }]);
+        }
+
+        #[test]
+        fn a_rate_limited_interruption_after_an_older_resume_does_not_aim_the_stop_at_its_workspace()
+         {
+            let (rig, run) = resume_being_set_up(&[
+                "resume-requested 1 fac/8-1-r1".into(),
+                format!("resume-workspace 1 {RESUME_WS}"),
+                "resume-sending 1".into(),
+            ]);
+            rig.write(
+                &run,
+                Event::SessionRateLimited {
+                    run_ordinal: 2,
+                    branch: None,
+                    resumes: 1,
+                    model: None,
+                },
+            );
+            assert!(matches!(pass(&rig, &run), StopStep::Stuck { .. }));
+            assert_eq!(calls(&rig), vec![Call::EndSessions { workspace: ws() }]);
         }
 
         #[test]
