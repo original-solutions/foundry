@@ -1447,6 +1447,87 @@ mod tests {
                 == &serde_json::json!({"step": "advance", "reason": "stop-requested"})));
         }
 
+        const ROUND_WS: &str = "00000000-0000-0000-0000-000000000f11";
+
+        fn round_ws() -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(0xf11))
+        }
+
+        /// A run the gate passed and a feedback round took back to `building`: decided and not
+        /// launched, the build's workspace archived and a stop asked for. `steps` are what the
+        /// round recorded of its set-up.
+        fn round_being_set_up(steps: &[String]) -> (Rig, RunId) {
+            let (mut rig, run) = (Rig::new(), run_id(1));
+            built(&mut rig, &run);
+            rig.write(
+                &run,
+                Event::PrOpened {
+                    pr: 12,
+                    url: "https://github.com/rawphp/softfac/pull/12".into(),
+                },
+            );
+            rig.moved(&run, State::Building, State::PrOpen);
+            let decision = Event::FeedbackRelaunching {
+                n: 1,
+                branch: BRANCH.into(),
+                items: vec!["review:11".into()],
+                message: "Please rename it.".into(),
+            };
+            rig.write(&run, decision.clone());
+            rig.moved(&run, State::PrOpen, State::Building);
+            rig.write(&run, decision);
+            for step in steps {
+                rig.step(&run, step);
+            }
+            rig.write(&run, stop_line());
+            rig.sim.set_labels(&["factory:building"]);
+            rig.sim.set_assignees(&[LOGIN]);
+            // The build's workspace is archived; the round's shows once it was made.
+            let mut view = FleetView::builder().online(rig.machine);
+            if steps.iter().any(|step| step.starts_with("feedback-workspace")) {
+                view = view.workspace(workspace_record(rig.machine, round_ws(), "fac/8-1-f1"));
+            }
+            rig.view = view.build();
+            (rig, run)
+        }
+
+        #[test]
+        fn during_a_rounds_set_up_ends_the_sessions_of_the_rounds_workspace_not_the_old_one() {
+            let (rig, run) = round_being_set_up(&[
+                "feedback-requested 1 fac/8-1-f1".into(),
+                format!("feedback-workspace 1 {ROUND_WS}"),
+                "feedback-sending 1".into(),
+            ]);
+            assert_eq!(
+                pass(&rig, &run),
+                StopStep::Stuck {
+                    reason: STOPPED_BY_HAND.into()
+                }
+            );
+            assert_eq!(
+                calls(&rig),
+                vec![Call::EndSessions {
+                    workspace: round_ws()
+                }]
+            );
+            assert!(rig.finished(&run));
+            assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+        }
+
+        #[test]
+        fn before_a_round_has_a_workspace_ends_nothing_and_still_goes_stuck() {
+            let (rig, run) = round_being_set_up(&["feedback-requested 1 fac/8-1-f1".into()]);
+            assert_eq!(
+                pass(&rig, &run),
+                StopStep::Stuck {
+                    reason: STOPPED_BY_HAND.into()
+                }
+            );
+            assert!(calls(&rig).is_empty(), "{:?}", calls(&rig));
+            assert!(rig.finished(&run));
+            assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+        }
+
         #[test]
         fn is_never_stuck_twice() {
             let (rig, run) = requested();
@@ -2243,6 +2324,29 @@ mod tests {
                 rig.sim.set_approval(stranger_edited());
                 assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
                 assert_eq!(text_reads(&rig), 0);
+            }
+
+            #[test]
+            fn a_merged_pull_request_ends_a_pr_open_run_with_a_round_decided_without_ending_the_old_session()
+             {
+                let (mut rig, run) = pr_open_run();
+                rig.write(&run, round_decision());
+                // The build's workspace still shows, as its archive may not have gone through.
+                rig.view = FleetView::builder()
+                    .online(rig.machine)
+                    .workspace(workspace_record(rig.machine, ws(), BRANCH))
+                    .build();
+                rig.sim.set_pull(12, pull("MERGED"));
+                assert_eq!(pass(&rig, &run), ReconcileStep::Ended);
+                assert!(rig.finished(&run));
+                // The build's session ended at the gate; the round has none yet.
+                assert!(
+                    !calls(&rig)
+                        .iter()
+                        .any(|call| matches!(call, Call::EndSessions { .. })),
+                    "{:?}",
+                    calls(&rig)
+                );
             }
 
             #[test]
