@@ -201,7 +201,8 @@ fn write_sample_with(
         }
     };
     let update_refused = update_refused(data_dir);
-    store_sample(store, me, machine, update_refused)
+    let update_ready = update_ready(data_dir);
+    store_sample(store, me, machine, update_refused, update_ready)
 }
 
 fn store_sample(
@@ -209,6 +210,7 @@ fn store_sample(
     me: MachineId,
     machine: MachineSample,
     update_refused: Option<String>,
+    update_ready: Option<String>,
 ) -> Result<Record<MachineSample>, MachineError> {
     // A task that panicked while holding the store leaves it consistent: SQLite rolls back
     // a transaction that was not committed. Stopping here would freeze this machine's last
@@ -218,7 +220,7 @@ fn store_sample(
         sessions: store.live_session_count(me)?,
         update_refused,
         version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-        update_ready: None,
+        update_ready,
         ..machine
     };
     let record = Record {
@@ -244,6 +246,33 @@ pub fn update_refused(home: &Path) -> Option<String> {
     };
     let version = refused.strip_prefix('v').unwrap_or(&refused);
     (!update::lowered(update::current_version(home).as_deref(), version)).then_some(refused)
+}
+
+/// The tag the updater in `home` has ready, like `v0.2.0`, for this daemon. `None` unless it
+/// counts as ready (both its binaries on disk), is above the version this daemon was built as,
+/// is not the refused tag, and this daemon runs from `<home>/current`. An `update.json` that
+/// cannot be read is logged and reports nothing, so it never stops a sample.
+pub fn update_ready(home: &Path) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    update_ready_with(home, &exe, env!("CARGO_PKG_VERSION"))
+}
+
+/// [`update_ready`] for the daemon at `exe`, built as `running`.
+fn update_ready_with(home: &Path, exe: &Path, running: &str) -> Option<String> {
+    let state = match update::state(home) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!("the ready tag cannot be read: {error}");
+            return None;
+        }
+    };
+    let ready = state.ready?;
+    let above = update::tag_version(&ready).is_some_and(|version| update::above(version, running));
+    (above
+        && state.refused.as_deref() != Some(ready.as_str())
+        && update::is_ready(home, &ready)
+        && update::from_current(home, exe, running))
+    .then_some(ready)
 }
 /// Writes a sample every [`SAMPLE_EVERY`], the first at once, each on the blocking pool so a
 /// slow disk read or a busy store never stalls an async worker. A sample that cannot be read
@@ -691,6 +720,124 @@ mod tests {
         updated(dir.path(), Some("v0.2.0"), Some("0.3.0"));
         let written = write_sample(&store, me, dir.path()).unwrap();
         assert_eq!(written.body.update_refused, None);
+    }
+
+    /// A home where the daemon of `0.1.0` runs from `current`, with both binaries of `ready`'s
+    /// version on disk and `update.json` naming `ready` and `refused`. Returns the daemon's path.
+    fn ready_home(home: &Path, ready: &str, refused: Option<&str>) -> PathBuf {
+        for version in ["0.1.0", ready.trim_start_matches('v')] {
+            let dir = home.join("versions").join(version);
+            std::fs::create_dir_all(&dir).unwrap();
+            for name in ["foundryd", "foundry-holder"] {
+                std::fs::write(dir.join(name), version).unwrap();
+            }
+        }
+        crate::update::point_current(home, "0.1.0").unwrap();
+        let state = serde_json::json!({ "ready": ready, "refused": refused });
+        std::fs::write(home.join("update.json"), state.to_string()).unwrap();
+        home.join("versions/0.1.0/foundryd")
+    }
+
+    #[test]
+    fn update_ready_is_the_ready_tag_above_the_running_version_with_its_binaries_on_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let exe = ready_home(home.path(), "v0.2.0", Some("v0.1.5"));
+
+        assert_eq!(
+            update_ready_with(home.path(), &exe, "0.1.0").as_deref(),
+            Some("v0.2.0")
+        );
+    }
+
+    #[test]
+    fn update_ready_is_none_for_a_tag_not_above_the_running_version() {
+        for ready in ["v0.1.0", "v0.0.9"] {
+            let home = tempfile::tempdir().unwrap();
+            let exe = ready_home(home.path(), ready, None);
+            assert_eq!(
+                update_ready_with(home.path(), &exe, "0.1.0"),
+                None,
+                "{ready}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_ready_is_none_while_a_binary_of_the_ready_version_is_gone() {
+        for gone in ["foundryd", "foundry-holder"] {
+            let home = tempfile::tempdir().unwrap();
+            let exe = ready_home(home.path(), "v0.2.0", None);
+            std::fs::remove_file(home.path().join("versions/0.2.0").join(gone)).unwrap();
+            assert_eq!(
+                update_ready_with(home.path(), &exe, "0.1.0"),
+                None,
+                "{gone}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_ready_is_none_for_the_refused_tag() {
+        let home = tempfile::tempdir().unwrap();
+        let exe = ready_home(home.path(), "v0.2.0", Some("v0.2.0"));
+
+        assert_eq!(update_ready_with(home.path(), &exe, "0.1.0"), None);
+    }
+
+    #[test]
+    fn update_ready_is_none_for_a_daemon_not_run_from_current() {
+        let home = tempfile::tempdir().unwrap();
+        ready_home(home.path(), "v0.2.0", None);
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::write(&elsewhere, "0.1.0").unwrap();
+
+        assert_eq!(update_ready_with(home.path(), &elsewhere, "0.1.0"), None);
+    }
+
+    #[test]
+    fn update_ready_is_none_with_no_ready_tag_or_an_unreadable_update_state() {
+        let home = tempfile::tempdir().unwrap();
+        let exe = ready_home(home.path(), "v0.2.0", None);
+        std::fs::write(home.path().join("update.json"), r#"{"ready":null}"#).unwrap();
+        assert_eq!(update_ready_with(home.path(), &exe, "0.1.0"), None);
+
+        std::fs::write(home.path().join("update.json"), "not json").unwrap();
+        assert_eq!(update_ready_with(home.path(), &exe, "0.1.0"), None);
+    }
+
+    #[test]
+    fn write_sample_carries_the_ready_tag_of_a_daemon_run_from_current() {
+        let home = tempfile::tempdir().unwrap();
+        let running = home.path().join("versions").join(env!("CARGO_PKG_VERSION"));
+        std::fs::create_dir_all(&running).unwrap();
+        // This test binary stands in for the daemon `current` reaches.
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), running.join("foundryd"))
+            .unwrap();
+        crate::update::point_current(home.path(), env!("CARGO_PKG_VERSION")).unwrap();
+        let ready = home.path().join("versions/999.0.0");
+        std::fs::create_dir_all(&ready).unwrap();
+        for name in ["foundryd", "foundry-holder"] {
+            std::fs::write(ready.join(name), "999.0.0").unwrap();
+        }
+        std::fs::write(home.path().join("update.json"), r#"{"ready":"v999.0.0"}"#).unwrap();
+        let store = Mutex::new(Store::open(home.path().join("foundry.db")).unwrap());
+
+        let written = write_sample(&store, MachineId::random(), home.path()).unwrap();
+
+        assert_eq!(written.body.update_ready.as_deref(), Some("v999.0.0"));
+    }
+
+    #[test]
+    fn every_sample_carries_the_ready_tag_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(Store::open(dir.path().join("foundry.db")).unwrap());
+        let me = MachineId::random();
+        let machine = read(dir.path(), 0).unwrap();
+
+        let written = store_sample(&store, me, machine, None, Some("v9.9.9".into())).unwrap();
+
+        assert_eq!(written.body.update_ready.as_deref(), Some("v9.9.9"));
+        assert_eq!(held_sample(&store.lock().unwrap(), me), Some(written));
     }
 
     #[test]
