@@ -901,4 +901,26 @@ mod tests {
             json!(true)
         );
     }
+
+    /// The names the round's reset and the workspace names are read by are the ones the
+    /// ledger writes: a rename of either event fails here, not in a silent miscount.
+    #[test]
+    fn the_event_names_are_the_ledgers() {
+        let relaunching = Event::FeedbackRelaunching {
+            n: 1,
+            branch: "feat/pr-12".into(),
+            items: vec![],
+            message: String::new(),
+        };
+        assert_eq!(relaunching.name(), names::FEEDBACK_RELAUNCHING);
+        let interrupted = Event::SessionInterrupted {
+            resumes: 1,
+            relaunch: false,
+            run_ordinal: None,
+            branch: None,
+            t3_error: None,
+            ended_in_pass: 0,
+        };
+        assert_eq!(interrupted.name(), names::SESSION_INTERRUPTED);
+    }
 }

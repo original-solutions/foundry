@@ -3991,4 +3991,62 @@ mod tests {
             assert_eq!(names.prs.into_iter().collect::<Vec<_>>(), [9, 12]);
         }
     }
+
+    mod the_ledger_readers {
+        use super::*;
+
+        #[test]
+        fn step_text_is_the_step_of_a_step_changed_line_only() {
+            let events = read_lines(&[
+                step(0, "resume-workspace 1 abc"),
+                line(1, "session_launched", json!({ "step": "not a step" })),
+                line(2, "step_changed", json!({ "step": 3 })),
+            ]);
+            let texts: Vec<Option<&str>> = events.iter().map(step_text).collect();
+            assert_eq!(texts, [Some("resume-workspace 1 abc"), None, None]);
+        }
+
+        #[test]
+        fn numbered_is_what_follows_the_prefix_and_the_count() {
+            let prefix = "resume-workspace ";
+            assert_eq!(numbered("resume-workspace 2 abc", prefix, 2), Some("abc"));
+            assert_eq!(numbered("resume-sending 2", "resume-sending ", 2), Some(""));
+            assert_eq!(numbered("resume-workspace 12 abc", prefix, 1), None);
+            assert_eq!(numbered("resume-workspace 2 abc", prefix, 1), None);
+            assert_eq!(numbered("feedback-workspace 2 abc", prefix, 2), None);
+        }
+
+        #[test]
+        fn highest_is_the_largest_count_of_the_event_and_0_for_none() {
+            let events = read_lines(&[
+                line(0, names::SESSION_INTERRUPTED, json!({ "resumes": 2 })),
+                line(1, names::SESSION_INTERRUPTED, json!({ "resumes": 5 })),
+                line(2, names::SESSION_INTERRUPTED, json!({ "resumes": 3 })),
+                line(3, names::SESSION_INTERRUPTED, json!({ "resumes": "7" })),
+                line(4, names::FEEDBACK_RELAUNCHING, json!({ "n": 9 })),
+            ]);
+            assert_eq!(highest(&events, names::SESSION_INTERRUPTED, "resumes"), 5);
+            assert_eq!(highest(&events, names::FEEDBACK_RELAUNCHING, "n"), 9);
+            assert_eq!(highest(&events, names::FEEDBACK_RELAUNCHING, "resumes"), 0);
+            assert_eq!(highest(&[], names::SESSION_INTERRUPTED, "resumes"), 0);
+        }
+
+        #[test]
+        fn highest_past_a_u32_is_0() {
+            let events = read_lines(&[line(
+                0,
+                names::FEEDBACK_RELAUNCHING,
+                json!({ "n": u64::from(u32::MAX) + 1 }),
+            )]);
+            assert_eq!(highest(&events, names::FEEDBACK_RELAUNCHING, "n"), 0);
+        }
+
+        #[test]
+        fn the_workspace_names_are_the_builds_a_resumes_and_a_rounds() {
+            let run = run_of(8);
+            assert_eq!(build_name(&run), "fac/8-1");
+            assert_eq!(resume_name(&run, 2), "fac/8-1-r2");
+            assert_eq!(feedback_name(&run, 3), "fac/8-1-f3");
+        }
+    }
 }
