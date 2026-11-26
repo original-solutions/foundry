@@ -2012,6 +2012,43 @@ mod tests {
     }
 
     #[test]
+    fn a_live_trial_is_kept_by_a_check_that_clears_a_pulled_tag_and_nothing_is_made_ready() {
+        // `current` names the trial's version: a daemon in its first minute, or one whose
+        // healthy mark could not be saved yet.
+        let home = trial_home();
+        let pulled = home.path().join("versions/0.2.5");
+        fs::create_dir_all(&pulled).unwrap();
+        release(&pulled, "0.2.5");
+        let mut before = state(home.path()).unwrap();
+        before.ready = Some("v0.2.5".into());
+        save(home.path(), &before).unwrap();
+
+        let result = check_with(
+            home.path(),
+            "0.2.0",
+            LIMIT,
+            // v0.2.5 was pulled, so `tidy` takes the lock to clear it; v0.3.0 is picked.
+            || Ok(tags(&["v0.2.0", "v0.3.0"])),
+            |_, stage| {
+                release(stage, "0.3.0");
+                Ok(())
+            },
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("a trial of 0.2.0 is on"), "{error}");
+        assert_eq!(
+            state(home.path()).unwrap(),
+            State {
+                ready: None,
+                ..before
+            }
+        );
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+        assert_eq!(versions(home.path()), ["0.1.0", "0.2.0", "0.2.5"]);
+    }
+
+    #[test]
     fn a_trial_current_does_not_name_is_cleared_and_the_check_makes_the_tag_ready() {
         let home = installed_home();
         save(
