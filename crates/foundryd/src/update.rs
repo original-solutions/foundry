@@ -1694,13 +1694,12 @@ mod tests {
     }
 
     #[test]
-    fn stages_left_by_dead_processes_and_older_releases_are_removed_by_the_next_stage() {
+    fn stages_left_by_dead_processes_are_removed_by_the_next_stage() {
         let home = installed_home();
         let dead = dead_pid();
         for name in [
             format!(".staging-0.2.0-{dead}"),
             format!(".staging-0.1.5-{dead}"),
-            ".staging-0.1.5".to_string(),
         ] {
             let left = home.path().join("versions").join(name);
             fs::create_dir_all(&left).unwrap();
@@ -1722,6 +1721,35 @@ mod tests {
         assert_eq!(done.as_deref(), Some("v0.2.0"));
         assert_eq!(stages(home.path()), Vec::<String>::new());
         assert_eq!(versions(home.path()), ["0.1.0", "0.2.0"]);
+    }
+
+    #[test]
+    fn a_stage_an_older_release_named_without_a_pid_is_left_alone() {
+        // An older release's process may still be filling it, and its name says nothing of
+        // whether that process is alive.
+        let home = installed_home();
+        let theirs = home.path().join("versions/.staging-0.2.0");
+        fs::create_dir_all(&theirs).unwrap();
+        fs::write(theirs.join("foundryd"), "half copied").unwrap();
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |_, stage| {
+                release(stage, "0.2.0");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.as_deref(), Some("v0.2.0"));
+        assert_eq!(
+            fs::read_to_string(theirs.join("foundryd")).unwrap(),
+            "half copied"
+        );
+        assert_eq!(stages(home.path()), [".staging-0.2.0"]);
     }
 
     #[test]
