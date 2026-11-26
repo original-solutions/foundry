@@ -4993,4 +4993,70 @@ mod tests {
             assert_eq!(waiting_reason(&report, 6).as_deref(), Some(NO_SLOT));
         }
     }
+
+    mod a_pass_that_panics_after_a_carried_run_recorded {
+        use super::*;
+        use crate::factory::github::Tracker;
+
+        /// The hub, but every call made once `run` has its `claimed` event panics, as an answer
+        /// of a shape nobody expected does in the middle of a step.
+        struct PanicsOnceClaimed {
+            hub: Arc<Hub>,
+            store: Arc<Mutex<Store>>,
+            run: RunId,
+        }
+
+        impl Tracker for PanicsOnceClaimed {
+            fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
+                let claimed = self
+                    .store
+                    .lock()
+                    .unwrap()
+                    .run_has_event(&self.run, "claimed")
+                    .unwrap();
+                if claimed {
+                    panic!("an answer of a shape nobody expected");
+                }
+                self.hub.gh(args)
+            }
+        }
+
+        #[test]
+        fn leaves_the_slot_of_the_run_it_recorded_held_in_the_book() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            let run = RunId::new(REPO, 5, 1).unwrap();
+            rig.hub.issue(5, &["factory:triage"]);
+            rig.hub
+                .edit(5, |issue| issue.assignees = vec![LOGIN.into()]);
+            rig.hub.comment_as(
+                5,
+                LOGIN,
+                &crate::factory::github::claim_comment(&run, &builder_machine()),
+            );
+            rig.tracker = Hiding::new(
+                Arc::new(PanicsOnceClaimed {
+                    hub: rig.hub.clone(),
+                    store: rig.store.clone(),
+                    run: run.clone(),
+                }),
+                Arc::new(|text: &str| text.to_string()),
+            );
+            let report = rig.pass();
+            assert_eq!(
+                report.failed.as_deref(),
+                Some("the pass panicked"),
+                "{report:?}"
+            );
+            assert!(
+                !rig.ledger.read(&run).unwrap().is_empty(),
+                "the takeover recorded its run before the panic"
+            );
+            assert_eq!(
+                rig.book.runs_free(1),
+                0,
+                "no other project's pass may take the slot of a run that is going"
+            );
+        }
+    }
 }
