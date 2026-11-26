@@ -514,6 +514,14 @@ pub fn run(world: &World<'_>, memo: &mut Memo) -> PassReport {
     }
 }
 
+/// A pass that could not begin [`run`], or that died outside it: counted, its status written
+/// from the last good results, idle once [`IDLE_AFTER_FAILURES`] have failed in a row, as for
+/// a pass that fails inside it. It changes nothing on GitHub and asks nothing of a worker.
+pub fn fail(world: &World<'_>, memo: &mut Memo, error: String) -> PassReport {
+    let pass = next_pass(world, memo);
+    failed(world, memo, PassReport::default(), pass, error)
+}
+
 fn run_pass(world: &World<'_>, memo: &mut Memo, pass: u64, ticket: Ticket) -> PassReport {
     let mut report = PassReport::default();
     let project = world.project.id;
@@ -684,17 +692,7 @@ fn not_holding(world: &World<'_>, report: &mut PassReport, pass: u64) {
                 generation: *generation,
             },
         ),
-        LeaseState::Unknown { reason } => {
-            let mut status = status::not_holding(
-                project,
-                NotHolding::NoToken {
-                    login: String::new(),
-                },
-            );
-            status.not_holding = None;
-            status.idle = Some((*reason).to_owned());
-            status
-        }
+        LeaseState::Unknown { reason } => idle_not_holding(project, (*reason).to_owned()),
     };
     write(world, report, with_pass(status, pass));
 }
@@ -737,27 +735,47 @@ fn failed(
     report
 }
 
-/// Writes `status` as this machine's record, and keeps it on the report.
-fn write(world: &World<'_>, report: &mut PassReport, status: FactoryStatus) {
-    let mut store = world.store.lock().unwrap_or_else(PoisonError::into_inner);
+/// A status of `project` that does not hold the lease and says only why it is idle: `reason`.
+pub(super) fn idle_not_holding(project: ProjectId, reason: String) -> FactoryStatus {
+    let mut status = status::not_holding(
+        project,
+        NotHolding::NoToken {
+            login: String::new(),
+        },
+    );
+    status.not_holding = None;
+    status.idle = Some(reason);
+    status
+}
+
+/// Stores `status` as `me`'s record, at its next factory version.
+pub(super) fn store_status(
+    store: &mut Store,
+    me: MachineId,
+    status: FactoryStatus,
+) -> Result<(), String> {
     let written = store.own_next_factory_version().and_then(|version| {
         store.apply_factory(
             &FactoryRecord {
-                owner: world.me,
+                owner: me,
                 version,
-                body: FactoryBody::Status(status.clone()),
+                body: FactoryBody::Status(status),
             },
-            world.me,
+            me,
         )
     });
     match written {
-        Ok(Applied::Stored) => {}
-        Ok(other) => {
-            tracing::warn!(project = %status.project, "factory: the status was not stored: {other:?}")
-        }
-        Err(error) => {
-            tracing::warn!(project = %status.project, "factory: the status could not be written: {error}")
-        }
+        Ok(Applied::Stored) => Ok(()),
+        Ok(other) => Err(format!("the status was not stored: {other:?}")),
+        Err(error) => Err(format!("the status could not be written: {error}")),
+    }
+}
+
+/// Writes `status` as this machine's record, and keeps it on the report.
+fn write(world: &World<'_>, report: &mut PassReport, status: FactoryStatus) {
+    let mut store = world.store.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Err(error) = store_status(&mut store, world.me, status.clone()) {
+        tracing::warn!(project = %status.project, "factory: {error}");
     }
     report.status = Some(status);
 }
@@ -1051,9 +1069,9 @@ impl<'a, 'w> Pass<'a, 'w> {
         // 7. The sweeps: orphans for a machine heard from again, and finished runs.
         self.sweep()?;
 
-        // 8. What the status says.
-        self.results_of()?;
-        let after = self.known()?;
+        // 8. What the status says. Nothing is written after its read of the ledger, so the book
+        // is set from the same read.
+        let after = self.results_of()?;
         world.book.finish(ticket, Self::holding(&after));
         Ok(())
     }
@@ -1544,11 +1562,12 @@ impl<'a, 'w> Pass<'a, 'w> {
     }
 
     /// The live runs, the held-up runs and the finished runs, for the status.
-    fn results_of(&mut self) -> Result<(), Ended> {
+    /// Answers the unfinished runs it read.
+    fn results_of(&mut self) -> Result<Vec<Known>, Ended> {
         let world = self.world;
         let known = self.known()?;
         let unfinished: BTreeSet<RunId> = known.iter().map(|k| k.info.id.clone()).collect();
-        for k in known {
+        for k in &known {
             let run = k.info.id.clone();
             match k.info.state {
                 Some(State::Stuck | State::NeedsInfo) => {
@@ -1606,7 +1625,7 @@ impl<'a, 'w> Pass<'a, 'w> {
         // Newest first by where the `finished` event stands, then by run id for a tie.
         done.sort_by(|a, b| (&b.at, &b.run.run).cmp(&(&a.at, &a.run.run)));
         self.results.finished = done.into_iter().map(|done| done.run.clone()).collect();
-        Ok(())
+        Ok(known)
     }
 
     /// Reads into the memo each run that is not in `unfinished` and not seen finished yet. A
@@ -1626,6 +1645,7 @@ impl<'a, 'w> Pass<'a, 'w> {
         if unseen.is_empty() {
             return Ok(());
         }
+        // Every run is summed up to keep the unseen ones: a read of only those is #265's.
         for summary in self.ledger.summaries(repo)? {
             if !unseen.contains(&summary.id) {
                 continue;
@@ -2970,6 +2990,48 @@ mod tests {
             assert!(rig.creates().is_empty());
         }
 
+        /// The login's newest claim comment on issue 5 is a Foundry claim, of a run of issue 9
+        /// or of another repo (copied, or edited by hand): it is a foreign claim. No run is
+        /// carried on from it.
+        #[test]
+        fn a_foundry_claim_naming_another_issue_or_repo_is_foreign() {
+            for named in [
+                RunId::new(REPO, 9, 1).unwrap(),
+                RunId::new("rawphp/elsewhere", 5, 1).unwrap(),
+            ] {
+                let mut rig = Rig::new();
+                rig.hub.issue(5, &["factory:triage"]);
+                rig.hub
+                    .edit(5, |issue| issue.assignees = vec![LOGIN.into()]);
+                rig.hub.comment_as(
+                    5,
+                    LOGIN,
+                    &crate::factory::github::claim_comment(&named, &builder_machine()),
+                );
+                let report = rig.pass();
+                assert_eq!(report.failed, None, "{named}: {report:?}");
+                assert_eq!(
+                    report.foreign.iter().map(|c| c.issue).collect::<Vec<_>>(),
+                    vec![5],
+                    "{named}"
+                );
+                assert!(rig.ledger.read(&named).unwrap().is_empty(), "{named}");
+                assert!(
+                    rig.ledger
+                        .read(&RunId::new(REPO, 5, 1).unwrap())
+                        .unwrap()
+                        .is_empty(),
+                    "{named}"
+                );
+                assert!(rig.creates().is_empty(), "{named}: {:?}", rig.creates());
+                assert!(
+                    rig.hub.writes().iter().all(|w| !w.contains(" 5 ")),
+                    "{named}: {:?}",
+                    rig.hub.writes()
+                );
+            }
+        }
+
         #[test]
         fn a_claim_marker_in_another_logins_comment_is_no_claim_of_ours() {
             let mut rig = Rig::new();
@@ -3329,6 +3391,95 @@ mod tests {
             assert!(
                 said.iter().any(|s| s.contains("gate")),
                 "the gate step ran for the run: {report:?}"
+            );
+        }
+    }
+
+    mod the_fleets_gate_slots {
+        use super::following_a_building_run::building_with_report;
+        use super::*;
+
+        /// What the pass said of `run`.
+        fn said_of(report: &PassReport, run: &RunId) -> Vec<String> {
+            report
+                .runs
+                .iter()
+                .filter(|(r, _)| r == run)
+                .map(|(_, s)| s.clone())
+                .collect()
+        }
+
+        /// A run ready for its gate when another project's runs hold `others` of the fleet's
+        /// one gate slot: what the pass said of it.
+        fn ready_for_its_gate_while_another_project_holds(others: u32) -> Vec<String> {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_gates = 1);
+            rig.book.seed(
+                other_project(),
+                Held {
+                    runs: 0,
+                    gates: others,
+                    placed: vec![],
+                },
+            );
+            let run = building_with_report(&mut rig);
+            rig.hub.lock().pulls.insert(12, "fac/5-1".into());
+            rig.worker.inner.on_turn(Ok(TurnText {
+                message: format!("Done.\nFACTORY-DONE: https://github.com/{REPO}/pull/12"),
+                question: None,
+            }));
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            said_of(&report, &run)
+        }
+
+        #[test]
+        fn a_run_ready_for_its_gate_waits_while_another_project_holds_every_gate_slot() {
+            let held = ready_for_its_gate_while_another_project_holds(1);
+            assert!(
+                held.iter().any(|s| s.contains("gate: Queued")),
+                "the fleet's one gate slot is another project's: {held:?}"
+            );
+            let free = ready_for_its_gate_while_another_project_holds(0);
+            assert!(
+                free.iter()
+                    .any(|s| s.contains("gate: ") && !s.contains("gate: Queued")),
+                "with the slot free the gate is placed: {free:?}"
+            );
+        }
+
+        #[test]
+        fn two_projects_never_both_take_the_last_gate_slot() {
+            let book = Book::default();
+            let a = book.ticket(project_id());
+            let b = book.ticket(other_project());
+            book.begin(
+                a,
+                Held {
+                    runs: 0,
+                    gates: 0,
+                    placed: vec![],
+                },
+            )
+            .unwrap();
+            book.begin(
+                b,
+                Held {
+                    runs: 0,
+                    gates: 1,
+                    placed: vec![],
+                },
+            )
+            .unwrap();
+            assert!(book.take_gate(a, 2));
+            assert!(!book.take_gate(b, 2), "the fleet holds 2 of 2");
+            assert!(!book.take_gate(a, 2), "nor the project that took the last");
+            book.give_gate(a);
+            assert!(book.take_gate(b, 2), "a gate given back is free again");
+            book.forget(project_id());
+            assert!(
+                !book.take_gate(a, 5),
+                "a pass of a forgotten project takes none"
             );
         }
     }
@@ -5520,7 +5671,7 @@ mod tests {
         /// sweeps fails, and the next one sweeps on from the run after it, so one run cannot
         /// fail every pass of its project.
         #[test]
-        fn a_sweep_that_fails_again_waits_for_the_next_stuck_read() {
+        fn a_sweep_that_stops_at_its_last_run_is_done_at_the_next_pass() {
             let mut rig = Rig::new();
             finished_stuck(&rig, 3);
             assert_eq!(rig.pass().failed, None);
@@ -5533,6 +5684,40 @@ mod tests {
             assert_eq!(next.failed, None, "it sweeps on after run 3: {next:?}");
             let after = rig.pass();
             assert_eq!(after.failed, None, "{after:?}");
+            assert_eq!(rig.status().idle, None, "{:?}", rig.status());
+        }
+
+        /// Runs 3, 4 and 5 finished stuck, and GitHub refuses to show any of their issues. The
+        /// sweep stops at run 3, and its one retry stops at run 4: that retry counts as the
+        /// sweep, so the pass after it does not sweep and ends well, and three failed passes in
+        /// a row never make the project idle.
+        #[test]
+        fn a_sweep_that_fails_again_waits_for_the_next_stuck_read() {
+            let mut rig = Rig::new();
+            for issue in [3, 4, 5] {
+                finished_stuck(&rig, issue);
+            }
+            assert_eq!(rig.pass().failed, None);
+            rig.view = fleet_with(&[3, 4, 5]);
+            for issue in [3, 4, 5] {
+                rig.hub.fail(&format!("issue view {issue}"), usize::MAX);
+            }
+            rig.clock.advance(STUCK_READ_EVERY);
+            let first = rig.pass();
+            assert!(
+                first.failed.is_some(),
+                "the sweep stops at run 3: {first:?}"
+            );
+            let retry = rig.pass();
+            assert!(
+                retry.failed.is_some(),
+                "the retry stops at run 4: {retry:?}"
+            );
+            let next = rig.pass();
+            assert_eq!(
+                next.failed, None,
+                "the next sweep waits for STUCK_READ_EVERY: {next:?}"
+            );
             assert_eq!(rig.status().idle, None, "{:?}", rig.status());
         }
 

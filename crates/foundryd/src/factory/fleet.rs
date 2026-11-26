@@ -243,6 +243,25 @@ fn end_request(workspace: WorkspaceId) -> Request {
     }
 }
 
+/// Where a forced archive of a workspace is run, from the owner its record names.
+#[derive(Debug, PartialEq, Eq)]
+enum ArchiveAt {
+    /// The record has not reached this machine: asked again next pass, never taken as done.
+    NotKnown,
+    /// This machine owns the workspace: P1's archive runs here.
+    Here,
+    /// Carried to the owner.
+    Owner(MachineId),
+}
+
+fn archive_at(owner: Option<MachineId>, me: MachineId) -> ArchiveAt {
+    match owner {
+        None => ArchiveAt::NotKnown,
+        Some(owner) if owner == me => ArchiveAt::Here,
+        Some(owner) => ArchiveAt::Owner(owner),
+    }
+}
+
 /// P1's archive route, forced, as a carried call to the workspace's owner sends it.
 fn archive_request(workspace: WorkspaceId) -> Request {
     Request {
@@ -335,16 +354,16 @@ impl Worker for FleetWorker {
             .map_err(|e| {
                 WorkerError::Failed(redact(&format!("the store could not be read: {e}")))
             })?;
-            match owner {
-                None => Err(WorkerError::Unreachable(format!(
+            match archive_at(owner, api.peers.me()) {
+                ArchiveAt::NotKnown => Err(WorkerError::Unreachable(format!(
                     "the record of workspace {workspace} has not reached this machine yet"
                 ))),
-                Some(owner) if owner == api.peers.me() => api
+                ArchiveAt::Here => api
                     .workspaces
                     .archive(workspace, true)
                     .await
                     .map_err(|e| WorkerError::Failed(redact(&e.to_string()))),
-                Some(owner) => {
+                ArchiveAt::Owner(owner) => {
                     let request = archive_request(workspace);
                     let body = request.body.map(|b| b.to_string()).unwrap_or_default();
                     let answer = api
@@ -375,6 +394,19 @@ mod tests {
             status,
             body: Bytes::copy_from_slice(body.as_bytes()),
         }
+    }
+
+    #[test]
+    fn a_forced_archive_runs_here_for_this_machines_workspace_and_is_carried_to_any_other_owner() {
+        let me = MachineId(uuid::Uuid::from_u128(1));
+        let other = MachineId(uuid::Uuid::from_u128(2));
+        assert_eq!(archive_at(Some(me), me), ArchiveAt::Here);
+        assert_eq!(archive_at(Some(other), me), ArchiveAt::Owner(other));
+        assert_eq!(
+            archive_at(None, me),
+            ArchiveAt::NotKnown,
+            "a workspace whose record has not come is not taken as archived"
+        );
     }
 
     #[test]
