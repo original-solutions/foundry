@@ -1,4 +1,4 @@
-//! Instructor feedback on a `pr-open` run.
+//! Instructor feedback on a `pr-open` run, and instructors' comments forwarded to a building one.
 //!
 //! Ported from the runner's `src/runner/feedback.ts` with `feedback.test.ts`. [`advance`] is one
 //! pass over a run the gate left in `pr-open`: every `feedback_seconds` it reads what the
