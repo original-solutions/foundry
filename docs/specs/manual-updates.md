@@ -2,7 +2,7 @@
 
 Product: Foundry. A change to P1's updates.
 
-Status: drafted 2026-11-26 from a brainstorm the same day, revised after two council rounds. Nothing here is built.
+Status: drafted 2026-11-26 from a brainstorm the same day, revised after three council rounds. Nothing here is built.
 
 ## Why
 
@@ -69,7 +69,7 @@ A machine has at most one ready tag. A daemon that does not run from `<home>/cur
 
 A ready tag counts only while both binaries of its version are on disk. One whose binaries are gone counts as not ready, so the next check fetches it again.
 
-A hand install clears the ready tag under the updater's lock before it places any files, whatever version it installs.
+A hand install clears the ready tag, whatever version it installs. It may unpack into a private stage first, then holds the updater's lock from clearing the ready tag through moving its files into `<home>/versions/` and pointing `current`, so no check or click runs between those steps.
 
 A trial is on only while `current` names the trial's version. A trial whose version `current` does not name, as a crash between the install's two writes leaves, is cleared under the lock by the next check or install, which then goes on with the state that remains. Its tag is then no longer ready, so the next check fetches and stages it again.
 
@@ -96,7 +96,7 @@ A sample from a peer on an older release has neither. The UI shows its version a
 
 The badge sits in the page's top bar, so it shows on a phone without opening the sidebar. It shows while any listed machine has `update_ready`, or while the checklist is open. It names each waiting tag and how many machines it waits on, grouped by tag. Machines between checks can wait on different tags, so "v0.9.1 on 2 machines, v0.9.0 on 1" is a normal state. Removed machines are left out. Each machine in the Machines view shows the version it runs and its waiting tag.
 
-Opening the badge shows a checklist of the listed machines with a release waiting. All are ticked at first. Install sends, for each ticked machine, that machine's own `update_ready` tag. It sends the calls for every machine except the one serving the page first, and the serving machine's call only once every other call has finished, with an answer, a timeout or a dropped connection. That way a restart of the serving machine never cuts off calls still on their way to the others.
+Opening the badge shows a checklist of the listed machines with a release waiting. All are ticked at first. Install takes, at the moment of the click, each ticked machine with the `update_ready` tag shown for it, and sends exactly those pairs for the whole batch. A machine whose ready tag changes meanwhile answers `409`. It sends the calls for every machine except the one serving the page first, and the serving machine's call only once every other call has finished, with an answer, a timeout or a dropped connection. That way a restart of the serving machine never cuts off calls still on their way to the others.
 
 Each row keeps its machine, its tag and its call's answer until the checklist is closed, after the machine's `update_ready` clears. Its state is decided in this order, the first match winning:
 
@@ -125,12 +125,12 @@ No hand install is needed. The release that adds this reaches each machine throu
 
 Tests come first, as for every change.
 
-- `update.rs`: a check that finds a higher tag downloads, verifies and unpacks it, records it as ready, and leaves `current`, the trial and the daemon alone. A check whose wanted tag is already ready downloads nothing. A refused highest tag makes nothing ready and leaves the ready tag. A higher tag replaces the ready one. A check that finishes after an install moved `current` records nothing and removes nothing. Making a tag ready leaves `refused` alone. A ready tag whose binaries are gone is fetched again. A hand install clears the ready tag before it places files. A trial whose version `current` does not name is cleared, and the check goes on.
+- `update.rs`: a check that finds a higher tag downloads, verifies and unpacks it, records it as ready, and leaves `current`, the trial and the daemon alone. A check whose wanted tag is already ready downloads nothing. A refused highest tag makes nothing ready and leaves the ready tag. A higher tag replaces the ready one. A check that finishes after an install moved `current` records nothing and removes nothing. Making a tag ready leaves `refused` alone. A ready tag whose binaries are gone is fetched again. A hand install clears the ready tag and places its files under one hold of the lock. A trial whose version `current` does not name is cleared, and the check goes on.
 - The endpoint: each `409` case changes nothing, including a stale ready tag after a hand install of a higher version. The ready tag saves the trial and clears the ready tag before `current` moves, keeps a refusal of a higher tag, answers `202` and then stops the daemon once. A failure to point `current` restores the state, answers `500` and does not stop.
 - Carry: the route runs on the machine it names. A peer on protocol 5 gets `503` with nothing sent. A carried install's `202` reaches the caller before the target stops.
 - `machine.rs`: the sample carries `version` and `update_ready`, and an older peer's sample without them still reads. A daemon not run from `current` reports no `update_ready`.
 - Fleet, three daemons: a UI on the first installs on the second and the third, the serving machine last. The third's sample shows the new version, its terminals keep running, and a machine left unticked keeps its version and its ready tag.
-- Web: the badge shows and hides with the records, groups machines by tag and leaves out removed machines. The checklist starts with every machine ticked and sends the serving machine's call last. Each row follows the table above, in its order.
+- Web: the badge shows and hides with the records, groups machines by tag and leaves out removed machines. The checklist starts with every machine ticked, sends the serving machine's call last, and sends the tags shown at the click even when a record changes before a call goes. Each row follows the table above, in its order.
 
 ## Acceptance criteria
 
