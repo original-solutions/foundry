@@ -5471,5 +5471,42 @@ mod tests {
                 "a sweep that did not finish is not counted as done"
             );
         }
+
+        /// A finished stuck run whose issue GitHub refuses to show every time: the pass that
+        /// sweeps fails and the next one sweeps once more, then the sweep waits for
+        /// STUCK_READ_EVERY, so one run cannot fail every pass of its project.
+        #[test]
+        fn a_sweep_that_fails_again_waits_for_the_next_stuck_read() {
+            let mut rig = Rig::new();
+            let run = rig.run_in(3, 1, State::Stuck);
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::Finished {
+                        outcome: crate::factory::ledger::events::Outcome::Stuck,
+                        total_ms: 0,
+                        gate_attempts: 0,
+                        review_cycles: None,
+                        pr_url: None,
+                        pr_end: None,
+                    },
+                    &Cause::new(CauseStep::Start, "test"),
+                )
+                .unwrap();
+            assert_eq!(rig.pass().failed, None);
+            rig.view = fleet_with(&[3]);
+            rig.hub.fail("issue view 3", usize::MAX);
+            rig.clock.advance(STUCK_READ_EVERY);
+            let first = rig.pass();
+            assert!(first.failed.is_some(), "the sweep is due: {first:?}");
+            let retry = rig.pass();
+            assert!(
+                retry.failed.is_some(),
+                "the next pass sweeps once more: {retry:?}"
+            );
+            let after = rig.pass();
+            assert_eq!(after.failed, None, "{after:?}");
+            assert_eq!(rig.status().idle, None, "{:?}", rig.status());
+        }
     }
 }
