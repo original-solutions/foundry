@@ -1276,101 +1276,62 @@ fn blocked_by(repo: &str, blockers: &[super::github::Blocker]) -> String {
     format!("blocked by {}", named.join(", "))
 }
 
+/// GitHub in memory for the pass's tests and the service's: many issues of one repo.
 #[cfg(test)]
-mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+pub(crate) mod testing {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
 
-    use foundry_proto::factory::{
-        FactoryBody, FactorySettings, FactoryStatus, MachineHeld, NotHolding, ProjectFactory,
-        RunId, SessionTurn,
-    };
-    use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
-    use foundry_proto::record::{MachineSample, Record, Session, Workspace};
-    use foundry_proto::settings::{Limits, Machine, SharedSettings};
-    use foundry_proto::state::SessionState;
     use serde_json::{Value, json};
 
-    use super::*;
-    use crate::clock::FakeClock;
-    use crate::factory::github::{Hiding, OtherKind, Tracker, TrackerError};
-    use crate::factory::lease::LeaseState;
-    use crate::factory::ledger::Ledger;
-    use crate::factory::ledger::events::{Cause, CauseStep, Event};
-    use crate::factory::ledger::testing::open_store;
-    use crate::factory::messages::Message;
-    use crate::factory::runs::RunProject;
+    use crate::factory::github::{OtherKind, Tracker, TrackerError};
     use crate::factory::runs::testing::approval_answer;
-    use crate::factory::worker::{
-        AlwaysHeld, Call, CreateWorkspace, FakeWorker, FleetView, Guard, LeaseLost, Lost, Worker,
-        WorkerError,
-    };
-    use crate::sessions::factory::{FactoryStart, SendRefused};
-    use crate::sessions::turns::TurnText;
-    use crate::store::Store;
 
-    const REPO: &str = "rawphp/softfac";
-    const LOGIN: &str = "softfac-bot";
-    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
-    const SHA2: &str = "89abcdef0123456789abcdef0123456789abcdef";
-    const LABELED_AT: &str = "2026-10-04T10:00:00Z";
-    const CONFIG: &str = "factory:\n  instructors: [tom]\n  base: main\n  provision: []\n  gate: [cargo test]\n  autonomy: pr\n  limits: { minutes: 90, gate_retries: 2, checks_minutes: 30, interruption_resumes: 2 }\n";
-
-    fn me() -> MachineId {
-        MachineId(uuid::Uuid::from_u128(0x1))
-    }
-
-    fn builder_machine() -> MachineId {
-        MachineId(uuid::Uuid::from_u128(0x2))
-    }
-
-    fn project_id() -> ProjectId {
-        ProjectId(uuid::Uuid::from_u128(0x7001))
-    }
-
-    fn other_project() -> ProjectId {
-        ProjectId(uuid::Uuid::from_u128(0x7002))
-    }
+    pub(crate) const REPO: &str = "rawphp/softfac";
+    pub(crate) const LOGIN: &str = "softfac-bot";
+    pub(crate) const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    pub(crate) const LABELED_AT: &str = "2026-10-04T10:00:00Z";
+    pub(crate) const CONFIG: &str = "factory:\n  instructors: [tom]\n  base: main\n  provision: []\n  gate: [cargo test]\n  autonomy: pr\n  limits: { minutes: 90, gate_retries: 2, checks_minutes: 30, interruption_resumes: 2 }\n";
 
     // ----- GitHub in memory, many issues -----
 
     #[derive(Clone, Debug)]
-    struct HubIssue {
-        title: String,
-        body: String,
-        labels: Vec<String>,
-        assignees: Vec<String>,
-        closed: bool,
+    pub(crate) struct HubIssue {
+        pub(crate) title: String,
+        pub(crate) body: String,
+        pub(crate) labels: Vec<String>,
+        pub(crate) assignees: Vec<String>,
+        pub(crate) closed: bool,
         /// Open issues a dependency link says block it.
-        linked: Vec<u64>,
+        pub(crate) linked: Vec<u64>,
     }
 
     #[derive(Default)]
-    struct HubState {
-        issues: BTreeMap<u64, HubIssue>,
+    pub(crate) struct HubState {
+        pub(crate) issues: BTreeMap<u64, HubIssue>,
         /// `(id, issue, author, body)`.
-        comments: Vec<(u64, u64, String, String)>,
-        next_comment: u64,
-        head: String,
-        config: String,
+        pub(crate) comments: Vec<(u64, u64, String, String)>,
+        pub(crate) next_comment: u64,
+        pub(crate) head: String,
+        pub(crate) config: String,
         /// A needle and how many calls holding it fail.
-        failures: Vec<(String, usize)>,
-        calls: Vec<Vec<String>>,
+        pub(crate) failures: Vec<(String, usize)>,
+        pub(crate) calls: Vec<Vec<String>>,
         /// Writes made after the guard first failed.
-        late_writes: Vec<String>,
+        pub(crate) late_writes: Vec<String>,
         /// Open draft pull requests by number, with their head branch.
-        pulls: BTreeMap<u64, String>,
+        pub(crate) pulls: BTreeMap<u64, String>,
     }
 
     /// GitHub as one login sees one repo, every issue kept, every call recorded.
-    struct Hub {
-        state: Mutex<HubState>,
+    pub(crate) struct Hub {
+        pub(crate) state: Mutex<HubState>,
         /// Set once the pass's guard has failed: a write after it is recorded as late.
-        lost: Arc<AtomicBool>,
+        pub(crate) lost: Arc<AtomicBool>,
     }
 
-    fn b64(bytes: &[u8]) -> String {
+    pub(crate) fn b64(bytes: &[u8]) -> String {
         const TABLE: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
@@ -1391,7 +1352,7 @@ mod tests {
     }
 
     impl Hub {
-        fn new() -> Arc<Self> {
+        pub(crate) fn new() -> Arc<Self> {
             Arc::new(Self {
                 state: Mutex::new(HubState {
                     next_comment: 100,
@@ -1403,12 +1364,12 @@ mod tests {
             })
         }
 
-        fn lock(&self) -> std::sync::MutexGuard<'_, HubState> {
+        pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, HubState> {
             self.state.lock().unwrap_or_else(PoisonError::into_inner)
         }
 
         /// An open issue with `labels`, nobody assigned.
-        fn issue(&self, number: u64, labels: &[&str]) -> &Self {
+        pub(crate) fn issue(&self, number: u64, labels: &[&str]) -> &Self {
             self.lock().issues.insert(
                 number,
                 HubIssue {
@@ -1423,31 +1384,31 @@ mod tests {
             self
         }
 
-        fn ready(&self, number: u64) -> &Self {
+        pub(crate) fn ready(&self, number: u64) -> &Self {
             self.issue(number, &["factory:ready"])
         }
 
-        fn edit(&self, number: u64, change: impl FnOnce(&mut HubIssue)) {
+        pub(crate) fn edit(&self, number: u64, change: impl FnOnce(&mut HubIssue)) {
             change(self.lock().issues.get_mut(&number).expect("an issue"));
         }
 
-        fn comment_as(&self, issue: u64, author: &str, body: &str) {
+        pub(crate) fn comment_as(&self, issue: u64, author: &str, body: &str) {
             let mut state = self.lock();
             let id = state.next_comment;
             state.next_comment += 1;
             state.comments.push((id, issue, author.into(), body.into()));
         }
 
-        fn fail(&self, needle: &str, times: usize) {
+        pub(crate) fn fail(&self, needle: &str, times: usize) {
             self.lock().failures.push((needle.into(), times));
         }
 
-        fn calls(&self) -> Vec<Vec<String>> {
+        pub(crate) fn calls(&self) -> Vec<Vec<String>> {
             self.lock().calls.clone()
         }
 
         /// The calls that change GitHub.
-        fn writes(&self) -> Vec<String> {
+        pub(crate) fn writes(&self) -> Vec<String> {
             self.calls()
                 .into_iter()
                 .filter(|args| is_write(args))
@@ -1455,35 +1416,35 @@ mod tests {
                 .collect()
         }
 
-        fn labels(&self, number: u64) -> Vec<String> {
+        pub(crate) fn labels(&self, number: u64) -> Vec<String> {
             self.lock().issues[&number].labels.clone()
         }
 
-        fn late_writes(&self) -> Vec<String> {
+        pub(crate) fn late_writes(&self) -> Vec<String> {
             self.lock().late_writes.clone()
         }
 
-        fn other(args: &[String], message: &str) -> TrackerError {
+        pub(crate) fn other(args: &[String], message: &str) -> TrackerError {
             TrackerError::Other {
                 kind: OtherKind::Failed,
                 message: format!("`gh {}` failed: {message}", args.join(" ")),
             }
         }
 
-        fn flag_values(args: &[String], flag: &str) -> Vec<String> {
+        pub(crate) fn flag_values(args: &[String], flag: &str) -> Vec<String> {
             args.windows(2)
                 .filter(|pair| pair[0] == flag)
                 .map(|pair| pair[1].clone())
                 .collect()
         }
 
-        fn number_arg(args: &[String]) -> Option<u64> {
+        pub(crate) fn number_arg(args: &[String]) -> Option<u64> {
             Self::flag_values(args, "-F")
                 .into_iter()
                 .find_map(|f| f.strip_prefix("number=").and_then(|n| n.parse().ok()))
         }
 
-        fn issue_json(number: u64, issue: &HubIssue) -> Value {
+        pub(crate) fn issue_json(number: u64, issue: &HubIssue) -> Value {
             json!({
                 "number": number,
                 "title": issue.title,
@@ -1495,7 +1456,7 @@ mod tests {
             })
         }
 
-        fn answer(&self, args: &[String]) -> Result<String, TrackerError> {
+        pub(crate) fn answer(&self, args: &[String]) -> Result<String, TrackerError> {
             let mut state = self.lock();
             state.calls.push(args.to_vec());
             if is_write(args) && self.lost.load(Ordering::SeqCst) {
@@ -1652,7 +1613,7 @@ mod tests {
     }
 
     /// Whether `args` change GitHub.
-    fn is_write(args: &[String]) -> bool {
+    pub(crate) fn is_write(args: &[String]) -> bool {
         let word = |at: usize| args.get(at).map(String::as_str);
         matches!(
             (word(0), word(1)),
@@ -1667,6 +1628,56 @@ mod tests {
         fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
             self.answer(args)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use foundry_proto::factory::{
+        FactorySettings, FactoryStatus, MachineHeld, NotHolding, ProjectFactory, RunId, SessionTurn,
+    };
+    use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
+    use foundry_proto::record::{MachineSample, Record, Session, Workspace};
+    use foundry_proto::settings::{Limits, Machine, SharedSettings};
+    use foundry_proto::state::SessionState;
+
+    use super::*;
+    use crate::clock::FakeClock;
+    use crate::factory::github::Hiding;
+    use crate::factory::lease::LeaseState;
+    use crate::factory::ledger::Ledger;
+    use crate::factory::ledger::events::{Cause, CauseStep, Event};
+    use crate::factory::ledger::testing::open_store;
+    use crate::factory::messages::Message;
+    use crate::factory::runs::RunProject;
+    use crate::factory::worker::{
+        AlwaysHeld, Call, CreateWorkspace, FakeWorker, FleetView, Guard, LeaseLost, Lost, Worker,
+        WorkerError,
+    };
+    use crate::sessions::factory::{FactoryStart, SendRefused};
+    use crate::sessions::turns::TurnText;
+    use crate::store::Store;
+
+    use super::testing::{CONFIG, Hub, LABELED_AT, LOGIN, REPO, SHA};
+    const SHA2: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+    fn me() -> MachineId {
+        MachineId(uuid::Uuid::from_u128(0x1))
+    }
+
+    fn builder_machine() -> MachineId {
+        MachineId(uuid::Uuid::from_u128(0x2))
+    }
+
+    fn project_id() -> ProjectId {
+        ProjectId(uuid::Uuid::from_u128(0x7001))
+    }
+
+    fn other_project() -> ProjectId {
+        ProjectId(uuid::Uuid::from_u128(0x7002))
     }
 
     // ----- a guard that is lost after a number of checks -----
@@ -2880,7 +2891,4 @@ mod tests {
             assert_eq!(status.ready[0].issue, 6);
         }
     }
-
-    #[allow(dead_code)]
-    fn unused(_: BTreeSet<u64>, _: FactoryBody) {}
 }
