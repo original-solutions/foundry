@@ -21,12 +21,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use foundry_proto::factory::{RunEvent, RunId};
+use foundry_proto::ids::{MachineId, WorkspaceId};
 use serde_json::Value;
 
+use super::gating::GATE_REQUESTED;
+use super::resume::UNREACHABLE_FOR;
+use super::{RunContext, RunError};
+use crate::factory::gate;
 use crate::factory::github::read::{CheckState, CheckStatus};
 use crate::factory::ledger::events::{ModelOption, names};
 use crate::factory::ledger::read::{field, text};
 use crate::factory::lifecycle::State;
+use crate::factory::lifecycle::approval::TextCheck;
+use crate::factory::messages::{CANNOT_CONFIRM, CANNOT_VERIFY_DURING_BUILD, CHANGED_DURING_BUILD};
 use crate::factory::text::{elapsed_ms, is_commit_id};
 
 /// The ledger step that says a launch call is about to be sent.
@@ -1056,7 +1063,7 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                     seen.bound_branches.push(branch.to_owned());
                 }
             }
-            "session_interrupted" => {
+            names::SESSION_INTERRUPTED => {
                 let resumes = number(data, "resumes");
                 let ordinal = number(data, "run_ordinal");
                 let branch = text(data, "branch");
@@ -1258,7 +1265,7 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
             }
             // No `gate-sending`: it is no gate attempt, and no re-gate. Read only so that a
             // feedback relaunch that is decided and not committed is never gated meanwhile.
-            "feedback_relaunching" => {
+            names::FEEDBACK_RELAUNCHING => {
                 let (Some(n), Some(branch), Some(message)) = (
                     number(data, "n"),
                     text(data, "branch"),
@@ -1356,11 +1363,11 @@ pub fn run_names(events: &[RunEvent], seen: &Seen) -> RunNames {
                 add(field(data, "resumed_from").and_then(|from| text(from, "branch")));
             }
             names::STUCK
-            | "session_interrupted"
+            | names::SESSION_INTERRUPTED
             | "session_rate_limited"
             | "branch_bound"
             | "regate_relaunching"
-            | "feedback_relaunching" => add(text(data, "branch")),
+            | names::FEEDBACK_RELAUNCHING => add(text(data, "branch")),
             names::PR_OPENED | "pr_left" => {
                 if let Some(pr) = field(data, "pr").and_then(Value::as_u64) {
                     names.prs.insert(pr);
@@ -1410,6 +1417,138 @@ impl SendTries {
         }
         self.tries += 1;
     }
+}
+
+// ----- the readers the run steps share -----
+
+/// The text of a `step_changed` event.
+pub(super) fn step_text(event: &RunEvent) -> Option<&str> {
+    if event.event != names::STEP_CHANGED {
+        return None;
+    }
+    event.data.get("step").and_then(Value::as_str)
+}
+
+/// What follows `prefix` and the count `n` in `step`, or `None` for a step of another kind or
+/// another count.
+pub(super) fn numbered<'a>(step: &'a str, prefix: &str, n: u32) -> Option<&'a str> {
+    let rest = step.strip_prefix(prefix)?;
+    let (count, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+    (count == n.to_string()).then_some(tail)
+}
+
+/// The highest number `field` holds in the `event` lines of `events`, 0 for none.
+pub(super) fn highest(events: &[RunEvent], event: &str, field: &str) -> u32 {
+    events
+        .iter()
+        .filter(|line| line.event == event)
+        .filter_map(|line| line.data.get(field).and_then(Value::as_u64))
+        .max()
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0)
+}
+
+/// The build workspace's name: `fac/<N>-<attempt>`.
+pub(super) fn build_name(run: &RunId) -> String {
+    format!("fac/{}-{}", run.issue(), run.attempt())
+}
+
+/// The k-th resume workspace's name: `fac/<N>-<attempt>-r<k>`.
+pub(super) fn resume_name(run: &RunId, k: u32) -> String {
+    format!("{}-r{k}", build_name(run))
+}
+
+/// The name of feedback round `n`'s workspace: `fac/<N>-<attempt>-f<n>`.
+pub(super) fn feedback_name(run: &RunId, n: u32) -> String {
+    format!("{}-f{n}", build_name(run))
+}
+
+/// A workspace of a run that the fleet shows.
+#[derive(Clone, Debug)]
+pub(super) struct Live {
+    pub id: WorkspaceId,
+    pub machine: MachineId,
+    /// A gate's workspace: its machine is given up on sooner.
+    pub gate: bool,
+}
+
+impl Live {
+    /// Whether its machine has been unreachable for as long as the factory waits for it.
+    pub fn gone(&self, ctx: &RunContext<'_>) -> bool {
+        let after = if self.gate {
+            gate::MACHINE_GONE_AFTER
+        } else {
+            UNREACHABLE_FOR
+        };
+        ctx.view.unreachable_for(self.machine) >= after
+    }
+}
+
+/// Every workspace the fleet shows under a name the run can have: its build workspace, a
+/// resume's (`-r<k>`), a feedback round's (`-f<k>`) and a gate's (`-g<k>`), one past the
+/// highest count its own ledger names, so a workspace being asked for is among them. A
+/// workspace is listed once, in the order of the names.
+pub(super) fn live_workspaces(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent]) -> Vec<Live> {
+    let gates = events
+        .iter()
+        .filter_map(step_text)
+        .filter_map(|step| step.strip_prefix(GATE_REQUESTED))
+        .filter_map(|rest| rest.split(' ').nth(1)?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    let mut named = vec![(build_name(run), false)];
+    named.extend(
+        (1..=highest(events, names::SESSION_INTERRUPTED, "resumes").saturating_add(1))
+            .map(|k| (resume_name(run, k), false)),
+    );
+    named.extend(
+        (1..=highest(events, names::FEEDBACK_RELAUNCHING, "n").saturating_add(1))
+            .map(|k| (feedback_name(run, k), false)),
+    );
+    named.extend((1..=gates.saturating_add(1)).map(|k| (gate::name(run, k), true)));
+    let mut found: Vec<Live> = Vec::new();
+    for (name, is_gate) in named {
+        for record in ctx.view.workspaces_named(ctx.project.id, &name) {
+            if found.iter().all(|live| live.id != record.body.id) {
+                found.push(Live {
+                    id: record.body.id,
+                    machine: record.owner,
+                    gate: is_gate,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// The code of the stuck path a building run takes when its issue text was changed since the
+/// approval by someone who is not an instructor.
+pub(super) const TEXT_CODE: &str = "text-changed-during-build";
+/// The code of the stuck path when the edits since the approval cannot be judged.
+pub(super) const UNVERIFIED_CODE: &str = "edits-unverifiable";
+/// The code of the stuck path of a run with no `approved` step.
+pub(super) const UNCONFIRMED_CODE: &str = "approval-unconfirmed";
+
+/// Why the issue text no longer stands for a building run, as the code and the public reason, or
+/// `None`. A run with no `approved` step fails closed without a read; otherwise every rename and
+/// body edit since the approval must be an instructor's. A history that cannot be judged counts
+/// as changed; a failed read is an error, never an answer.
+pub(super) fn text_stop(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    seen: &Seen,
+) -> Result<Option<(&'static str, &'static str)>, RunError> {
+    let Some(approved_at) = &seen.approved_at else {
+        return Ok(Some((UNCONFIRMED_CODE, CANNOT_CONFIRM)));
+    };
+    let check = ctx
+        .tracker
+        .text_check(ctx.repo(), issue, approved_at, &ctx.config.instructors)?;
+    Ok(match check {
+        TextCheck::Unchanged => None,
+        TextCheck::Changed => Some((TEXT_CODE, CHANGED_DURING_BUILD)),
+        TextCheck::Unjudged => Some((UNVERIFIED_CODE, CANNOT_VERIFY_DURING_BUILD)),
+    })
 }
 
 /// The id after a `<name> <id>` intent step: 0 for the bare name an older ledger wrote.

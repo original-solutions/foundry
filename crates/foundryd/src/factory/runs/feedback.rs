@@ -287,13 +287,12 @@ use foundry_proto::state::{SessionState, TerminalState};
 use serde_json::Value;
 
 use super::progress::{
-    BODY_EDIT_DROPPED, BODY_EDIT_FORWARDED, COMMENT_DROPPED, Fixes, STUCK_DETAIL, STUCK_STOP, Seen,
-    pending_relaunch, read_progress,
+    BODY_EDIT_DROPPED, BODY_EDIT_FORWARDED, COMMENT_DROPPED, Fixes, Live, STUCK_DETAIL, STUCK_STOP,
+    Seen, feedback_name, live_workspaces, numbered, pending_relaunch, read_progress, step_text,
+    text_stop,
 };
 use super::resume::{BRANCH_REFUSED, UNREACHABLE_FOR};
 use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
-use super::stop::Live;
-use super::stop::{live_workspaces, numbered, step_text, text_stop as shared_text_stop};
 use super::{
     ActionPayload, Closing, ForwardPayload, Progress, RunContext, RunError, Stop, StuckStop,
     abandon, apply_actions, closed_issue, end_own_merge, end_run, go_stuck, moved_on_by_closing,
@@ -316,15 +315,6 @@ use crate::factory::text;
 use crate::factory::worker::{CreateWorkspace, WorkerError};
 use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
 use crate::workspaces::{Checkout, FactoryTag, Setup};
-
-/// The name of a round's decision line (`Event::FeedbackRelaunching`), as the ledger writes it.
-/// `ledger::events::names` has no constant for it; the test `the_event_names_are_the_ledgers`
-/// pins this one to `Event::name`.
-pub const FEEDBACK_RELAUNCHING: &str = "feedback_relaunching";
-
-/// The name of an interruption line (`Event::SessionInterrupted`), which the round's reset of
-/// the resume cap counts after the newest [`FEEDBACK_RELAUNCHING`]; pinned as that one is.
-pub const SESSION_INTERRUPTED: &str = "session_interrupted";
 
 /// Why a round that has feedback does not start when every run slot is held.
 pub const NO_SLOT: &str = "no run slot is free";
@@ -844,11 +834,6 @@ fn parse_machine(text: &str) -> Option<MachineId> {
     uuid::Uuid::parse_str(text).ok().map(MachineId)
 }
 
-/// The name of round `n`'s workspace: `fac/<N>-<attempt>-f<n>`.
-fn round_name(run: &RunId, n: u32) -> String {
-    format!("fac/{}-{}-f{n}", run.issue(), run.attempt())
-}
-
 /// The id feedback on the issue carries, so that it cannot collide with a review's or a pull
 /// request comment's.
 fn issue_comment_feedback_id(id: &str) -> String {
@@ -945,7 +930,7 @@ fn launches_since_the_round(events: &[RunEvent]) -> Option<usize> {
     }
     let at = events
         .iter()
-        .rposition(|event| event.event == FEEDBACK_RELAUNCHING)?;
+        .rposition(|event| event.event == names::FEEDBACK_RELAUNCHING)?;
     Some(
         events[at + 1..]
             .iter()
@@ -980,7 +965,7 @@ impl Round {
 
     fn read(events: &[RunEvent]) -> Option<Round> {
         let number = |event: &RunEvent| {
-            (event.event == FEEDBACK_RELAUNCHING)
+            (event.event == names::FEEDBACK_RELAUNCHING)
                 .then(|| event.data.get("n").and_then(Value::as_u64))
                 .flatten()
                 .and_then(|n| u32::try_from(n).ok())
@@ -1040,8 +1025,8 @@ impl Round {
     }
 }
 
-/// The run's build, resume or feedback workspace `id` the fleet shows, not archived: stop's
-/// list of the run's workspaces without the gate's (`-g<k>`), which is not one this step
+/// The run's build, resume or feedback workspace `id` the fleet shows, not archived: the run's
+/// workspaces ([`live_workspaces`]) without the gate's (`-g<k>`), which is not one this step
 /// archives.
 fn live_workspace(
     ctx: &RunContext<'_>,
@@ -1216,8 +1201,8 @@ fn read_and_decide(
         abandon(ctx, run, &round_seen(seen, None), CauseStep::Forward)?;
         return Ok(FeedbackStep::Abandoned);
     }
-    if let Some((code, stop)) = text_stop(ctx, issue, seen)? {
-        return stuck(ctx, run, &mut at, code, stop);
+    if let Some((code, reason)) = text_stop(ctx, issue, seen)? {
+        return stuck(ctx, run, &mut at, code, Stop::new(reason));
     }
     if !is_safe_branch_name(&pull.head_ref) {
         let stop = Stop {
@@ -1395,17 +1380,6 @@ fn record_decision(ctx: &RunContext<'_>, run: &RunId, round: &Round) -> Result<(
         },
         &Cause::new(CauseStep::Forward, "instructor-feedback"),
     )
-}
-
-/// Whether the issue text was changed since the approval by someone who is not an instructor,
-/// or cannot be judged: the code and the stop of the run, or `None` when it stands. The rule is
-/// `stop`'s, which `building`'s watch is.
-fn text_stop(
-    ctx: &RunContext<'_>,
-    issue: u64,
-    seen: &Seen,
-) -> Result<Option<(&'static str, Stop)>, RunError> {
-    Ok(shared_text_stop(ctx, issue, seen)?.map(|(code, reason)| (code, Stop::new(reason))))
 }
 
 /// The run goes stuck under `code`, with `stop`.
@@ -1762,7 +1736,7 @@ fn carry_on(
             }),
         };
     }
-    let name = round_name(run, n);
+    let name = feedback_name(run, n);
     let named = ctx.view.workspaces_named(ctx.project.id, &name);
     let record = match round.workspace {
         Some(id) => match named.iter().find(|record| record.body.id == id) {
@@ -1848,8 +1822,8 @@ fn carry_on(
     }
     // Before every start, the text since the approval: a session that would act on text no
     // instructor approved is not started.
-    if let Some((code, stop)) = text_stop(ctx, issue, seen)? {
-        return stuck(ctx, run, &mut at, code, stop);
+    if let Some((code, reason)) = text_stop(ctx, issue, seen)? {
+        return stuck(ctx, run, &mut at, code, Stop::new(reason));
     }
     let start = FactoryStart {
         project: ctx.project.id,
@@ -5187,28 +5161,6 @@ mod tests {
 
     mod feedback_the_budgets_start_again {
         use super::*;
-
-        /// The names the round's reset and the workspace names are read by are the ones the
-        /// ledger writes: a rename of either event fails here, not in a silent miscount.
-        #[test]
-        fn the_event_names_are_the_ledgers() {
-            let relaunching = Event::FeedbackRelaunching {
-                n: 1,
-                branch: BRANCH.into(),
-                items: vec![],
-                message: String::new(),
-            };
-            assert_eq!(relaunching.name(), FEEDBACK_RELAUNCHING);
-            let interrupted = Event::SessionInterrupted {
-                resumes: 1,
-                relaunch: false,
-                run_ordinal: None,
-                branch: None,
-                t3_error: None,
-                ended_in_pass: 0,
-            };
-            assert_eq!(interrupted.name(), SESSION_INTERRUPTED);
-        }
 
         /// What `building::time_limit` measures from starts again at the round's move to
         /// `building`: the worked time and the running stint, which are what this checks.

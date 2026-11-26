@@ -40,7 +40,7 @@ use serde::Deserialize;
 use super::progress::{
     APPROVAL_RECHECKED, APPROVAL_WITHDRAWN, APPROVED, LAUNCH_BASE, LAUNCH_ENDING_SESSIONS,
     LAUNCH_MODEL, LAUNCH_PULL_REQUEST, LAUNCH_RESENDING, LAUNCH_RESUMING, LAUNCH_SENDING,
-    LAUNCH_SENDING_RESUMED, Seen, TIME_LIMIT, WORKSPACE_CREATED, WORKSPACE_REQUESTED,
+    LAUNCH_SENDING_RESUMED, Seen, TIME_LIMIT, WORKSPACE_CREATED, WORKSPACE_REQUESTED, build_name,
     read_progress,
 };
 use super::{
@@ -771,7 +771,7 @@ fn finish_begun_path(
                 .map(MachineId)
             && let Some(record) = find_workspace(
                 ctx,
-                &workspace_name(run),
+                &build_name(run),
                 machine,
                 seen.workspace.as_deref().map(workspace_id).transpose()?,
             )
@@ -925,11 +925,6 @@ impl Resumed {
             },
         }
     }
-}
-
-/// The build workspace's name: `fac/<N>-<attempt>`.
-fn workspace_name(run: &RunId) -> String {
-    format!("fac/{}-{}", run.issue(), run.attempt())
 }
 
 /// The launch message of a run on `base`, continuing `resumed` when it does.
@@ -1274,7 +1269,7 @@ fn build(
         .ok_or_else(|| {
             RunError::Invalid(format!("run {run} has no machine its build is asked of"))
         })?;
-    let name = workspace_name(run);
+    let name = build_name(run);
     let wanted = seen.workspace.as_deref().map(workspace_id).transpose()?;
     let found = find_workspace(ctx, &name, machine, wanted);
     let cause = Cause::new(CauseStep::Start, "launch-decided");

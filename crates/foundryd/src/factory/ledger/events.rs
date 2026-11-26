@@ -287,6 +287,8 @@ pub mod names {
     pub const STATE_CHANGED: &str = "state_changed";
     pub const STUCK: &str = "stuck";
     pub const FINISHED: &str = "finished";
+    pub const SESSION_INTERRUPTED: &str = "session_interrupted";
+    pub const FEEDBACK_RELAUNCHING: &str = "feedback_relaunching";
 }
 
 impl Event {
@@ -299,7 +301,7 @@ impl Event {
             Event::AnswerReceived { .. } => "answer_received",
             Event::SessionLaunched { .. } => names::SESSION_LAUNCHED,
             Event::CommentForwarded { .. } => "comment_forwarded",
-            Event::SessionInterrupted { .. } => "session_interrupted",
+            Event::SessionInterrupted { .. } => names::SESSION_INTERRUPTED,
             Event::SessionRateLimited { .. } => "session_rate_limited",
             Event::SessionPaused { .. } => "session_paused",
             Event::StopRequested { .. } => "stop_requested",
@@ -316,7 +318,7 @@ impl Event {
             Event::GateFinished { .. } => "gate_finished",
             Event::GateRegate { .. } => "gate_regate",
             Event::RegateRelaunching { .. } => "regate_relaunching",
-            Event::FeedbackRelaunching { .. } => "feedback_relaunching",
+            Event::FeedbackRelaunching { .. } => names::FEEDBACK_RELAUNCHING,
             Event::FeedbackForwarding { .. } => "feedback_forwarding",
             Event::GateCleanupFailed { .. } => "gate_cleanup_failed",
             Event::WorktreeRemoved { .. } => "worktree_removed",
@@ -370,7 +372,7 @@ pub const FIELDS: [(&str, &[&str]); 33] = [
     ),
     ("comment_forwarded", &["comment_id"]),
     (
-        "session_interrupted",
+        names::SESSION_INTERRUPTED,
         &[
             "resumes",
             "relaunch",
@@ -405,7 +407,10 @@ pub const FIELDS: [(&str, &[&str]); 33] = [
         &["sha", "base_sha", "previous_base_sha", "conflict"],
     ),
     ("regate_relaunching", &["attempt", "branch", "message"]),
-    ("feedback_relaunching", &["n", "branch", "items", "message"]),
+    (
+        names::FEEDBACK_RELAUNCHING,
+        &["n", "branch", "items", "message"],
+    ),
     (
         "feedback_forwarding",
         &["n", "run_ordinal", "items", "message"],

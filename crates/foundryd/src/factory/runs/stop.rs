@@ -170,30 +170,24 @@
 use std::collections::BTreeSet;
 
 use foundry_proto::factory::{RunEvent, RunId};
-use foundry_proto::ids::{MachineId, WorkspaceId};
-use serde_json::Value;
+use foundry_proto::ids::WorkspaceId;
 
 use super::feedback;
-use super::gating::{self, GATE_REQUESTED};
-use super::progress::{Seen, pending_relaunch, read_progress};
-use super::resume::{
-    ENDING_SESSIONS as RESUME_ENDING_SESSIONS, MACHINE as RESUME_MACHINE,
-    MACHINE_GIVEN_UP as RESUME_MACHINE_GIVEN_UP, SENDING as RESUME_SENDING, UNREACHABLE_FOR,
-    WORKSPACE as RESUME_WORKSPACE,
+use super::gating;
+use super::progress::{
+    Live, Seen, TEXT_CODE, UNCONFIRMED_CODE, UNVERIFIED_CODE, live_workspaces, pending_relaunch,
+    read_progress, step_text, text_stop,
 };
+use super::resume;
 use super::{
     Closing, Progress, RunContext, RunError, Stop, StuckStop, abandon, closed_issue, end_own_merge,
     end_run, go_stuck, progress_from, recorded_reason, workspace_id,
 };
-use crate::factory::gate;
 use crate::factory::github::TrackerError;
 use crate::factory::ledger::Ledger;
-use crate::factory::ledger::events::{Cause, CauseStep, Event, names};
+use crate::factory::ledger::events::{Cause, CauseStep, Event};
 use crate::factory::lifecycle::State;
-use crate::factory::lifecycle::approval::TextCheck;
-use crate::factory::messages::{
-    CANNOT_CONFIRM, CANNOT_VERIFY_DURING_BUILD, CHANGED_DURING_BUILD, STOPPED_BY_HAND,
-};
+use crate::factory::messages::STOPPED_BY_HAND;
 use crate::factory::worker::{Guard, WorkerError};
 
 /// What [`request`] found.
@@ -407,40 +401,19 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StopStep, RunError> 
 /// step recorded for it. The session to end is in that workspace (`-r<k>`), the earlier one
 /// being archived; a start may have gone out once `resume-sending <k>` or
 /// `resume-ending-sessions <k>` is recorded, and then the session may exist without a
-/// `session_launched` line. `None` when no resume has a workspace yet: `seen` stands. The step
-/// names are `resume.rs`'s constants. It reads resume.rs's own steps (`RESUME_MACHINE`,
-/// `RESUME_MACHINE_GIVEN_UP`, `RESUME_WORKSPACE`, `RESUME_SENDING`, `RESUME_ENDING_SESSIONS`)
-/// and must follow `resume::read_round` if those rules change.
+/// `session_launched` line. `None` when no resume has a workspace yet: `seen` stands. The
+/// round is the one [`resume::read_round`] reads.
 fn resuming_seen(events: &[RunEvent], seen: &Seen) -> Option<Seen> {
     let interruption = seen.interruption.as_ref().filter(|interruption| {
         !interruption.relaunch && !interruption.rate_limited && !interruption.sent
     })?;
-    let k = interruption.resumes;
-    let at = events.iter().rposition(|event| {
-        event.event == feedback::SESSION_INTERRUPTED
-            && event.data.get("relaunch") != Some(&Value::Bool(true))
-    })?;
-    let (mut workspace, mut sending) = (None, false);
-    for step in events[at + 1..].iter().filter_map(step_text) {
-        if numbered(step, RESUME_MACHINE_GIVEN_UP, k).is_some()
-            || numbered(step, RESUME_MACHINE, k).is_some()
-        {
-            workspace = None;
-            sending = false;
-        } else if let Some(rest) = numbered(step, RESUME_WORKSPACE, k) {
-            workspace = uuid::Uuid::parse_str(rest).ok().map(WorkspaceId);
-        } else if numbered(step, RESUME_SENDING, k).is_some()
-            || numbered(step, RESUME_ENDING_SESSIONS, k).is_some()
-        {
-            sending = true;
-        }
-    }
-    let id = workspace?;
+    let round = resume::read_round(events).filter(|round| round.k == interruption.resumes)?;
+    let id = round.workspace?;
     let mut stopping = seen.clone();
     stopping.workspace = None;
     stopping.worktree = Some(id.to_string());
     stopping.thread_id = None;
-    stopping.launch_sent = sending;
+    stopping.launch_sent = round.sending || round.ending_sessions;
     Some(stopping)
 }
 
@@ -523,92 +496,6 @@ fn forget_unreachable_session(
     }
 }
 
-/// A workspace of a run that the fleet shows.
-#[derive(Clone, Debug)]
-pub(super) struct Live {
-    pub id: WorkspaceId,
-    pub machine: MachineId,
-    /// A gate's workspace: its machine is given up on sooner.
-    pub gate: bool,
-}
-
-impl Live {
-    /// Whether its machine has been unreachable for as long as the factory waits for it.
-    pub fn gone(&self, ctx: &RunContext<'_>) -> bool {
-        let after = if self.gate {
-            gate::MACHINE_GONE_AFTER
-        } else {
-            UNREACHABLE_FOR
-        };
-        ctx.view.unreachable_for(self.machine) >= after
-    }
-}
-
-/// The text of a `step_changed` event.
-pub(super) fn step_text(event: &RunEvent) -> Option<&str> {
-    if event.event != names::STEP_CHANGED {
-        return None;
-    }
-    event.data.get("step").and_then(Value::as_str)
-}
-
-/// What follows `prefix` and the count `n` in `step`, or `None` for a step of another kind or
-/// another count.
-pub(super) fn numbered<'a>(step: &'a str, prefix: &str, n: u32) -> Option<&'a str> {
-    let rest = step.strip_prefix(prefix)?;
-    let (count, tail) = rest.split_once(' ').unwrap_or((rest, ""));
-    (count == n.to_string()).then_some(tail)
-}
-
-/// The highest number `field` holds in the `event` lines of `events`, 0 for none.
-fn highest(events: &[RunEvent], event: &str, field: &str) -> u32 {
-    events
-        .iter()
-        .filter(|line| line.event == event)
-        .filter_map(|line| line.data.get(field).and_then(Value::as_u64))
-        .max()
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0)
-}
-
-/// Every workspace the fleet shows under a name the run can have: its build workspace, a
-/// resume's (`-r<k>`), a feedback round's (`-f<k>`) and a gate's (`-g<k>`), one past the
-/// highest count its own ledger names, so a workspace being asked for is among them. A
-/// workspace is listed once, in the order of the names.
-pub(super) fn live_workspaces(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent]) -> Vec<Live> {
-    let base = format!("fac/{}-{}", run.issue(), run.attempt());
-    let gates = events
-        .iter()
-        .filter_map(step_text)
-        .filter_map(|step| step.strip_prefix(GATE_REQUESTED))
-        .filter_map(|rest| rest.split(' ').nth(1)?.parse::<u32>().ok())
-        .max()
-        .unwrap_or(0);
-    let mut named = vec![(base.clone(), false)];
-    named.extend(
-        (1..=highest(events, feedback::SESSION_INTERRUPTED, "resumes").saturating_add(1))
-            .map(|k| (format!("{base}-r{k}"), false)),
-    );
-    named.extend(
-        (1..=highest(events, feedback::FEEDBACK_RELAUNCHING, "n").saturating_add(1))
-            .map(|k| (format!("{base}-f{k}"), false)),
-    );
-    named.extend((1..=gates.saturating_add(1)).map(|k| (gate::name(run, k), true)));
-    let mut found: Vec<Live> = Vec::new();
-    for (name, is_gate) in named {
-        for record in ctx.view.workspaces_named(ctx.project.id, &name) {
-            if found.iter().all(|live| live.id != record.body.id) {
-                found.push(Live {
-                    id: record.body.id,
-                    machine: record.owner,
-                    gate: is_gate,
-                });
-            }
-        }
-    }
-    found
-}
-
 /// The public reason of a run a person took `factory:building` off.
 pub const LABEL_REMOVED: &str = "a person removed factory:building from the issue";
 
@@ -635,9 +522,6 @@ pub enum ReconcileStep {
 }
 
 /// The codes of the stuck paths this step decides, the runner's `watch` and its own.
-const TEXT_CODE: &str = "text-changed-during-build";
-const UNVERIFIED_CODE: &str = "edits-unverifiable";
-const UNCONFIRMED_CODE: &str = "approval-unconfirmed";
 const LABEL_CODE: &str = "label-removed";
 const ASSIGNEE_CODE: &str = "assignee-changed";
 /// The codes `feedback` also begins, for the same text checks, while it sets a round up.
@@ -828,28 +712,6 @@ fn committed(seen: &Seen) -> bool {
         && !seen.regating
         && pending_relaunch(seen).is_none()
         && seen.stuck_commenting.is_none()
-}
-
-/// Why the issue text no longer stands for a building run, as the code and the public reason, or
-/// `None`. A run with no `approved` step fails closed without a read; otherwise every rename and
-/// body edit since the approval must be an instructor's. A history that cannot be judged counts
-/// as changed; a failed read is an error, never an answer.
-pub(super) fn text_stop(
-    ctx: &RunContext<'_>,
-    issue: u64,
-    seen: &Seen,
-) -> Result<Option<(&'static str, &'static str)>, RunError> {
-    let Some(approved_at) = &seen.approved_at else {
-        return Ok(Some((UNCONFIRMED_CODE, CANNOT_CONFIRM)));
-    };
-    let check = ctx
-        .tracker
-        .text_check(ctx.repo(), issue, approved_at, &ctx.config.instructors)?;
-    Ok(match check {
-        TextCheck::Unchanged => None,
-        TextCheck::Changed => Some((TEXT_CODE, CHANGED_DURING_BUILD)),
-        TextCheck::Unjudged => Some((UNVERIFIED_CODE, CANNOT_VERIFY_DURING_BUILD)),
-    })
 }
 
 /// The run goes stuck with `reason`, its session ended and its workspace kept.

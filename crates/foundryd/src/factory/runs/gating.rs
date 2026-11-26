@@ -303,7 +303,7 @@ use foundry_proto::settings::SharedSettings;
 use foundry_proto::state::{SessionState, TerminalState};
 
 use super::progress::{
-    CHECKS_TIMED_OUT, GATE_PASSED, GATE_SENDING, PassRecord, Seen, read_progress,
+    CHECKS_TIMED_OUT, GATE_PASSED, GATE_SENDING, PassRecord, Seen, read_progress, step_text,
 };
 use super::resume::UNREACHABLE_FOR;
 use super::{
@@ -635,7 +635,7 @@ impl Log {
                     }
                 }
                 names::STEP_CHANGED => {
-                    if let Some(step) = event.data["step"].as_str() {
+                    if let Some(step) = step_text(event) {
                         log.step(step);
                     }
                 }
