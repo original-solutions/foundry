@@ -5,17 +5,19 @@
 //! gives: Foundry's claim comment first, then the label, the assignee and the status comment,
 //! with the run's `approved` and `claimed` lines written before any of it. [`advance`] is one
 //! pass of what follows: it asks for the build workspace, looks at its setup terminal on later
-//! passes, checks the approval again, starts the session with the launch message, moves the
-//! label to `building` and asks for the launch again by count when the session is idle a pass
-//! later. No pass waits on a worker: a step records what it is about to do, does it, and a pass
-//! that finds more to wait for says so ([`StartStep::Waiting`]) and returns.
+//! passes, checks the text since the approval, starts the session with the launch message,
+//! moves the label to `building` and asks for the launch again by count when the session is
+//! idle a pass later. No pass waits on a worker: a step records what it is about to do, does
+//! it, and a pass that finds more to wait for says so ([`StartStep::Waiting`]) and returns.
 //!
 //! Where it differs from the runner:
 //!
 //! - The runner launches in one call and checks the issue text after it. Foundry decides what
 //!   the launch continues from and the base before the workspace is asked for (it is made on
-//!   that branch), asks for the workspace, waits for its setup, checks the approval again and
-//!   only then starts the session: an approval taken back means no session was started.
+//!   that branch), asks for the workspace, waits for its setup, checks the text since the
+//!   approval the run recorded and only then starts the session: a text changed since means no
+//!   session was started. Who applied the label is not read again: the claim holds the approval,
+//!   and its own removal of `factory:ready` is no approval taken back.
 //! - The claim is Foundry's comment first (F13): a claim cut short after the comment leaves the
 //!   issue `ready` and the next claim's comment is the newest. The runner's `claim` call, its
 //!   claim winner among machines and its give-way after five minutes are not ported: one
@@ -1407,17 +1409,10 @@ fn build(
             session: session.body.id,
         });
     }
-    // Before the session starts, on every pass that is about to start it: the approval, and the
-    // text since it. A start retried a pass later is checked again.
-    match ctx
-        .tracker
-        .approval(ctx.repo(), issue, &ctx.config.instructors)?
-    {
-        Approval::Refused(refusal) => {
-            return withdraw(ctx, run, at, Some(&refusal), workspace);
-        }
-        Approval::Approved { .. } => {}
-    }
+    // Before the session starts, on every pass that is about to start it: the text since the
+    // approval the run recorded, as the runner checks it. The claim holds the approval, and the
+    // claim's own removal of `factory:ready` is no approval taken back. A start retried a pass
+    // later is checked again.
     let Some(approved_at) = &seen.approved_at else {
         return Err(RunError::Invalid(format!("run {run} records no approval")));
     };
