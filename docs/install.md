@@ -147,18 +147,19 @@ A token never leaves the machine that holds it. The factory hides every token an
 
 Each run is a Claude Code session that starts with `/factory-build`. The daemon looks for `~/.claude/skills/factory-build/SKILL.md` under the service user's home every 5 seconds, and places no run on a machine where it is missing.
 
-The skill's source is `~/EA/skills/factory-build`. Install the version changed for Foundry, which reads its brief from the file named on its command line and leaves the GitHub login to Foundry ([Before P2 starts](specs/P2-factory.md#before-p2-starts)). An older copy picks a `gh` login of its own. On a machine with the skills hub, its installer links it into `~/.agents/skills/`, which `~/.claude/skills` links to:
+Install the version changed for Foundry, which reads its brief from the file named on its command line and leaves the GitHub login to Foundry. An older copy picks a `gh` login of its own. That change, and the move of the skill's source to `~/EA/skills/factory-build`, are done by hand before P2 starts ([Before P2 starts](specs/P2-factory.md#before-p2-starts)). The daemon checks only that `SKILL.md` is there, so it cannot tell an older copy from the Foundry one. Replace any older copy before the machine takes its first run.
+
+Once the source is there, its installer links it into `~/.agents/skills/` on a machine with the skills hub, which `~/.claude/skills` links to:
 
 ```sh
 ~/EA/skills/factory-build/install.sh
-test -f ~/.claude/skills/factory-build/SKILL.md && echo installed
 ```
 
 On any other machine, copy the folder to `~/.claude/skills/factory-build/`. If the service sets `CLAUDE_CONFIG_DIR`, Claude Code reads skills from `$CLAUDE_CONFIG_DIR/skills/` but the daemon still checks `~/.claude/skills/`, so put the skill in both.
 
 ### Turn a project's factory on
 
-The project's repo URL must be `https://github.com/<owner>/<repo>`, because the factory reaches GitHub only over HTTPS. The repo's default branch must hold a `.dw/config.yml` with a `factory` block (`instructors`, `base`, `provision`, `gate`). A file that does not load leaves the project idle with an attention item.
+The project's repo URL must be `https://github.com/<owner>/<repo>`, because the factory reaches GitHub only over HTTPS. The repo's default branch must hold a `.dw/config.yml` whose `factory` block has `instructors`, `base`, `provision`, `gate`, `limits` with at least `gate_retries`, and `autonomy: pr`. This repo's own [`.dw/config.yml`](../.dw/config.yml) is one. A file that does not load leaves the project idle with an attention item.
 
 The UI has no factory switch yet, so use the daemon's API on any machine of the fleet. Find the project's id:
 
@@ -175,7 +176,7 @@ curl -s -X POST http://127.0.0.1:7433/api/projects/<project id>/factory \
 
 With no `login`, the project takes the acting coordinator's default login. Add `"login": "<login>"` to name another. The answer is `{"factory": {...}}` with the login it took. A `422` says why it refused, for example a repo URL that is not on `https://github.com/`, or no login named and no default on the coordinator.
 
-A project that is on acts as its login, so every later edit names it. To pause its claims:
+A project that is on acts as its login, so every later edit that keeps it on names the login. To pause its claims:
 
 ```sh
 curl -s -X POST http://127.0.0.1:7433/api/projects/<project id>/factory \
@@ -193,16 +194,29 @@ Foundry goes first, and builds itself until 10 runs have reached `pr-open` or `s
 To move one repo:
 
 1. Stop the runner claiming: `factory-runner claims pause`.
-2. Wait until no issue of the repo is in `factory:triage` or `factory:building`. `factory-runner status` lists the runner's runs.
+2. Wait until no issue of the repo is in `factory:triage` or `factory:building`. `factory-runner status` lists the runner's runs, and `gh issue list --repo <owner>/<repo> --label factory:building` lists the issues in one state.
 3. Take the repo out of `repos:` in the runner's config, `~/.config/factory-runner/config.yml`, and restart the runner with `launchctl kickstart -k gui/$(id -u)/io.github.original-solutions.factory-runner`.
 4. Let the runner claim for its other repos again: `factory-runner claims resume`.
 5. Turn the project's factory on in Foundry, as above.
 
-Foundry leaves an issue alone when its newest claim comment is the runner's. An issue the runner left in `pr-open` gets no feedback round from Foundry. Label it `factory:ready` again and Foundry starts a run that carries on from its pull request's branch.
+Foundry leaves an issue in `factory:triage` or `factory:building` alone when its newest claim comment is the runner's, and lists it as a foreign claim on the attention list. An issue the runner left in `pr-open` gets no feedback round from Foundry. Label it `factory:ready` again and Foundry claims it. The run carries on from the issue's open pull request only when the project's login opened it, it is a branch of the same repo, and it targets the base. Otherwise the run starts again from the base and opens a second pull request. To keep the runner's branch, give the project the login the runner opened its pull requests as.
 
-The way back is per repo. Turn the project's factory off in Foundry, put the repo back in the runner's `repos:` and restart the runner. While Foundry cannot build foundry, the runner builds the fix.
+The way back is per repo, and mirrors the way forward:
 
-When every repo has moved, the runner stays stopped, still installed, for a week. Then `retro` compares the two, and the runner is uninstalled.
+1. Pause the project's claims in Foundry, as above.
+2. Wait until no issue of the repo is in `factory:triage` or `factory:building`.
+3. Turn the project's factory off in Foundry.
+4. Put the repo back in the runner's `repos:` and restart the runner.
+
+If Foundry is too broken to finish its runs, label each issue it left in `factory:triage` or `factory:building` `factory:ready` again and take its assignee off, so the runner claims it afresh. While Foundry cannot build foundry, the runner builds the fix.
+
+When the last repo moves, skip step 4 of the way forward and stop the runner instead, which leaves it installed:
+
+```sh
+launchctl bootout gui/$(id -u)/io.github.original-solutions.factory-runner
+```
+
+A login loads it again, but with an empty `repos:` it claims nothing. It stays stopped for a week. Then `retro` compares the two, and the runner is uninstalled.
 
 ### Compare Foundry with the runner
 
@@ -219,7 +233,9 @@ factory-runner retro --data-dir ~/foundry-runs --since <first day> --until <day 
 factory-runner retro --data-dir ~/.config/factory-runner --since <date>
 ```
 
-For the runner, pick `--since` so its window holds its last 30 runs. `retro` prints the number of runs in the window on its first line. It reads merged pull requests' reviews with `gh`, so run it where `gh` can read the repos. Foundry passes when its `reached pr-open without a person` is no lower than the runner's and its `stuck` is no higher.
+For the runner, pick `--since` so its window holds its last 30 runs. `retro` prints the number of runs in the window on its first line. It reads merged pull requests' reviews with `gh`, so run it where `gh` can read the repos.
+
+The exit criterion asks for a gate pass rate and a stuck rate no worse than the runner's. `retro` prints no gate pass rate. Its nearest line is `reached pr-open without a person`: the share of runs that passed the gate and reached `pr-open` before any question or stop. Foundry passes when that share is no lower than the runner's and its `stuck` share is no higher.
 
 ## Updates
 
