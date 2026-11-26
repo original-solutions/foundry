@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn factory_records_are_carried_from_protocol_5_and_this_build_speaks_it() {
+    fn factory_records_are_carried_from_protocol_5_and_this_build_speaks_the_newest_protocol() {
         assert_eq!(FACTORY_SINCE, ANSWERS_SINCE + 1);
         assert_eq!(FACTORY_SINCE, 5);
         assert_eq!(PROTOCOL, UPDATES_SINCE);
