@@ -5215,18 +5215,18 @@ mod tests {
         }
 
         /// A finished run of `issue`.
-        fn finished(rig: &Rig, issue: u64) -> RunId {
+        pub(super) fn finished(rig: &Rig, issue: u64) -> RunId {
             let run = rig.run_in(issue, 1, State::Building);
             finish(rig, &run);
             run
         }
 
-        fn workspace_of(issue: u64) -> WorkspaceId {
+        pub(super) fn workspace_of(issue: u64) -> WorkspaceId {
             WorkspaceId(uuid::Uuid::from_u128(0xa00 + u128::from(issue)))
         }
 
         /// The fleet with the build workspace of each of `issues` live on the builder.
-        fn fleet_with(issues: &[u64]) -> FleetView {
+        pub(super) fn fleet_with(issues: &[u64]) -> FleetView {
             let mut view = FleetView::builder().online(me()).online(builder_machine());
             for issue in issues {
                 view = view.workspace(Record {
@@ -5253,7 +5253,7 @@ mod tests {
         }
 
         /// The same, with `sql` run on the database as the store's failure.
-        fn break_store_with(rig: &Rig, issue: u64, sql: &'static str) {
+        pub(super) fn break_store_with(rig: &Rig, issue: u64, sql: &'static str) {
             let path = rig._dir.path().join("foundry.db");
             *rig.worker.after_archive.lock().unwrap() = Some(Box::new(move |archived| {
                 if archived == workspace_of(issue) {
@@ -5435,6 +5435,37 @@ mod tests {
             let report = rig.pass();
             assert_eq!(report.failed, None, "{report:?}");
             assert_eq!(rig.claimed_issues(), vec![6], "{report:?}");
+        }
+    }
+
+    mod the_sweep_that_ends_part_way {
+        use super::the_sweep_when_the_store_fails::{
+            break_store_with, finished, fleet_with, workspace_of,
+        };
+        use super::*;
+
+        /// The store fails in the sweep after it began: the pass fails, and the next pass sweeps
+        /// again, so that the finished runs the sweep did not reach do not wait for another
+        /// STUCK_READ_EVERY.
+        #[test]
+        fn is_swept_again_by_the_next_pass() {
+            let mut rig = Rig::new();
+            finished(&rig, 3);
+            finished(&rig, 4);
+            assert_eq!(rig.pass().failed, None);
+            let swept = rig.memo.swept;
+            assert!(swept.is_some());
+            rig.view = fleet_with(&[3]);
+            rig.clock.advance(STUCK_READ_EVERY);
+            // The sweep is due, and the store fails once run 3's workspace is archived.
+            break_store_with(&rig, 3, "ALTER TABLE factory_records RENAME TO gone");
+            let report = rig.pass();
+            assert!(report.failed.is_some(), "{report:?}");
+            assert!(report.archived.contains(&workspace_of(3)), "{report:?}");
+            assert_eq!(
+                rig.memo.swept, swept,
+                "a sweep that did not finish is not counted as done"
+            );
         }
     }
 }
