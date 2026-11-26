@@ -281,9 +281,11 @@ pub struct PassReport {
 /// each pass ([`Book::begin`], [`Book::finish`]), and raised in between, under the book's lock,
 /// by each slot a claim, a gate or a feedback round takes ([`Book::take_run`],
 /// [`Book::take_gate`]): a slot is taken only while the whole fleet's count is under its
-/// limit, so two projects' passes never both take the last one. A pass holds a [`Ticket`];
-/// once its project is forgotten (turned off, or this machine stops acting) the ticket is
-/// stale and nothing it does changes the book.
+/// limit, so two projects' passes never both take the last one. A project's entry is seeded
+/// from its ledger when the service starts it ([`seed`]), so its runs count before its first
+/// pass has begun. A pass holds a [`Ticket`]; once its project is forgotten (turned off, or
+/// this machine stops acting) or seeded again (started again) the ticket is stale and nothing
+/// it does changes the book.
 #[derive(Debug, Default)]
 pub struct Book {
     state: Mutex<BookState>,
@@ -376,7 +378,7 @@ impl Book {
     }
 
     /// How many of the fleet's `max` run slots are free now.
-    fn runs_free(&self, max: u32) -> u32 {
+    pub(super) fn runs_free(&self, max: u32) -> u32 {
         max.saturating_sub(self.lock().total(|h| h.runs))
     }
 
@@ -422,6 +424,17 @@ impl Book {
                 .placed
                 .push(machine);
         }
+    }
+
+    /// The project is about to run here, or to run again: its entry is `held`, what its ledger
+    /// holds, and a pass begun before this changes nothing after it. Its runs count against
+    /// the fleet's limit from now, before its first pass reaches [`Book::begin`], which is the
+    /// count every other project's pass claims against.
+    fn seed(&self, project: ProjectId, held: Held) {
+        let mut state = self.lock();
+        state.held.insert(project, held);
+        let epoch = state.epochs.entry(project).or_insert(0);
+        *epoch = epoch.saturating_add(1);
     }
 
     /// The project no longer runs here: it holds nothing of the fleet, and a pass of it still
@@ -797,6 +810,21 @@ struct Known {
     info: RunInfo,
     events: Vec<foundry_proto::factory::RunEvent>,
     seen: super::runs::progress::Seen,
+}
+
+/// Sets `project`'s entry of `book` from what its runs in `ledger` hold. The service does this
+/// when it starts the project's tasks, whether the first time or after the project's token
+/// changed, so that the project's runs are counted before its first pass has read anything.
+/// A project that is no longer watched is [`Book::forget`]ten instead.
+pub fn seed(
+    book: &Book,
+    ledger: &Ledger,
+    project: ProjectId,
+    repo: &str,
+) -> Result<(), StoreError> {
+    let held = Pass::holding(&known_of(ledger, repo)?);
+    book.seed(project, held);
+    Ok(())
 }
 
 /// The unfinished runs of `repo` in `ledger`, each with its events.

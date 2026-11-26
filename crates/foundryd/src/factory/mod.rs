@@ -283,10 +283,21 @@ impl<H: Host> Factory<H> {
                     let keep = want.contains(&run.watched) && same;
                     if !keep {
                         run.lease.release();
-                        self.book.forget(*project);
+                        // A project still watched (its token changed) starts again below,
+                        // and its entry is seeded from its ledger there: its sessions go on.
+                        if !want.iter().any(|w| w.project == *project) {
+                            self.book.forget(*project);
+                        }
                     }
                     keep
                 });
+                // Every project about to start counts its runs before any pass of any
+                // project may claim.
+                for watched in &want {
+                    if !running.contains_key(&watched.project) {
+                        self.seed(watched);
+                    }
+                }
                 for watched in want {
                     if let std::collections::btree_map::Entry::Vacant(slot) =
                         running.entry(watched.project)
@@ -296,6 +307,14 @@ impl<H: Host> Factory<H> {
                 }
             }
             wait(&*self.clock, looked, SCAN).await;
+        }
+    }
+
+    /// The project's entry in the book, from its ledger.
+    fn seed(&self, watched: &Watched) {
+        let ledger = ledger::Ledger::new(self.store.clone(), self.me, 0, self.host.hide());
+        if let Err(error) = pass::seed(&self.book, &ledger, watched.project, &watched.repo) {
+            tracing::warn!(project = %watched.project, "factory: the project's runs could not be counted: {error}");
         }
     }
 
