@@ -412,10 +412,9 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StopStep, RunError> 
 /// `RESUME_MACHINE_GIVEN_UP`, `RESUME_WORKSPACE`, `RESUME_SENDING`, `RESUME_ENDING_SESSIONS`)
 /// and must follow `resume::read_round` if those rules change.
 fn resuming_seen(events: &[RunEvent], seen: &Seen) -> Option<Seen> {
-    let interruption = seen
-        .interruption
-        .as_ref()
-        .filter(|interruption| !interruption.relaunch && !interruption.sent)?;
+    let interruption = seen.interruption.as_ref().filter(|interruption| {
+        !interruption.relaunch && !interruption.rate_limited && !interruption.sent
+    })?;
     let k = interruption.resumes;
     let at = events.iter().rposition(|event| {
         event.event == "session_interrupted"
