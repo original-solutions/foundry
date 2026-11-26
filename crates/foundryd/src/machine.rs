@@ -584,6 +584,23 @@ mod tests {
     }
 
     #[test]
+    fn every_sample_this_machine_writes_carries_its_version_and_no_ready_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(Store::open(dir.path().join("foundry.db")).unwrap());
+        let me = MachineId::random();
+        let mut system = None;
+        for _ in 0..2 {
+            let written = write_sample_with(&mut system, &store, me, dir.path()).unwrap();
+            assert_eq!(
+                written.body.version.as_deref(),
+                Some(env!("CARGO_PKG_VERSION"))
+            );
+            assert_eq!(written.body.update_ready, None);
+            assert_eq!(held_sample(&store.lock().unwrap(), me), Some(written));
+        }
+    }
+
+    #[test]
     fn write_sample_with_keeps_one_system_and_refreshes_it_each_sample() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path().join("foundry.db")).unwrap();

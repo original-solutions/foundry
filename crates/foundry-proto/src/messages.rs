@@ -266,7 +266,13 @@ mod tests {
     fn factory_records_are_carried_from_protocol_5_and_this_build_speaks_it() {
         assert_eq!(FACTORY_SINCE, ANSWERS_SINCE + 1);
         assert_eq!(FACTORY_SINCE, 5);
-        assert_eq!(PROTOCOL, FACTORY_SINCE);
+        assert_eq!(PROTOCOL, UPDATES_SINCE);
+    }
+
+    #[test]
+    fn update_calls_are_carried_from_protocol_6_the_protocol_after_factory_records() {
+        assert_eq!(UPDATES_SINCE, FACTORY_SINCE + 1);
+        assert_eq!(UPDATES_SINCE, 6);
     }
 
     #[test]
