@@ -2,7 +2,7 @@
 
 Product: Foundry. A change to P1's updates.
 
-Status: drafted 2026-11-26 from a brainstorm the same day, revised after one council round. Nothing here is built.
+Status: drafted 2026-11-26 from a brainstorm the same day, revised after two council rounds. Nothing here is built.
 
 ## Why
 
@@ -67,6 +67,12 @@ The check every 10 minutes keeps today's rule for which tag it wants: the highes
 
 A machine has at most one ready tag. A daemon that does not run from `<home>/current`, such as one started with `cargo run`, makes no tag ready, as it installs nothing today.
 
+A ready tag counts only while both binaries of its version are on disk. One whose binaries are gone counts as not ready, so the next check fetches it again.
+
+A hand install clears the ready tag under the updater's lock before it places any files, whatever version it installs.
+
+A trial is on only while `current` names the trial's version. A trial whose version `current` does not name, as a crash between the install's two writes leaves, is cleared under the lock by the next check or install, which then goes on with the state that remains. Its tag is then no longer ready, so the next check fetches and stages it again.
+
 ### The machine record
 
 `MachineSample` gains two fields, each `#[serde(default)]`:
@@ -81,7 +87,7 @@ A sample from a peer on an older release has neither. The UI shows its version a
 `POST /api/machines/{id}/update` with `{"tag":"v0.9.1"}`.
 
 - The carry layer sends it to machine `{id}`. A machine not in the list is `404`. One that is offline, whose link is down or whose link is below protocol 6 is `503` and names it, and nothing was sent to it. One whose link went down after the call was sent is `504`, as for every carried route, and the install may have happened.
-- On the machine, the handler acts only when `{id}` is its own id. It takes the updater's lock and re-reads the state. It answers `409` with `{"error": "...", "ready": "v0.9.2"}`, or `"ready": null`, and changes nothing, when any of these holds: the tag is not the ready tag, the daemon does not run from `<home>/current`, `current` does not name the running version, a trial is on, or the ready version's two binaries are not on disk.
+- On the machine, the handler acts only when `{id}` is its own id. It takes the updater's lock and re-reads the state. It answers `409` with `{"error": "...", "ready": "v0.9.2"}`, or `"ready": null`, and changes nothing, when any of these holds: the tag is not the ready tag (as counted above), the tag is not above the running version, the tag is the refused one, the daemon does not run from `<home>/current`, `current` does not name the running version, or a trial is on (as defined above). `ready` in the body is the tag `update_ready` would report, or `null`.
 - Otherwise, in this order: it saves the trial with the running version as `previous`, clears the ready tag in the same write, and clears `refused` only when the installed tag is above the refused one. Then it points `current` at the new version. This is the order `commit_version` uses today, so a crash between the two writes never starts a version with no trial.
 - If pointing `current` fails, it writes the state back as it was before, answers `500` with the error, and the daemon keeps running.
 - Once both writes succeed it answers `202`. The daemon stops only after that answer has left, whether it went to a browser or as the answer of a carried call on the peer link, and stops anyway 5 seconds after the writes if it could not be sent. The service starts the new version, and the trial and rollback run as they do now.
@@ -90,18 +96,18 @@ A sample from a peer on an older release has neither. The UI shows its version a
 
 The badge sits in the page's top bar, so it shows on a phone without opening the sidebar. It shows while any listed machine has `update_ready`, or while the checklist is open. It names each waiting tag and how many machines it waits on, grouped by tag. Machines between checks can wait on different tags, so "v0.9.1 on 2 machines, v0.9.0 on 1" is a normal state. Removed machines are left out. Each machine in the Machines view shows the version it runs and its waiting tag.
 
-Opening the badge shows a checklist of the listed machines with a release waiting. All are ticked at first. Install sends, for each ticked machine, that machine's own `update_ready` tag. It sends the calls for every machine except the one serving the page first, and the serving machine's call only once every other call has answered. That way a restart of the serving machine never cuts off calls still on their way to the others.
+Opening the badge shows a checklist of the listed machines with a release waiting. All are ticked at first. Install sends, for each ticked machine, that machine's own `update_ready` tag. It sends the calls for every machine except the one serving the page first, and the serving machine's call only once every other call has finished, with an answer, a timeout or a dropped connection. That way a restart of the serving machine never cuts off calls still on their way to the others.
 
 Each row keeps its machine, its tag and its call's answer until the checklist is closed, after the machine's `update_ready` clears. Its state is decided in this order, the first match winning:
 
 | Row says | When |
 |---|---|
-| Rolled back | Its `update_refused` is the tag. The "Update refused" attention item is raised as today |
-| Running the tag | Its `version` matches the tag. This can still turn into Rolled back during the trial's first minute |
+| Refused | Its `update_refused` is the tag: it rolled the tag back after a failed trial, or a hand install refused it. The "Update refused" attention item is raised as today |
+| Running the tag | Its `version` matches the tag. This can still turn into Refused until the trial has stayed up, which can take up to three starts |
 | Restarting | The call answered `202` |
 | Sent, outcome unknown | The call answered `504`, or the connection dropped after it was sent. The row follows the records from here, and nothing is sent again on its own |
 | Not sent | The call answered `503` or `404`, with the reason given |
-| Already changed | The call answered `409`. The row shows the tag now ready, if any |
+| Already changed | The call answered `409`. The row shows the error text and the tag now ready, if any |
 | Failed | Any other answer, with its error text |
 
 When the serving machine restarts on a new version, the page reconnects and reloads with the new bundle as it does today, which closes the checklist. By then every other call has answered. The Machines view then shows what each machine runs.
@@ -119,8 +125,8 @@ No hand install is needed. The release that adds this reaches each machine throu
 
 Tests come first, as for every change.
 
-- `update.rs`: a check that finds a higher tag downloads, verifies and unpacks it, records it as ready, and leaves `current`, the trial and the daemon alone. A check whose wanted tag is already ready downloads nothing. A refused highest tag makes nothing ready and leaves the ready tag. A higher tag replaces the ready one. A check that finishes after an install moved `current` records nothing and removes nothing. Making a tag ready leaves `refused` alone.
-- The endpoint: each `409` case changes nothing. The ready tag saves the trial and clears the ready tag before `current` moves, keeps a refusal of a higher tag, answers `202` and then stops the daemon once. A failure to point `current` restores the state, answers `500` and does not stop.
+- `update.rs`: a check that finds a higher tag downloads, verifies and unpacks it, records it as ready, and leaves `current`, the trial and the daemon alone. A check whose wanted tag is already ready downloads nothing. A refused highest tag makes nothing ready and leaves the ready tag. A higher tag replaces the ready one. A check that finishes after an install moved `current` records nothing and removes nothing. Making a tag ready leaves `refused` alone. A ready tag whose binaries are gone is fetched again. A hand install clears the ready tag before it places files. A trial whose version `current` does not name is cleared, and the check goes on.
+- The endpoint: each `409` case changes nothing, including a stale ready tag after a hand install of a higher version. The ready tag saves the trial and clears the ready tag before `current` moves, keeps a refusal of a higher tag, answers `202` and then stops the daemon once. A failure to point `current` restores the state, answers `500` and does not stop.
 - Carry: the route runs on the machine it names. A peer on protocol 5 gets `503` with nothing sent. A carried install's `202` reaches the caller before the target stops.
 - `machine.rs`: the sample carries `version` and `update_ready`, and an older peer's sample without them still reads. A daemon not run from `current` reports no `update_ready`.
 - Fleet, three daemons: a UI on the first installs on the second and the third, the serving machine last. The third's sample shows the new version, its terminals keep running, and a machine left unticked keeps its version and its ready tag.
@@ -132,5 +138,5 @@ Tests come first, as for every change.
 2. Every UI shows every machine's version and its waiting tag, on a desktop and on a phone.
 3. Installing from the UI on machine A onto machine C restarts only C, ends no terminal on C, and C's row reads "Running the tag".
 4. Installing on all three machines from machine A's UI updates all three, A last.
-5. A release that fails its trial on C reads "Rolled back" in the UI and raises "Update refused".
-6. A second install of the same tag, sent after the first, is `409` and changes nothing.
+5. A release that fails its trial on C reads "Refused" in the UI and raises "Update refused".
+6. A second install of the same tag, sent once the machine is back after the first, is `409` and changes nothing.
