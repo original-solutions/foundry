@@ -23,7 +23,8 @@
 //!    that took it there) is read, and only when a read is due. The window is kept in the
 //!    ledger, measured on `ctx.clock` as gating's `checks-waiting` is: every read writes one
 //!    step, `feedback-read <generation> <ms>`, with ` clean` after it when the read found
-//!    nothing new. A read is due when no such step is on record, when the newest is of another
+//!    nothing new and ` found` after it when it found feedback that no round could start on
+//!    (step 4). A read is due when no such step is on record, when the newest is of another
 //!    lease generation or above the clock now (a takeover, or a clock that was reset: never
 //!    later), or when `feedback_seconds` have passed since it. A pass that finds nothing due
 //!    writes and reads nothing. A read that fails writes its step too, so it waits for the
@@ -37,12 +38,17 @@
 //!    (`slots.runs_free > 0`, which the round takes: two runs in one pass do not both take the
 //!    last) and `placing::place_run` must have a machine (which the round reserves in
 //!    `reserved`). Otherwise the pass is [`FeedbackStep::Waiting`] with the reason ([`NO_SLOT`],
-//!    or the placement's own, or [`NO_MACHINE`]), and nothing is written, on GitHub or in the
-//!    ledger, not even the read's step: the issue stays `pr-open`, the wait adds nothing to
-//!    `Seen::worked_ms` (which counts `triage` and `building` only), and the feedback is read
-//!    again on the next pass, so a slot that frees is used at once. (The items are not kept:
-//!    the read costs two calls on each pass while a round with feedback waits.) Then, as the
-//!    runner does, the pull request is read (merged or closed ends the run with `end_run`), the
+//!    or the placement's own, or [`NO_MACHINE`]), and nothing is written on GitHub; the one
+//!    line in the ledger is the read's step, ` found` (a read that found feedback is no
+//!    clean read, so the floor does not move). The issue stays `pr-open` and the wait adds
+//!    nothing to `Seen::worked_ms` (which counts `triage` and `building` only). The items are
+//!    not kept, and GitHub is not asked on every pass while the round waits (the spec's "every
+//!    `feedback_seconds`"): on a pass where no read is due and the newest read is a found one,
+//!    the slot and the placement are looked at first, with no call to GitHub and nothing
+//!    written, and the pass is `Waiting` with the reason again; on the first pass a slot and a
+//!    machine are free the feedback is read at once, though no read is due, and the round
+//!    starts. When a read is due the feedback is read again, and a found read is written again
+//!    if the round still cannot start. Then, as the runner does, the pull request is read (merged or closed ends the run with `end_run`), the
 //!    issue (closed: `abandon`), the issue text against the approval (a text a person who is not
 //!    an instructor changed, one that cannot be judged and a run with no recorded approval are
 //!    stuck, as `building`'s are) and the pull request's branch: one that is not a plain branch
@@ -59,7 +65,9 @@
 //!    slot. `Seen` clears a decision at a state change, so the decision is written again after
 //!    the move: until the session is recorded, `pending_relaunch` is `Some`, which is what
 //!    `building::advance` and `resume::advance` skip a run for (a `building` run whose newest
-//!    session is the old, ended one would otherwise be read as an interruption).
+//!    session is the old, ended one would otherwise be read as an interruption). A pass cut
+//!    between the move and the second line leaves it `None`: the pass's routing, below, keys
+//!    on [`round_pending`] for that reason.
 //!    `minutes`, `gate_retries` and `interruption_resumes` start again: see below.
 //! 6. **The workspace and the session**, a step to a pass, as `resume` does. The earlier
 //!    workspace (the run's newest, when the fleet still shows it: the gate archived it at
@@ -300,7 +308,8 @@ pub const NO_MACHINE: &str = "no machine can take the round";
 
 /// The step written for every read of the feedback: `feedback-read <generation> <ms>`, the
 /// generation the lease was held at and the sleep-counting clock's reading (milliseconds) at
-/// the read, with ` clean` after it when the read found nothing new.
+/// the read, with ` clean` after it when the read found nothing new and ` found` after it when
+/// it found feedback and the round could not start (no run slot, no machine).
 pub const READ: &str = "feedback-read ";
 /// The step that records the machine the round's workspace is made on: `feedback-machine <n> <id>`.
 pub const MACHINE: &str = "feedback-machine ";
@@ -838,6 +847,18 @@ fn issue_comment_feedback_id(id: &str) -> String {
 
 // ----- what the ledger says of the reads -----
 
+/// What a read of the feedback came to, as its step records it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A read that failed, or that found feedback and started a round on it.
+    Read,
+    /// A read that found nothing new: its time is where the next read stops paging.
+    Clean,
+    /// A read that found feedback and could not start a round on it: no slot, or no machine.
+    /// It is no clean read, so the floor does not move; the round is waited for.
+    Found,
+}
+
 /// The reads of the feedback a ledger records.
 #[derive(Debug, Default)]
 struct ReadLog {
@@ -845,6 +866,8 @@ struct ReadLog {
     last: Option<(u64, u64)>,
     /// The wall time (the event's) of the newest clean read.
     clean: Option<u64>,
+    /// The newest read found feedback and no round could start on it: the round waits.
+    found: bool,
 }
 
 impl ReadLog {
@@ -855,16 +878,18 @@ impl ReadLog {
                 continue;
             };
             let parts: Vec<&str> = rest.split(' ').collect();
-            let (generation, at, clean) = match parts.as_slice() {
-                [generation, at] => (generation, at, false),
-                [generation, at, "clean"] => (generation, at, true),
+            let (generation, at, kind) = match parts.as_slice() {
+                [generation, at] => (generation, at, Kind::Read),
+                [generation, at, "clean"] => (generation, at, Kind::Clean),
+                [generation, at, "found"] => (generation, at, Kind::Found),
                 _ => continue,
             };
             let (Some(generation), Some(at)) = (canonical(generation), canonical(at)) else {
                 continue;
             };
             log.last = Some((generation, at));
-            if clean {
+            log.found = kind == Kind::Found;
+            if kind == Kind::Clean {
                 log.clean = Some(event.ms);
             }
         }
@@ -1135,7 +1160,15 @@ fn read_and_decide(
     let now = clock_ms(ctx);
     let log = ReadLog::read(events);
     if !log.due(generation, now, ctx.settings.fleet.feedback_seconds) {
-        return Ok(FeedbackStep::None);
+        // A read that found feedback for a round that could not start is not made again before
+        // it is due: the slot and the placement are looked at, with no call to GitHub, and the
+        // round is read now on the first pass it can start.
+        if !log.found {
+            return Ok(FeedbackStep::None);
+        }
+        if let Some(reason) = cannot_start(ctx, shared, slots, reserved) {
+            return Ok(FeedbackStep::Waiting { reason });
+        }
     }
     let since = second_before(since_ms);
     let clean_floor = log.clean.unwrap_or(0).saturating_sub(CLEAN_READ_MARGIN_MS);
@@ -1144,28 +1177,21 @@ fn read_and_decide(
         Ok(items) => items,
         // A read that fails waits for the next one too.
         Err(error) => {
-            let _ = record_read(ctx, run, generation, now, false);
+            let _ = record_read(ctx, run, generation, now, Kind::Read);
             return Err(error);
         }
     };
     if items.is_empty() {
-        record_read(ctx, run, generation, now, true)?;
+        record_read(ctx, run, generation, now, Kind::Clean)?;
         return Ok(FeedbackStep::None);
     }
-    // Nothing is written for a round that cannot start: the items are read again next pass.
-    if slots.runs_free == 0 {
-        return Ok(FeedbackStep::Waiting {
-            reason: NO_SLOT.into(),
-        });
+    // A round that cannot start writes the read's step and nothing else: the items are not
+    // kept, and are read again when the next read is due or a slot and a machine are free.
+    if let Some(reason) = cannot_start(ctx, shared, slots, reserved) {
+        record_read(ctx, run, generation, now, Kind::Found)?;
+        return Ok(FeedbackStep::Waiting { reason });
     }
-    if let Err(reasons) =
-        placing::place_run(ctx.view, shared, &ctx.project.login, &mut reserved.clone())
-    {
-        return Ok(FeedbackStep::Waiting {
-            reason: waiting_reason(&reasons),
-        });
-    }
-    record_read(ctx, run, generation, now, false)?;
+    record_read(ctx, run, generation, now, Kind::Read)?;
 
     let issue = run.issue();
     let pull = ctx.tracker.pull_request(ctx.repo(), last.pr)?;
@@ -1237,6 +1263,22 @@ fn read_and_decide(
     })
 }
 
+/// Why a round cannot start now: no run slot is free, or placement has no machine for its
+/// session. Nothing is taken and nothing is reserved.
+fn cannot_start(
+    ctx: &RunContext<'_>,
+    shared: &SharedSettings,
+    slots: &Slots,
+    reserved: &Reserved,
+) -> Option<String> {
+    if slots.runs_free == 0 {
+        return Some(NO_SLOT.into());
+    }
+    placing::place_run(ctx.view, shared, &ctx.project.login, &mut reserved.clone())
+        .err()
+        .map(|reasons| waiting_reason(&reasons))
+}
+
 fn waiting_reason(reasons: &[String]) -> String {
     if reasons.is_empty() {
         NO_MACHINE.into()
@@ -1251,9 +1293,13 @@ fn record_read(
     run: &RunId,
     generation: u64,
     now: u64,
-    clean: bool,
+    kind: Kind,
 ) -> Result<(), RunError> {
-    let tail = if clean { " clean" } else { "" };
+    let tail = match kind {
+        Kind::Read => "",
+        Kind::Clean => " clean",
+        Kind::Found => " found",
+    };
     note(
         ctx,
         run,
@@ -3457,13 +3503,14 @@ mod tests {
                 panic!("expected a wait, got {step:?}");
             };
             assert!(reason.starts_with("mac:"), "{reason}");
-            assert_eq!(world.count(), before);
+            // Only the found read's step is written.
+            assert_eq!(world.count(), before + 1);
             assert!(world.writes().is_empty());
             assert_eq!(world.rig.sim.labels(), ["factory:pr-open"]);
             // No machine at all.
             world.rig.view = FleetView::builder().build();
             assert!(matches!(world.go(), FeedbackStep::Waiting { .. }));
-            assert_eq!(world.count(), before);
+            assert_eq!(world.count(), before + 1);
         }
 
         #[test]
