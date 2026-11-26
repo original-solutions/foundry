@@ -9,6 +9,18 @@
 //!   several times between two reads is sent once, at its newest version. A record this build
 //!   cannot read, one a newer build wrote before a rollback, leaves out its owner's changes up
 //!   to it, with a warning, and the socket goes on.
+//!
+//!   After each state, a [`UiMessage::FactoryStatus`] for each project with a status believed
+//!   of it ([`factory`]'s `GET /api/factory` believes the same one), and another each time the
+//!   status believed of a project changes: the factory records, the machines heard from and
+//!   the settings are looked at every [`EVENTS_EVERY`], and only a change of one of them reads
+//!   the statuses again. When a project that had a status has none believed any more, the
+//!   whole state is sent again, then the statuses still believed, so the UI drops what it
+//!   held. Its strings have the known secrets hidden ([`Api::secrets`]); a status is not sent
+//!   while the secret store cannot be read, and is tried again after a wait that doubles from
+//!   a second to half a minute, which bounds the reads of the store and the warnings they log.
+//!   No run event is ever sent, on this socket or in `GET /api/state`: those are P1's
+//!   records.
 //! - `GET /api/terminals/{id}`, a WebSocket: see [`terminals`].
 //! - `GET /api/machine`: `{id}`, the machine that serves the UI, see [`machine`].
 //! - `GET /api/machines`: `{me, machines: [{id, name, online}]}`, this machine's id and each
@@ -99,7 +111,7 @@ use tokio::net::TcpListener;
 
 use crate::coordinator::CoordinatorError;
 use crate::placement::{self, Queue, Want};
-use crate::secrets::redact;
+use crate::secrets::{Secrets, redact};
 use crate::sessions::{SessionError, Sessions};
 use crate::store::{Store, StoreError};
 use crate::sync::Peers;
@@ -148,6 +160,9 @@ pub struct Api {
     pub sessions_refused: Option<String>,
     /// The creates waiting for a machine to qualify, which [`placement::run`] places.
     pub placements: Arc<Queue>,
+    /// The secret store whose known secrets the events socket hides in the factory statuses
+    /// it sends. `None` until the daemon sets it, which hides only the passwords of URLs.
+    pub secrets: Option<Arc<dyn Secrets>>,
 }
 
 impl Api {
@@ -169,6 +184,7 @@ impl Api {
             sessions_refused: None,
             placements,
             names,
+            secrets: None,
         }
     }
 }
@@ -576,12 +592,154 @@ async fn events(
     }))
 }
 
-/// What the events socket has sent: the highest version per owner, the settings' `seq` and
-/// which machines were online.
+/// What the events socket has sent: the highest version per owner, the settings' `seq`,
+/// which machines were online, and the factory status believed of each project, with the
+/// factory versions it was read at.
 struct Sent {
     versions: BTreeMap<MachineId, u64>,
     seq: u64,
     online: BTreeSet<MachineId>,
+    factory: Believed,
+}
+
+/// The factory statuses the events socket has sent, and what they were read from.
+#[derive(Default)]
+struct Believed {
+    /// The factory versions per owner, the settings' `seq` and the machines heard from when
+    /// the statuses were last read: `None` before the first read.
+    read_at: Option<(BTreeMap<MachineId, u64>, u64, BTreeSet<MachineId>)>,
+    statuses: BTreeMap<ProjectId, foundry_proto::factory::FactoryStatus>,
+    /// While a status cannot be hidden: when to try again, and how long the last wait was
+    /// ([`next_wait`]).
+    unreadable: Option<(tokio::time::Instant, Duration)>,
+}
+
+/// The first wait before a status the secret store could not hide is tried again.
+const UNREADABLE_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest wait before a status the secret store could not hide is tried again.
+const UNREADABLE_WAIT_MOST: Duration = Duration::from_secs(30);
+
+/// What [`send_factory`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum Factory {
+    /// Every status it had to send went, or there was none.
+    Sent,
+    /// A project it had sent a status of has none believed now. The UI is to be sent the whole
+    /// state again, after which only the statuses still believed follow.
+    Gone,
+    /// A send failed: the UI has gone.
+    Closed,
+}
+
+/// Sends a [`UiMessage::FactoryStatus`] for each project whose believed status is not the one
+/// `believed` says was sent. The statuses, and the settings they are believed by, are read only
+/// when the factory records, the settings' `seq` or the machines heard from (`online`) changed
+/// since the last read. The web UI's handling of this message (`web/src/fleet.ts`) is #161's.
+async fn send_factory(
+    api: &Api,
+    socket: &mut WebSocket,
+    believed: &mut Believed,
+    seq: u64,
+    online: &BTreeSet<MachineId>,
+) -> Result<Factory, StoreError> {
+    if believed
+        .unreadable
+        .is_some_and(|(again, _)| tokio::time::Instant::now() < again)
+    {
+        return Ok(Factory::Sent);
+    }
+    let versions = on_store(&api.store, |store| store.factory_versions()).await?;
+    let now = (versions, seq, online.clone());
+    if believed.read_at.as_ref() == Some(&now) {
+        return Ok(Factory::Sent);
+    }
+    let heard = online.clone();
+    let read = on_store(&api.store, move |store| {
+        let settings = store.settings()?;
+        factory::believed_statuses(store, &settings, &heard)
+    })
+    .await?;
+    if believed
+        .statuses
+        .keys()
+        .any(|project| !read.contains_key(project))
+    {
+        return Ok(Factory::Gone);
+    }
+    // A status that could not be hidden leaves the read to be made again, after a wait.
+    believed.read_at = Some(now);
+    let mut hidden_all = true;
+    for (project, (_, status)) in read {
+        if believed.statuses.get(&project) == Some(&status) {
+            continue;
+        }
+        let message = UiMessage::FactoryStatus {
+            protocol: PROTOCOL,
+            status: status.clone(),
+        };
+        let Some(text) = hidden_text(api, &message).await else {
+            hidden_all = false;
+            continue;
+        };
+        if socket.send(ws::Message::Text(text.into())).await.is_err() {
+            return Ok(Factory::Closed);
+        }
+        believed.statuses.insert(project, status);
+    }
+    if hidden_all {
+        if believed.unreadable.take().is_some() {
+            tracing::info!("api: the factory statuses are sent again: the secret store reads");
+        }
+    } else {
+        believed.read_at = None;
+        let last = believed.unreadable.map(|(_, wait)| wait);
+        if last.is_none() {
+            tracing::warn!("api: factory statuses are not sent while they cannot be hidden");
+        }
+        let wait = next_wait(last);
+        believed.unreadable = Some((tokio::time::Instant::now() + wait, wait));
+    }
+    Ok(Factory::Sent)
+}
+
+/// How long to wait before a status that could not be hidden is tried again, after a wait of
+/// `last`, or none: [`UNREADABLE_WAIT`] at first, then twice the last, at most
+/// [`UNREADABLE_WAIT_MOST`].
+fn next_wait(last: Option<Duration>) -> Duration {
+    last.map_or(UNREADABLE_WAIT, |last| (last * 2).min(UNREADABLE_WAIT_MOST))
+}
+
+/// `message` as JSON text, every string in it hidden with the known secrets of
+/// [`Api::secrets`], or only the passwords of URLs without one. `None` when the secret store
+/// cannot be read, or the message cannot be written, which is logged.
+async fn hidden_text(api: &Api, message: &UiMessage) -> Option<String> {
+    let mut value = match serde_json::to_value(message) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("api: an event cannot be sent: {error}");
+            return None;
+        }
+    };
+    let secrets = api.secrets.clone();
+    let hidden = tokio::task::spawn_blocking(move || {
+        let hidden = match &secrets {
+            Some(secrets) => factory::hide_strings(&mut value, &|text| {
+                crate::secrets::hide_known(text, &**secrets)
+            }),
+            None => factory::hide_strings(&mut value, &|text| redact(text)),
+        };
+        hidden.map(|()| value.to_string())
+    })
+    .await;
+    match hidden {
+        Ok(Ok(text)) => Some(text),
+        Ok(Err(factory::Unreadable)) => None,
+        Err(error) => {
+            tracing::warn!("api: an event cannot be sent: {error}");
+            None
+        }
+    }
 }
 
 /// Sends the state, then every change, until the UI goes or a send fails.
@@ -649,10 +807,19 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
                 return Ok(());
             }
         }
+        match send_factory(api, &mut socket, &mut sent.factory, sent.seq, &sent.online).await? {
+            Factory::Sent => {}
+            Factory::Closed => return Ok(()),
+            Factory::Gone => match send_state(api, &mut socket).await? {
+                Some(again) => sent = again,
+                None => return Ok(()),
+            },
+        }
     }
 }
 
-/// Sends the full state and says what it covered, or `None` when the UI has gone.
+/// Sends the full state, then the factory status believed of each project, and says what it
+/// covered, or `None` when the UI has gone.
 async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, StoreError> {
     let online = api.peers.online();
     let (state, versions) = full_state_for(api, &online).await?;
@@ -660,10 +827,19 @@ async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, S
         UiMessage::State { settings, .. } => settings.seq,
         _ => 0,
     };
-    Ok(send(socket, &state).await.then_some(Sent {
+    if !send(socket, &state).await {
+        return Ok(None);
+    }
+    // Nothing was sent before, so no status can be gone.
+    let mut factory = Believed::default();
+    if send_factory(api, socket, &mut factory, seq, &online).await? == Factory::Closed {
+        return Ok(None);
+    }
+    Ok(Some(Sent {
         versions,
         seq,
         online,
+        factory,
     }))
 }
 
@@ -1050,4 +1226,454 @@ async fn close_terminal(
     let id = parse_id(&id, "terminal", TerminalId)?;
     api.terminals.close(id).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// The events socket's factory statuses, against a real store and socket.
+#[cfg(test)]
+mod factory_events {
+    use std::time::Duration;
+
+    use foundry_proto::factory::{FactoryBody, FactoryRecord, FactoryStatus, RunId};
+    use foundry_proto::messages::UiMessage;
+    use futures::StreamExt as _;
+    use futures::future::BoxFuture;
+    use tempfile::TempDir;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::*;
+    use crate::factory::ledger::Ledger;
+    use crate::factory::ledger::events::{Cause, CauseStep, Event};
+    use crate::secrets::Secrets;
+    use crate::sessions::{self, Gateway};
+    use crate::sync::{Conn, Dialer};
+
+    const WAIT: Duration = Duration::from_secs(20);
+    const TOKEN: &str = "ghp_events0test0token0that0must0never0show";
+
+    type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    struct NoDial;
+
+    impl Dialer for NoDial {
+        fn dial(
+            &self,
+            _: &foundry_proto::settings::Machine,
+        ) -> BoxFuture<'static, std::io::Result<Conn>> {
+            Box::pin(async { Err(std::io::Error::other("no peers in these tests")) })
+        }
+    }
+
+    use super::test_secrets::Switch;
+
+    /// One machine's API, alone, on a loopback port, with a secret store that holds [`TOKEN`].
+    struct Served {
+        me: MachineId,
+        secrets: Arc<Switch>,
+        store: Arc<Mutex<Store>>,
+        addr: SocketAddr,
+        server: tokio::task::JoinHandle<()>,
+        _dir: TempDir,
+    }
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    fn project() -> ProjectId {
+        ProjectId(uuid::Uuid::from_u128(0x51))
+    }
+
+    fn run() -> RunId {
+        RunId::new("rawphp/softfac", 8, 1).unwrap()
+    }
+
+    async fn serve() -> Served {
+        let dir = tempfile::tempdir().unwrap();
+        let me = MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(dir.path().join("foundry.db")).unwrap(),
+        ));
+        {
+            let mut store = store.lock().unwrap();
+            let mut settings = store.settings().unwrap();
+            settings.seq += 1;
+            settings.priority = vec![me];
+            settings.projects.push(foundry_proto::settings::Project {
+                id: project(),
+                name: "softfac".into(),
+                repo: "https://github.com/rawphp/softfac".into(),
+            });
+            store.apply_settings(settings).unwrap();
+        }
+        let terminals = Arc::new(Terminals::new(
+            me,
+            store.clone(),
+            dir.path(),
+            dir.path().join("no-holder"),
+        ));
+        let workspaces = Arc::new(Workspaces::new(
+            me,
+            store.clone(),
+            dir.path(),
+            terminals.clone(),
+        ));
+        let sessions = Arc::new(Sessions::new(
+            me,
+            store.clone(),
+            terminals.clone(),
+            dir.path(),
+            sessions::Config {
+                claude: vec!["claude".into()],
+                claude_json: dir.path().join(".claude.json"),
+                hook_port: 9,
+                gateway: Gateway {
+                    base_url: "http://127.0.0.1:9/gateway".into(),
+                    key: "gw-key".into(),
+                },
+            },
+        ));
+        let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
+        let mut api = Api::new(
+            store.clone(),
+            peers,
+            terminals,
+            workspaces,
+            sessions,
+            Vec::new(),
+        );
+        let secrets = Arc::new(Switch::default());
+        secrets.set("github:softfac-bot", TOKEN).unwrap();
+        api.secrets = Some(secrets.clone());
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(api)).await.unwrap();
+        });
+        Served {
+            me,
+            secrets,
+            store,
+            addr,
+            server,
+            _dir: dir,
+        }
+    }
+
+    fn holding(pass: u64, idle: Option<String>) -> FactoryStatus {
+        FactoryStatus {
+            project: project(),
+            pass,
+            holds: true,
+            generation: 1,
+            not_holding: None,
+            idle,
+            owner_ignored: false,
+            ready: Vec::new(),
+            feedback_waiting: Vec::new(),
+            runs: Vec::new(),
+            held_up: Vec::new(),
+            gate_infra: Vec::new(),
+            finished: Vec::new(),
+            foreign: Vec::new(),
+        }
+    }
+
+    impl Served {
+        /// Writes `status` as `owner`'s status record, at a version above any `owner` has.
+        fn write_status(&self, owner: MachineId, status: FactoryStatus) {
+            let mut store = self.store.lock().unwrap();
+            let version = if owner == self.me {
+                store.own_next_factory_version().unwrap()
+            } else {
+                store.highest_factory_version(owner).unwrap().unwrap_or(0) + 1
+            };
+            let record = FactoryRecord {
+                owner,
+                version,
+                body: FactoryBody::Status(status),
+            };
+            store.apply_factory(&record, owner).unwrap();
+        }
+
+        fn write_event(&self) {
+            Ledger::new(
+                self.store.clone(),
+                self.me,
+                1,
+                Arc::new(|text: &str| text.to_owned()),
+            )
+            .write(
+                &run(),
+                &Event::StopRequested {
+                    by: "operator".into(),
+                },
+                &Cause::new(CauseStep::Operator, "stop-requested"),
+            )
+            .unwrap();
+        }
+
+        async fn events(&self) -> Socket {
+            let url = format!("ws://{}/api/events", self.addr);
+            let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            let first = next_text(&mut socket).await;
+            assert!(
+                matches!(
+                    serde_json::from_str::<UiMessage>(&first).unwrap(),
+                    UiMessage::State { .. }
+                ),
+                "{first}"
+            );
+            assert!(!first.contains(&run().to_string()), "{first}");
+            socket
+        }
+    }
+
+    async fn next_text(socket: &mut Socket) -> String {
+        loop {
+            let frame = tokio::time::timeout(WAIT, socket.next())
+                .await
+                .expect("a frame in time")
+                .unwrap()
+                .unwrap();
+            if let Message::Text(text) = frame {
+                return text.as_str().to_owned();
+            }
+        }
+    }
+
+    /// Every text frame that arrives within `span`.
+    async fn texts_within(socket: &mut Socket, span: Duration) -> Vec<String> {
+        let mut texts = Vec::new();
+        let end = tokio::time::Instant::now() + span;
+        while let Ok(Some(frame)) = tokio::time::timeout_at(end, socket.next()).await {
+            if let Message::Text(text) = frame.unwrap() {
+                texts.push(text.as_str().to_owned());
+            }
+        }
+        texts
+    }
+
+    /// The next frame, which must be a factory status.
+    async fn next_status(socket: &mut Socket) -> (String, FactoryStatus) {
+        let text = next_text(socket).await;
+        match serde_json::from_str::<UiMessage>(&text).unwrap() {
+            UiMessage::FactoryStatus { status, .. } => (text, status),
+            other => panic!("not a factory status: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_events_socket_sends_a_believed_status_as_it_changes_and_never_a_run_event() {
+        let served = serve().await;
+        let mut socket = served.events().await;
+
+        served.write_status(served.me, holding(1, Some(format!("gh said {TOKEN}"))));
+        let (text, status) = next_status(&mut socket).await;
+        assert!(!text.contains(TOKEN), "{text}");
+        assert_eq!(status.pass, 1);
+        assert_eq!(status.idle.as_deref(), Some("gh said ***"));
+
+        served.write_event();
+        let texts = texts_within(&mut socket, Duration::from_secs(1)).await;
+        assert!(texts.is_empty(), "a run event sends nothing: {texts:?}");
+
+        // A status that changes nothing believed sends nothing: one from a writer not heard.
+        served.write_status(MachineId::random(), holding(7, None));
+        let texts = texts_within(&mut socket, Duration::from_secs(1)).await;
+        assert!(texts.is_empty(), "{texts:?}");
+
+        served.write_status(served.me, holding(2, None));
+        let (_, status) = next_status(&mut socket).await;
+        assert_eq!(status, holding(2, None));
+        let texts = texts_within(&mut socket, Duration::from_secs(1)).await;
+        assert!(texts.is_empty(), "each change is sent once: {texts:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_is_not_sent_while_the_secret_store_cannot_be_read_and_follows_once_it_can() {
+        let served = serve().await;
+        let mut socket = served.events().await;
+        served.secrets.readable(false);
+        served.write_status(served.me, holding(1, Some(format!("gh said {TOKEN}"))));
+        let texts = texts_within(&mut socket, Duration::from_secs(2)).await;
+        assert!(texts.is_empty(), "nothing is sent unhidden: {texts:?}");
+        served.secrets.readable(true);
+        let (text, status) = next_status(&mut socket).await;
+        assert!(!text.contains(TOKEN), "{text}");
+        assert_eq!(status.idle.as_deref(), Some("gh said ***"));
+        let texts = texts_within(&mut socket, Duration::from_secs(1)).await;
+        assert!(texts.is_empty(), "sent once: {texts:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_the_store_cannot_hide_is_tried_again_after_a_wait_not_every_tick() {
+        let served = serve().await;
+        let mut socket = served.events().await;
+        served.secrets.readable(false);
+        let before = served.secrets.reads();
+        served.write_status(served.me, holding(1, None));
+        // Ticks come every 200 ms; the tries at 0, 1 and 3 seconds read the store once each.
+        let texts = texts_within(&mut socket, Duration::from_millis(2500)).await;
+        assert!(texts.is_empty(), "{texts:?}");
+        let reads = served.secrets.reads() - before;
+        assert!((1..=3).contains(&reads), "the store was read {reads} times");
+    }
+
+    #[test]
+    fn the_wait_before_a_status_is_tried_again_doubles_from_a_second_to_half_a_minute() {
+        assert_eq!(next_wait(None), Duration::from_secs(1));
+        assert_eq!(
+            next_wait(Some(Duration::from_secs(1))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            next_wait(Some(Duration::from_secs(16))),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            next_wait(Some(Duration::from_secs(30))),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_no_longer_believed_sends_the_state_again_and_no_status_after_it() {
+        let served = serve().await;
+        let mut socket = served.events().await;
+        served.write_status(served.me, holding(1, None));
+        let (_, status) = next_status(&mut socket).await;
+        assert_eq!(status.pass, 1);
+        // The project goes, so no status of it is believed.
+        {
+            let mut store = served.store.lock().unwrap();
+            let mut settings = store.settings().unwrap();
+            settings.seq += 1;
+            settings.projects.clear();
+            store.apply_settings(settings).unwrap();
+        }
+        let mut states = 0;
+        for text in texts_within(&mut socket, Duration::from_secs(2)).await {
+            match serde_json::from_str::<UiMessage>(&text).unwrap() {
+                UiMessage::State { .. } => states += 1,
+                UiMessage::Settings { .. } => {}
+                other => panic!("only the settings and the state again: {other:?}"),
+            }
+        }
+        assert_eq!(states, 1, "the state is sent again once");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_socket_opened_after_a_status_was_written_is_sent_it_after_the_state() {
+        let served = serve().await;
+        served.write_status(served.me, holding(3, None));
+        served.write_event();
+        let mut socket = served.events().await;
+        let (_, status) = next_status(&mut socket).await;
+        assert_eq!(status, holding(3, None));
+        let texts = texts_within(&mut socket, Duration::from_secs(1)).await;
+        assert!(texts.is_empty(), "{texts:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_state_holds_no_run_event() {
+        let served = serve().await;
+        served.write_event();
+        served.write_status(served.me, holding(1, None));
+        let mut stream = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+        let request = format!(
+            "GET /api/state HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            served.addr
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+            .await
+            .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!response.contains(&run().to_string()), "{response}");
+        assert!(!response.contains("stop_requested"), "{response}");
+    }
+}
+
+/// A secret store for the API's tests that can be made unreadable, now or after some reads.
+#[cfg(test)]
+pub(crate) mod test_secrets {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use crate::secrets::{Edit, MemorySecrets, Secrets, SecretsError};
+
+    /// Secrets in memory. Each read counts; a store made unreadable, or past its last good read,
+    /// fails every read with [`SecretsError::CannotList`].
+    #[derive(Default)]
+    pub struct Switch {
+        held: MemorySecrets,
+        unreadable: AtomicBool,
+        reads: AtomicUsize,
+        /// Reads that still succeed, plus one; 0 is no limit.
+        good_reads: AtomicUsize,
+    }
+
+    impl Switch {
+        fn check(&self) -> Result<(), SecretsError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let left = self.good_reads.load(Ordering::SeqCst);
+            if left == 1 {
+                self.unreadable.store(true, Ordering::SeqCst);
+            } else if left > 1 {
+                self.good_reads.store(left - 1, Ordering::SeqCst);
+            }
+            if self.unreadable.load(Ordering::SeqCst) {
+                Err(SecretsError::CannotList)
+            } else {
+                Ok(())
+            }
+        }
+
+        /// Makes every read succeed, or fail, from now on.
+        pub fn readable(&self, readable: bool) {
+            self.good_reads.store(0, Ordering::SeqCst);
+            self.unreadable.store(!readable, Ordering::SeqCst);
+        }
+
+        /// Lets `reads` more reads succeed, and fails every one after them.
+        pub fn readable_for(&self, reads: usize) {
+            self.unreadable.store(false, Ordering::SeqCst);
+            self.good_reads.store(reads + 1, Ordering::SeqCst);
+        }
+
+        /// How many reads were made.
+        pub fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Secrets for Switch {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            self.check()?;
+            self.held.get(name)
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+            self.held.set(name, value)
+        }
+        fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
+            self.check()?;
+            self.held.update(name, edit)
+        }
+        fn names(&self) -> Result<Vec<String>, SecretsError> {
+            self.check()?;
+            self.held.names()
+        }
+        fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+            self.check()?;
+            self.held.entries()
+        }
+    }
 }
