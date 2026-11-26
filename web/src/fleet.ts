@@ -1,4 +1,4 @@
-import type { AnyRecord, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
+import type { AnyRecord, FactoryStatus, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
 import { busy, plural, sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, urgency, type Glyph } from "./labels";
 
 export interface FleetState {
@@ -8,6 +8,8 @@ export interface FleetState {
   synced: boolean;
   /** Every machine the daemon serving the page hears, itself included, when its state carries it. */
   online?: string[];
+  /** The last status the socket sent for each project's factory, by project id. */
+  factory?: Record<string, FactoryStatus>;
 }
 
 export const emptyState: FleetState = {
@@ -23,7 +25,11 @@ const key = (record: AnyRecord) => (record.kind === "machine_sample" ? `sample:$
 export function apply(state: FleetState, message: UiMessage): FleetState {
   switch (message.type) {
     case "state":
-      return { records: message.records, settings: message.settings, synced: true, online: message.online };
+      // The daemon sends the whole state again when a project's status is no longer believed, then
+      // each status still believed, so what was held is dropped here.
+      return { records: message.records, settings: message.settings, synced: true, online: message.online, factory: {} };
+    case "factory_status":
+      return { ...state, factory: { ...state.factory, [message.status.project]: message.status } };
     case "settings":
       return { ...state, settings: message.settings };
     case "record": {
@@ -38,6 +44,9 @@ export function apply(state: FleetState, message: UiMessage): FleetState {
       records[at] = next;
       return { ...state, records };
     }
+    default:
+      // A message type this page does not know is left out, so a newer daemon cannot break it.
+      return state;
   }
 }
 

@@ -1,7 +1,12 @@
 import { useMutation } from "@tanstack/react-query";
 import { useRef, useState, type FormEvent } from "react";
 import { post, refused, type Project } from "./api";
+import { useProjectFactory } from "./factory";
+import { ProjectFactoryControls } from "./FactorySettings";
 import { button, dangerButton, field, Modal, primaryButton } from "./Modal";
+
+/** A project with no factory setting: off. */
+const FACTORY_OFF = { on: false, login: "", paused: false };
 
 /**
  * Adds a project through the daemon, which sends it to the acting coordinator, under `id`; its
@@ -37,8 +42,10 @@ function newId(): string {
  * once it arrives in the settings, on every machine. A refused add keeps what was typed and says
  * why under the form; a refused remove says why beside its project. An add sent again with
  * nothing retyped goes under the same id, so an add whose answer came too late is not made twice.
- * Closing the dialog clears what was typed and every refusal. `onAdded` is given each new
- * project's id.
+ * Each project also has its factory controls: a switch, the GitHub login it acts as and a pause,
+ * as the settings last sent them (read from the factory context, so opening the dialog fetches
+ * nothing), and only once the settings have arrived; a refused change says why beside the row. Closing the dialog clears what was typed and
+ * every refusal. `onAdded` is given each new project's id.
  */
 export function Projects({
   open,
@@ -51,6 +58,7 @@ export function Projects({
   projects: Project[];
   onAdded: (id: string) => void;
 }) {
+  const factories = useProjectFactory();
   const [name, setName] = useState("");
   const [repo, setRepo] = useState("");
   /** The id the typed project is added under, until it is added or the typing changes. */
@@ -139,6 +147,12 @@ export function Projects({
                   </button>
                 )}
               </div>
+              {factories ? (
+                <ProjectFactoryControls project={p} factory={factories[p.id] ?? FACTORY_OFF} />
+              ) : (
+                // Before the settings arrive the factory setting is unknown: a change built from a guess would overwrite it.
+                <p className="mt-2 text-xs text-neutral-500">The factory setting shows once the daemon&apos;s settings arrive.</p>
+              )}
               {remove.isError && remove.variables === p.id && (
                 <p role="alert" className="mt-1 text-xs text-red-400">
                   {remove.error.message}

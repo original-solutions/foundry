@@ -54,6 +54,11 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
       <Link to="/" aria-label="The board" title="The board" className="grid size-8 place-items-center rounded-md hover:bg-neutral-800">
         <Mark className="size-4 text-emerald-400" />
       </Link>
+      <Link to="/factory" aria-label="The factory" title="The factory" className="grid size-8 place-items-center rounded-md hover:bg-neutral-800 hover:text-neutral-200">
+        <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" className="size-4">
+          <path d="M2 14V7l4 2.5V7l4 2.5V3h4v11z" />
+        </svg>
+      </Link>
       <RailButton label="Expand sidebar" title={`Show every workspace and terminal by name (${railKey})`} onClick={onExpand}>
         <PanelIcon className="size-4" />
       </RailButton>

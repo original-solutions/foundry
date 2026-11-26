@@ -1,11 +1,74 @@
 import { describe, expect, it } from "vitest";
-import type { AnyRecord, UiMessage } from "./api";
+import type { AnyRecord, FactoryStatus, UiMessage } from "./api";
 import { apply, byUrgency, coordinatorOrder, emptyState, fleet, locate, machineNumbers, machineStats, rows, terminalRunning } from "./fleet";
 import type { Glyph } from "./labels";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const full = (records: AnyRecord[]): UiMessage => ({ type: "state", protocol: 1, records, settings: settings() });
 const one = (record: AnyRecord): UiMessage => ({ type: "record", protocol: 1, record });
+
+const status = (project: string, generation: number): FactoryStatus => ({
+  project,
+  pass: 1,
+  holds: true,
+  generation,
+  not_holding: null,
+  idle: null,
+  owner_ignored: false,
+  ready: [],
+  feedback_waiting: [],
+  runs: [],
+  held_up: [],
+  gate_infra: [],
+  finished: [],
+  foreign: [],
+});
+const said = (s: FactoryStatus): UiMessage => ({ type: "factory_status", protocol: 5, status: s });
+
+describe("apply and the factory", () => {
+  it("keeps the last status the socket sent for each project, and a later one replaces only its own project's", () => {
+    let state = apply(emptyState, said(status("p1", 1)));
+    state = apply(state, said(status("p2", 4)));
+    state = apply(state, said(status("p1", 2)));
+    expect(state.factory?.p1.generation).toBe(2);
+    expect(state.factory?.p2.generation).toBe(4);
+  });
+
+  it("drops the held statuses on a state message, which the daemon follows with each still believed", () => {
+    let state = apply(emptyState, said(status("p1", 1)));
+    state = apply(state, full([workspace(ME, "w1", "a")]));
+    expect(state.factory).toEqual({});
+    state = apply(state, said(status("p1", 3)));
+    expect(state.factory?.p1.generation).toBe(3);
+  });
+
+  it("keeps the statuses through a record and a settings message", () => {
+    let state = apply(emptyState, said(status("p1", 1)));
+    state = apply(state, one(workspace(ME, "w1", "a")));
+    state = apply(state, { type: "settings", protocol: 1, settings: settings({ seq: 9 }) });
+    expect(state.factory?.p1.generation).toBe(1);
+    expect(state.settings.seq).toBe(9);
+  });
+
+  it("keeps the very same statuses object through a record and a settings message", () => {
+    const first = apply(emptyState, said(status("p1", 1)));
+    const before = first.factory;
+    const appended = apply(first, one(workspace(ME, "w1", "a", { version: 1 })));
+    const replaced = apply(appended, one(workspace(ME, "w1", "b", { version: 2 })));
+    const moved = apply(replaced, { type: "settings", protocol: 1, settings: settings({ seq: 9 }) });
+    expect(appended.factory).toBe(before);
+    expect(replaced.factory).toBe(before);
+    expect(moved.factory).toBe(before);
+  });
+
+  it("returns the very same state for a message type it does not know", () => {
+    const state = apply(apply(emptyState, full([workspace(ME, "w1", "a")])), said(status("p1", 1)));
+    const next = apply(state, { type: "something_new", protocol: 6 } as unknown as UiMessage);
+    expect(next).toBe(state);
+    expect(next.records).toHaveLength(1);
+    expect(next.settings.machines[0].name).toBe("studio");
+  });
+});
 
 describe("apply", () => {
   it("replaces everything on a state message", () => {

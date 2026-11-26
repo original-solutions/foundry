@@ -725,6 +725,97 @@ describe("App", () => {
     expect(screen.queryByText("unknown")).toBeNull();
   });
 
+  const factoryOverview = (status: unknown = null) =>
+    json(200, {
+      settings: { paused: false, poll_seconds: 30, feedback_seconds: 300, max_runs: 2, max_gates: 3, model: "opus", effort: "high" },
+      projects: [{ id: "p1", name: "demo", factory: { on: true, login: "bot", paused: false }, writer: null, status }],
+    });
+  const heldStatus = (generation: number) => ({
+    project: "p1",
+    pass: 1,
+    holds: true,
+    generation,
+    not_holding: null,
+    idle: null,
+    owner_ignored: false,
+    ready: [],
+    feedback_waiting: [],
+    runs: [],
+    held_up: [],
+    gate_infra: [],
+    finished: [],
+    foreign: [],
+  });
+
+  it("shows the Factory view at /factory in place of the board, and a factory_status reaches it", async () => {
+    mockActions(factoryOverview(), factoryOverview(), factoryOverview());
+    await open("/factory", live);
+    expect(await screen.findByRole("heading", { name: "Factory" })).toBeDefined();
+    expect(await screen.findByText("No status yet")).toBeDefined();
+    expect(screen.queryByRole("radiogroup", { name: "View" })).toBeNull();
+
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: heldStatus(9) })));
+    expect(await screen.findByText(/Holds the lease at generation 9/)).toBeDefined();
+  });
+
+  it("shows the Factory view, not the launchpad, at /factory for a fleet with no workspaces", async () => {
+    mockActions(factoryOverview());
+    await open("/factory", { type: "state", protocol: 1, records: [sample(ME, 1)], settings: settings() });
+    expect(await screen.findByRole("heading", { name: "Factory" })).toBeDefined();
+    expect(screen.queryByText("What should Claude work on?")).toBeNull();
+  });
+
+  it("keeps the board working after a factory_status or a message it does not know", async () => {
+    mockActions();
+    await open("/", live);
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: heldStatus(2) })));
+    act(() => events.deliver(JSON.stringify({ type: "something_new", protocol: 6 })));
+    expect(await screen.findByRole("radiogroup", { name: "View" })).toBeDefined();
+  });
+
+  it("gives the Projects dialog each project's factory settings from the events socket, and follows a later settings message", async () => {
+    mockActions();
+    await open("/", {
+      type: "state",
+      protocol: 1,
+      records: [sample(ME, 1)],
+      settings: settings({ project_factory: { p1: { on: true, login: "bot", paused: true } } }),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    const dialog = await screen.findByRole("dialog", { name: "Projects" });
+    expect(within(dialog).getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("true");
+    expect((within(dialog).getByLabelText("GitHub login for demo") as HTMLInputElement).value).toBe("bot");
+    expect((within(dialog).getByLabelText("Pause claims for demo") as HTMLInputElement).checked).toBe(true);
+
+    const events = sockets("/api/events").at(-1)!;
+    act(() =>
+      events.deliver(
+        JSON.stringify({ type: "settings", protocol: 1, settings: settings({ seq: 2, project_factory: { p1: { on: false, login: "ops", paused: false } } }) }),
+      ),
+    );
+    await waitFor(() => expect(within(dialog).getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("false"));
+    expect((within(dialog).getByLabelText("GitHub login for demo") as HTMLInputElement).value).toBe("ops");
+    expect((within(dialog).getByLabelText("Pause claims for demo") as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("offers no factory controls from the fleet this browser remembers, only once the daemon's own settings arrive", async () => {
+    mockActions();
+    const remembered = settings({ project_factory: { p1: { on: true, login: "bot", paused: false } } });
+    keep({ records: live.records, settings: remembered, synced: true }, Date.now() - 180_000);
+    const events = await before("/");
+    fireEvent.focus(screen.getByRole("textbox", { name: "New task" }));
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    const dialog = await screen.findByRole("dialog", { name: "Projects" });
+    expect(within(dialog).queryByRole("switch", { name: "Factory for demo" })).toBeNull();
+    expect(within(dialog).queryByLabelText("Pause claims for demo")).toBeNull();
+
+    act(() => events.open());
+    act(() => events.deliver(JSON.stringify({ ...live, settings: settings({ seq: 2, project_factory: { p1: { on: false, login: "bot", paused: false } } }) })));
+    await waitFor(() => expect(within(dialog).getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("false"));
+  });
+
   it("starts a new shell from the palette and opens it", async () => {
     const calls = mockActions(json(201, { id: "t9" }));
     const router = await open("/", live);
