@@ -40,10 +40,10 @@ use foundry_proto::state::{SessionState, TerminalState};
 use serde::Deserialize;
 
 use super::progress::{
-    APPROVAL_RECHECKED, APPROVAL_WITHDRAWN, APPROVED, LAUNCH_BASE, LAUNCH_ENDING_SESSIONS,
-    LAUNCH_MODEL, LAUNCH_PULL_REQUEST, LAUNCH_RESENDING, LAUNCH_RESUMING, LAUNCH_SENDING,
-    LAUNCH_SENDING_RESUMED, Seen, TIME_LIMIT, UNCONFIRMED_CODE, WORKSPACE_CREATED,
-    WORKSPACE_REQUESTED, build_name, read_progress,
+    APPROVAL_RECHECKED, APPROVED, LAUNCH_BASE, LAUNCH_ENDING_SESSIONS, LAUNCH_MODEL,
+    LAUNCH_PULL_REQUEST, LAUNCH_RESENDING, LAUNCH_RESUMING, LAUNCH_SENDING, LAUNCH_SENDING_RESUMED,
+    Seen, TIME_LIMIT, UNCONFIRMED_CODE, WORKSPACE_CREATED, WORKSPACE_REQUESTED, build_name,
+    read_progress,
 };
 use super::{
     Closing, Progress, RunContext, RunError, Stop, abandon, as_posted, end_own_merge,
@@ -1412,8 +1412,9 @@ fn build(
     }
     // Before the session starts, on every pass that is about to start it: the text since the
     // approval the run recorded, as the runner checks it. The claim holds the approval, and the
-    // claim's own removal of `factory:ready` is no approval taken back. A start retried a pass
-    // later is checked again.
+    // claim's own removal of `factory:ready` is no approval taken back, so who holds the label
+    // is not read again here (issue #164, answer 2). A start retried a pass later is checked
+    // again.
     let Some(approved_at) = &seen.approved_at else {
         return Err(RunError::Invalid(format!("run {run} records no approval")));
     };
@@ -1434,6 +1435,8 @@ fn build(
             reason: messages::TEXT_CHANGED.into(),
         });
     }
+    // `approval-rechecked` is the runner's own name for this step, which records its check of
+    // the text since the approval; the name stays so the ledger reads as the runner's.
     if !seen.rechecked {
         ctx.record_step(
             run,
@@ -1494,11 +1497,6 @@ fn withdraw(
     let issue = run.issue();
     let cause = Cause::new(CauseStep::Start, "approval-withdrawn");
     let reason = refusal.map_or("the approval was taken back", refusal_reason);
-    // Recorded before it is acted on: a pass that finds it carries on from here, whatever the
-    // issue's label and assignee now are (`finish_begun_path`).
-    if !at.seen.withdrawn {
-        ctx.record_step(run, APPROVAL_WITHDRAWN, &cause)?;
-    }
     // A refusal is explained once; a resumed withdraw whose approval reads as given again has
     // nothing to explain.
     if let Some(refusal) = refusal {
