@@ -2525,6 +2525,25 @@ mod tests {
             }
 
             #[test]
+            fn a_text_stop_begun_while_a_round_is_set_up_is_left_to_feedback() {
+                let (rig, run) = round_moved();
+                rig.step(
+                    &run,
+                    "stuck-stop {\"code\":\"text-changed-during-build\",\"stop\":{\"reason\":\"said so\"}}",
+                );
+                let events = rig.events(&run).len();
+                assert_eq!(
+                    pass(&rig, &run),
+                    ReconcileStep::Skipped {
+                        why: "relaunching"
+                    }
+                );
+                assert_eq!(rig.events(&run).len(), events);
+                assert!(calls(&rig).is_empty());
+                assert!(rig.sim.writes().is_empty());
+            }
+
+            #[test]
             fn the_projects_own_login_assigned_is_what_a_claim_leaves() {
                 let (rig, run) = building_run();
                 rig.sim.set_assignees(&["Softfac-Bot"]);
