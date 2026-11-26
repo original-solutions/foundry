@@ -42,44 +42,153 @@ impl FleetWorker {
     }
 }
 
-/// What a call that was not answered by its owner is to a run.
+/// What a call that was not answered by its owner is to a run: one that never reached the
+/// machine, or may not have, is unreachable and asked again next pass; a machine that is not in
+/// the list, or runs a Foundry too old for the call, will not take it.
 fn not_answered(error: &CallError) -> WorkerError {
-    let _ = error;
-    todo!()
+    let said = redact(&error.to_string());
+    match error {
+        CallError::NotListed(_) | CallError::Older(_) => WorkerError::Failed(said),
+        CallError::Offline(_) | CallError::Down(_) | CallError::Lost(_) | CallError::Refused(_) => {
+            WorkerError::Unreachable(said)
+        }
+    }
 }
 
-/// The reason an answer gives: its `error` when it is JSON with one, else its text.
+/// The reason an answer gives: its `error` when it is JSON with one, else its text, with the
+/// passwords of URLs hidden.
 fn reason(answer: &Answer) -> String {
-    let _ = answer;
-    todo!()
+    let text = String::from_utf8_lossy(&answer.body);
+    let said = serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| text.trim().to_owned());
+    let said = if said.is_empty() {
+        format!("the machine answered {}", answer.status)
+    } else {
+        said
+    };
+    redact(&said)
 }
 
-/// The id a create or a session start answered with.
+fn success(answer: &Answer) -> bool {
+    (200..300).contains(&answer.status)
+}
+
+fn json(answer: &Answer) -> Result<Value, WorkerError> {
+    serde_json::from_slice(&answer.body)
+        .map_err(|e| WorkerError::Failed(format!("the machine's answer is not JSON: {e}")))
+}
+
+/// The id a create or a session start answered with. A create whose setup could not be started
+/// is still made, and answers its id beside an `error`.
 fn created_id(answer: &Answer) -> Result<uuid::Uuid, WorkerError> {
-    let _ = answer;
-    todo!()
+    if !success(answer) {
+        return Err(WorkerError::Failed(reason(answer)));
+    }
+    json(answer)?
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .ok_or_else(|| WorkerError::Failed("the machine's answer names no id".into()))
 }
 
-/// What a send's answer says.
+/// What a send's answer says: the count of prompts before the send, or why it was not sent. A
+/// call that did not reach the machine, or an answer that is no refusal of the route's, is
+/// failed with no count, so nothing guards a resend by one.
 fn sent(answer: Result<Answer, CallError>) -> Result<u64, SendRefused> {
-    let _ = answer;
-    todo!()
+    let failed = |reason: String| SendRefused::Failed {
+        reason,
+        prompts: None,
+    };
+    let answer = answer.map_err(|error| failed(redact(&error.to_string())))?;
+    let value: Option<Value> = serde_json::from_slice(&answer.body).ok();
+    let field = |name: &str| {
+        value
+            .as_ref()
+            .and_then(|v| v.get(name))
+            .and_then(Value::as_u64)
+    };
+    if success(&answer) {
+        return field("prompts")
+            .ok_or_else(|| failed("the machine's answer names no count".into()));
+    }
+    if answer.status != 409 {
+        return Err(failed(reason(&answer)));
+    }
+    let said = value
+        .as_ref()
+        .and_then(|v| v.get("reason"))
+        .and_then(Value::as_str);
+    Err(match said {
+        Some("not_idle") => SendRefused::NotIdle,
+        Some("count_rose") => match field("now") {
+            Some(now) => SendRefused::CountRose { now },
+            None => failed(reason(&answer)),
+        },
+        Some("no_such_session") => SendRefused::NoSuchSession,
+        Some("body_without_path") => SendRefused::BodyWithoutPath,
+        Some("secrets_unreadable") => SendRefused::SecretsUnreadable,
+        Some("failed") => SendRefused::Failed {
+            reason: reason(&answer),
+            prompts: field("prompts"),
+        },
+        _ => failed(reason(&answer)),
+    })
 }
 
-/// What a turn read's answer says.
+/// What a turn read's answer says. `404` is a turn not written yet while its session runs: asked
+/// again. `410`, a turn that will never be written, and any other refusal are failed.
 fn turn_read(answer: &Answer) -> Result<TurnText, WorkerError> {
-    let _ = answer;
-    todo!()
+    if answer.status == 404 {
+        return Err(WorkerError::Unreachable(reason(answer)));
+    }
+    if !success(answer) {
+        return Err(WorkerError::Failed(reason(answer)));
+    }
+    let value = json(answer)?;
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorkerError::Failed("the machine's answer has no message".into()))?
+        .to_owned();
+    let question = value
+        .get("question")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(TurnText { message, question })
 }
 
-/// An answer with no body to read: done when 2xx.
+/// An answer with no body to read: done when 2xx, else failed with the owner's words, which a
+/// run reads (an archive's "is not a live workspace of this machine" counts as archived).
 fn done(answer: &Answer) -> Result<(), WorkerError> {
-    let _ = answer;
-    todo!()
+    if success(answer) {
+        Ok(())
+    } else {
+        Err(WorkerError::Failed(reason(answer)))
+    }
 }
 
 fn message_json(message: &Message) -> Value {
     serde_json::json!({ "line": message.line, "body": message.body })
+}
+
+impl FleetWorker {
+    /// A `POST` of `body` to the worker route `path`, answered by its owner.
+    fn call(&self, path: &str, body: Option<Value>) -> Result<Answer, CallError> {
+        let bytes = body.map(|b| b.to_string().into_bytes()).unwrap_or_default();
+        self.runtime
+            .block_on(api::factory::call(&self.api, path, &bytes))
+    }
+
+    fn answered(&self, path: &str, body: Option<Value>) -> Result<Answer, WorkerError> {
+        self.call(path, body).map_err(|error| not_answered(&error))
+    }
 }
 
 impl Worker for FleetWorker {
@@ -88,8 +197,16 @@ impl Worker for FleetWorker {
         machine: MachineId,
         request: CreateWorkspace,
     ) -> Result<WorkspaceId, WorkerError> {
-        let _ = (machine, request, &self.api, &self.runtime, message_json, api::factory::TAIL_LIMIT);
-        todo!()
+        let body = serde_json::json!({
+            "machine": machine,
+            "project": request.project,
+            "name": request.name,
+            "checkout": request.checkout,
+            "setup": request.setup,
+            "tag": request.tag,
+        });
+        let answer = self.answered("/api/factory/workspaces", Some(body))?;
+        created_id(&answer).map(WorkspaceId)
     }
 
     fn start_session(
@@ -98,8 +215,18 @@ impl Worker for FleetWorker {
         start: FactoryStart,
         first: Message,
     ) -> Result<SessionId, WorkerError> {
-        let _ = (workspace, start, first);
-        todo!()
+        let body = serde_json::json!({
+            "project": start.project,
+            "login": start.login,
+            "model": start.model,
+            "effort": start.effort,
+            "message": message_json(&first),
+        });
+        let answer = self.answered(
+            &format!("/api/workspaces/{workspace}/factory/session"),
+            Some(body),
+        )?;
+        created_id(&answer).map(SessionId)
     }
 
     fn send(
@@ -108,28 +235,82 @@ impl Worker for FleetWorker {
         message: Message,
         only_if_prompts: Option<u64>,
     ) -> Result<u64, SendRefused> {
-        let _ = (session, message, only_if_prompts);
-        todo!()
+        let body = serde_json::json!({
+            "message": message_json(&message),
+            "only_if_prompts": only_if_prompts,
+        });
+        sent(self.call(
+            &format!("/api/sessions/{session}/factory/message"),
+            Some(body),
+        ))
     }
 
     fn turn(&self, session: SessionId, n: u64) -> Result<TurnText, WorkerError> {
-        let _ = (session, n);
-        todo!()
+        let answer = self.answered(
+            &format!("/api/sessions/{session}/factory/turn"),
+            Some(serde_json::json!({ "turn": n })),
+        )?;
+        turn_read(&answer)
     }
 
     fn tail(&self, terminal: TerminalId) -> Result<String, WorkerError> {
-        let _ = terminal;
-        todo!()
+        let answer = self.answered(&format!("/api/terminals/{terminal}/tail"), None)?;
+        if !success(&answer) {
+            return Err(WorkerError::Failed(reason(&answer)));
+        }
+        let text = String::from_utf8_lossy(&answer.body);
+        let mut at = text.len().saturating_sub(api::factory::TAIL_LIMIT);
+        while !text.is_char_boundary(at) {
+            at += 1;
+        }
+        Ok(text[at..].to_owned())
     }
 
     fn end_sessions(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
-        let _ = workspace;
-        todo!()
+        let answer = self.answered(&format!("/api/workspaces/{workspace}/factory/end"), None)?;
+        done(&answer)
     }
 
     fn archive(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
-        let _ = (workspace, redact);
-        todo!()
+        let api = self.api.clone();
+        self.runtime.block_on(async move {
+            let store = api.store.clone();
+            let owner = tokio::task::spawn_blocking(move || {
+                store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .workspace(workspace)
+                    .map(|record| record.map(|record| record.owner))
+            })
+            .await
+            .map_err(|e| WorkerError::Failed(format!("the store read did not finish: {e}")))?
+            .map_err(|e| {
+                WorkerError::Failed(redact(&format!("the store could not be read: {e}")))
+            })?;
+            match owner {
+                None => Err(WorkerError::Unreachable(format!(
+                    "the record of workspace {workspace} has not reached this machine yet"
+                ))),
+                Some(owner) if owner == api.peers.me() => api
+                    .workspaces
+                    .archive(workspace, true)
+                    .await
+                    .map_err(|e| WorkerError::Failed(redact(&e.to_string()))),
+                Some(owner) => {
+                    let answer = api
+                        .peers
+                        .call(
+                            owner,
+                            &format!("/api/workspaces/{workspace}/archive"),
+                            Some("application/json"),
+                            br#"{"force":true}"#,
+                        )
+                        .await
+                        .map_err(|error| not_answered(&error))?;
+                    done(&answer)
+                }
+            }
+        })
     }
 }
 
@@ -163,19 +344,28 @@ mod tests {
             CallError::NotListed(MachineId(uuid::Uuid::from_u128(7))),
             CallError::Older("mac".into()),
         ] {
-            assert!(matches!(not_answered(&error), WorkerError::Failed(_)), "{error}");
+            assert!(
+                matches!(not_answered(&error), WorkerError::Failed(_)),
+                "{error}"
+            );
         }
     }
 
     #[test]
     fn a_create_or_a_start_answers_its_id_also_beside_an_error() {
         let id = uuid::Uuid::from_u128(0x55);
-        assert_eq!(created_id(&answer(201, &format!(r#"{{"id":"{id}"}}"#))).unwrap(), id);
+        assert_eq!(
+            created_id(&answer(201, &format!(r#"{{"id":"{id}"}}"#))).unwrap(),
+            id
+        );
         assert_eq!(
             created_id(&answer(201, &format!(r#"{{"id":"{id}","error":"setup"}}"#))).unwrap(),
             id
         );
-        assert_eq!(created_id(&answer(200, &format!(r#"{{"id":"{id}"}}"#))).unwrap(), id);
+        assert_eq!(
+            created_id(&answer(200, &format!(r#"{{"id":"{id}"}}"#))).unwrap(),
+            id
+        );
         let refused = created_id(&answer(422, r#"{"error":"no token for x"}"#)).unwrap_err();
         assert_eq!(refused, WorkerError::Failed("no token for x".into()));
         assert!(matches!(
@@ -192,23 +382,38 @@ mod tests {
             Err(SendRefused::NotIdle)
         );
         assert_eq!(
-            sent(Ok(answer(409, r#"{"error":"x","reason":"count_rose","now":5}"#))),
+            sent(Ok(answer(
+                409,
+                r#"{"error":"x","reason":"count_rose","now":5}"#
+            ))),
             Err(SendRefused::CountRose { now: 5 })
         );
         assert_eq!(
-            sent(Ok(answer(409, r#"{"error":"x","reason":"no_such_session"}"#))),
+            sent(Ok(answer(
+                409,
+                r#"{"error":"x","reason":"no_such_session"}"#
+            ))),
             Err(SendRefused::NoSuchSession)
         );
         assert_eq!(
-            sent(Ok(answer(409, r#"{"error":"x","reason":"body_without_path"}"#))),
+            sent(Ok(answer(
+                409,
+                r#"{"error":"x","reason":"body_without_path"}"#
+            ))),
             Err(SendRefused::BodyWithoutPath)
         );
         assert_eq!(
-            sent(Ok(answer(409, r#"{"error":"x","reason":"secrets_unreadable"}"#))),
+            sent(Ok(answer(
+                409,
+                r#"{"error":"x","reason":"secrets_unreadable"}"#
+            ))),
             Err(SendRefused::SecretsUnreadable)
         );
         assert_eq!(
-            sent(Ok(answer(409, r#"{"error":"typed?","reason":"failed","prompts":2}"#))),
+            sent(Ok(answer(
+                409,
+                r#"{"error":"typed?","reason":"failed","prompts":2}"#
+            ))),
             Err(SendRefused::Failed {
                 reason: "typed?".into(),
                 prompts: Some(2)
@@ -227,7 +432,10 @@ mod tests {
 
     #[test]
     fn a_turn_not_written_yet_is_asked_again_and_one_never_written_is_failed() {
-        let read = turn_read(&answer(200, r#"{"message":"FACTORY-DONE: x","question":null}"#));
+        let read = turn_read(&answer(
+            200,
+            r#"{"message":"FACTORY-DONE: x","question":null}"#,
+        ));
         assert_eq!(
             read.unwrap(),
             TurnText {
@@ -260,7 +468,10 @@ mod tests {
 
     #[test]
     fn a_reason_has_the_password_of_a_url_hidden() {
-        let said = reason(&answer(500, "fetch https://user:hunter2@github.com/o/r failed"));
+        let said = reason(&answer(
+            500,
+            "fetch https://user:hunter2@github.com/o/r failed",
+        ));
         assert!(!said.contains("hunter2"), "{said}");
     }
 }
