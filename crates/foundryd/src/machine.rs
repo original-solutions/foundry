@@ -201,7 +201,8 @@ fn write_sample_with(
         }
     };
     let update_refused = update_refused(data_dir);
-    store_sample(store, me, machine, update_refused)
+    let update_ready = update_ready(data_dir);
+    store_sample(store, me, machine, update_refused, update_ready)
 }
 
 fn store_sample(
@@ -209,6 +210,7 @@ fn store_sample(
     me: MachineId,
     machine: MachineSample,
     update_refused: Option<String>,
+    update_ready: Option<String>,
 ) -> Result<Record<MachineSample>, MachineError> {
     // A task that panicked while holding the store leaves it consistent: SQLite rolls back
     // a transaction that was not committed. Stopping here would freeze this machine's last
@@ -218,7 +220,7 @@ fn store_sample(
         sessions: store.live_session_count(me)?,
         update_refused,
         version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-        update_ready: None,
+        update_ready,
         ..machine
     };
     let record = Record {
@@ -244,6 +246,35 @@ pub fn update_refused(home: &Path) -> Option<String> {
     };
     let version = refused.strip_prefix('v').unwrap_or(&refused);
     (!update::lowered(update::current_version(home).as_deref(), version)).then_some(refused)
+}
+
+/// The tag the updater in `home` has ready, like `v0.2.0`, for this daemon. `None` unless it
+/// counts as ready (both its binaries on disk), is above the version this daemon was built as,
+/// is not the refused tag, and this daemon runs from `<home>/current`. An `update.json` that
+/// cannot be read is logged and reports nothing, so it never stops a sample.
+pub fn update_ready(home: &Path) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    update_ready_with(home, &exe, env!("CARGO_PKG_VERSION"))
+}
+
+/// [`update_ready`] for the daemon at `exe`, built as `running`.
+fn update_ready_with(home: &Path, exe: &Path, running: &str) -> Option<String> {
+    let state = match update::state(home) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!("the ready tag cannot be read: {error}");
+            return None;
+        }
+    };
+    let ready = state.ready?;
+    let above = ready
+        .strip_prefix('v')
+        .is_some_and(|version| update::above(version, running));
+    (above
+        && state.refused.as_deref() != Some(ready.as_str())
+        && update::is_ready(home, &ready)
+        && update::from_current(home, exe, running))
+    .then_some(ready)
 }
 /// Writes a sample every [`SAMPLE_EVERY`], the first at once, each on the blocking pool so a
 /// slow disk read or a busy store never stalls an async worker. A sample that cannot be read
@@ -725,7 +756,11 @@ mod tests {
         for ready in ["v0.1.0", "v0.0.9"] {
             let home = tempfile::tempdir().unwrap();
             let exe = ready_home(home.path(), ready, None);
-            assert_eq!(update_ready_with(home.path(), &exe, "0.1.0"), None, "{ready}");
+            assert_eq!(
+                update_ready_with(home.path(), &exe, "0.1.0"),
+                None,
+                "{ready}"
+            );
         }
     }
 
@@ -735,7 +770,11 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let exe = ready_home(home.path(), "v0.2.0", None);
             std::fs::remove_file(home.path().join("versions/0.2.0").join(gone)).unwrap();
-            assert_eq!(update_ready_with(home.path(), &exe, "0.1.0"), None, "{gone}");
+            assert_eq!(
+                update_ready_with(home.path(), &exe, "0.1.0"),
+                None,
+                "{gone}"
+            );
         }
     }
 

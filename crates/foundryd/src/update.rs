@@ -1,11 +1,13 @@
-//! Installs newer release tags and rolls back a version that does not stay up.
+//! Makes newer release tags ready to install, and rolls back a version that does not stay up.
 //!
 //! The data directory holds `versions/<version>/{foundryd,foundry-holder}`, `current` (a
-//! relative link to one of them, which the service runs) and `update.json`. A new version is
-//! a trial: the daemon that starts from it counts its starts, and `update::run` calls it
-//! healthy once it has run for a minute. A trial that starts three times without becoming
-//! healthy is put back to the previous version and its tag is refused until a higher one
-//! appears. Only a daemon that runs from `<home>/current` takes part in any of this.
+//! relative link to one of them, which the service runs) and `update.json`. The check every
+//! ten minutes downloads, verifies and unpacks a newer tag into `versions/` and saves it as the
+//! ready tag; it never installs it. A new version is a trial: the daemon that starts from it
+//! counts its starts, and `update::run` calls it healthy once it has run for a minute. A trial
+//! that starts three times without becoming healthy is put back to the previous version and its
+//! tag is refused until a higher one appears. Only a daemon that runs from `<home>/current`
+//! takes part in any of this.
 //!
 //! `foundryd install` and the daemon are separate processes that both change `update.json`
 //! and `current`, so every change to either is made while holding `<home>/update.lock`.
@@ -22,7 +24,6 @@ use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
-use nix::sys::signal::{Signal, raise};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
@@ -244,6 +245,39 @@ pub struct State {
     /// A tag that was refused, like `v0.2.0`. It is skipped while it is the highest.
     #[serde(default)]
     pub refused: Option<String>,
+    /// The tag the check downloaded, verified and placed in `versions/`, waiting to be
+    /// installed, like `v0.2.0`. It counts only while [`is_ready`] says so.
+    #[serde(default)]
+    pub ready: Option<String>,
+}
+
+/// True when both binaries of `tag`'s version are in `versions/`, so the tag counts as ready.
+pub fn is_ready(home: &Path, tag: &str) -> bool {
+    tag.strip_prefix('v')
+        .filter(|version| parse(version).is_some())
+        .is_some_and(|version| {
+            let dir = home.join("versions").join(version);
+            BINARIES.iter().all(|name| dir.join(name).is_file())
+        })
+}
+
+/// True when `state` holds a trial and `current` names its version: the rule the check goes by.
+/// A trial `current` does not name, as a crash between an install's two writes leaves, is
+/// stranded. [`trial_on`] keeps its own, wider rule for its callers.
+fn trial_live(home: &Path, state: &State) -> bool {
+    state
+        .trial
+        .as_ref()
+        .is_some_and(|trial| current_version(home).as_deref() == Some(trial.version.as_str()))
+}
+
+/// Clears a stranded trial from `state`. True when there was one.
+fn clear_stranded_trial(home: &Path, state: &mut State) -> bool {
+    let stranded = state.trial.is_some() && !trial_live(home, state);
+    if stranded {
+        state.trial = None;
+    }
+    stranded
 }
 
 /// Reads `update.json`. A missing file is an empty state.
@@ -257,8 +291,8 @@ pub fn state(home: &Path) -> io::Result<State> {
 }
 
 /// Takes `<home>/update.lock`, waiting for another process that holds it. Every holder only
-/// reads and writes `update.json` and moves `current` (no network and no child process), so the
-/// wait is short. The lock is let go when the value is dropped. Never take it twice in one
+/// reads and writes `update.json`, removes or renames directories under `versions/` and moves
+/// `current` (no network, no copy and no child process), so the wait is short. The lock is let go when the value is dropped. Never take it twice in one
 /// thread: a second open of the file waits for the first.
 fn lock(home: &Path) -> io::Result<Flock<File>> {
     let file = OpenOptions::new()
@@ -380,7 +414,7 @@ fn start_with(home: &Path, running: &str) -> io::Result<Start> {
 
 /// True when this process runs from `<home>/current`, the only place that is updated: that
 /// link names `running`, and `exe` is the file the link reaches.
-fn from_current(home: &Path, exe: &Path, running: &str) -> bool {
+pub(crate) fn from_current(home: &Path, exe: &Path, running: &str) -> bool {
     if current_version(home).as_deref() != Some(running) {
         return false;
     }
@@ -526,6 +560,11 @@ pub fn lowered(before: Option<&str>, version: &str) -> bool {
     before.is_some_and(|before| parse(before).is_some() && parse(before) > parse(version))
 }
 
+/// True when `version` and `running` are both versions and `version` is the higher.
+pub(crate) fn above(version: &str, running: &str) -> bool {
+    matches!((parse(version), parse(running)), (Some(version), Some(running)) if version > running)
+}
+
 /// Records a hand install of `version` over `before` (the version `current` named). It ends
 /// a trial of any other version. When `version` is lower it refuses `v<before>`, as an
 /// automatic rollback does, so the updater does not undo the install until a higher tag
@@ -576,13 +615,48 @@ pub(crate) fn place_version(
     fill: impl FnOnce(&Path) -> Result<(), UpdateError>,
     record: impl FnOnce() -> io::Result<()>,
 ) -> Result<(), UpdateError> {
-    let versions = home.join("versions");
-    let stage = versions.join(format!(".staging-{version}"));
-    let result = fill_and_swap(home, &versions, &stage, version, fill, record);
+    let stage = stage_version(home, version, fill)?;
+    let result =
+        swap_in(home, &stage, version).and_then(|()| commit_version(home, version, record));
     if result.is_err() {
         let _ = fs::remove_dir_all(&stage);
     }
     result
+}
+
+/// Fills a fresh `versions/.staging-<version>` with `fill` and checks that both binaries are
+/// there, made executable. Returns its path; a stage that fails is removed. It takes no lock:
+/// nothing under it touches `update.json` or `current`.
+pub(crate) fn stage_version(
+    home: &Path,
+    version: &str,
+    fill: impl FnOnce(&Path) -> Result<(), UpdateError>,
+) -> Result<PathBuf, UpdateError> {
+    let stage = home.join("versions").join(format!(".staging-{version}"));
+    let filled = (|| {
+        let _ = fs::remove_dir_all(&stage);
+        fs::create_dir_all(&stage).map_err(io_error("cannot make the staging directory"))?;
+        fill(&stage)?;
+        make_executable(&stage)
+    })();
+    match filled {
+        Ok(()) => Ok(stage),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&stage);
+            Err(error)
+        }
+    }
+}
+
+/// Renames `stage` to `versions/<version>`, replacing what is there.
+pub(crate) fn swap_in(home: &Path, stage: &Path, version: &str) -> Result<(), UpdateError> {
+    let target = home.join("versions").join(version);
+    match fs::remove_dir_all(&target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("cannot clear the old copy")(error)),
+    }
+    fs::rename(stage, &target).map_err(io_error("cannot move the new version into place"))
 }
 
 /// Checks that `stage` holds both binaries and makes them executable.
@@ -598,28 +672,6 @@ fn make_executable(stage: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
-fn fill_and_swap(
-    home: &Path,
-    versions: &Path,
-    stage: &Path,
-    version: &str,
-    fill: impl FnOnce(&Path) -> Result<(), UpdateError>,
-    record: impl FnOnce() -> io::Result<()>,
-) -> Result<(), UpdateError> {
-    let _ = fs::remove_dir_all(stage);
-    fs::create_dir_all(stage).map_err(io_error("cannot make the staging directory"))?;
-    fill(stage)?;
-    make_executable(stage)?;
-    let target = versions.join(version);
-    match fs::remove_dir_all(&target) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io_error("cannot clear the old copy")(error)),
-    }
-    fs::rename(stage, &target).map_err(io_error("cannot move the new version into place"))?;
-    commit_version(home, version, record)
-}
-
 /// Runs `record`, then points `current` at `versions/<version>`, both under [`lock`]. `record`
 /// runs first, so a crash in between never leaves a version running that nothing recorded.
 /// `record` must not take the lock itself.
@@ -633,10 +685,13 @@ pub(crate) fn commit_version(
     point_current(home, version).map_err(io_error("cannot point current at the new version"))
 }
 
-/// Installs `tag`: `fetch` puts the release's files in a fresh stage directory, the binaries
-/// are checked and the new `foundryd` must say it is this version, then the version is placed
-/// as a trial.
-fn install_tag(
+/// Makes `tag` ready: `fetch` puts the release's files in a fresh stage directory, the
+/// binaries are checked and the new `foundryd` must say it is this version. Then, in one step
+/// under [`lock`], the stage becomes `versions/<version>` and `tag` is saved as the ready tag,
+/// leaving `refused`, `current` and any live trial as they are. That step goes ahead only while
+/// `current` still names `running` and no trial is live; otherwise it changes nothing and the
+/// stage is removed.
+fn make_ready(
     home: &Path,
     tag: &str,
     running: &str,
@@ -647,7 +702,7 @@ fn install_tag(
         .strip_prefix('v')
         .filter(|version| parse(version).is_some())
         .ok_or_else(|| UpdateError::BadTag(tag.to_string()))?;
-    let fill = |stage: &Path| {
+    let stage = stage_version(home, version, |stage| {
         fetch(tag, stage)?;
         make_executable(stage)?;
         let result = run_bounded(
@@ -655,29 +710,54 @@ fn install_tag(
             version_limit,
         );
         judge_version_check(result, tag, version)
-    };
-    let record = || {
-        // Checked again under the lock: a hand install may have moved `current` while the
-        // release was downloaded, and its version and refusal must stand.
-        if current_version(home).as_deref() != Some(running) {
-            return Err(io::Error::other(format!(
-                "current no longer names {running}: a hand install moved it, so {tag} waits"
-            )));
-        }
-        // A trial of the new version, and no refusal: this tag is the highest there is.
-        save(
-            home,
-            &State {
-                trial: Some(Trial {
-                    version: version.to_string(),
-                    previous: running.to_string(),
-                    starts: 0,
-                }),
-                refused: None,
-            },
-        )
-    };
-    place_version(home, version, fill, record)
+    })?;
+    let placed = lock(home)
+        .map_err(io_error("cannot lock the update state"))
+        .and_then(|_lock| {
+            let mut held = state(home).map_err(io_error("cannot read the update state"))?;
+            let waits = |why: String| io_error(format!("{tag} waits"))(io::Error::other(why));
+            // Checked again under the lock: an install may have moved `current` or started a
+            // trial while the release was downloaded, and what it did must stand.
+            if current_version(home).as_deref() != Some(running) {
+                return Err(waits(format!(
+                    "current no longer names {running}: a hand install moved it"
+                )));
+            }
+            clear_stranded_trial(home, &mut held);
+            if let Some(trial) = held.trial.as_ref() {
+                return Err(waits(format!("a trial of {} is on", trial.version)));
+            }
+            swap_in(home, &stage, version)?;
+            held.ready = Some(tag.to_string());
+            save(home, &held).map_err(io_error("cannot save the update state"))
+        });
+    if placed.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    placed
+}
+
+/// Clears, under [`lock`], a stranded trial and a ready tag `tags` does not hold (that release
+/// was pulled). The ready tag is cleared only if the state re-read under the lock still names
+/// it. Returns the state that remains. The lock is taken only when there is something to clear.
+fn tidy(home: &Path, tags: &[String]) -> io::Result<State> {
+    let seen = state(home)?;
+    let pulled = seen.ready.clone().filter(|ready| !tags.contains(ready));
+    let stranded = seen.trial.is_some() && !trial_live(home, &seen);
+    if pulled.is_none() && !stranded {
+        return Ok(seen);
+    }
+    let _lock = lock(home)?;
+    let mut held = state(home)?;
+    let mut changed = clear_stranded_trial(home, &mut held);
+    if pulled.is_some() && held.ready == pulled {
+        held.ready = None;
+        changed = true;
+    }
+    if changed {
+        save(home, &held)?;
+    }
+    Ok(held)
 }
 
 /// Judges what happened when the new `foundryd` was asked its version. A binary the system
@@ -800,11 +880,13 @@ fn verifies(key: &[u8], archive: &[u8], signature: &[u8]) -> bool {
         .is_ok()
 }
 
-/// One look for a newer tag. `Some` is the tag that was installed. A release is refused, so it
-/// is not downloaded again, when its signature does not verify, when it lacks a binary, when
-/// its `foundryd` cannot be executed, or when that `foundryd` ran and failed or printed the
-/// wrong version. Any other failure, including a missing signature or a version check that
-/// times out or hits a passing system error, is tried again later.
+/// One look for a newer tag. `Some` is the tag this look made ready. A ready tag the list no
+/// longer holds is cleared first, and a tag already ready is not fetched again. A release is
+/// refused, so it is not downloaded again, when its signature does not verify, when it lacks a
+/// binary, when its `foundryd` cannot be executed, or when that `foundryd` ran and failed or
+/// printed the wrong version. Any other failure, including a missing signature or a version
+/// check that times out or hits a passing system error, is tried again later. Neither changes
+/// the ready tag.
 fn check_with(
     home: &Path,
     running: &str,
@@ -813,18 +895,19 @@ fn check_with(
     fetch: impl FnOnce(&str, &Path) -> Result<(), UpdateError>,
 ) -> Result<Option<String>, UpdateError> {
     // A hand install moved `current` away from this daemon: the service starts that version
-    // at its next restart, so this one installs nothing over it.
+    // at its next restart, so this one makes nothing ready over it.
     if current_version(home).as_deref() != Some(running) {
         return Ok(None);
     }
     let tags = list()?;
-    let refused = state(home)
-        .map_err(io_error("cannot read the update state"))?
-        .refused;
-    let Some(tag) = pick(&tags, running, refused.as_deref()) else {
+    let held = tidy(home, &tags).map_err(io_error("cannot read or tidy the update state"))?;
+    let Some(tag) = pick(&tags, running, held.refused.as_deref()) else {
         return Ok(None);
     };
-    match install_tag(home, &tag, running, version_limit, fetch) {
+    if held.ready.as_deref() == Some(tag.as_str()) && is_ready(home, &tag) {
+        return Ok(None);
+    }
+    match make_ready(home, &tag, running, version_limit, fetch) {
         Ok(()) => Ok(Some(tag)),
         Err(
             error @ (UpdateError::BadSignature(_)
@@ -854,9 +937,8 @@ fn became_healthy(flag: &AtomicBool, home: &Path, exe: &Path, running: &str) -> 
 }
 
 /// Marks this version healthy after a minute (again at each check until the mark is saved),
-/// then looks for a newer tag every ten minutes.
-/// After installing one it stops the daemon with SIGTERM, so the service starts the new
-/// `current`. Never returns: a daemon that is not run from `current` just waits.
+/// then looks for a newer tag every ten minutes and makes it ready. It never installs one and
+/// never stops the daemon. Never returns: a daemon that is not run from `current` just waits.
 pub async fn run(home: PathBuf) {
     let running = env!("CARGO_PKG_VERSION");
     let work = home.clone();
@@ -866,24 +948,18 @@ pub async fn run(home: PathBuf) {
         running,
         &HEALTHY,
         move || check_with(&work, running, VERSION_LIMIT, list_tags, download),
-        || {
-            if let Err(error) = raise(Signal::SIGTERM) {
-                tracing::error!("cannot stop for the update: {error}");
-            }
-        },
     )
     .await;
 }
 
-/// [`run`] with its inputs given: this process's path, the flag the watchdog reads, one
-/// update check, and what stops the daemon once a check has installed a tag.
+/// [`run`] with its inputs given: this process's path, the flag the watchdog reads, and one
+/// update check.
 async fn run_with(
     home: PathBuf,
     exe: io::Result<PathBuf>,
     running: &'static str,
     flag: &AtomicBool,
     check: impl Fn() -> Result<Option<String>, UpdateError> + Clone + Send + 'static,
-    stop: impl Fn(),
 ) {
     tokio::time::sleep(HEALTHY_AFTER).await;
     // The flag is set whatever `exe` is, so a failed lookup never lets the watchdog kill a
@@ -907,9 +983,7 @@ async fn run_with(
         }
         match tokio::task::spawn_blocking(check.clone()).await {
             Ok(Ok(Some(tag))) => {
-                tracing::info!("installed {tag}: stopping so the service starts it");
-                stop();
-                pending::<()>().await;
+                tracing::info!("{tag} is downloaded and checked, and waits to be installed");
             }
             Ok(Ok(None)) => {}
             Ok(Err(error)) => tracing::warn!("update check failed, trying again later: {error}"),
@@ -1739,7 +1813,11 @@ mod tests {
                 || Ok(left.clone()),
                 |tag, stage| {
                     assert_eq!(tag, "v0.1.5");
-                    assert_eq!(state(&path).unwrap().ready, None, "cleared before the fetch");
+                    assert_eq!(
+                        state(&path).unwrap().ready,
+                        None,
+                        "cleared before the fetch"
+                    );
                     release(stage, "0.1.5");
                     Ok(())
                 },
@@ -2216,13 +2294,7 @@ mod tests {
         let home = trial_home();
         let elsewhere = home.path().join("elsewhere");
         script(&elsewhere, "foundryd 0.2.0");
-        let task = spawn_run(
-            home.path(),
-            Ok(elsewhere),
-            &FLAG,
-            &CHECKS,
-            nothing,
-        );
+        let task = spawn_run(home.path(), Ok(elsewhere), &FLAG, &CHECKS, nothing);
 
         tokio::time::sleep(HEALTHY_AFTER + CHECK_EVERY * 3).await;
         std::thread::sleep(Duration::from_millis(100));
@@ -2487,7 +2559,14 @@ mod tests {
         with_ready(home.path(), "0.2.0", None);
         let path = home.path().to_path_buf();
         assert!(!finished_while_locked(home.path(), move || {
-            check_with(&path, "0.1.0", LIMIT, || Ok(tags(&[])), |_, _| unreachable!()).unwrap();
+            check_with(
+                &path,
+                "0.1.0",
+                LIMIT,
+                || Ok(tags(&[])),
+                |_, _| unreachable!(),
+            )
+            .unwrap();
         }));
         assert_eq!(state(home.path()).unwrap().ready, None);
     }
