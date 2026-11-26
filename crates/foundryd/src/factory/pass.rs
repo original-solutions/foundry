@@ -154,6 +154,7 @@ use super::config::{self, ProjectConfig};
 use super::github::{Claim, Commenting, IssueSummary, TrackerError, newest_claim};
 use super::lease::LeaseState;
 use super::ledger::Ledger;
+use super::ledger::events::names;
 use super::ledger::list::{RunInfo, holds_slot};
 use super::lifecycle::State;
 use super::placing::{self, Reserved, Slots};
@@ -237,6 +238,18 @@ pub struct Memo {
     orphans_owed: bool,
     /// When the finished runs were last swept, on the clock.
     swept: Option<Duration>,
+    /// The runs seen finished, by run id: a finished run's summary never changes, so its
+    /// events are read once. `None` for one this build cannot show.
+    finished: BTreeMap<RunId, Option<Done>>,
+}
+
+/// A finished run as the status shows it, with where its `finished` event stands.
+#[derive(Debug)]
+struct Done {
+    /// The lease generation, the record's version and the writer of the `finished` event:
+    /// the order the runs' events put it in, never the wall clock. `None` when not read.
+    at: Option<(u64, u64, MachineId)>,
+    run: FinishedRun,
 }
 
 /// What one pass did.
@@ -1329,43 +1342,52 @@ impl<'a, 'w> Pass<'a, 'w> {
         }
         let mut owed = false;
         for run in runs {
-            // A run whose events this build cannot read (a newer build's) is noted, and the
-            // sweep goes on: it must not end every pass of the project.
-            let events = match self.ledger.read(&run) {
-                Ok(events) => events,
-                Err(_) => {
-                    self.note(&run, UNREADABLE_SWEPT);
-                    continue;
-                }
-            };
-            let seen = read_progress(&events);
-            if sweep_due && seen.finished {
+            // A run finished is known by the memo, or asked of the store with no row read.
+            // The pass reads a run's events itself only for its orphans: the reconcile reads
+            // them for its own sake.
+            let finished = self.memo.finished.contains_key(&run)
+                || world
+                    .store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .run_has_event(&run, names::FINISHED)
+                    .unwrap_or(false);
+            if sweep_due && finished {
                 let ctx = self.ctx(self.config);
                 match stop::reconcile(&ctx, &run) {
                     Ok(ReconcileStep::Archived { workspaces }) => {
                         self.report.archived.extend(workspaces);
                     }
                     Ok(_) => {}
+                    // A finished run whose events this build cannot read is the run's own.
+                    Err(RunError::Store(_)) => self.note(&run, UNREADABLE_SWEPT),
                     Err(error) => {
                         let said = ending(error)?;
                         self.note(&run, said);
                     }
                 }
             }
-            if heard_again {
-                for workspace in resume::orphans(world.view, world.project.id, &run, &events) {
-                    if self.report.archived.contains(&workspace) {
-                        continue;
-                    }
-                    if world.guard.check().is_err() {
-                        return Err(Ended::Lost);
-                    }
-                    match world.worker.archive(workspace) {
-                        Ok(()) => self.report.archived.push(workspace),
-                        Err(error) => {
-                            owed = true;
-                            self.note(&run, format!("an orphan was not archived: {error}"));
-                        }
+            if !heard_again {
+                continue;
+            }
+            // A run whose events this build cannot read (a newer build's) is noted, and the
+            // sweep goes on: it must not end every pass of the project.
+            let Ok(events) = self.ledger.read(&run) else {
+                self.note(&run, UNREADABLE_SWEPT);
+                continue;
+            };
+            for workspace in resume::orphans(world.view, world.project.id, &run, &events) {
+                if self.report.archived.contains(&workspace) {
+                    continue;
+                }
+                if world.guard.check().is_err() {
+                    return Err(Ended::Lost);
+                }
+                match world.worker.archive(workspace) {
+                    Ok(()) => self.report.archived.push(workspace),
+                    Err(error) => {
+                        owed = true;
+                        self.note(&run, format!("an orphan was not archived: {error}"));
                     }
                 }
             }
@@ -1379,8 +1401,9 @@ impl<'a, 'w> Pass<'a, 'w> {
     /// The live runs, the held-up runs and the finished runs, for the status.
     fn results_of(&mut self) -> Result<(), Ended> {
         let world = self.world;
-        let repo = world.project.repo.clone();
-        for k in self.known()? {
+        let known = self.known()?;
+        let unfinished: BTreeSet<RunId> = known.iter().map(|k| k.info.id.clone()).collect();
+        for k in known {
             let run = k.info.id.clone();
             match k.info.state {
                 Some(State::Stuck | State::NeedsInfo) => {
@@ -1433,30 +1456,80 @@ impl<'a, 'w> Pass<'a, 'w> {
                 }
             }
         }
-        let mut finished: Vec<FinishedRun> = self
-            .ledger
-            .summaries(&repo)?
+        self.see_finished(&unfinished)?;
+        let mut done: Vec<&Done> = self.memo.finished.values().flatten().collect();
+        // Newest first by where the `finished` event stands, then by run id for a tie.
+        done.sort_by(|a, b| (&b.at, &b.run.run).cmp(&(&a.at, &a.run.run)));
+        self.results.finished = done.into_iter().map(|done| done.run.clone()).collect();
+        Ok(())
+    }
+
+    /// Reads into the memo each run that is not in `unfinished` and not seen finished yet. A
+    /// finished run's summary never changes, so a pass over a history it has seen reads no
+    /// finished run's events.
+    fn see_finished(&mut self, unfinished: &BTreeSet<RunId>) -> Result<(), Ended> {
+        let world = self.world;
+        let repo = &world.project.repo;
+        let unseen: BTreeSet<RunId> = world
+            .store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .runs_of(repo)?
             .into_iter()
-            .filter(|summary| summary.finished)
-            .filter_map(|summary| {
-                let outcome = match summary.state? {
+            .filter(|id| !unfinished.contains(id) && !self.memo.finished.contains_key(id))
+            .collect();
+        if unseen.is_empty() {
+            return Ok(());
+        }
+        for summary in self.ledger.summaries(repo)? {
+            if !unseen.contains(&summary.id) {
+                continue;
+            }
+            if summary.unreadable {
+                // A finished run a newer build wrote: not shown, and not read again.
+                self.memo.finished.insert(summary.id, None);
+                continue;
+            }
+            if !summary.finished {
+                continue;
+            }
+            let at = finishing(
+                &world.store.lock().unwrap_or_else(PoisonError::into_inner),
+                &summary.id,
+            );
+            let id = summary.id.clone();
+            let run = summary.state.map(|state| FinishedRun {
+                title: summary.title.clone().unwrap_or_default(),
+                outcome: match state {
                     State::Stuck => RunOutcome::Stuck,
                     State::NeedsInfo => RunOutcome::NeedsInfo,
                     _ => RunOutcome::PrOpen,
-                };
-                Some(FinishedRun {
-                    title: summary.title.clone().unwrap_or_default(),
-                    outcome,
-                    pr_end: summary.pr_end,
-                    pr_url: summary.pr_url.clone(),
-                    run: summary.id,
-                })
-            })
-            .collect();
-        finished.reverse();
-        self.results.finished = finished;
+                },
+                pr_end: summary.pr_end,
+                pr_url: summary.pr_url.clone(),
+                run: summary.id,
+            });
+            self.memo
+                .finished
+                .insert(id, run.map(|run| Done { at, run }));
+        }
         Ok(())
     }
+}
+
+/// Where the newest `finished` event of `run` stands: its lease generation, its record's
+/// version and its writer. A writer's versions only rise, and a later lease holder writes at a
+/// higher generation, so this orders every machine's finished runs, which no clock does.
+fn finishing(store: &Store, run: &RunId) -> Option<(u64, u64, MachineId)> {
+    let mut newest = None;
+    for writer in store.run_writers(run).ok()? {
+        for (version, event) in store.run_events_by(run, writer, None).ok()? {
+            if event.event == names::FINISHED {
+                newest = newest.max(Some((event.generation, version, writer)));
+            }
+        }
+    }
+    newest
 }
 
 impl PassResults {
@@ -4319,13 +4392,11 @@ mod tests {
             let before = read();
             rig.pass();
             let swept = read() - before;
-            // Three runs of fifteen events: the reconcile reads each once, and the pass does
-            // not read them again for itself.
-            assert!(
-                swept >= plain + 3 * 15,
-                "the reconcile reads: {plain} {swept}"
-            );
-            assert!(swept <= plain + 3 * 15, "one read of each: {plain} {swept}");
+            // Three runs of fifteen events: the reconcile reads each once, and the sweep lists
+            // the three ids; the pass does not read the events again for itself.
+            let reconcile = 3 * 15;
+            assert!(swept >= plain + reconcile, "{plain} {swept}");
+            assert!(swept <= plain + reconcile + 3, "{plain} {swept}");
         }
     }
 }
