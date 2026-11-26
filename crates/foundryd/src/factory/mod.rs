@@ -172,8 +172,9 @@ pub trait Host: Send + Sync + 'static {
     /// GitHub as `login`, with the machine's hider; `None` when no token is held for it.
     fn tracker(&self, login: &str) -> Option<Arc<dyn Commenting>>;
     /// A fingerprint of the token held for `login` now, never the token: a lease made with
-    /// another one, or with none, is made again. `None` when none is held.
-    fn token_mark(&self, login: &str) -> Option<u64>;
+    /// another one, or with none, is made again. `None` when none is held; an error when the
+    /// secret store cannot be read, which changes nothing.
+    fn token_mark(&self, login: &str) -> Result<Option<u64>, String>;
     /// The lease of `watched`.
     fn lease(&self, watched: &Watched) -> Arc<dyn Leasing>;
     /// The worker that calls the fleet.
@@ -241,10 +242,19 @@ impl<H: Host> Factory<H> {
                 running.retain(|project, run| {
                     // A lease made with another token than the one held now, or with none, or
                     // whose token could not be given to git, is made again.
-                    let mark = self.host.token_mark(&run.watched.login);
-                    let unusable =
-                        mark.is_some() && matches!(*lock(&run.state), Some(LeaseState::NoToken));
-                    let keep = want.contains(&run.watched) && mark == run.mark && !unusable;
+                    // A store that cannot be read says nothing of the token: the lease stays.
+                    let same = match self.host.token_mark(&run.watched.login) {
+                        Ok(mark) => {
+                            mark == run.mark
+                                && !(mark.is_some()
+                                    && matches!(*lock(&run.state), Some(LeaseState::NoToken)))
+                        }
+                        Err(error) => {
+                            tracing::warn!(project = %project, "factory: the token could not be read: {error}");
+                            true
+                        }
+                    };
+                    let keep = want.contains(&run.watched) && same;
                     if !keep {
                         run.lease.release();
                         self.book.forget(*project);
@@ -265,7 +275,7 @@ impl<H: Host> Factory<H> {
 
     /// Starts the lease task and the pass task of `watched`.
     fn start(&self, watched: Watched, offline: Arc<Mutex<Offline>>) -> Running {
-        let mark = self.host.token_mark(&watched.login);
+        let mark = self.host.token_mark(&watched.login).ok().flatten();
         let lease = self.host.lease(&watched);
         let state: Arc<Mutex<Option<LeaseState>>> = Arc::default();
         let mut tasks = tokio::task::JoinSet::new();
@@ -572,16 +582,20 @@ impl Host for Daemon {
         Some(Arc::new(github::Hiding::new(Arc::new(gh), self.hide())))
     }
 
-    fn token_mark(&self, login: &str) -> Option<u64> {
+    fn token_mark(&self, login: &str) -> Result<Option<u64>, String> {
         use std::hash::{Hash, Hasher};
-        let token = crate::secrets::github_token(&*self.secrets, login).ok()??;
+        let Some(token) =
+            crate::secrets::github_token(&*self.secrets, login).map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
         let token = token.trim();
         if token.is_empty() {
-            return None;
+            return Ok(None);
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         token.hash(&mut hasher);
-        Some(hasher.finish())
+        Ok(Some(hasher.finish()))
     }
 
     fn lease(&self, watched: &Watched) -> Arc<dyn Leasing> {

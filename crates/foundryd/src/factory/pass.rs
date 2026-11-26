@@ -25,9 +25,9 @@
 //!    the resume before the start and the build, the reconcile before the build, the build
 //!    and its forward, and the gate in the same pass as a pull request is reported. A run whose
 //!    end the reconcile is winding up is touched by no other step that pass. Runs in `pr-open`,
-//!    and runs a feedback round owns, have their feedback step after the claims (step 6), as
-//!    the runner's `prOpenRuns` comes after its claim, so a claim of an issue put back to
-//!    `ready` ends its older `pr-open` run first.
+//!    and runs a feedback round owns, have their feedback step after the other runs' steps and
+//!    before the claims, as the issue numbers them (the runner's `prOpenRuns` came after its
+//!    claim; the issue's order decides).
 //! 6. Ready issues are claimed, oldest first (by number, as the runner orders them), while a run
 //!    slot is free, claims are not paused and `placing::place_run` has a machine. An issue
 //!    labelled `postponed`, one whose older run is gating, and one blocked by an open issue
@@ -121,6 +121,10 @@
 //!   cannot be read is an error line and counts as active`: the ledger is the store, which the
 //!   fakes cannot make fail. A store error ends the pass (`Ended::Failed`), and a run whose
 //!   events cannot be read is noted and holds a slot by `holds_slot`.
+//! - `a repo two T3 projects name is watched from neither: one error line, one event, the rest go
+//!   on` (T3 projects) and `an issue blocked by its text is recorded as a skipped claim` (a
+//!   machine-log event; the status's ready queue says it is blocked, see
+//!   `each_blocker_from_the_text_carries_the_suffix_and_one_in_another_repo_names_its_repo`).
 //! - `a start that finds a gate running says so and is no error`: the pass does not claim an
 //!   issue whose older run is gating (`a_ready_issue_whose_older_run_is_gating`), so `start`
 //!   never meets the gate there.
@@ -306,19 +310,31 @@ impl Book {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A pass of `project` begins, holding `held`: its entry is set, and the pass's ticket and
-    /// the machines every other project placed runs on are answered.
-    fn begin(&self, project: ProjectId, held: Held) -> (Ticket, Vec<MachineId>) {
+    /// The ticket of a pass of `project` that is about to check its lease. Taken before that
+    /// check, so a project forgotten after it (the service releases the lease, then forgets)
+    /// leaves the ticket stale.
+    fn ticket(&self, project: ProjectId) -> Ticket {
+        let epoch = self.lock().epochs.get(&project).copied().unwrap_or(0);
+        Ticket { project, epoch }
+    }
+
+    /// The ticket's pass begins, its project holding `held`: its entry is set, and the
+    /// machines every other project placed runs on are answered. `None` for a stale ticket,
+    /// which writes nothing.
+    fn begin(&self, ticket: Ticket, held: Held) -> Option<Vec<MachineId>> {
         let mut state = self.lock();
-        let epoch = state.epochs.get(&project).copied().unwrap_or(0);
-        state.held.insert(project, held);
-        let others = state
-            .held
-            .iter()
-            .filter(|(p, _)| **p != project)
-            .flat_map(|(_, held)| held.placed.iter().copied())
-            .collect();
-        (Ticket { project, epoch }, others)
+        if !state.current(ticket) {
+            return None;
+        }
+        state.held.insert(ticket.project, held);
+        Some(
+            state
+                .held
+                .iter()
+                .filter(|(p, _)| **p != ticket.project)
+                .flat_map(|(_, held)| held.placed.iter().copied())
+                .collect(),
+        )
     }
 
     /// The pass ends, its project holding `held`.
@@ -434,6 +450,7 @@ fn ending(error: RunError) -> Result<String, Ended> {
 pub fn run(world: &World<'_>, memo: &mut Memo) -> PassReport {
     let mut report = PassReport::default();
     let project = world.project.id;
+    let ticket = world.book.ticket(project);
     let pass = next_pass(world, memo);
     if matches!(world.lease, LeaseState::NoToken) {
         let why = NotHolding::NoToken {
@@ -498,7 +515,7 @@ pub fn run(world: &World<'_>, memo: &mut Memo) -> PassReport {
         report,
         memo,
         titles: BTreeMap::new(),
-        ticket: None,
+        ticket,
     };
     match one.go() {
         Ok(()) => {
@@ -623,13 +640,16 @@ fn failed(
 ) -> PassReport {
     let error = world.tracker.hide(&error);
     tracing::warn!(project = %world.project.id, "factory: the pass ended: {error}");
-    memo.failures = memo.failures.saturating_add(1);
-    memo.failed = Some(error.clone());
     report.failed = Some(error.clone());
     let Ok(generation) = world.guard.check() else {
+        // Only the passes that hold the lease count toward the idle reason.
+        memo.failures = 0;
+        memo.failed = None;
         not_holding(world, &mut report, pass);
         return report;
     };
+    memo.failures = memo.failures.saturating_add(1);
+    memo.failed = Some(error.clone());
     report.generation = Some(generation);
     let mut results = memo
         .last
@@ -713,8 +733,8 @@ struct Pass<'a, 'w> {
     memo: &'a mut Memo,
     /// Each issue's title, from the listings read.
     titles: BTreeMap<u64, String>,
-    /// The pass's hold on the book, once it has begun there.
-    ticket: Option<Ticket>,
+    /// The pass's hold on the book, taken before the lease was checked.
+    ticket: Ticket,
 }
 
 /// Whose claim an issue in `triage` or `building` carries.
@@ -809,7 +829,6 @@ impl<'a, 'w> Pass<'a, 'w> {
     fn go(&mut self) -> Result<(), Ended> {
         let world = self.world;
         let repo = world.project.repo.clone();
-        let project = world.project.id;
         let known = self.known()?;
         // The fleet's slots: this project's runs hold what their events say, and every other
         // project's entry in the book holds theirs.
@@ -818,8 +837,11 @@ impl<'a, 'w> Pass<'a, 'w> {
         for machine in &held.placed {
             reserved.hold(*machine);
         }
-        let (ticket, others) = world.book.begin(project, held);
-        self.ticket = Some(ticket);
+        let ticket = self.ticket;
+        // A project stopped since the pass checked its lease: nothing more is changed.
+        let Some(others) = world.book.begin(ticket, held) else {
+            return Err(Ended::Lost);
+        };
         for machine in others {
             reserved.hold(machine);
         }
@@ -853,8 +875,7 @@ impl<'a, 'w> Pass<'a, 'w> {
             self.note(&run, said);
         }
 
-        // 5. Every run; the feedback steps come after the claims, as the runner's `prOpenRuns`
-        // does, so a claim of an issue put back to `ready` ends its older `pr-open` run first.
+        // 5. Every run, then the feedback steps, before the claims as the issue orders them.
         let mut later = Vec::new();
         for k in &known {
             let run = &k.info.id;
@@ -883,8 +904,6 @@ impl<'a, 'w> Pass<'a, 'w> {
             }
         }
 
-        // 6. The claims.
-        self.claims(&known, &mut reserved)?;
         for k in later {
             let said = match self.feedback(k, &mut reserved) {
                 Ok(said) => said,
@@ -892,6 +911,9 @@ impl<'a, 'w> Pass<'a, 'w> {
             };
             self.note(&k.info.id, said);
         }
+
+        // 6. The claims.
+        self.claims(&known, &mut reserved)?;
 
         // 7. The sweeps: orphans for a machine heard from again, and finished runs.
         self.sweep()?;
@@ -905,7 +927,6 @@ impl<'a, 'w> Pass<'a, 'w> {
 
     fn ticket(&self) -> Ticket {
         self.ticket
-            .expect("a pass that holds the lease has begun in the book")
     }
 
     /// Whose claim `issue` carries: a run of Foundry's, named by Foundry's newest claim
@@ -962,12 +983,13 @@ impl<'a, 'w> Pass<'a, 'w> {
         let config = run_config(self.config, k.info.base.as_deref());
         let ctx = context(self.world, self.ledger, self.settings, &config);
         if gating::gate_running(&k.events) {
-            return self.gate(&ctx, run);
+            // Its slot is already counted: a gate in flight is polled, not placed.
+            return self.gate(&ctx, run, false);
         }
         if k.seen.stop_requested && matches!(state, Some(State::Building | State::Stuck)) {
             match stop::advance(&ctx, run)? {
                 StopStep::Skipped { .. } => {}
-                StopStep::GateHolds => return self.gate(&ctx, run),
+                StopStep::GateHolds => return self.gate(&ctx, run, true),
                 StopStep::Stuck { .. } => return Ok("stuck: stopped by hand".into()),
                 other => return Ok(format!("stop: {other:?}")),
             }
@@ -1025,7 +1047,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                 let step = building::advance(&ctx, run)?;
                 let mut said = format!("build: {step:?}");
                 if let BuildStep::ReadyForGate { .. } = step {
-                    said = format!("{said}; {}", self.gate(&ctx, run)?);
+                    said = format!("{said}; {}", self.gate(&ctx, run, true)?);
                 }
                 let forwarded = feedback::forward(&ctx, run)?;
                 if forwarded.comments > 0 || forwarded.body_edit {
@@ -1042,10 +1064,15 @@ impl<'a, 'w> Pass<'a, 'w> {
 
     /// The gate step of `run`, with what it says.
     /// A gate slot of the fleet is taken for the step, and given back when it placed no gate.
-    fn gate(&mut self, ctx: &RunContext<'_>, run: &RunId) -> Result<String, RunError> {
+    fn gate(
+        &mut self,
+        ctx: &RunContext<'_>,
+        run: &RunId,
+        may_place: bool,
+    ) -> Result<String, RunError> {
         let book = self.world.book;
         let ticket = self.ticket();
-        let taken = book.take_gate(ticket, self.settings.fleet.max_gates);
+        let taken = may_place && book.take_gate(ticket, self.settings.fleet.max_gates);
         let mut slots = Slots {
             runs_free: 0,
             gates_free: u32::from(taken),
@@ -1077,7 +1104,9 @@ impl<'a, 'w> Pass<'a, 'w> {
         }
         let book = self.world.book;
         let ticket = self.ticket();
-        let taken = book.take_run(ticket, self.settings.fleet.max_runs);
+        // Only a run in `pr-open` can start a round; a round under way holds its slot already.
+        let taken = k.info.state == Some(State::PrOpen)
+            && book.take_run(ticket, self.settings.fleet.max_runs);
         let mut slots = Slots {
             runs_free: u32::from(taken),
             gates_free: 0,
@@ -2371,8 +2400,9 @@ mod tests {
         fn a_run_in_any_watched_repo_uses_a_slot() {
             let mut rig = Rig::new();
             rig.fleet_settings(|f| f.max_runs = 1);
+            let other = rig.book.ticket(other_project());
             rig.book.begin(
-                other_project(),
+                other,
                 Held {
                     runs: 1,
                     gates: 0,
@@ -3502,8 +3532,12 @@ mod tests {
                 .filter(|(r, _)| *r == run)
                 .map(|(_, s)| s)
                 .collect();
-            assert_eq!(said.len(), 1, "{report:?}");
             assert!(said[0].starts_with("reconcile: Waiting"), "{report:?}");
+            assert!(
+                said.iter()
+                    .all(|s| !s.contains("build:") && !s.contains("gate:")),
+                "no other step of the run: {report:?}"
+            );
         }
     }
 
