@@ -1243,7 +1243,7 @@ mod tests {
                 ready: Some("v0.2.0".into()),
             }
         );
-        assert!(!home.path().join("versions/.staging-0.2.0").exists());
+        assert_eq!(stages(home.path()), Vec::<String>::new());
     }
 
     #[test]
@@ -1587,6 +1587,63 @@ mod tests {
         let home = installed_home();
         assert!(!is_ready(home.path(), "v0.3.0"));
         assert!(!is_ready(home.path(), "0.1.0"));
+        let outside = home.path().join("x");
+        fs::create_dir_all(&outside).unwrap();
+        release(&outside, "0.2.0");
+        assert!(!is_ready(home.path(), "v../x"));
+    }
+
+    #[test]
+    fn binaries_on_disk_without_a_ready_tag_are_fetched_and_made_ready() {
+        let home = installed_home();
+        let dir = home.path().join("versions/0.2.0");
+        fs::create_dir_all(&dir).unwrap();
+        release(&dir, "0.2.0");
+        let fetched = AtomicUsize::new(0);
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |_, stage| {
+                fetched.fetch_add(1, Ordering::Relaxed);
+                release(stage, "0.2.0");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.as_deref(), Some("v0.2.0"));
+        assert_eq!(fetched.load(Ordering::Relaxed), 1);
+        assert_eq!(state(home.path()).unwrap().ready.as_deref(), Some("v0.2.0"));
+    }
+
+    #[test]
+    fn a_stage_another_process_made_is_left_alone() {
+        let home = installed_home();
+        let theirs = home.path().join("versions/.staging-0.2.0");
+        fs::create_dir_all(&theirs).unwrap();
+        fs::write(theirs.join("foundryd"), "half copied").unwrap();
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |_, stage| {
+                release(stage, "0.2.0");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.as_deref(), Some("v0.2.0"));
+        assert_eq!(
+            fs::read_to_string(theirs.join("foundryd")).unwrap(),
+            "half copied"
+        );
+        assert_eq!(stages(home.path()), [".staging-0.2.0"]);
     }
 
     #[test]
@@ -1855,6 +1912,46 @@ mod tests {
         assert!(matches!(result, Err(UpdateError::Fetch(_))), "{result:?}");
         assert_eq!(state(home.path()).unwrap(), State::default());
         assert!(is_ready(home.path(), "v0.2.0"));
+    }
+
+    #[test]
+    fn a_stranded_trial_is_cleared_even_when_the_check_picks_nothing() {
+        for listed in [tags(&["v0.2.0"]), tags(&["v0.1.0"])] {
+            let home = installed_home();
+            with_ready(home.path(), "0.2.0", Some("v0.0.5"));
+            let mut held = state(home.path()).unwrap();
+            held.trial = Some(Trial {
+                version: "0.3.0".into(),
+                previous: "0.1.0".into(),
+                starts: 0,
+            });
+            save(home.path(), &held).unwrap();
+
+            let done = check_with(
+                home.path(),
+                "0.1.0",
+                LIMIT,
+                || Ok(listed.clone()),
+                |_, _| panic!("fetched"),
+            )
+            .unwrap();
+
+            assert_eq!(done, None);
+            let expected = if listed.contains(&"v0.2.0".to_string()) {
+                Some("v0.2.0".to_string())
+            } else {
+                None
+            };
+            assert_eq!(
+                state(home.path()).unwrap(),
+                State {
+                    trial: None,
+                    refused: Some("v0.0.5".into()),
+                    ready: expected,
+                },
+                "{listed:?}"
+            );
+        }
     }
 
     #[test]

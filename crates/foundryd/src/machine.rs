@@ -805,7 +805,28 @@ mod tests {
 
         std::fs::write(home.path().join("update.json"), "not json").unwrap();
         assert_eq!(update_ready_with(home.path(), &exe, "0.1.0"), None);
-        assert_eq!(update_ready(home.path()), None);
+    }
+
+    #[test]
+    fn write_sample_carries_the_ready_tag_of_a_daemon_run_from_current() {
+        let home = tempfile::tempdir().unwrap();
+        let running = home.path().join("versions").join(env!("CARGO_PKG_VERSION"));
+        std::fs::create_dir_all(&running).unwrap();
+        // This test binary stands in for the daemon `current` reaches.
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), running.join("foundryd"))
+            .unwrap();
+        crate::update::point_current(home.path(), env!("CARGO_PKG_VERSION")).unwrap();
+        let ready = home.path().join("versions/999.0.0");
+        std::fs::create_dir_all(&ready).unwrap();
+        for name in ["foundryd", "foundry-holder"] {
+            std::fs::write(ready.join(name), "999.0.0").unwrap();
+        }
+        std::fs::write(home.path().join("update.json"), r#"{"ready":"v999.0.0"}"#).unwrap();
+        let store = Mutex::new(Store::open(home.path().join("foundry.db")).unwrap());
+
+        let written = write_sample(&store, MachineId::random(), home.path()).unwrap();
+
+        assert_eq!(written.body.update_ready.as_deref(), Some("v999.0.0"));
     }
 
     #[test]
