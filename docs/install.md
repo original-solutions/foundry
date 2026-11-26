@@ -187,7 +187,7 @@ To turn it off, send `{"on": false, "paused": false}`. Use the port you gave `in
 
 ### Move a repo from the runner to Foundry
 
-The Paradev runner (`original-solutions/factory-on-paradev`) builds every factory repo until it moves. The runner and Foundry never watch the same repo. Before the first repo moves, P1's acceptance run has passed and every machine runs a P2 release.
+The Paradev runner (`original-solutions/factory-on-paradev`) builds every factory repo until it moves. The runner and Foundry never watch the same repo. Before the first repo moves, the issues under [Before P2 starts](specs/P2-factory.md#before-p2-starts) are closed, P1's acceptance run has passed, and every machine runs a P2 release.
 
 Foundry goes first, and builds itself until 10 runs have reached `pr-open` or `stuck` and no factory bug is open. Then factory-paradev-spike, spec-reader, clockwork, factory-on-paradev and people-hub move one at a time, each after the last moved repo has 5 clean runs.
 
@@ -201,7 +201,7 @@ To move one repo:
 
 Foundry leaves an issue in `factory:triage` or `factory:building` alone when its newest claim comment by the project's login is the runner's, and lists it as a foreign claim on the attention list. A runner claim posted as any other login is left alone too, but not listed.
 
-An issue the runner left in `pr-open` gets no feedback round from Foundry. Label it `factory:ready` again and Foundry claims it. The run carries on from the issue's open pull request when the project's login opened it, it is a branch of the same repo, and it targets the run's base, which must be the repo's default branch. To keep the runner's branch, give the project the login the runner opened its pull requests as. Otherwise close the runner's pull request and delete its branch before you relabel the issue. The run starts again from the base on a branch named the way the runner names its own, `fac/<issue>-1`, and would collide with it.
+An issue the runner left in `pr-open` gets no feedback round from Foundry. Label it `factory:ready` again and Foundry claims it. The run carries on from the issue's open pull request when the project's login opened it, it is a branch of the same repo, and it targets the run's base, which must be the repo's default branch. To keep the runner's branch, give the project the login the runner opened its pull requests as. Otherwise close the runner's pull request before you relabel the issue, and delete its branch if it is `fac/<issue>-1`. The run starts again from the base on that branch name.
 
 The way back is per repo, and mirrors the way forward:
 
