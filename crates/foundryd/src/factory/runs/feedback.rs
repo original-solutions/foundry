@@ -137,15 +137,13 @@
 //!   and the stint runs from it, so `building::time_limit` counts from the round.
 //! - `gate_retries`: `gating` reads a round as beginning at each `state_changed` to `building`
 //!   (its `Log::read`), so its first gate has the whole budget.
-//! - `interruption_resumes`: **not reset by anything this step can write.** `resume::decide`
-//!   counts from `Seen::interruption`, the newest `session_interrupted` line of the run, which a
-//!   round does not clear (the runner's did not either). A run that used its resumes before
-//!   `pr-open` is stuck on the first interruption of the round's session. The fix is in
-//!   `progress.rs` (the `feedback_relaunching` arm clears `seen.interruption`) or in
-//!   `resume.rs` (`decide` counts the lines after the newest `feedback_relaunching`); neither
-//!   is this issue's file. A `session_interrupted` or `session_rate_limited` line written here
-//!   would be read as an owed resume, a relaunch or a rate limit, which `resume` and `building`
-//!   skip a run for.
+//! - `interruption_resumes`: `resume::decide` counts against the cap only the
+//!   `session_interrupted` lines after the newest `feedback_relaunching`, which the round
+//!   writes, so a run that used its resumes before `pr-open` is resumed on the first
+//!   interruption of the round's session. The `-r<k>` names keep counting across the whole run,
+//!   so no name is reused. Nothing else is written for it here: a `session_interrupted` or
+//!   `session_rate_limited` line written by this step would be read as an owed resume, a
+//!   relaunch or a rate limit, which `resume` and `building` skip a run for.
 //!
 //! Where it differs from the runner:
 //!
