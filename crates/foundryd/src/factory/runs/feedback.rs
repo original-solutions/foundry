@@ -100,6 +100,36 @@
 //!   as any building session, and its pull request is gated again.
 //! - Call `stop::reconcile` before this step: a merged pull request or a closed issue ends the
 //!   run there, and what both write is idempotent through the ledger.
+//! - Call [`forward`] for a run in `building` every pass, before or after `building::advance`
+//!   (it holds back while the session's newest turn is unread). It sends at most one message
+//!   per run per pass.
+//!
+//! [`forward`] ports the runner's `forward` (`src/runner/building.ts`) with `forward.test.ts`:
+//! each new instructor comment on the issue and each edit of its body goes into the building
+//! run's session once, in order, and is recorded; a send the worker refuses for good
+//! (`BodyWithoutPath`, `SecretsUnreadable`) is dropped, and the issue is told once, in fixed
+//! words ([`messages::dropped_comment`], [`messages::REFUSED_BODY_EDIT`]); a comment the
+//! activity read drops (edited by someone who is not an instructor, or an edit history that
+//! cannot be judged) is reported once. The send is the shared `send_once` through
+//! `apply_actions`: `send-intent`, `send-refused` and `send-typed` steps under the key
+//! `forward-comment <id>` or `forward-body-edit <step>`, the prompt count the session's turn
+//! shows, then `comment_forwarded` or `body-edit-forwarded <edited_at>`. A run is skipped (no
+//! read, no write) when it is finished, has a relaunch, an interruption or a rate limit decided,
+//! has no session or no events, is not `building` (a gate pass, a stop asked for, a stuck path
+//! or questions posted, begun or done), or has a gate failure being sent into its session. A
+//! closed issue abandons the run, unless the run's own merge closed it. The activity is asked
+//! for from the run's first line cut to whole seconds, never a moving cursor.
+//!
+//! One message goes in per pass. The worker types a message only when the session is idle and
+//! its count of prompts is the one it is sent under, and the count is read from a fleet view
+//! that shows a typed message a pass later, so a second send in the pass would be refused. What
+//! is left goes in the next pass. Nothing is typed (and nothing written for it) while the
+//! session is not idle, shows no turn to count by, has a question waiting, or has a newest turn
+//! `building` has not read yet: a message typed then would start a turn that hides the unread
+//! one, and a turn is acted on once. The pass shows that as [`ForwardStep::held_back`].
+//! `forward` can be called before or after `building::advance` for that reason. The text of
+//! what is sent is a body file named by a fixed line ([`FORWARD_COMMENT_LINE`],
+//! [`FORWARD_BODY_LINE`]), since a typed line is one short line.
 //!
 //! The three budgets start again for the round because of what the round writes:
 //!
@@ -174,6 +204,49 @@
 //! - `feedback: a run whose launch recorded a base other than the project's`: the case is
 //!   `relaunches_on_a_run_base_and_records_it`; the gate's read of that base's tip is the gate's.
 
+//!
+//! Runner cases of `forward.test.ts` that have no Rust test of the same name, each with its
+//! reason. The cases not listed are ported under their names, or under the name noted.
+//!
+//! `forward: the actions` (`send a forwarded comment and then record it`, `cannot forward a
+//! comment with no thread or message`, `send a forwarded body edit and then record its step`,
+//! `cannot forward a body edit with no thread or step`): `apply_actions` is task 22's and is
+//! tested in `runs/mod.rs` (`a_forward_goes_to_the_session_and_is_recorded`,
+//! `a_forward_without_its_payload_is_an_invalid_transition`).
+//!
+//! `forward: guards and failures`:
+//! - `on a run with no file is a ledger error`: a run's events are a read of the store, and a
+//!   run with none is one Foundry never ran; the case is `on_a_run_with_no_events_is_skipped_as_having_no_session`.
+//! - `a failed send (transport) stops the call, and the rest is sent in order under the same
+//!   ids`: ported under that name with the count a send is guarded by in place of a command id.
+//!
+//! `forward: waiting for the run a message starts` (every case): the runner's wait markers
+//! (`forward-wait <k>`, `forward-wait-cancelled`) and T3's run ordinals and thread status make
+//! the gate wait for the run a forwarded message starts in an idle thread. Foundry has no run
+//! ordinals; a session that is working takes no message, a typed message is known by the count
+//! of prompts, and the gate reads the session's state and turn. What the cases protect (a
+//! message is never typed into an idle session over a turn nobody read) is
+//! `a_newest_turn_that_building_has_not_read_is_read_first`, `a_session_at_work_holds_what_is_to_be_sent_back_and_writes_nothing`
+//! and `a_session_the_fleet_shows_no_turn_for_is_waited_for`; `a thread that no longer exists
+//! skips the call and sends nothing` is ported under its name (the fleet shows no such session)
+//! and `an archived thread counts as one T3 no longer has` has no counterpart.
+//!
+//! `forward: a send T3 refuses`: the cases about a wait marker that a refusal cancels, keeps or
+//! leaves after a crash (`a refused comment followed by a sendable edit sends the edit and
+//! keeps the wait`, `a call whose every send was refused holds no gate and leaves no wait`,
+//! `a refused send under a marker another message used keeps the wait`, `a marker whose refusal
+//! was recorded before a crash is cancelled on the next call`, `a marker whose refusal was
+//! recorded is cancelled when its comment has since gone`, `a recorded refusal is cancelled
+//! before the issue hears its comment was dropped`, `a marker with a send whose outcome was
+//! never recorded keeps the wait`, `a refusal of another comment does not close a send a crash
+//! left open`, `a send lost to a transport failure and refused when sent again is cancelled`,
+//! `a send a crash left without an outcome and refused when sent again is cancelled`, `the
+//! marker and the refusal of a send name its command id in their cause` and `a send lost to a
+//! transport failure that goes in when sent again waits for its run`): there are no markers. A refusal is `send-refused <key>` of
+//! `send_once`; the cases that port without a marker are
+//! `a_refused_comment_followed_by_a_sendable_edit_sends_the_edit` and
+//! `a_call_whose_every_send_was_refused_sends_nothing_and_tells_the_issue_of_each`.
+
 use foundry_proto::factory::{RunEvent, RunId};
 use foundry_proto::ids::{MachineId, SessionId, WorkspaceId};
 use foundry_proto::record::{Record, Workspace};
@@ -181,25 +254,30 @@ use foundry_proto::settings::SharedSettings;
 use foundry_proto::state::{SessionState, TerminalState};
 use serde_json::Value;
 
-use super::progress::{Fixes, STUCK_DETAIL, STUCK_STOP, Seen, pending_relaunch, read_progress};
+use super::progress::{
+    BODY_EDIT_DROPPED, BODY_EDIT_FORWARDED, COMMENT_DROPPED, Fixes, STUCK_DETAIL, STUCK_STOP, Seen,
+    pending_relaunch, read_progress,
+};
 use super::resume::{BRANCH_REFUSED, UNREACHABLE_FOR};
 use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
 use super::{
-    ActionPayload, Closing, Progress, RunContext, RunError, Stop, StuckStop, abandon,
-    apply_actions, end_own_merge, end_run, go_stuck, moved_on_by_closing, progress_from,
-    recorded_reason, session_id, workspace_id,
+    ActionPayload, Closing, ForwardPayload, Progress, RunContext, RunError, Stop, StuckStop,
+    abandon, apply_actions, closed_issue, end_own_merge, end_run, go_stuck, moved_on_by_closing,
+    pending_send, progress_from, recorded_reason, session_id, workspace_id,
 };
 use crate::factory::github::read::{
-    Feedback as Item, FeedbackKind as ItemKind, InlineComment as ItemInline, is_safe_branch_name,
+    Activity, BodyEdit, Comment, DropReason, Feedback as Item, FeedbackKind as ItemKind,
+    InlineComment as ItemInline, is_safe_branch_name,
 };
+use crate::factory::github::{OtherKind, TrackerError};
 use crate::factory::ledger::events::{
     Cause, CauseStep, Event, ModelOption, OptionValue, ResumedFrom, names,
 };
 use crate::factory::lifecycle::approval::TextCheck;
 use crate::factory::lifecycle::{Event as LifecycleEvent, State, transition};
 use crate::factory::messages::{
-    self, CANNOT_CONFIRM, CANNOT_VERIFY_DURING_BUILD, CHANGED_DURING_BUILD, LAUNCH_FAILED, Message,
-    prepare_output_tail,
+    self, CANNOT_CONFIRM, CANNOT_VERIFY_DURING_BUILD, CHANGED_DURING_BUILD, CommentDropReason,
+    LAUNCH_FAILED, Message, prepare_output_tail,
 };
 use crate::factory::placing::{self, Reserved, Slots};
 use crate::factory::text;
@@ -331,10 +409,374 @@ pub const FORWARD_COMMENT_LINE: &str = "The factory forwards an instructor's com
 /// The line of a forwarded edit of the issue body: the text is in the file it names.
 pub const FORWARD_BODY_LINE: &str = "The factory forwards an edit of the issue body. Read {body}";
 
-/// The instructors' new comments and body edit sent to a building run's session.
+/// The instructors' new comments and body edit sent to a building run's session. See the
+/// module's words.
 pub fn forward(ctx: &RunContext<'_>, run: &RunId) -> Result<ForwardStep, RunError> {
-    let _ = (ctx, run);
-    todo!("feedback::forward")
+    let skip = |why| {
+        Ok(ForwardStep {
+            comments: 0,
+            body_edit: false,
+            skipped: Some(why),
+            held_back: false,
+        })
+    };
+    if !run.repo().eq_ignore_ascii_case(ctx.repo()) {
+        return skip(Skip::OtherRepo);
+    }
+    let events = ctx.ledger.read(run)?;
+    let seen = read_progress(&events);
+    if seen.finished {
+        return skip(Skip::Finished);
+    }
+    let decided = seen.interruption.as_ref().is_some_and(|interruption| {
+        interruption.relaunch || interruption.rate_limited || !interruption.sent
+    }) || pending_relaunch(&seen).is_some();
+    if decided {
+        return skip(Skip::Relaunching);
+    }
+    let (Some(thread), Some(first)) = (&seen.thread_id, events.first()) else {
+        return skip(Skip::NoSession);
+    };
+    // `state_changed` is the commit marker, so a stuck decision or posted questions without it
+    // are a transition that was cut short. A recorded gate pass is not interrupted.
+    if seen.state != Some(State::Building)
+        || seen.pass.is_some()
+        || seen.stuck.is_some()
+        || seen.stuck_stop.is_some()
+        || seen.stop_requested
+        || seen.questions_posted
+    {
+        return skip(Skip::NotBuilding);
+    }
+    // The gate infers that a send-back reached the session from what the session did after it,
+    // so a message waits until the gate has sent the failure and recorded it.
+    if seen
+        .sending
+        .is_some_and(|sending| !seen.sent_back_attempts.contains(&sending.attempt))
+    {
+        return skip(Skip::GateSendPending);
+    }
+    // Only a run that would read the issue's activity asks whether the issue is closed. A run
+    // whose own merge closed the issue gets nothing more sent.
+    match closed_issue(ctx, run, &seen)?.0 {
+        Closing::Open => {}
+        Closing::PersonsMove => {
+            abandon(ctx, run, &seen, CauseStep::Forward)?;
+            return skip(Skip::Abandoned);
+        }
+        Closing::OwnMerge(_) => return skip(Skip::PrMerged),
+    }
+    let issue = run.issue();
+    let since = format!("{}Z", &crate::factory::ledger::format_ts(first.ms)[..19]);
+    let activity =
+        ctx.tracker
+            .activity_since(ctx.repo(), issue, &since, &ctx.config.instructors)?;
+    if let Some(edit) = &activity.body_edit
+        && !is_utc_second(&edit.edited_at)
+    {
+        let shown: String = edit.edited_at.chars().take(40).collect();
+        return Err(RunError::Tracker(TrackerError::Other {
+            kind: OtherKind::Parse,
+            message: format!(
+                "`gh api graphql` returned unexpected output: expected the body edit time as YYYY-MM-DDTHH:MM:SSZ, got {shown:?}"
+            ),
+        }));
+    }
+    let (comments, body_edit) = unsent(&seen, &activity);
+    let drops = unreported(&seen, &activity);
+    let notices = |refused: Vec<Notice>| -> Vec<Notice> {
+        refused
+            .into_iter()
+            .chain(drops.iter().map(|dropped| drop_notice(ctx, issue, dropped)))
+            .collect()
+    };
+    let done = |comments, body_edit, held_back| ForwardStep {
+        comments,
+        body_edit,
+        skipped: None,
+        held_back,
+    };
+    if comments.is_empty() && body_edit.is_none() {
+        tell_issue(ctx, run, &notices(Vec::new()))?;
+        return Ok(done(0, false, false));
+    }
+    // Something is to be sent: to a session the fleet shows, and only when it can take a
+    // message now.
+    let session = session_id(thread)?;
+    if ctx.view.session_state(session).is_none() {
+        return skip(Skip::SessionGone);
+    }
+    if cannot_take_a_message(ctx, &seen, session) {
+        tell_issue(ctx, run, &notices(Vec::new()))?;
+        return Ok(done(0, false, true));
+    }
+    let mut at = progress_from(run, CauseStep::Forward, &seen, State::Building);
+    let mut refused: Vec<Notice> = Vec::new();
+    let (mut sent, mut edit_sent, mut held_back) = (0, false, false);
+    // The comments in order, then the edit; but a message whose send may have been typed and is
+    // not known typed goes first, since no other goes before it is known.
+    let mut queue: Vec<Outgoing<'_>> = comments.iter().map(Outgoing::Comment).collect();
+    queue.extend(body_edit.as_ref().map(Outgoing::Edit));
+    if let Some(pending) = pending_send(&seen, "")
+        && let Some(at) = queue.iter().position(|item| item.key() == pending)
+    {
+        let item = queue.remove(at);
+        queue.insert(0, item);
+    }
+    // One message goes in per pass: the count of prompts the next send is guarded by is read
+    // from the fleet, which shows it a pass later.
+    for item in queue {
+        let (actions, payload, cause) = match item {
+            Outgoing::Comment(comment) => (
+                transition(
+                    State::Building,
+                    &LifecycleEvent::InstructorCommented {
+                        comment_id: comment.id.clone(),
+                    },
+                )?
+                .1,
+                ActionPayload {
+                    forward: Some(ForwardPayload {
+                        message: Message::new(
+                            FORWARD_COMMENT_LINE.into(),
+                            messages::comment_text(
+                                ctx.repo(),
+                                issue,
+                                &comment.author,
+                                &comment.body,
+                            ),
+                        ),
+                        step: None,
+                    }),
+                    ..ActionPayload::default()
+                },
+                Cause::new(CauseStep::Forward, "comment-forwarded"),
+            ),
+            Outgoing::Edit(edit) => (
+                transition(State::Building, &LifecycleEvent::BodyEdited)?.1,
+                ActionPayload {
+                    forward: Some(ForwardPayload {
+                        message: Message::new(
+                            FORWARD_BODY_LINE.into(),
+                            messages::body_edit_text(ctx.repo(), issue, &edit.editor, &edit.body),
+                        ),
+                        step: Some(format!("{BODY_EDIT_FORWARDED} {}", edit.edited_at)),
+                    }),
+                    ..ActionPayload::default()
+                },
+                Cause::new(CauseStep::Forward, "body-edit-forwarded"),
+            ),
+        };
+        match send_outcome(apply_actions(
+            ctx, issue, &mut at, &actions, &cause, &payload,
+        ))? {
+            Sent::Yes => {
+                match item {
+                    Outgoing::Comment(_) => sent = 1,
+                    Outgoing::Edit(_) => edit_sent = true,
+                }
+                break;
+            }
+            Sent::Refused => refused.push(match item {
+                Outgoing::Comment(comment) => drop_notice(
+                    ctx,
+                    issue,
+                    &Dropped {
+                        id: comment.id.clone(),
+                        reason: None,
+                    },
+                ),
+                Outgoing::Edit(edit) => Notice {
+                    body: messages::REFUSED_BODY_EDIT.into(),
+                    step: format!("{BODY_EDIT_DROPPED} {}", edit.edited_at),
+                    reason: "body-edit-dropped",
+                },
+            }),
+            Sent::Later => {
+                held_back = true;
+                break;
+            }
+        }
+    }
+    // Last: telling the issue must not hold back what the session needs.
+    tell_issue(ctx, run, &notices(refused))?;
+    Ok(done(sent, edit_sent, held_back))
+}
+
+/// A message that is to go into the session.
+#[derive(Clone, Copy)]
+enum Outgoing<'a> {
+    Comment(&'a Comment),
+    Edit(&'a BodyEdit),
+}
+
+impl Outgoing<'_> {
+    /// The key `send_once` knows the message by.
+    fn key(&self) -> String {
+        match self {
+            Outgoing::Comment(comment) => format!("forward-comment {}", comment.id),
+            Outgoing::Edit(edit) => {
+                format!("forward-body-edit {BODY_EDIT_FORWARDED} {}", edit.edited_at)
+            }
+        }
+    }
+}
+
+/// What came of one try to send.
+enum Sent {
+    Yes,
+    /// Refused for good: the same message is refused again.
+    Refused,
+    /// Not typed now, and nothing says it never will be: tried again next pass.
+    Later,
+}
+
+/// A send's answer. A refusal that typed nothing and will be refused again is final; one that
+/// says the session is not ready, or that a message sent before may have been typed, waits for
+/// the next pass. Anything else, a send that may have been typed included, is an error.
+fn send_outcome(result: Result<(), RunError>) -> Result<Sent, RunError> {
+    match result {
+        Ok(()) => Ok(Sent::Yes),
+        Err(RunError::Send(SendRefused::BodyWithoutPath | SendRefused::SecretsUnreadable)) => {
+            Ok(Sent::Refused)
+        }
+        Err(
+            RunError::Send(
+                SendRefused::NotIdle | SendRefused::CountRose { .. } | SendRefused::NoSuchSession,
+            )
+            | RunError::SendPending { .. }
+            | RunError::NoPromptCount { .. },
+        ) => Ok(Sent::Later),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether the session cannot be typed into now: it is not idle, it shows no turn to count
+/// prompts by, a question waits for a person, or its newest turn is not read yet (a message
+/// typed now would start a turn that hides it, and `building` acts on a turn once).
+fn cannot_take_a_message(ctx: &RunContext<'_>, seen: &Seen, session: SessionId) -> bool {
+    if ctx.view.session_state(session) != Some(SessionState::Idle) {
+        return true;
+    }
+    match ctx.view.session_turn(session) {
+        None => true,
+        Some(turn) => {
+            turn.question || (turn.turn > 0 && seen.turn_read.is_none_or(|read| turn.turn > read))
+        }
+    }
+}
+
+/// Whether `text` is a time as GitHub writes it: `YYYY-MM-DDTHH:MM:SSZ`.
+fn is_utc_second(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 20
+        && bytes.iter().enumerate().all(|(at, byte)| match at {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+/// What `forward` still has to send from one read of the instructors' activity: comments with
+/// no `comment_forwarded` in the ledger, oldest first and each id once, and the body edit whose
+/// time has no `body-edit-forwarded` step. A comment already dropped or sent as feedback is
+/// never sent later.
+fn unsent(seen: &Seen, activity: &Activity) -> (Vec<Comment>, Option<BodyEdit>) {
+    let mut told: std::collections::BTreeSet<&str> = seen
+        .forwarded
+        .iter()
+        .chain(&seen.dropped)
+        .map(String::as_str)
+        .collect();
+    let comments = activity
+        .comments
+        .iter()
+        .filter(|comment| {
+            // Nor one that went into the session as instructor feedback.
+            if told.contains(comment.id.as_str())
+                || seen
+                    .feedback_sent
+                    .contains(&issue_comment_feedback_id(&comment.id))
+            {
+                return false;
+            }
+            told.insert(comment.id.as_str());
+            true
+        })
+        .cloned()
+        .collect();
+    let body_edit = activity
+        .body_edit
+        .clone()
+        .filter(|edit| !seen.body_edits.contains(&edit.edited_at));
+    (comments, body_edit)
+}
+
+/// The dropped comments the issue was not told about yet, in the order read, each id once. A
+/// comment already forwarded, or sent as instructor feedback, is left out: the session has the
+/// instructor's own words, and a later edit by someone else changes nothing it holds.
+fn unreported(seen: &Seen, activity: &Activity) -> Vec<Dropped> {
+    let mut told: std::collections::BTreeSet<&str> =
+        seen.dropped.iter().map(String::as_str).collect();
+    activity
+        .dropped
+        .iter()
+        .filter(|dropped| {
+            if seen.forwarded.contains(&dropped.id)
+                || seen
+                    .feedback_sent
+                    .contains(&issue_comment_feedback_id(&dropped.id))
+                || told.contains(dropped.id.as_str())
+            {
+                return false;
+            }
+            told.insert(dropped.id.as_str());
+            true
+        })
+        .map(|dropped| Dropped {
+            id: dropped.id.clone(),
+            reason: Some(dropped.reason),
+        })
+        .collect()
+}
+
+/// A comment of the factory's for the issue, and the step that records it was posted: the
+/// comment first, the step after, so a crash between them posts it again (at-least-once).
+struct Notice {
+    body: String,
+    step: String,
+    reason: &'static str,
+}
+
+/// A comment that was not forwarded, and why: `None` when the worker refused it.
+struct Dropped {
+    id: String,
+    reason: Option<DropReason>,
+}
+
+fn drop_notice(ctx: &RunContext<'_>, issue: u64, dropped: &Dropped) -> Notice {
+    let reason = match dropped.reason {
+        Some(DropReason::EditedByOther) => CommentDropReason::EditedByOther,
+        Some(DropReason::Unverifiable) => CommentDropReason::Unverifiable,
+        None => CommentDropReason::Refused,
+    };
+    Notice {
+        body: messages::dropped_comment(ctx.repo(), issue, &dropped.id, reason),
+        step: format!("{COMMENT_DROPPED} {}", dropped.id),
+        reason: "comment-dropped",
+    }
+}
+
+/// Posts each notice and records it. A failure stops the call and the rest is said on the next
+/// one.
+fn tell_issue(ctx: &RunContext<'_>, run: &RunId, notices: &[Notice]) -> Result<(), RunError> {
+    for notice in notices {
+        ctx.post_comment(run.issue(), &notice.body)?;
+        note(ctx, run, &notice.step, notice.reason)?;
+    }
+    Ok(())
 }
 
 fn canonical(text: &str) -> Option<u64> {
@@ -3815,6 +4257,34 @@ mod tests {
         }
 
         #[test]
+        fn forward_does_not_send_an_issue_comment_again_that_went_as_feedback() {
+            let mut world = World::reviewed();
+            world.hub.set_activity(activity(vec![issue_comment(
+                "42",
+                "2026-10-04T13:00:00Z",
+                "update the docs",
+            )]));
+            world.round();
+            // The run is `building` again, its session idle with its first turn read, and the
+            // activity still lists the comment.
+            world.rig.view = session_view(SessionState::Idle, Some((1, 1)));
+            world.rig.step(&world.run, "turn-read 1");
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert!(world.sends().is_empty());
+            // A comment that was not feedback is still sent.
+            world.hub.set_activity(activity(vec![
+                issue_comment("42", "2026-10-04T13:00:00Z", "update the docs"),
+                issue_comment("43", "2026-10-04T14:00:00Z", "and the changelog"),
+            ]));
+            world.rig.worker.on_send(Ok(1));
+            assert_eq!(forward_in(&world), outcome(1, false));
+            let Call::Send { message, .. } = world.sends().remove(0) else {
+                unreachable!()
+            };
+            assert!(message.body.unwrap().contains("and the changelog"));
+        }
+
+        #[test]
         fn relaunches_on_a_run_base_and_records_it() {
             // The runner's `a run whose launch recorded a base other than the project's`: the
             // round's launch line carries the run's base, not the project's.
@@ -5289,6 +5759,67 @@ mod tests {
             let count = world.count();
             assert_eq!(forward_in(&world), outcome(0, false));
             assert_eq!(world.count(), count);
+        }
+
+        #[test]
+        fn a_crash_before_the_notice_says_it_on_the_next_call_and_the_step_comes_after_the_comment()
+        {
+            let world = forwarding();
+            world.rig.worker.on_send(Err(SendRefused::BodyWithoutPath));
+            script(&world, vec![bare_comment("101", "tom", "one")], None);
+            // The notice's post fails: no step is written, so the next call says it.
+            world.rig.sim.fail("issue comment", 1);
+            assert!(forward(&world.ctx(), &world.run).is_err());
+            assert!(world.steps_of("comment-dropped").is_empty());
+            assert!(world.rig.sim.comments().is_empty());
+            world.rig.worker.on_send(Err(SendRefused::BodyWithoutPath));
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.rig.sim.comments().len(), 1);
+            assert_eq!(world.steps_of("comment-dropped"), ["comment-dropped 101"]);
+            // The step follows the comment: a crash between them says the notice twice, never
+            // loses it.
+            let world = forwarding();
+            world.rig.worker.on_send(Err(SendRefused::BodyWithoutPath));
+            world.rig.worker.on_send(Err(SendRefused::BodyWithoutPath));
+            script(&world, vec![bare_comment("101", "tom", "one")], None);
+            world.rig.sim.lose("issue comment", 1);
+            assert!(forward(&world.ctx(), &world.run).is_err());
+            assert_eq!(world.rig.sim.comments().len(), 1, "the comment landed");
+            assert!(world.steps_of("comment-dropped").is_empty());
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.steps_of("comment-dropped"), ["comment-dropped 101"]);
+        }
+
+        #[test]
+        fn a_transport_failure_after_a_refusal_still_stops_the_call_and_the_refused_item_is_told_next_time()
+         {
+            let world = forwarding();
+            script(
+                &world,
+                vec![
+                    bare_comment("101", "tom", "one"),
+                    bare_comment("102", "tom", "two"),
+                ],
+                None,
+            );
+            world.rig.worker.on_send(Err(SendRefused::BodyWithoutPath));
+            world.rig.worker.on_send(Err(SendRefused::Failed {
+                reason: "timed out".into(),
+                prompts: None,
+            }));
+            assert!(forward(&world.ctx(), &world.run).is_err());
+            assert!(world.rig.sim.comments().is_empty(), "nothing was told yet");
+            assert!(world.steps_of("comment-dropped").is_empty());
+            // The next call sends the second again first, under the same count, since it may
+            // have been typed; the call after it refuses the first again and tells the issue.
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(forwarded_ids(&world), ["102"]);
+            assert!(world.rig.sim.comments().is_empty());
+            world.rig.worker.on_send(Err(SendRefused::BodyWithoutPath));
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.steps_of("comment-dropped"), ["comment-dropped 101"]);
+            assert_eq!(world.rig.sim.comments().len(), 1);
         }
 
         #[test]
