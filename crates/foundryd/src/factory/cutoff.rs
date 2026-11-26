@@ -5,9 +5,11 @@
 //! project's lease nor heard from its holder: [`Freshness::since_holding`] says how long that
 //! is, and only the lease pushed here or a holding status at the highest generation seen
 //! counts there, so a not-holding status, from this machine's own coordinator or any other,
-//! saves nothing. A project's timer starts when this machine first finds one of its factory
-//! sessions running, so a session started long after the last word from a holder still gets
-//! its ten minutes. It starts again once none runs.
+//! saves nothing. [`Freshness::held`] is called by the pass's lease task (#157) on each
+//! successful push, on the daemon's one `Freshness`, the one given here; until that lands no
+//! factory session starts, so there is nothing to end. A project's timer starts when this
+//! machine first finds one of its factory sessions running, so a session started long after
+//! the last word from a holder still gets its ten minutes. It starts again once none runs.
 //!
 //! Every age and wait is read on the sleep-counting clock of [`crate::clock`]: a Mac that
 //! slept past the ten minutes ends its sessions on the first look after it wakes.
@@ -194,10 +196,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use foundry_holder::protocol::Reply;
     use foundry_proto::factory::NotHolding;
     use foundry_proto::ids::{MachineId, ProjectId, SessionId, WorkspaceId};
     use foundry_proto::state::SessionState;
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{CUT_OFF_AFTER, Cutoff, TICK};
     use crate::clock::{Clock, FakeClock};
@@ -244,7 +248,7 @@ exec "$agent" "$@""#;
     /// One machine: real sessions over a real holder and the fake agent, which waits for
     /// input until its terminal is closed, the fake clock and a freshness read on it.
     struct Fx {
-        _data: TempDir,
+        data: TempDir,
         worktree: TempDir,
         _home: TempDir,
         _git_home: TempDir,
@@ -318,7 +322,7 @@ exec "$agent" "$@""#;
             let clock = Arc::new(FakeClock::new());
             let freshness = Arc::new(Freshness::new(clock.clone() as Arc<dyn Clock>));
             Fx {
-                _data: data,
+                data,
                 worktree: tempfile::tempdir().unwrap(),
                 _home: home,
                 _git_home: git_home,
@@ -399,6 +403,28 @@ exec "$agent" "$@""#;
             assert!(!self.ended(id), "{id} ended: {:?}", self.state(id));
         }
 
+        /// The socket of the holder of session `id`'s terminal.
+        fn socket(&self, id: SessionId) -> PathBuf {
+            let terminal = self
+                .store
+                .lock()
+                .unwrap()
+                .session(id)
+                .unwrap()
+                .unwrap()
+                .body
+                .terminal;
+            self.data
+                .path()
+                .join("terminals")
+                .join(format!("{terminal}.sock"))
+        }
+
+        /// A second connection to the store's database, to break and mend it under the store.
+        fn database(&self) -> rusqlite::Connection {
+            rusqlite::Connection::open(self.data.path().join("foundry.db")).unwrap()
+        }
+
         /// A status from the holder of `project`'s lease, at generation 1.
         fn holder_says(&self, project: ProjectId, pass: u64) {
             self.freshness.received(&build(PassResults {
@@ -421,6 +447,22 @@ exec "$agent" "$@""#;
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Serves `socket` as a holder that refuses every request, so a close of its terminal fails.
+    fn refusing_holder(socket: &Path) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let refused = Reply::Refused("not now".into()).encode();
+                    stream.write_all(&refused).await.unwrap();
+                    // Held open until the daemon reads the refusal and lets it go.
+                    let _ = stream.read(&mut [0; 64]).await;
+                });
+            }
+        })
     }
 
     #[test]
@@ -659,5 +701,60 @@ exec "$agent" "$@""#;
         f.clock.advance(60 * MINUTE);
         assert_eq!(cutoff.tick().await, []);
         f.assert_runs(session).await;
+    }
+
+    #[tokio::test]
+    async fn a_workspace_whose_end_fails_is_tried_again_at_the_next_look_and_the_others_end() {
+        let f = Fx::new().await;
+        let project = ProjectId::random();
+        let mut workspaces = [WorkspaceId::random(), WorkspaceId::random()];
+        workspaces.sort();
+        let [refusing_in, other_in] = workspaces;
+        let refusing = f.start_factory(refusing_in, project).await;
+        let other = f.start_factory(other_in, project).await;
+        let mut cutoff = f.cutoff();
+        assert_eq!(cutoff.tick().await, []);
+
+        // The first workspace's holder refuses to close, so its end fails before the other's.
+        let socket = f.socket(refusing);
+        let aside = socket.with_extension("aside");
+        std::fs::rename(&socket, &aside).unwrap();
+        let holder = refusing_holder(&socket);
+        f.clock.advance(CUT_OFF_AFTER);
+        assert_eq!(cutoff.tick().await, [other_in]);
+        f.until_ended(other).await;
+        f.assert_runs(refusing).await;
+
+        holder.abort();
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::rename(&aside, &socket).unwrap();
+        assert_eq!(cutoff.tick().await, [refusing_in]);
+        f.until_ended(refusing).await;
+    }
+
+    #[tokio::test]
+    async fn a_look_that_cannot_read_the_sessions_ends_nothing_and_keeps_the_timers() {
+        let f = Fx::new().await;
+        let project = ProjectId::random();
+        let workspace = WorkspaceId::random();
+        let session = f.start_factory(workspace, project).await;
+        let mut cutoff = f.cutoff();
+        assert_eq!(cutoff.tick().await, []);
+
+        f.clock.advance(9 * MINUTE);
+        let database = f.database();
+        database
+            .execute_batch("ALTER TABLE records RENAME TO records_away")
+            .unwrap();
+        assert_eq!(cutoff.tick().await, []);
+        database
+            .execute_batch("ALTER TABLE records_away RENAME TO records")
+            .unwrap();
+        f.assert_runs(session).await;
+
+        // The timer still counts from the first look, so the ten minutes end at 10:00.
+        f.clock.advance(MINUTE);
+        assert_eq!(cutoff.tick().await, [workspace]);
+        f.until_ended(session).await;
     }
 }
