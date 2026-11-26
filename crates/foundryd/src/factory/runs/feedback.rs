@@ -86,20 +86,29 @@
 //!    message asked for again by count (`feedback-resending <n> 0`), which the worker types only
 //!    when its count has not risen, as `start`'s and `resume`'s resends are.
 //!
-//! What the pass (task 30) must do with this step:
+//! What the pass (task 30) must do with this step, keyed on [`round_pending`] (the newest
+//! `feedback_relaunching` has no `session_launched` after it, and the run is not finished):
 //!
-//! - Call [`advance`] for a run in `pr-open` and for a run in `building` whose newest session
-//!   is a round's (`pending_relaunch` is `Some`, or the newest `session_launched` follows the
-//!   newest `feedback_relaunching` and shows no turn yet), every pass, with the `slots` and the
-//!   `reserved` of the pass, after the claims' placement and before they take the slots left.
-//! - Not call `building::advance` or `resume::advance` for a run while `pending_relaunch` is
-//!   `Some`: they skip it. Not call `start::advance`, nor `gating::advance`, for it either:
+//! - Call [`advance`] for a run in `pr-open`, and for a run for which [`round_pending`] holds,
+//!   every pass, with the `slots` and the `reserved` of the pass, after the claims' placement
+//!   and before they take the slots left. It also covers a run in `building` whose newest
+//!   `session_launched` is a round's and shows no turn yet (the first message resent, step 7).
+//!   `Seen` clears a decision at a `state_changed` and the round writes its decision again
+//!   after its move, so a pass cut between the two leaves a run whose `pending_relaunch` is
+//!   `None` and for which [`round_pending`] still holds; [`advance`] carries the round on from
+//!   the ledger's own record of it (its `Round`), not from `Seen`.
+//! - Not call `building::advance`, `resume::advance`, `start::advance` or `gating::advance` for
+//!   a run while [`round_pending`] holds. `building` and `resume` skip a run only on
+//!   `pending_relaunch` today, which is `None` in that window: they would take the build's
+//!   old, ended session for an interruption. It is the pass's routing that closes the window.
 //!   `start`'s resend would send the build's launch words to the round's session, and `gating`
 //!   reads the old, ended session; `gating` is for a run `building::advance` said
 //!   `ReadyForGate` for. Once the round's session shows a turn, `building::advance` follows it
 //!   as any building session, and its pull request is gated again.
 //! - Call `stop::reconcile` before this step: a merged pull request or a closed issue ends the
-//!   run there, and what both write is idempotent through the ledger.
+//!   run there, and what both write is idempotent through the ledger. It judges nothing while
+//!   [`round_pending`] holds, and it leaves a stuck path of the text codes begun here to this
+//!   step.
 //! - Call [`forward`] for a run in `building` every pass, before or after `building::advance`
 //!   (it holds back while the session's newest turn is unread). It sends at most one message
 //!   per run per pass.
