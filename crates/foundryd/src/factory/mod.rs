@@ -2856,15 +2856,22 @@ mod tests {
     }
 
     /// Waits until this machine's status of project 1 is idle, moving the clock an hour at a
-    /// time so the passes run, and answers what the first idle status says. The status is read
-    /// before each move, so no pass runs between the one that made it idle and the read.
+    /// time so the passes run, and answers what the first idle status says. The next pass
+    /// waits an interval from the time the last one began, and the clock moves only once the
+    /// status the last pass wrote has been read, so each move lets one more pass run, never
+    /// two. No pass runs between the one that made the status idle and the read.
     async fn idle_said(store: &Arc<Mutex<Store>>, clock: &Arc<FakeClock>) -> Option<String> {
         let (store, clock) = (store.clone(), clock.clone());
         tokio::task::spawn_blocking(move || {
             let mut said = None;
+            let mut moved_after = 0;
             came(|| {
-                said = status_of(&store, project(1)).and_then(|status| status.idle);
-                if said.is_none() {
+                let Some(status) = status_of(&store, project(1)) else {
+                    return false;
+                };
+                said = status.idle;
+                if said.is_none() && status.pass > moved_after {
+                    moved_after = status.pass;
                     clock.advance(Duration::from_secs(3600));
                 }
                 said.is_some()
