@@ -1426,6 +1426,32 @@ mod factory_events {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_no_longer_believed_sends_the_state_again_and_no_status_after_it() {
+        let served = serve().await;
+        let mut socket = served.events().await;
+        served.write_status(served.me, holding(1, None));
+        let (_, status) = next_status(&mut socket).await;
+        assert_eq!(status.pass, 1);
+        // The project goes, so no status of it is believed.
+        {
+            let mut store = served.store.lock().unwrap();
+            let mut settings = store.settings().unwrap();
+            settings.seq += 1;
+            settings.projects.clear();
+            store.apply_settings(settings).unwrap();
+        }
+        let mut states = 0;
+        for text in texts_within(&mut socket, Duration::from_secs(2)).await {
+            match serde_json::from_str::<UiMessage>(&text).unwrap() {
+                UiMessage::State { .. } => states += 1,
+                UiMessage::Settings { .. } => {}
+                other => panic!("only the settings and the state again: {other:?}"),
+            }
+        }
+        assert_eq!(states, 1, "the state is sent again once");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_socket_opened_after_a_status_was_written_is_sent_it_after_the_state() {
         let served = serve().await;
         served.write_status(served.me, holding(3, None));

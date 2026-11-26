@@ -3340,6 +3340,14 @@ mod tests {
         let (found, _) = leases.of_repo("rawphp/softfac").unwrap();
         assert_eq!(found, project(1));
         assert!(leases.of_repo("rawphp/other").is_none());
+        // A run id folds its repo as GitHub does; the URL a project names need not.
+        let capitals = Leased {
+            repo: "RawPHP/Capitals".into(),
+            ..leased(None, Arc::new(AlwaysHeld(1)))
+        };
+        leases.put(project(3), capitals.clone());
+        assert_eq!(leases.of_repo("rawphp/capitals").unwrap().0, project(3));
+        leases.clear(project(3), &capitals.lease);
         // A lease made again for the project replaces the first, and the first's clear leaves
         // the new one in place.
         let second = leased(None, Arc::new(AlwaysHeld(2)));
