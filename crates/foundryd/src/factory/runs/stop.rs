@@ -62,8 +62,10 @@
 //! 3. A `pr-open` run: a pull request merged, closed or gone ends it (`end_run`, as merged or
 //!    closed); an open one with a closed issue abandons it. Nothing else is judged: a person's
 //!    work on a pull request is feedback.
-//! 4. A `building` run, as the runner's `watch`: skipped when a relaunch or resume is decided,
-//!    with no session, with a stuck decision, a stop, questions posted, the gate holding it or a
+//! 4. A `building` run, as the runner's `watch`: skipped when a relaunch or resume is decided
+//!    or a feedback round is under way (`feedback::round_pending`: decided, and its session not
+//!    launched, which includes the moment a cut leaves between the round's move and its second
+//!    decision line), with no session, with a stuck decision, a stop, questions posted, the gate holding it or a
 //!    pass recorded. Then the issue text since the approval: changed by someone who is not an
 //!    instructor (`text-changed-during-build`), a history that cannot be judged
 //!    (`edits-unverifiable`) or no approval on record (`approval-unconfirmed`, no read) stops
@@ -97,9 +99,10 @@
 //!   assigning), is stopped as a stop by hand is: stuck, its session ended, its workspace kept.
 //!   The reasons are fixed words that quote nothing from the issue. Neither is judged while a
 //!   transition of the factory's own is in flight (a stuck decision, questions begun or
-//!   posted, an approval withdrawn, a stop, a relaunch or resume, a recorded pass, a gate in
-//!   flight): the label moves before the ledger's `state_changed`, so those would read as a
-//!   person's move.
+//!   posted, an approval withdrawn, a stop, a relaunch or resume or a feedback round decided
+//!   and not launched, a recorded pass, a gate in flight): the label moves before the ledger's
+//!   `state_changed`, so those would read as a person's move. A relaunch whose session is
+//!   recorded is over: a feedback round's run is judged again from its `session_launched`.
 //! - The session is ended and the workspace kept for a stop (the spec's stuck workspace); the
 //!   runner archived the thread and removed the worktree, and wrote `worktree_removed`, which
 //!   Foundry never does. A machine unreachable for 15 minutes is not asked to end its session
