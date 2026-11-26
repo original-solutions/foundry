@@ -10,6 +10,7 @@
 //! The runner's progress read (`runner/progress.ts`, `Seen`) is not ported yet; the few facts
 //! of it a listing needs are read here, by the runner's rules.
 
+use std::collections::BTreeSet;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use foundry_proto::factory::{RunEvent, RunId};
@@ -48,6 +49,11 @@ impl Ledger {
     /// [`summaries`] of the ledger's store.
     pub fn summaries(&self, repo: &str) -> Result<Vec<RunSummary>, StoreError> {
         summaries(&self.store, repo)
+    }
+
+    /// [`run_summaries`] of the ledger's store.
+    pub fn run_summaries(&self, ids: &BTreeSet<RunId>) -> Vec<RunSummary> {
+        run_summaries(&self.store, ids)
     }
 }
 
@@ -357,6 +363,14 @@ fn cap_reason(reason: &str) -> String {
 pub fn summaries(store: &Mutex<Store>, repo: &str) -> Result<Vec<RunSummary>, StoreError> {
     let ids = locked(store).runs_of(repo)?;
     Ok(summaries_of(ids, |id| events(&locked(store), id)))
+}
+
+/// One summary per run among `ids`, as [`summaries`] gives them: in run id order, with any whose
+/// events cannot be read last. Only those runs' events are read, each under one lock.
+pub fn run_summaries(store: &Mutex<Store>, ids: &BTreeSet<RunId>) -> Vec<RunSummary> {
+    summaries_of(ids.iter().cloned().collect(), |id| {
+        events(&locked(store), id)
+    })
 }
 
 /// One summary per run among `ids`, each run's events got from `read`, unreadable ones last.
@@ -1100,6 +1114,47 @@ mod tests {
                 unreadable: true,
                 ..summary(softfac(2))
             }
+        );
+    }
+
+    #[test]
+    fn a_summary_of_chosen_runs_reads_the_events_of_those_runs_only() {
+        let (_dir, store) = open_store();
+        run_at(&store, &softfac(1), T0, Some(State::Building), false, true);
+        let ledger = run_at(&store, &softfac(2), T0, Some(State::Stuck), true, true);
+        run_at(&store, &softfac(3), T0, Some(State::Building), false, true);
+        let whole = summaries_of(&store, "rawphp/softfac");
+        let its_events = store.lock().unwrap().run_events(&softfac(2)).unwrap().len();
+        let read = Store::run_rows_read;
+
+        let before = read();
+        let chosen = ledger.run_summaries(&BTreeSet::from([softfac(2)]));
+        // The chosen run's events, and no run id or event of the other two.
+        assert_eq!(read() - before, its_events);
+        let same = whole.into_iter().find(|run| run.id == softfac(2)).unwrap();
+        assert_eq!(chosen, [same]);
+    }
+
+    #[test]
+    fn an_unreadable_run_among_the_chosen_ones_comes_back_last_marked_unreadable() {
+        let (dir, store) = open_store();
+        let ledger = run_at(&store, &softfac(7), T0, Some(State::Building), false, true);
+        unreadable_run(dir.path(), &softfac(6));
+        run_at(&store, &softfac(8), T0, Some(State::Building), false, true);
+        run_at(&store, &softfac(9), T0, Some(State::Building), false, true);
+        let whole = summaries_of(&store, "rawphp/softfac");
+        let of = |issue| whole.iter().find(|run| run.id == softfac(issue)).cloned();
+        let (seven, eight) = (of(7).unwrap(), of(8).unwrap());
+        assert_eq!(
+            ledger.run_summaries(&BTreeSet::from([softfac(8), softfac(7), softfac(6)])),
+            [
+                seven,
+                eight,
+                RunSummary {
+                    unreadable: true,
+                    ..summary(softfac(6))
+                },
+            ]
         );
     }
 

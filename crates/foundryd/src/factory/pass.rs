@@ -1645,11 +1645,7 @@ impl<'a, 'w> Pass<'a, 'w> {
         if unseen.is_empty() {
             return Ok(());
         }
-        // Every run is summed up to keep the unseen ones: a read of only those is #265's.
-        for summary in self.ledger.summaries(repo)? {
-            if !unseen.contains(&summary.id) {
-                continue;
-            }
+        for summary in self.ledger.run_summaries(&unseen) {
             if summary.unreadable {
                 // A finished run a newer build wrote: not shown, and not read again.
                 self.memo.finished.insert(summary.id, None);
@@ -4729,6 +4725,26 @@ mod tests {
             // Only the runs' ids are listed, a handful of times; no event of a finished run.
             assert!(read() - before <= 4 * 4, "{} rows", read() - before);
             assert_eq!(rig.status().finished.len(), 4);
+        }
+
+        #[test]
+        fn a_pass_after_a_run_finishes_reads_the_events_of_that_run_and_not_the_seen_ones() {
+            let mut rig = Rig::new();
+            // Four runs of fifteen events each, seen by the first pass.
+            for issue in 1..=4 {
+                finished_run(&rig, issue, 10);
+            }
+            rig.pass();
+            let new = finished_run(&rig, 5, 0);
+            let its_events = rig.store.lock().unwrap().run_events(&new).unwrap().len();
+            let read = Store::run_rows_read;
+            let before = read();
+            rig.pass();
+            // The runs' ids, a handful of times, and the new run's events, a few times. Reading
+            // even one seen run's fifteen events again goes over.
+            let most = 5 * 4 + 3 * its_events;
+            assert!(read() - before <= most, "{} rows", read() - before);
+            assert_eq!(rig.status().finished.len(), 5);
         }
 
         #[test]
