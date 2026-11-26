@@ -319,6 +319,10 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StopStep, RunError> 
             why: "not-building",
         });
     }
+    // While a round is under way the session to end is the round's, in its workspace: the
+    // build's ended at the gate and its workspace is archived.
+    let round = feedback::stopping_seen(&events, &seen);
+    let seen = round.unwrap_or(seen);
     let mut at = progress_from(run, CauseStep::Advance, &seen, State::Building);
     if begun(&seen) {
         forget_unreachable_session(ctx, run, &events, &mut at);
@@ -619,7 +623,11 @@ pub fn reconcile(ctx: &RunContext<'_>, run: &RunId) -> Result<ReconcileStep, Run
         });
     }
     match seen.state {
-        Some(State::PrOpen) => pr_open(ctx, run, &events, &seen),
+        Some(State::PrOpen) => {
+            // A round decided and not launched ends in its own workspace, not the build's.
+            let seen = feedback::stopping_seen(&events, &seen).unwrap_or(seen);
+            pr_open(ctx, run, &events, &seen)
+        }
         Some(State::Building) => building(ctx, run, &events, &seen),
         _ => Ok(ReconcileStep::Skipped {
             why: "not-building",

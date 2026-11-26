@@ -1046,6 +1046,14 @@ fn round_seen(seen: &Seen, round: Option<&Round>) -> Seen {
     stopping
 }
 
+/// `seen` as a stop, an abandon or an end of the run must read it while a round is under way
+/// ([`round_pending`]): the round's workspace once it has one, and no session before. The
+/// build's session and workspace ended at the gate, so what `seen` names is not what is live.
+/// `None` when no round is under way: `seen` stands.
+pub(super) fn stopping_seen(events: &[RunEvent], seen: &Seen) -> Option<Seen> {
+    round_pending(events).then(|| round_seen(seen, Round::read(events).as_ref()))
+}
+
 /// One pass of the feedback step over `run`. See the module's words.
 pub fn advance(
     ctx: &RunContext<'_>,
