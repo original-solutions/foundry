@@ -5342,4 +5342,69 @@ mod tests {
             );
         }
     }
+
+    mod a_pass_that_fails_after_a_carried_run_recorded {
+        use super::*;
+        use crate::factory::github::{OtherKind, Tracker};
+
+        /// The hub, but every call made once `run` has its `claimed` event is answered with an
+        /// error, as a GitHub that stops answering in the middle of a step does.
+        struct FailsOnceClaimed {
+            hub: Arc<Hub>,
+            store: Arc<Mutex<Store>>,
+            run: RunId,
+        }
+
+        impl Tracker for FailsOnceClaimed {
+            fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
+                let claimed = self
+                    .store
+                    .lock()
+                    .unwrap()
+                    .run_has_event(&self.run, "claimed")
+                    .unwrap();
+                if claimed {
+                    return Err(TrackerError::Other {
+                        kind: OtherKind::Failed,
+                        message: "gh stopped answering".into(),
+                    });
+                }
+                self.hub.gh(args)
+            }
+        }
+
+        #[test]
+        fn leaves_the_slot_of_the_run_it_recorded_held_in_the_book() {
+            let mut rig = Rig::new();
+            rig.fleet_settings(|f| f.max_runs = 1);
+            let run = RunId::new(REPO, 5, 1).unwrap();
+            rig.hub.issue(5, &["factory:triage"]);
+            rig.hub
+                .edit(5, |issue| issue.assignees = vec![LOGIN.into()]);
+            rig.hub.comment_as(
+                5,
+                LOGIN,
+                &crate::factory::github::claim_comment(&run, &builder_machine()),
+            );
+            rig.tracker = Hiding::new(
+                Arc::new(FailsOnceClaimed {
+                    hub: rig.hub.clone(),
+                    store: rig.store.clone(),
+                    run: run.clone(),
+                }),
+                Arc::new(|text: &str| text.to_string()),
+            );
+            let report = rig.pass();
+            assert!(report.failed.is_some(), "{report:?}");
+            assert!(
+                !rig.ledger.read(&run).unwrap().is_empty(),
+                "the takeover recorded its run before the call failed"
+            );
+            assert_eq!(
+                rig.book.runs_free(1),
+                0,
+                "no other project's pass may take the slot of a run that is going"
+            );
+        }
+    }
 }
