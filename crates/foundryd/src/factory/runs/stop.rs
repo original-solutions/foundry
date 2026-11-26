@@ -1725,6 +1725,56 @@ mod tests {
             };
         }
 
+        const ROUND_SESSION: &str = "00000000-0000-0000-0000-0000000005e9";
+
+        /// A feedback round's decision, as `feedback` records it.
+        fn round_decision() -> Event {
+            Event::FeedbackRelaunching {
+                n: 1,
+                branch: BRANCH.into(),
+                items: vec!["review:11".into()],
+                message: "Please rename it.".into(),
+            }
+        }
+
+        /// The round's session, launched in the round's workspace.
+        fn round_session_launched(run: &RunId) -> Event {
+            Event::SessionLaunched {
+                thread_id: ROUND_SESSION.into(),
+                worktree: Some(FEEDBACK_WS.into()),
+                branch: Some(BRANCH.into()),
+                model_instance: None,
+                model: Some("opus".into()),
+                model_options: None,
+                resumed_from: Some(crate::factory::ledger::events::ResumedFrom {
+                    run: run.to_string(),
+                    branch: BRANCH.into(),
+                }),
+                base: Some("main".into()),
+                title: None,
+            }
+        }
+
+        /// A run whose feedback round moved it back to `building` (the decision written again
+        /// after the move) and whose session is not launched yet.
+        fn round_moved() -> (Rig, RunId) {
+            let (mut rig, run) = pr_open_run();
+            rig.write(&run, round_decision());
+            rig.moved(&run, State::PrOpen, State::Building);
+            rig.write(&run, round_decision());
+            rig.sim.set_labels(&["factory:building"]);
+            rig.sim.set_assignees(&[LOGIN]);
+            with_feedback_workspace(&mut rig, None);
+            (rig, run)
+        }
+
+        /// [`round_moved`] with the round's session launched and working.
+        fn round_launched() -> (Rig, RunId) {
+            let (rig, run) = round_moved();
+            rig.write(&run, round_session_launched(&run));
+            (rig, run)
+        }
+
         fn stranger_edited() -> String {
             approval_answer(
                 "2026-10-04T12:00:00Z",
@@ -2444,6 +2494,36 @@ mod tests {
                 assert!(!rig.sim.comments().iter().any(|c| c.contains("mallory")));
             }
 
+            /// What a stop of the round's session says: ended in the round's workspace, which is
+            /// kept, and not in the build's.
+            fn stopped_in_the_round(rig: &Rig, run: &RunId, reason: &str) {
+                assert_eq!(
+                    pass(rig, run),
+                    ReconcileStep::Stopped {
+                        reason: reason.into()
+                    }
+                );
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                assert!(rig.finished(run));
+                assert_eq!(calls(rig), vec![Call::EndSessions { workspace: fws() }]);
+                assert_eq!(stuck_comments(rig), 1);
+            }
+
+            #[test]
+            fn a_removed_label_stops_a_run_whose_feedback_round_has_launched() {
+                let (rig, run) = round_launched();
+                assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
+                rig.sim.set_labels(&[]);
+                stopped_in_the_round(&rig, &run, LABEL_REMOVED);
+            }
+
+            #[test]
+            fn an_assignee_other_than_the_login_stops_a_run_whose_feedback_round_has_launched() {
+                let (rig, run) = round_launched();
+                rig.sim.set_assignees(&[LOGIN, "mallory"]);
+                stopped_in_the_round(&rig, &run, ASSIGNEE_CHANGED);
+            }
+
             #[test]
             fn the_projects_own_login_assigned_is_what_a_claim_leaves() {
                 let (rig, run) = building_run();
@@ -2492,6 +2572,33 @@ mod tests {
                                 ended_in_pass: 1,
                             },
                         )
+                    }),
+                    ("a feedback round decided and not launched", |rig, run| {
+                        rig.write(run, pr_opened());
+                        rig.moved(run, State::Building, State::PrOpen);
+                        rig.write(run, round_decision());
+                        rig.moved(run, State::PrOpen, State::Building);
+                        rig.write(run, round_decision());
+                    }),
+                    (
+                        "a feedback round whose move to building was written and whose decision was not written again",
+                        |rig, run| {
+                            rig.write(run, pr_opened());
+                            rig.moved(run, State::Building, State::PrOpen);
+                            rig.write(run, round_decision());
+                            rig.moved(run, State::PrOpen, State::Building);
+                        },
+                    ),
+                    ("a re-gate relaunch decided and not launched", |rig, run| {
+                        rig.write(run, pr_opened());
+                        rig.write(
+                            run,
+                            Event::RegateRelaunching {
+                                attempt: 1,
+                                branch: BRANCH.into(),
+                                message: "The gate failed.".into(),
+                            },
+                        );
                     }),
                     ("a gate pass recorded", |rig, run| {
                         rig.ledger
