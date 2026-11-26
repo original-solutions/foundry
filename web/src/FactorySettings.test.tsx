@@ -86,6 +86,18 @@ describe("FleetSettings", () => {
     expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("6");
   });
 
+  it("keeps a model typed while a save is on its way", async () => {
+    let answer: (r: Response) => void = () => {};
+    const later = new Promise<Response>((resolve) => (answer = resolve));
+    mockFetch(later as unknown as Response);
+    await renderApp(<FleetSettings settings={current} />);
+    type("Model", "sonnet");
+    save();
+    type("Model", "haiku");
+    await act(async () => answer(json(200, { settings: { ...current, model: "sonnet" } })));
+    expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("haiku");
+  });
+
   it("shows the daemon's refusal", async () => {
     mockFetch(json(422, { error: "poll_seconds is out of range" }));
     await renderApp(<FleetSettings settings={current} />);
@@ -120,19 +132,19 @@ describe("ProjectFactoryControls", () => {
 
   const idle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-  it("builds a second change from the value last sent while the props are stale", async () => {
-    const calls = mockFetch(json(200, {}), json(200, {}));
+  it("builds a second change from the daemon's answer while the props are stale", async () => {
+    const calls = mockFetch(json(200, { factory: { on: true, login: "bot", paused: false } }), json(200, { factory: { on: true, login: "bot", paused: true } }));
     await renderApp(<ProjectFactoryControls project={project} factory={{ on: false, login: "", paused: false }} />);
     fireEvent.click(screen.getByRole("switch", { name: "Factory for demo" }));
     await waitFor(() => expect(screen.getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("true"));
     await waitFor(() => expect((screen.getByLabelText("Pause claims for demo") as HTMLInputElement).disabled).toBe(false));
     fireEvent.click(screen.getByLabelText("Pause claims for demo"));
     await waitFor(() => expect(calls).toHaveLength(2));
-    expect(calls[1].body).toEqual({ on: true, paused: true, login: null });
+    expect(calls[1].body).toEqual({ on: true, paused: true, login: "bot" });
   });
 
   it("keeps a saved login after Save login while the props are stale", async () => {
-    const calls = mockFetch(json(200, {}), json(200, {}));
+    const calls = mockFetch(json(200, { factory: { on: true, login: "bot2", paused: false } }), json(200, { factory: { on: true, login: "bot2", paused: true } }));
     await renderApp(<ProjectFactoryControls project={project} factory={{ on: true, login: "bot", paused: false }} />);
     fireEvent.change(screen.getByLabelText("GitHub login for demo"), { target: { value: "bot2" } });
     fireEvent.click(screen.getByRole("button", { name: "Save login" }));
@@ -145,13 +157,43 @@ describe("ProjectFactoryControls", () => {
   });
 
   it("sends the saved login, never one typed and not saved, from the switch and the pause", async () => {
-    const calls = mockFetch(json(200, {}));
+    const calls = mockFetch(json(200, { factory: { on: true, login: "bot", paused: true } }));
     await renderApp(<ProjectFactoryControls project={project} factory={{ on: true, login: "bot", paused: false }} />);
     fireEvent.change(screen.getByLabelText("GitHub login for demo"), { target: { value: "other" } });
     fireEvent.click(screen.getByLabelText("Pause claims for demo"));
     await waitFor(() => expect(calls).toHaveLength(1));
     expect(calls[0].body).toEqual({ on: true, paused: true, login: "bot" });
     await act(idle);
+  });
+
+  it("keeps a login typed and never saved when another change succeeds", async () => {
+    mockFetch(json(200, { factory: { on: true, login: "bot", paused: true } }));
+    await renderApp(<ProjectFactoryControls project={project} factory={{ on: true, login: "bot", paused: false }} />);
+    fireEvent.change(screen.getByLabelText("GitHub login for demo"), { target: { value: "other" } });
+    fireEvent.click(screen.getByLabelText("Pause claims for demo"));
+    await waitFor(() => expect((screen.getByLabelText("Pause claims for demo") as HTMLInputElement).checked).toBe(true));
+    await waitFor(() => expect((screen.getByLabelText("Pause claims for demo") as HTMLInputElement).disabled).toBe(false));
+    expect((screen.getByLabelText("GitHub login for demo") as HTMLInputElement).value).toBe("other");
+    expect(screen.getByRole("button", { name: "Save login" })).toBeDefined();
+  });
+
+  it("drops the value last sent when new props arrive", async () => {
+    let set: (f: { on: boolean; login: string; paused: boolean }) => void = () => {};
+    function Harness() {
+      const [f, setF] = useState({ on: false, login: "", paused: false });
+      set = setF;
+      return <ProjectFactoryControls project={project} factory={f} />;
+    }
+    const calls = mockFetch(json(200, { factory: { on: true, login: "", paused: false } }), json(200, { factory: { on: false, login: "", paused: true } }));
+    await renderApp(<Harness />);
+    fireEvent.click(screen.getByRole("switch", { name: "Factory for demo" }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("true"));
+    act(() => set({ on: false, login: "", paused: false }));
+    expect(screen.getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("false");
+    await waitFor(() => expect((screen.getByLabelText("Pause claims for demo") as HTMLInputElement).disabled).toBe(false));
+    fireEvent.click(screen.getByLabelText("Pause claims for demo"));
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1].body).toEqual({ on: false, paused: true, login: null });
   });
 
   it("shows a refusal beside the row", async () => {

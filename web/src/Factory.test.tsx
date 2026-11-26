@@ -63,6 +63,7 @@ const holding = status({
   feedback_waiting: [{ issue: 12, title: "Rework the form", reason: "review feedback is 4 minutes old", run: RUN }],
   runs: [{ run: RUN, title: "Rework the form", step: "building", machine: ME, gate_retries_used: 2, minutes_used: 17, workspaces: ["w0", "w1"], sessions: ["s1"] }],
   held_up: [{ run: "acme__foundry__9__2", kind: "stuck", reason: "the gate failed 3 times" }],
+  foreign: [{ issue: 33, title: "Taken elsewhere", state: "claimed" }],
   finished: [
     { run: "acme__foundry__5__1", title: "Shipped one", outcome: "pr-open", pr_end: "merged", pr_url: "https://github.com/acme/foundry/pull/50" },
     { run: "acme__foundry__6__1", title: "Needed words", outcome: "needs-info", pr_end: null, pr_url: null },
@@ -150,6 +151,8 @@ describe("Factory", () => {
       ["no status", { status: null }, undefined, /No status yet/],
       ["no token", { status: null }, { p1: status({ holds: false, generation: 0, not_holding: { kind: "no_token", login: "bot" } }) }, /Idle: this coordinator holds no token for bot/],
       ["held by", { status: null }, { p1: status({ holds: false, generation: 4, not_holding: { kind: "held_by", machine: OTHER, generation: 4 } }) }, /Idle here: laptop holds the lease at generation 4/],
+      ["idle, no reason", { status: null }, { p1: status({ holds: false, not_holding: null }) }, /^Idle$/],
+      ["idle, only text", { status: null }, { p1: status({ holds: false, not_holding: null, idle: "x" }) }, /Idle: x/],
       ["idle text", { status: null }, { p1: status({ idle: "the factory is paused" }) }, /Idle: the factory is paused/],
     ];
     for (const [name, entry, statuses, line] of cases) {
@@ -194,6 +197,13 @@ describe("Factory", () => {
       expect(within(project).getByText(/Holds the lease at generation 7, on studio/)).toBeDefined();
     });
 
+    it("does not name the writer when the overview's status does not hold but the socket's does", async () => {
+      const away = at(7, { holds: false, not_holding: { kind: "held_by", machine: ME, generation: 7 } });
+      const { project } = await show(overview({ status: away, writer: OTHER }), { p1: at(7) });
+      expect(within(project).getByText(/Holds the lease at generation 7/)).toBeDefined();
+      expect(within(project).queryByText(/on laptop/)).toBeNull();
+    });
+
     it("shows the socket's content over the overview's", async () => {
       const socket = at(7, { ready: [{ issue: 77, title: "From the socket", reason: "fresh" }] });
       const { project } = await show(overview({ status: at(7, { ready: [{ issue: 1, title: "From the overview", reason: "old" }] }) }), { p1: socket });
@@ -212,7 +222,6 @@ describe("Factory", () => {
       return <Factory statuses={props.statuses} settings={withSeq} machines={machines} />;
     }
     const reads = (calls: { url: string; method: string }[]) => calls.filter((c) => c.url === "/api/factory" && c.method === "GET").length;
-    const settle = () => act(() => new Promise((resolve) => setTimeout(resolve, 20)));
     const believed = (extra: Partial<FactoryStatus> = {}) => status({ pass: 3, generation: 7, ...extra });
 
     async function start() {
@@ -229,17 +238,28 @@ describe("Factory", () => {
       await waitFor(() => expect(reads(calls)).toBe(2));
     });
 
-    it("reads it again when a status holds at another generation", async () => {
+    it("reads it again for any new status from the socket", async () => {
       const calls = await start();
-      act(() => set({ seq: 1, statuses: { p1: believed({ generation: 8 }) } }));
+      act(() => set({ seq: 1, statuses: { p1: believed({ pass: 4 }) } }));
       await waitFor(() => expect(reads(calls)).toBe(2));
     });
 
-    it("does not read it again for a status that differs only in its pass", async () => {
-      const calls = await start();
-      act(() => set({ seq: 1, statuses: { p1: believed({ pass: 4 }) } }));
-      await settle();
-      expect(reads(calls)).toBe(1);
+    it("after a failed read, the next status reads it again and the view shows the project", async () => {
+      const calls = mockFetch(json(500, { error: "the store cannot be read" }), json(200, overview()));
+      await renderApp(<Harness />);
+      await screen.findByRole("alert");
+      act(() => set({ seq: 1, statuses: { p1: believed() } }));
+      expect(await screen.findByRole("region", { name: "foundry" })).toBeDefined();
+      expect(reads(calls)).toBe(2);
+    });
+
+    it("reads it again when the statuses are reset, and a project with none believed says so", async () => {
+      const calls = mockFetch(json(200, overview({ status: believed() })), json(200, overview({ status: null })));
+      await renderApp(<Harness />);
+      await screen.findByRole("region", { name: "foundry" });
+      act(() => set({ seq: 1, statuses: {} }));
+      await waitFor(() => expect(reads(calls)).toBe(2));
+      expect(await screen.findByText("No status yet")).toBeDefined();
     });
   });
 
