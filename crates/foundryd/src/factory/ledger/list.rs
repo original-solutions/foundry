@@ -10,6 +10,7 @@
 //! The runner's progress read (`runner/progress.ts`, `Seen`) is not ported yet; the few facts
 //! of it a listing needs are read here, by the runner's rules.
 
+use std::collections::BTreeSet;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use foundry_proto::factory::{RunEvent, RunId};
@@ -48,6 +49,11 @@ impl Ledger {
     /// [`summaries`] of the ledger's store.
     pub fn summaries(&self, repo: &str) -> Result<Vec<RunSummary>, StoreError> {
         summaries(&self.store, repo)
+    }
+
+    /// [`run_summaries`] of the ledger's store.
+    pub fn run_summaries(&self, ids: &BTreeSet<RunId>) -> Vec<RunSummary> {
+        run_summaries(&self.store, ids)
     }
 }
 
@@ -357,6 +363,14 @@ fn cap_reason(reason: &str) -> String {
 pub fn summaries(store: &Mutex<Store>, repo: &str) -> Result<Vec<RunSummary>, StoreError> {
     let ids = locked(store).runs_of(repo)?;
     Ok(summaries_of(ids, |id| events(&locked(store), id)))
+}
+
+/// One summary per run among `ids`, as [`summaries`] gives them: in run id order, with any whose
+/// events cannot be read last. Only those runs' events are read, each under one lock.
+pub fn run_summaries(store: &Mutex<Store>, ids: &BTreeSet<RunId>) -> Vec<RunSummary> {
+    summaries_of(ids.iter().cloned().collect(), |id| {
+        events(&locked(store), id)
+    })
 }
 
 /// One summary per run among `ids`, each run's events got from `read`, unreadable ones last.

@@ -1645,11 +1645,7 @@ impl<'a, 'w> Pass<'a, 'w> {
         if unseen.is_empty() {
             return Ok(());
         }
-        // Every run is summed up to keep the unseen ones: a read of only those is #265's.
-        for summary in self.ledger.summaries(repo)? {
-            if !unseen.contains(&summary.id) {
-                continue;
-            }
+        for summary in self.ledger.run_summaries(&unseen) {
             if summary.unreadable {
                 // A finished run a newer build wrote: not shown, and not read again.
                 self.memo.finished.insert(summary.id, None);
