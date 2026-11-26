@@ -374,6 +374,21 @@ describe("ProjectFactoryControls", () => {
     expect(calls[1].body).toEqual({ on: true, paused: true, login: "bot" });
   });
 
+  it("keeps the login Save login sent, not the one held before, when the daemon answers its placeholder", async () => {
+    const c = controls({ on: true, login: "bot", paused: false });
+    const calls = mockFetch(json(200, { factory: { on: true, login: HIDDEN, paused: false } }), json(200, { factory: { on: true, login: "bot2", paused: true } }));
+    await renderApp(<c.Harness />);
+    fireEvent.change(c.box(), { target: { value: "bot2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save login" }));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    await c.ready();
+    expect(c.box().value).toBe("bot2");
+    expect(screen.queryByRole("button", { name: "Save login" })).toBeNull();
+    fireEvent.click(c.pause());
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1].body).toEqual({ on: true, paused: true, login: "bot2" });
+  });
+
   it("shows a refusal beside the row", async () => {
     mockFetch(json(422, { error: "only https://github.com repos are in scope" }));
     await renderApp(<ProjectFactoryControls project={project} factory={{ on: false, login: "", paused: false }} />);

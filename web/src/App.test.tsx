@@ -775,6 +775,31 @@ describe("App", () => {
     expect(await screen.findByRole("radiogroup", { name: "View" })).toBeDefined();
   });
 
+  it("gives the Projects dialog each project's factory settings from the events socket, and follows a later settings message", async () => {
+    mockActions();
+    await open("/", {
+      type: "state",
+      protocol: 1,
+      records: [sample(ME, 1)],
+      settings: settings({ project_factory: { p1: { on: true, login: "bot", paused: true } } }),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    const dialog = await screen.findByRole("dialog", { name: "Projects" });
+    expect(within(dialog).getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("true");
+    expect((within(dialog).getByLabelText("GitHub login for demo") as HTMLInputElement).value).toBe("bot");
+    expect((within(dialog).getByLabelText("Pause claims for demo") as HTMLInputElement).checked).toBe(true);
+
+    const events = sockets("/api/events").at(-1)!;
+    act(() =>
+      events.deliver(
+        JSON.stringify({ type: "settings", protocol: 1, settings: settings({ seq: 2, project_factory: { p1: { on: false, login: "ops", paused: false } } }) }),
+      ),
+    );
+    await waitFor(() => expect(within(dialog).getByRole("switch", { name: "Factory for demo" }).getAttribute("aria-checked")).toBe("false"));
+    expect((within(dialog).getByLabelText("GitHub login for demo") as HTMLInputElement).value).toBe("ops");
+    expect((within(dialog).getByLabelText("Pause claims for demo") as HTMLInputElement).checked).toBe(false);
+  });
+
   it("starts a new shell from the palette and opens it", async () => {
     const calls = mockActions(json(201, { id: "t9" }));
     const router = await open("/", live);

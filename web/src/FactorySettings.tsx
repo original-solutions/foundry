@@ -4,8 +4,6 @@ import { HIDDEN, saveFactorySettings, setProjectFactory, type FactorySettings, t
 import { checkSettings, factoryKey, type NumericSetting } from "./factory";
 import { button, field, inlineField, primaryButton } from "./Modal";
 
-/** What the daemon gives in place of a model, effort or login it could not read safely. */
-
 /** The form's fields as text, so a half-typed number is kept as typed. */
 function texts(s: FactorySettings) {
   return {
@@ -153,7 +151,9 @@ export function ProjectFactoryControls({ project, factory }: { project: Project;
       // Typing is cleared when it is what was sent or the daemon now holds it; typing since stays.
       setTyped((t) => (t === undefined || (savingLogin && t === sentTyped) || t.trim() === answer.login ? undefined : t));
       // The daemon hides only strings when its secret store cannot be read: the switch and pause it
-      // answers are what it holds, and the login is the one sent (blank when the coordinator picked it).
+      // answers are what it holds, and the login is the one sent. A turn-on that named no login took
+      // the coordinator's default, which the answer hides, so the login stays blank until the
+      // settings arrive; a change sent before then names none and is refused, and the refusal shows.
       const value = answer.login === HIDDEN ? { ...answer, login: next.login ?? "" } : answer;
       setAnswered((prev) => ({ value, seen: [...new Set([...(prev?.seen ?? []), base, props.current, ...(prev ? [keyOf(prev.value)] : [])])] }));
       return client.invalidateQueries({ queryKey: factoryKey });

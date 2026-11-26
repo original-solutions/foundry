@@ -2,7 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import { createRootRoute, createRoute, createRouter, useNavigate, useParams, useRouterState } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { Board } from "./Board";
-import { Factory } from "./Factory";
+// The extension is spelled out: on a case-insensitive disk (macOS) "./Factory" finds factory.ts first.
+import { Factory } from "./Factory.tsx";
 import { FactoryContext } from "./factory";
 import { ChangesPanel } from "./ChangesPanel";
 import { LinkBanner, Unreachable } from "./Connection";

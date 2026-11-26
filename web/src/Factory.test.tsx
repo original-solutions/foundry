@@ -2,7 +2,8 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FactoryOverview, FactorySettings, FactoryStatus, FinishedRun, ProjectFactory } from "./api";
-import { Factory } from "./Factory";
+// The extension is spelled out: on a case-insensitive disk (macOS) "./Factory" finds factory.ts first.
+import { Factory } from "./Factory.tsx";
 import { fleet } from "./fleet";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import type { SharedSettings } from "./api";
