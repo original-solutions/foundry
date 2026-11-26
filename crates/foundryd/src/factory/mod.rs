@@ -52,7 +52,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use foundry_proto::factory::FactorySettings;
+use foundry_proto::factory::{FactoryBody, FactoryRecord, FactorySettings};
 use foundry_proto::ids::{MachineId, ProjectId};
 use foundry_proto::messages::{FACTORY_SINCE, PROTOCOL};
 use foundry_proto::settings::SharedSettings;
@@ -61,7 +61,7 @@ use crate::api::Api;
 use crate::clock::Clock;
 use crate::coordinator::Coordinator;
 use crate::secrets::Secrets;
-use crate::store::Store;
+use crate::store::{Applied, Store};
 use github::Commenting;
 use lease::{Lease, LeaseState};
 use ledger::Hide;
@@ -117,13 +117,17 @@ pub fn github_repo(url: &str) -> Option<String> {
 
 /// The projects whose factory is on and whose repo is on GitHub, with a login. A repo that
 /// more than one of them names is watched from none of them: the lease is one ref of the repo,
-/// and two passes over the same runs would claim the same issues twice.
+/// and two passes over the same runs would claim the same issues twice. The service writes each
+/// of them a status that says so.
 pub fn watched(settings: &SharedSettings) -> Vec<Watched> {
     watched_and_shared(settings).0
 }
 
-/// [`watched`], with the projects left out because another one names their repo.
-fn watched_and_shared(settings: &SharedSettings) -> (Vec<Watched>, BTreeSet<ProjectId>) {
+/// [`watched`], with the projects left out because another one names their repo, each with the
+/// names of the other projects that name it.
+fn watched_and_shared(
+    settings: &SharedSettings,
+) -> (Vec<Watched>, BTreeMap<ProjectId, Vec<String>>) {
     let mut found = Vec::new();
     for project in &settings.projects {
         let Some(factory) = settings.project_factory.get(&project.id) else {
@@ -150,7 +154,72 @@ fn watched_and_shared(settings: &SharedSettings) -> (Vec<Watched>, BTreeSet<Proj
     }
     let (alone, shared): (Vec<Watched>, Vec<Watched>) =
         found.into_iter().partition(|w| count[&folded(w)] == 1);
-    (alone, shared.into_iter().map(|w| w.project).collect())
+    let name = |id: ProjectId| {
+        settings
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .map_or_else(|| id.to_string(), |p| p.name.clone())
+    };
+    let left_out = shared
+        .iter()
+        .map(|w| {
+            let others = shared
+                .iter()
+                .filter(|o| o.project != w.project && folded(o) == folded(w))
+                .map(|o| name(o.project))
+                .collect();
+            (w.project, others)
+        })
+        .collect();
+    (alone, left_out)
+}
+
+/// Why the factory is idle for a project left out because the projects `others` name its repo.
+fn shared_reason(others: &[String]) -> String {
+    match others {
+        [one] => format!(
+            "the repo of this project is also named by {one}, a project whose factory is on, so the factory watches neither"
+        ),
+        _ => format!(
+            "the repo of this project is also named by {}, projects whose factories are on, so the factory watches none of them",
+            others.join(", ")
+        ),
+    }
+}
+
+/// Writes the status of a project left out because other projects name its repo: not holding,
+/// with `reason` as the idle text, in the shape a pass writes for a lease it cannot read.
+fn write_shared_status(
+    store: &Mutex<Store>,
+    me: MachineId,
+    project: ProjectId,
+    reason: String,
+) -> Result<(), String> {
+    let mut status = status::not_holding(
+        project,
+        foundry_proto::factory::NotHolding::NoToken {
+            login: String::new(),
+        },
+    );
+    status.not_holding = None;
+    status.idle = Some(reason);
+    let mut store = lock(store);
+    let written = store.own_next_factory_version().and_then(|version| {
+        store.apply_factory(
+            &FactoryRecord {
+                owner: me,
+                version,
+                body: FactoryBody::Status(status),
+            },
+            me,
+        )
+    });
+    match written {
+        Ok(Applied::Stored) => Ok(()),
+        Ok(other) => Err(format!("the status was not stored: {other:?}")),
+        Err(error) => Err(format!("the status could not be written: {error}")),
+    }
 }
 
 /// A project's lease, as the service uses it.
@@ -233,8 +302,9 @@ impl<H: Host> Factory<H> {
     pub async fn serve(self) {
         let mut running: BTreeMap<ProjectId, Running> = BTreeMap::new();
         let offline = Arc::new(Mutex::new(Offline::default()));
-        // The projects last said to share a repo, so the line is written when it changes.
-        let mut said_shared = BTreeSet::new();
+        // What each project left out for sharing a repo was last told, so the log line and the
+        // status are written when that changes, not every scan.
+        let mut said_shared: BTreeMap<ProjectId, String> = BTreeMap::new();
         loop {
             let looked = self.clock.now();
             let acting = PROTOCOL >= FACTORY_SINCE && self.host.acting().await;
@@ -243,11 +313,40 @@ impl<H: Host> Factory<H> {
                 match tokio::task::spawn_blocking(move || lock(&store).settings()).await {
                     Ok(Ok(settings)) => {
                         let (watched, shared) = watched_and_shared(&settings);
-                        if shared != said_shared {
-                            if !shared.is_empty() {
-                                tracing::warn!(projects = ?shared, "factory: projects that name one repo are watched from none of them");
+                        let reasons: BTreeMap<ProjectId, String> = shared
+                            .iter()
+                            .map(|(project, others)| (*project, shared_reason(others)))
+                            .collect();
+                        if reasons != said_shared {
+                            if !reasons.is_empty() {
+                                tracing::warn!(projects = ?reasons.keys().collect::<Vec<_>>(), "factory: projects that name one repo are watched from none of them");
                             }
-                            said_shared = shared;
+                            let new: Vec<(ProjectId, String)> = reasons
+                                .iter()
+                                .filter(|(project, reason)| {
+                                    said_shared.get(*project) != Some(*reason)
+                                })
+                                .map(|(project, reason)| (*project, (self.host.hide())(reason)))
+                                .collect();
+                            let (store, me) = (self.store.clone(), self.me);
+                            let written = tokio::task::spawn_blocking(move || {
+                                new.into_iter()
+                                    .map(|(project, reason)| {
+                                        let done = write_shared_status(&store, me, project, reason);
+                                        (project, done)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .await
+                            .unwrap_or_default();
+                            said_shared = reasons;
+                            for (project, done) in written {
+                                if let Err(error) = done {
+                                    tracing::warn!(%project, "factory: {error}");
+                                    // Written again at the next scan.
+                                    said_shared.remove(&project);
+                                }
+                            }
                         }
                         Some(watched)
                     }
