@@ -67,6 +67,8 @@ pub struct Issue {
     pub closed: bool,
     /// Each label applied: the label, when, and by whom.
     pub labeled: Vec<(String, String, String)>,
+    /// Each label removed: the label, when, and by whom.
+    pub unlabeled: Vec<(String, String, String)>,
 }
 
 /// One comment, on an issue or a pull request: GitHub keeps both as issue comments.
@@ -141,6 +143,7 @@ impl FakeTracker {
                 assignees: Vec::new(),
                 closed: false,
                 labeled: Vec::new(),
+                unlabeled: Vec::new(),
             },
         );
     }
@@ -370,7 +373,10 @@ impl FakeTracker {
                             issue.labeled.push((label, now(), login.clone()));
                         }
                         for label in Self::values(args, "--remove-label") {
-                            issue.labels.retain(|l| *l != label);
+                            if issue.labels.contains(&label) {
+                                issue.labels.retain(|l| *l != label);
+                                issue.unlabeled.push((label, now(), login.clone()));
+                            }
                         }
                         for who in Self::values(args, "--add-assignee") {
                             if !issue.assignees.contains(&who) {
@@ -425,7 +431,12 @@ impl FakeTracker {
                 Some(Ok(Value::Array(rows).to_string()))
             }
             (Some("api"), Some("graphql")) => self.graphql(&mut hub, args),
-            (Some("api"), Some("-X")) => {
+            (Some("api"), Some("-X"))
+                if word(2) == Some("PATCH")
+                    && word(3).is_some_and(|path| {
+                        path.starts_with(&format!("repos/{}/issues/comments/", self.repo))
+                    }) =>
+            {
                 let path = word(3).unwrap_or_default();
                 let id: u64 = path
                     .rsplit('/')
@@ -536,12 +547,20 @@ impl FakeTracker {
             json!({"data": {"repository": {"issue": {"closedByPullRequestsReferences": {"nodes": nodes}}}}})
         } else if query.contains("timelineItems") {
             let issue = hub.issues.get(&number)?;
-            let nodes: Vec<Value> = issue
+            // Oldest first, as GitHub lists the timeline; a change in the same second as
+            // another keeps the order it was made in.
+            let mut changes: Vec<(&str, &(String, String, String))> = issue
                 .labeled
                 .iter()
-                .map(|(label, at, by)| {
+                .map(|c| ("LabeledEvent", c))
+                .chain(issue.unlabeled.iter().map(|c| ("UnlabeledEvent", c)))
+                .collect();
+            changes.sort_by(|a, b| a.1.1.cmp(&b.1.1));
+            let nodes: Vec<Value> = changes
+                .into_iter()
+                .map(|(kind, (label, at, by))| {
                     json!({
-                        "__typename": "LabeledEvent",
+                        "__typename": kind,
                         "createdAt": at,
                         "actor": Self::actor(by),
                         "label": {"name": label},
@@ -686,6 +705,15 @@ agent '- hook: {event: SessionStart}
             );
             h.ready(12, "Make the widgets faster");
             h.reaches(12, "factory:stuck").await;
+            // Stuck by the retries running out: one retry, two gates.
+            assert!(
+                h.github
+                    .comments_on(12)
+                    .iter()
+                    .any(|c| c.contains("the gate failed after 2 attempts")),
+                "{:?}",
+                h.github.comments_on(12)
+            );
             // Issue 14's session asks questions holding both.
             h.script(
                 14,

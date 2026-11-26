@@ -151,6 +151,10 @@ where
         ),
     )
     .unwrap();
+    // One child at a time: each runs three daemons, and the factory's limits are on a clock
+    // ten times as fast as the wall clock.
+    static ALONE: Mutex<()> = Mutex::new(());
+    let _alone = lock(&ALONE);
     let path = format!(
         "{}:{}",
         bin.display(),
@@ -399,6 +403,7 @@ struct Recording {
 }
 
 impl Recording {
+    /// Keeps `message` once the worker took it: a send the worker refused reached no one.
     fn keep(&self, message: &Message) {
         lock(&self.sent).push(Sent {
             line: message.line.clone(),
@@ -422,8 +427,12 @@ impl Worker for Recording {
         start: FactoryStart,
         first: Message,
     ) -> Result<SessionId, WorkerError> {
-        self.keep(&first);
-        self.inner.start_session(workspace, start, first)
+        let kept = first.clone();
+        let started = self.inner.start_session(workspace, start, first);
+        if started.is_ok() {
+            self.keep(&kept);
+        }
+        started
     }
 
     fn send(
@@ -432,8 +441,12 @@ impl Worker for Recording {
         message: Message,
         only_if_prompts: Option<u64>,
     ) -> Result<u64, SendRefused> {
-        self.keep(&message);
-        self.inner.send(session, message, only_if_prompts)
+        let kept = message.clone();
+        let sent = self.inner.send(session, message, only_if_prompts);
+        if sent.is_ok() {
+            self.keep(&kept);
+        }
+        sent
     }
 
     fn turn(&self, session: SessionId, n: u64) -> Result<TurnText, WorkerError> {
@@ -721,7 +734,7 @@ impl Harness {
                 sent.clone(),
             )
             .await;
-            write_held(daemon, builds);
+            write_held(daemon, i == 0 || builds, builds);
             daemon.write(sample(0));
             machines.push(machine);
         }
@@ -762,7 +775,10 @@ impl Harness {
         let k = (1..)
             .find(|k| !dir.join(format!("{k}.sh")).exists())
             .unwrap();
-        std::fs::write(dir.join(format!("{k}.sh")), script).unwrap();
+        // Whole or not there: a session may look for it at any time.
+        let partial = dir.join(format!("{k}.partial"));
+        std::fs::write(&partial, script).unwrap();
+        std::fs::rename(partial, dir.join(format!("{k}.sh"))).unwrap();
     }
 
     /// Opens issue `number` and has the instructor label it `factory:ready`.
@@ -779,10 +795,25 @@ impl Harness {
     /// Waits until issue `number` has only `label` of the factory's labels.
     pub async fn reaches(&self, number: u64, label: &str) {
         eprintln!("fleet: waiting for #{number} to reach {label}");
-        until(WAIT, &format!("issue #{number} reaches {label}"), || {
-            self.state(number) == BTreeSet::from([label.to_owned()])
-        })
-        .await;
+        let want = BTreeSet::from([label.to_owned()]);
+        let mut said = BTreeSet::new();
+        let start = tokio::time::Instant::now();
+        loop {
+            let now = self.state(number);
+            if now == want {
+                return;
+            }
+            if now != said {
+                eprintln!("fleet: #{number} is {now:?}");
+                said = now;
+            }
+            assert!(
+                start.elapsed() <= WAIT,
+                "issue #{number} reaches {label}: not done within {WAIT:?}; it is {said:?}, with the comments {:#?}",
+                self.github.comments_on(number)
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// The factory's clock now.
@@ -900,15 +931,20 @@ fn all(daemon: &Daemon) -> Vec<AnyRecord> {
         .collect()
 }
 
-/// Writes `daemon`'s [`MachineHeld`]: the project's login, and the skill when it `builds`.
-fn write_held(daemon: &Daemon, builds: bool) {
+/// Writes `daemon`'s [`MachineHeld`]: the project's login when it holds its `token`, and the
+/// skill when it `builds`.
+fn write_held(daemon: &Daemon, token: bool, builds: bool) {
     let mut store = lock(&daemon.store);
     let version = store.own_next_factory_version().unwrap();
     let record = FactoryRecord {
         owner: daemon.id,
         version,
         body: FactoryBody::Held(MachineHeld {
-            logins: vec![LOGIN.into()],
+            logins: if token {
+                vec![LOGIN.into()]
+            } else {
+                Vec::new()
+            },
             skill: builds,
         }),
     };

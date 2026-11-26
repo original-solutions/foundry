@@ -81,9 +81,10 @@ fn an_issue_reaches_pr_open_with_its_build_session_ended_and_its_workspace_gone(
                 builder, h.fleet.daemons[0].id,
                 "the coordinator builds nothing"
             );
+            let gates = h.workspaces_named("fac/12-1-g1");
             assert!(
-                h.workspaces_named("fac/12-1-g1").iter().all(|w| w.deleted),
-                "the gate workspace is gone too"
+                !gates.is_empty() && gates.iter().all(|w| w.deleted),
+                "the gate workspace is gone too: {gates:?}"
             );
             let first = &h.sent()[0];
             assert!(
@@ -137,16 +138,20 @@ agent '- stop: {last_assistant_message: "Fixed the gate.\nFACTORY-DONE: https://
                 .collect();
             assert_eq!(gates, vec![1, 2], "the first gate and one retry");
             let sent = h.sent();
-            assert_eq!(sent.len(), 2, "the launch, then the failure: {sent:?}");
+            let failures: Vec<_> = sent
+                .iter()
+                .filter(|m| m.line.starts_with("The factory gate failed"))
+                .collect();
+            assert_eq!(failures.len(), 1, "one failure sent back: {sent:?}");
             assert!(
-                sent[1].text().contains("test -f fixed.txt"),
+                failures[0].text().contains("test -f fixed.txt"),
                 "the failure names the command: {:?}",
-                sent[1]
+                failures[0]
             );
             assert!(
-                !sent[1].text().contains(CONFIG_DIFFERS),
+                !failures[0].text().contains(CONFIG_DIFFERS),
                 "the configs are the same: {:?}",
-                sent[1]
+                failures[0]
             );
             assert!(!h.github.is_draft(102));
             gone(&h, "fac/12-1").await;
@@ -224,9 +229,6 @@ agent '- stop: {last_assistant_message: "Opened the pull request.\nFACTORY-DONE:
             h.reaches(13, "factory:building").await;
 
             // GitHub's times are to the second: the comment comes after the run's last read.
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-            h.github
-                .comment_as(101, INSTRUCTOR, "Please also make them blue.");
             h.script(
                 12,
                 &format!(
@@ -234,6 +236,9 @@ agent '- stop: {last_assistant_message: "Opened the pull request.\nFACTORY-DONE:
                     opens(101)
                 ),
             );
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            h.github
+                .comment_as(101, INSTRUCTOR, "Please also make them blue.");
 
             // Many feedback reads go by, on the clock the factory reads, and the round waits.
             let start = h.clock_now();
@@ -251,24 +256,27 @@ agent '- stop: {last_assistant_message: "Opened the pull request.\nFACTORY-DONE:
                 "no round workspace while the slot is held"
             );
             assert_eq!(h.state(13), BTreeSet::from(["factory:building".to_owned()]));
+            // It read the comment, and has a round to start once a slot frees.
+            assert!(
+                named(&h, 12, "step_changed").iter().any(|d| {
+                    let step = d["step"].as_str().unwrap_or_default();
+                    step.starts_with("feedback-read ") && step.ends_with(" found")
+                }),
+                "the round found the feedback and waits"
+            );
 
             std::fs::write(h.marks.join("release-13"), "").unwrap();
             h.reaches(13, "factory:pr-open").await;
-            let round = h.made("fac/12-1-f1").await;
+            h.made("fac/12-1-f1").await;
             h.reaches(12, "factory:pr-open").await;
-            assert!(
-                h.github
-                    .tip("fac/12-1")
-                    .is_some_and(|sha| sha == super::git(&h.origin, &["rev-parse", "fac/12-1"])),
-                "the round pushed"
-            );
+            // The round's commit is on the pull request's branch.
+            super::git(&h.origin, &["cat-file", "-e", "fac/12-1:blue.txt"]);
             gone(&h, "fac/12-1-f1").await;
             let feedback = h
                 .sent()
                 .into_iter()
                 .find(|m| m.text().contains("Please also make them blue."));
             assert!(feedback.is_some(), "the round's session got the comment");
-            let _ = round;
             h.no_unknown_calls();
         },
     );
@@ -294,9 +302,6 @@ fn a_feedback_round_on_the_machine_that_built_the_run_starts_from_origins_branch
 
             // A person pushes to the pull request's branch, then asks for more.
             let pushed = h.push_to("fac/12-1", "person.txt", "a person's change\n");
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-            h.github
-                .comment_as(101, INSTRUCTOR, "Please also make them blue.");
             h.script(
                 12,
                 &format!(
@@ -304,6 +309,9 @@ fn a_feedback_round_on_the_machine_that_built_the_run_starts_from_origins_branch
                     opens(101)
                 ),
             );
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            h.github
+                .comment_as(101, INSTRUCTOR, "Please also make them blue.");
 
             let round = h.made("fac/12-1-f1").await;
             h.reaches(12, "factory:pr-open").await;
@@ -328,7 +336,7 @@ fn a_pull_request_that_changes_provision_and_gate_is_gated_with_the_default_bran
         || async {
             let h = Harness::start(Options {
                 config: config(
-                    &["touch {marks}/main-provision"],
+                    &["git symbolic-ref -q HEAD || echo detached >> {marks}/main-provision"],
                     &["touch {marks}/main-gate", "exit 1"],
                     1,
                 ),
@@ -351,17 +359,24 @@ fn a_pull_request_that_changes_provision_and_gate_is_gated_with_the_default_bran
             );
             h.ready(12, "Make the widgets faster");
 
+            let failure = || {
+                h.sent()
+                    .into_iter()
+                    .find(|m| m.line.starts_with("The factory gate failed"))
+            };
             until(WAIT, "the gate failure is sent back", || {
-                h.sent().len() >= 2
+                failure().is_some()
             })
             .await;
 
-            let failure = &h.sent()[1];
+            let failure = failure().unwrap();
             assert!(failure.text().contains(CONFIG_DIFFERS), "{failure:?}");
             assert!(failure.text().contains("exit 1"), "{failure:?}");
+            // The build's own setup runs main's provision too; only a gate is on no branch.
+            let provisioned = std::fs::read_to_string(h.marks.join("main-provision")).unwrap();
             assert!(
-                h.marks.join("main-provision").exists(),
-                "main's provision ran"
+                provisioned.contains("detached"),
+                "main's provision ran in the gate"
             );
             assert!(h.marks.join("main-gate").exists(), "main's gate ran");
             assert!(
@@ -438,6 +453,11 @@ fn a_gate_terminal_holds_no_token_and_its_git_gets_none_from_the_machines_helper
             assert!(
                 !credential.contains("password="),
                 "the gate's git got a password: {credential}"
+            );
+            assert!(
+                credential.contains("terminal prompts disabled")
+                    || credential.contains("could not read Username"),
+                "the gate's git ran and was refused: {credential}"
             );
             h.no_unknown_calls();
         },
