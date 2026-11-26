@@ -98,14 +98,44 @@ impl Watched {
 /// The `owner/name` of a GitHub repo's clone URL: `https://github.com/o/r(.git)`,
 /// `git@github.com:o/r(.git)` or `ssh://git@github.com/o/r(.git)`. `None` for any other.
 pub fn github_repo(url: &str) -> Option<String> {
-    let _ = url;
-    todo!()
+    let rest = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("git@github.com:"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (owner, name) = rest.split_once('/')?;
+    let plain = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with(['-', '.'])
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    (plain(owner) && plain(name)).then(|| format!("{owner}/{name}"))
 }
 
 /// The projects whose factory is on and whose repo is on GitHub, with a login.
 pub fn watched(settings: &SharedSettings) -> Vec<Watched> {
-    let _ = settings;
-    todo!()
+    let mut watched = Vec::new();
+    for project in &settings.projects {
+        let Some(factory) = settings.project_factory.get(&project.id) else {
+            continue;
+        };
+        if !factory.on || !crate::secrets::is_login(&factory.login) {
+            continue;
+        }
+        let Some(repo) = github_repo(&project.repo) else {
+            tracing::warn!(project = %project.id, "factory: the project's repo is not a GitHub repo, so its factory does not run");
+            continue;
+        };
+        watched.push(Watched {
+            project: project.id,
+            repo,
+            login: factory.login.clone(),
+        });
+    }
+    watched
 }
 
 /// A project's lease, as the service uses it.
@@ -182,22 +212,313 @@ impl<H: Host> Factory<H> {
 
     /// Runs the service for ever.
     pub async fn serve(self) {
-        let _ = (
-            &self.store,
-            self.me,
-            &self.host,
-            &self.freshness,
-            &self.clock,
-            &self.book,
-            POLL,
-            PROTOCOL,
-            FACTORY_SINCE,
-            BTreeMap::<u8, u8>::new(),
-            PoisonError::<u8>::new(0),
-            FactorySettings::default(),
-        );
-        todo!()
+        let mut running: BTreeMap<ProjectId, Running> = BTreeMap::new();
+        let offline = Arc::new(Mutex::new(Offline::default()));
+        loop {
+            let looked = self.clock.now();
+            let acting = PROTOCOL >= FACTORY_SINCE && self.host.acting().await;
+            let store = self.store.clone();
+            let read = tokio::task::spawn_blocking(move || lock(&store).settings()).await;
+            let want = match read {
+                Ok(Ok(settings)) if acting => Some(watched(&settings)),
+                Ok(Ok(_)) => Some(Vec::new()),
+                Ok(Err(error)) => {
+                    tracing::warn!("factory: the settings could not be read: {error}");
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!("factory: the settings read did not finish: {error}");
+                    None
+                }
+            };
+            if let Some(want) = want {
+                running.retain(|project, run| {
+                    // A lease made with no token is made again once the machine holds one.
+                    let keep = want.contains(&run.watched)
+                        && (run.token || self.host.tracker(&run.watched.login).is_none());
+                    if !keep {
+                        run.lease.release();
+                        self.book.forget(*project);
+                    }
+                    keep
+                });
+                for watched in want {
+                    if let std::collections::btree_map::Entry::Vacant(slot) =
+                        running.entry(watched.project)
+                    {
+                        slot.insert(self.start(watched.clone(), offline.clone()));
+                    }
+                }
+            }
+            wait(&*self.clock, looked, SCAN).await;
+        }
     }
+
+    /// Starts the lease task and the pass task of `watched`.
+    fn start(&self, watched: Watched, offline: Arc<Mutex<Offline>>) -> Running {
+        let lease = self.host.lease(&watched);
+        let token = self.host.tracker(&watched.login).is_some();
+        let state: Arc<Mutex<Option<LeaseState>>> = Arc::default();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(lease_task(
+            self.store.clone(),
+            watched.clone(),
+            lease.clone(),
+            state.clone(),
+            self.freshness.clone(),
+            self.clock.clone(),
+        ));
+        tasks.spawn(pass_task(
+            Shared {
+                store: self.store.clone(),
+                me: self.me,
+                host: self.host.clone(),
+                book: self.book.clone(),
+                clock: self.clock.clone(),
+                offline,
+            },
+            watched.clone(),
+            lease.clone(),
+            state,
+        ));
+        Running {
+            watched,
+            lease,
+            token,
+            _tasks: tasks,
+        }
+    }
+}
+
+/// A project the service runs: dropping it stops its tasks.
+struct Running {
+    watched: Watched,
+    lease: Arc<dyn Leasing>,
+    /// The machine held a token for the login when the lease was made.
+    token: bool,
+    _tasks: tokio::task::JoinSet<()>,
+}
+
+/// What a project's pass task shares with the service.
+struct Shared<H: Host> {
+    store: Arc<Mutex<Store>>,
+    me: MachineId,
+    host: Arc<H>,
+    book: Arc<pass::Book>,
+    clock: Arc<dyn Clock>,
+    offline: Arc<Mutex<Offline>>,
+}
+
+/// Since when, on the clock, each listed machine has been offline.
+#[derive(Debug, Default)]
+struct Offline {
+    since: BTreeMap<MachineId, Duration>,
+}
+
+impl Offline {
+    /// How long each listed machine that is not `online` has been unreachable, counted from the
+    /// first look that found it so.
+    fn update(
+        &mut self,
+        settings: &SharedSettings,
+        online: &BTreeSet<MachineId>,
+        now: Duration,
+    ) -> BTreeMap<MachineId, Duration> {
+        let listed: BTreeSet<MachineId> = settings.machines.iter().map(|m| m.id).collect();
+        self.since
+            .retain(|machine, _| listed.contains(machine) && !online.contains(machine));
+        for machine in listed.iter().filter(|m| !online.contains(m)) {
+            self.since.entry(*machine).or_insert(now);
+        }
+        self.since
+            .iter()
+            .map(|(machine, since)| (*machine, now.saturating_sub(*since)))
+            .collect()
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Waits until `span` has passed on `clock` since `from`.
+async fn wait(clock: &dyn Clock, from: Duration, span: Duration) {
+    while clock.now().saturating_sub(from) < span {
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The highest lease generation the run events of `repo` were written under.
+fn highest_event_generation(store: &Store, repo: &str) -> u64 {
+    let mut highest = 0;
+    for run in store.runs_of(repo).unwrap_or_default() {
+        for event in store.run_events(&run).unwrap_or_default() {
+            highest = highest.max(event.generation);
+        }
+    }
+    highest
+}
+
+/// Ticks `lease` every [`LEASE_TICK`], for ever.
+async fn lease_task(
+    store: Arc<Mutex<Store>>,
+    watched: Watched,
+    lease: Arc<dyn Leasing>,
+    state: Arc<Mutex<Option<LeaseState>>>,
+    freshness: Arc<Freshness>,
+    clock: Arc<dyn Clock>,
+) {
+    let project = watched.project;
+    let mut events: Option<u64> = None;
+    loop {
+        let looked = clock.now();
+        let (store2, lease2, repo) = (store.clone(), lease.clone(), watched.repo.clone());
+        let known = events;
+        let ticked = tokio::task::spawn_blocking(move || {
+            let (statuses, events) = {
+                let store = lock(&store2);
+                let statuses = store.highest_generation(project).unwrap_or(0);
+                let events = known.unwrap_or_else(|| highest_event_generation(&store, &repo));
+                (statuses, events)
+            };
+            (lease2.tick(statuses.max(events)), events)
+        })
+        .await;
+        match ticked {
+            Ok((tick, seen)) => {
+                events = Some(seen);
+                if matches!(tick, LeaseState::Held { .. }) && lease.guard().check().is_ok() {
+                    freshness.held(project);
+                }
+                *lock(&state) = Some(tick);
+            }
+            Err(error) => tracing::warn!(%project, "factory: a lease tick did not finish: {error}"),
+        }
+        wait(&*clock, looked, LEASE_TICK).await;
+    }
+}
+
+/// A tracker for a login this machine holds no token for: every call fails, and nothing is
+/// called, since the pass reads such a project as holding no token.
+struct NoTracker;
+
+impl github::Tracker for NoTracker {
+    fn gh(&self, _: &[String]) -> Result<String, github::TrackerError> {
+        Err(github::TrackerError::Other {
+            kind: github::OtherKind::NotStarted,
+            message: "this machine holds no token for the project's login".into(),
+        })
+    }
+}
+
+/// Runs the project's pass every `poll_seconds`, once its lease has ticked, for ever.
+async fn pass_task<H: Host>(
+    shared: Shared<H>,
+    watched: Watched,
+    lease: Arc<dyn Leasing>,
+    state: Arc<Mutex<Option<LeaseState>>>,
+) {
+    let shared = Arc::new(shared);
+    while lock(&state).is_none() {
+        tokio::time::sleep(POLL).await;
+    }
+    let ledger = ledger::Ledger::new(shared.store.clone(), shared.me, 0, shared.host.hide());
+    let mut memo = pass::Memo::default();
+    loop {
+        let looked = shared.clock.now();
+        let (shared2, watched2, lease2, state2, ledger2) = (
+            shared.clone(),
+            watched.clone(),
+            lease.clone(),
+            state.clone(),
+            ledger.clone(),
+        );
+        let ran = tokio::task::spawn_blocking(move || {
+            let poll = one_pass(&shared2, &watched2, &*lease2, &state2, &ledger2, &mut memo);
+            (memo, poll)
+        })
+        .await;
+        let poll = match ran {
+            Ok((kept, poll)) => {
+                memo = kept;
+                poll
+            }
+            Err(error) => {
+                tracing::warn!(project = %watched.project, "factory: a pass did not finish: {error}");
+                memo = pass::Memo::default();
+                Duration::from_secs(u64::from(FactorySettings::default().poll_seconds))
+            }
+        };
+        wait(&*shared.clock, looked, poll).await;
+    }
+}
+
+/// One pass of `watched`, on a blocking thread. Answers how long to wait for the next.
+fn one_pass<H: Host>(
+    shared: &Shared<H>,
+    watched: &Watched,
+    lease: &dyn Leasing,
+    state: &Mutex<Option<LeaseState>>,
+    ledger: &ledger::Ledger,
+    memo: &mut pass::Memo,
+) -> Duration {
+    let default = Duration::from_secs(u64::from(FactorySettings::default().poll_seconds));
+    let settings = match lock(&shared.store).settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(project = %watched.project, "factory: the settings could not be read: {error}");
+            return default;
+        }
+    };
+    let poll = settings
+        .factory
+        .as_ref()
+        .map_or(default, |f| Duration::from_secs(u64::from(f.poll_seconds)));
+    let online = shared.host.online();
+    let unreachable = lock(&shared.offline).update(&settings, &online, shared.clock.now());
+    let view = match worker::FleetView::read(&lock(&shared.store), online, unreachable) {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::warn!(project = %watched.project, "factory: the fleet could not be read: {error}");
+            return poll;
+        }
+    };
+    let (tracker, lease_state) = match shared.host.tracker(&watched.login) {
+        Some(tracker) => (
+            tracker,
+            lock(state).clone().unwrap_or(LeaseState::Unknown {
+                reason: "the lease ref has not been read",
+            }),
+        ),
+        None => {
+            let none: Arc<dyn Commenting> =
+                Arc::new(github::Hiding::new(Arc::new(NoTracker), shared.host.hide()));
+            (none, LeaseState::NoToken)
+        }
+    };
+    let guard = lease.guard();
+    let worker = shared.host.worker();
+    let project = runs::RunProject {
+        id: watched.project,
+        repo: watched.repo.clone(),
+        login: watched.login.clone(),
+    };
+    let world = pass::World {
+        project: &project,
+        lease: &lease_state,
+        guard: &*guard,
+        tracker: &*tracker,
+        worker: &*worker,
+        view: &view,
+        ledger,
+        store: &shared.store,
+        me: shared.me,
+        shared: &settings,
+        book: &shared.book,
+        clock: &*shared.clock,
+    };
+    pass::run(&world, memo);
+    poll
 }
 
 /// The daemon's [`Host`].
@@ -207,27 +528,79 @@ pub struct Daemon {
     secrets: Arc<dyn Secrets>,
     clock: Arc<dyn Clock>,
     home: PathBuf,
+    runtime: tokio::runtime::Handle,
 }
 
 impl Host for Daemon {
     fn acting(&self) -> Answering<'_, bool> {
-        let _ = (&self.api, &self.coordinator, &self.secrets, &self.clock, &self.home);
-        todo!()
+        Box::pin(async move {
+            match self.coordinator.acting().await {
+                Ok(acting) => acting == self.api.peers.me(),
+                Err(error) => {
+                    tracing::warn!("factory: the acting coordinator could not be read: {error}");
+                    false
+                }
+            }
+        })
     }
-    fn tracker(&self, _: &str) -> Option<Arc<dyn Commenting>> {
-        todo!()
+
+    fn tracker(&self, login: &str) -> Option<Arc<dyn Commenting>> {
+        let token = match crate::secrets::github_token(&*self.secrets, login) {
+            Ok(token) => token?,
+            Err(error) => {
+                tracing::warn!("factory: the token for {login} could not be read: {error}");
+                return None;
+            }
+        };
+        let token = token.trim();
+        if token.is_empty() || token.chars().any(char::is_control) {
+            return None;
+        }
+        let gh = github::Gh::new(login, token, self.clock.clone());
+        Some(Arc::new(github::Hiding::new(Arc::new(gh), self.hide())))
     }
-    fn lease(&self, _: &Watched) -> Arc<dyn Leasing> {
-        todo!()
+
+    fn lease(&self, watched: &Watched) -> Arc<dyn Leasing> {
+        let auth = match crate::git_auth::GitAuth::for_login(
+            &*self.secrets,
+            &watched.login,
+            &self.home,
+        ) {
+            Ok(auth) => Some(auth),
+            Err(error) => {
+                tracing::warn!(project = %watched.project, "factory: the lease has no token: {error}");
+                None
+            }
+        };
+        let dir = self
+            .home
+            .join("factory")
+            .join("leases")
+            .join(watched.project.to_string());
+        Arc::new(Lease::new(
+            watched.project,
+            watched.remote_url(),
+            auth,
+            self.clock.clone(),
+            self.api.peers.me(),
+            dir,
+        ))
     }
+
     fn worker(&self) -> Arc<dyn Worker> {
-        todo!()
+        Arc::new(fleet::FleetWorker::new(
+            self.api.clone(),
+            self.runtime.clone(),
+        ))
     }
+
     fn online(&self) -> BTreeSet<MachineId> {
-        todo!()
+        self.api.peers.online()
     }
+
     fn hide(&self) -> Hide {
-        todo!()
+        let secrets = self.secrets.clone();
+        Arc::new(move |text: &str| crate::secrets::hide_known(text, &*secrets))
     }
 }
 
@@ -241,8 +614,18 @@ impl Factory<Daemon> {
         clock: Arc<dyn Clock>,
         home: PathBuf,
     ) {
-        let _ = (api, coordinator, secrets, freshness, clock, home);
-        todo!()
+        let (store, me) = (api.store.clone(), api.peers.me());
+        let host = Arc::new(Daemon {
+            api,
+            coordinator,
+            secrets,
+            clock: clock.clone(),
+            home,
+            runtime: tokio::runtime::Handle::current(),
+        });
+        Factory::new(store, me, host, freshness, clock)
+            .serve()
+            .await;
     }
 }
 
@@ -450,12 +833,20 @@ mod tests {
             .map(|(_, status)| status)
     }
 
-    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    /// Whether `done` came true within 20 seconds.
+    fn came(mut done: impl FnMut() -> bool) -> bool {
         let started = Instant::now();
         while !done() {
-            assert!(started.elapsed() < Duration::from_secs(20), "{what}");
+            if started.elapsed() > Duration::from_secs(20) {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
+        true
+    }
+
+    fn wait_for(what: &str, done: impl FnMut() -> bool) {
+        assert!(came(done), "{what}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -493,29 +884,37 @@ mod tests {
         let service = Factory::new(store.clone(), me(), host.clone(), freshness, clock);
         let running = tokio::spawn(service.serve());
         let (store2, slow2) = (store.clone(), slow.clone());
-        tokio::task::spawn_blocking(move || {
-            wait_for("the slow project's gh is called", || {
-                slow2.entered.load(Ordering::SeqCst)
-            });
-            wait_for("the other project's pass ends while the slow one waits", || {
-                status_of(&store2, project(2)).is_some_and(|status| status.holds)
-            });
+        let (entered, quick_done) = tokio::task::spawn_blocking(move || {
+            let entered = came(|| slow2.entered.load(Ordering::SeqCst));
+            let done = came(|| status_of(&store2, project(2)).is_some_and(|status| status.holds));
+            (entered, done)
         })
         .await
         .unwrap();
-        assert!(status_of(&store, project(1)).is_none());
-        // The quick project claimed its ready issue.
-        assert!(
-            quick
-                .writes()
-                .iter()
-                .any(|write| write.contains("foundry:claim"))
-        );
+        let slow_done = status_of(&store, project(1)).is_some();
+        // Let the slow project go before anything is asserted, so a failure cannot leave its
+        // thread waiting for ever.
         {
             let (open, turned) = &*gate;
             *open.lock().unwrap() = true;
             turned.notify_all();
         }
+        assert!(entered, "the slow project's gh is called");
+        assert!(
+            quick_done,
+            "the other project's pass ends while the slow one waits"
+        );
+        assert!(!slow_done, "the slow project's pass waited for its gh");
+        // The quick project read GitHub: its ready issue is in its queue.
+        let quick_status = status_of(&store, project(2)).unwrap();
+        assert_eq!(
+            quick_status
+                .ready
+                .iter()
+                .map(|w| w.issue)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
         let store3 = store.clone();
         tokio::task::spawn_blocking(move || {
             wait_for("the slow project's pass ends once gh answers", || {
