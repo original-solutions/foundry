@@ -3,11 +3,12 @@
 //! The data directory holds `versions/<version>/{foundryd,foundry-holder}`, `current` (a
 //! relative link to one of them, which the service runs) and `update.json`. The check every
 //! ten minutes downloads, verifies and unpacks a newer tag into `versions/` and saves it as the
-//! ready tag; it never installs it. A new version is a trial: the daemon that starts from it
-//! counts its starts, and `update::run` calls it healthy once it has run for a minute. A trial
-//! that starts three times without becoming healthy is put back to the previous version and its
-//! tag is refused until a higher one appears. Only a daemon that runs from `<home>/current`
-//! takes part in any of this.
+//! ready tag; it never installs it. A version installed with a trial record in `update.json` is
+//! a trial: the daemon that starts from it counts its starts, and `update::run` calls it
+//! healthy once it has run for a minute. A trial that starts three times without becoming
+//! healthy is put back to the previous version and its tag is refused until a higher one
+//! appears. Nothing in this module writes a trial any more: a hand install (`foundryd install`)
+//! starts none. Only a daemon that runs from `<home>/current` takes part in any of this.
 //!
 //! `foundryd install` and the daemon are separate processes that both change `update.json`
 //! and `current`, so every change to either is made while holding `<home>/update.lock`.
@@ -261,23 +262,28 @@ pub fn is_ready(home: &Path, tag: &str) -> bool {
         })
 }
 
-/// True when `state` holds a trial and `current` names its version: the rule the check goes by.
-/// A trial `current` does not name, as a crash between an install's two writes leaves, is
-/// stranded. [`trial_on`] keeps its own, wider rule for its callers.
-fn trial_live(home: &Path, state: &State) -> bool {
+/// True when `state` holds a trial and `current` names its version: a trial is on, by the rule
+/// the check goes by. [`trial_on`] keeps its own, wider rule for its callers.
+fn current_names_trial(home: &Path, state: &State) -> bool {
     state
         .trial
         .as_ref()
         .is_some_and(|trial| current_version(home).as_deref() == Some(trial.version.as_str()))
 }
 
+/// True when `state` holds a trial whose version `current` does not name, as a crash between an
+/// install's two writes leaves.
+fn stranded(home: &Path, state: &State) -> bool {
+    state.trial.is_some() && !current_names_trial(home, state)
+}
+
 /// Clears a stranded trial from `state`. True when there was one.
 fn clear_stranded_trial(home: &Path, state: &mut State) -> bool {
-    let stranded = state.trial.is_some() && !trial_live(home, state);
-    if stranded {
+    let cleared = stranded(home, state);
+    if cleared {
         state.trial = None;
     }
-    stranded
+    cleared
 }
 
 /// Reads `update.json`. A missing file is an empty state.
@@ -292,8 +298,9 @@ pub fn state(home: &Path) -> io::Result<State> {
 
 /// Takes `<home>/update.lock`, waiting for another process that holds it. Every holder only
 /// reads and writes `update.json`, removes or renames directories under `versions/` and moves
-/// `current` (no network, no copy and no child process), so the wait is short. The lock is let go when the value is dropped. Never take it twice in one
-/// thread: a second open of the file waits for the first.
+/// `current` (no network, no copy and no child process), so the wait is short. The lock is let
+/// go when the value is dropped. Never take it twice in one thread: a second open of the file
+/// waits for the first.
 fn lock(home: &Path) -> io::Result<Flock<File>> {
     let file = OpenOptions::new()
         .write(true)
@@ -624,15 +631,18 @@ pub(crate) fn place_version(
     result
 }
 
-/// Fills a fresh `versions/.staging-<version>` with `fill` and checks that both binaries are
-/// there, made executable. Returns its path; a stage that fails is removed. It takes no lock:
-/// nothing under it touches `update.json` or `current`.
+/// Fills a fresh `versions/.staging-<version>-<pid>` with `fill` and checks that both binaries
+/// are there, made executable. Returns its path; a stage that fails is removed. The stage is this
+/// process's own, so a hand install and the daemon's check never wipe each other's. It takes no
+/// lock: nothing under it touches `update.json` or `current`.
 pub(crate) fn stage_version(
     home: &Path,
     version: &str,
     fill: impl FnOnce(&Path) -> Result<(), UpdateError>,
 ) -> Result<PathBuf, UpdateError> {
-    let stage = home.join("versions").join(format!(".staging-{version}"));
+    let stage = home
+        .join("versions")
+        .join(format!(".staging-{version}-{}", std::process::id()));
     let filled = (|| {
         let _ = fs::remove_dir_all(&stage);
         fs::create_dir_all(&stage).map_err(io_error("cannot make the staging directory"))?;
@@ -743,8 +753,7 @@ fn make_ready(
 fn tidy(home: &Path, tags: &[String]) -> io::Result<State> {
     let seen = state(home)?;
     let pulled = seen.ready.clone().filter(|ready| !tags.contains(ready));
-    let stranded = seen.trial.is_some() && !trial_live(home, &seen);
-    if pulled.is_none() && !stranded {
+    if pulled.is_none() && !stranded(home, &seen) {
         return Ok(seen);
     }
     let _lock = lock(home)?;
@@ -1818,7 +1827,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!trial_live(home.path(), &state(home.path()).unwrap()));
+        assert!(!current_names_trial(
+            home.path(),
+            &state(home.path()).unwrap()
+        ));
 
         let done = check_with(
             home.path(),
@@ -1845,15 +1857,15 @@ mod tests {
     }
 
     #[test]
-    fn a_trial_is_live_only_while_current_names_its_version() {
+    fn a_trial_is_on_for_the_check_only_while_current_names_its_version() {
         let home = trial_home();
         let held = state(home.path()).unwrap();
-        assert!(trial_live(home.path(), &held));
+        assert!(current_names_trial(home.path(), &held));
 
         point_current(home.path(), "0.1.0").unwrap();
-        assert!(!trial_live(home.path(), &held));
+        assert!(!current_names_trial(home.path(), &held));
         assert!(trial_on(home.path()), "trial_on keeps its rule");
-        assert!(!trial_live(home.path(), &State::default()));
+        assert!(!current_names_trial(home.path(), &State::default()));
     }
 
     #[test]
