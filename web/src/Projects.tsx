@@ -5,6 +5,9 @@ import { useProjectFactory } from "./factory";
 import { ProjectFactoryControls } from "./FactorySettings";
 import { button, dangerButton, field, Modal, primaryButton } from "./Modal";
 
+/** A project with no factory setting: off. One object, so a control keeping what it sent is not told its props changed. */
+const FACTORY_OFF = { on: false, login: "", paused: false };
+
 /**
  * Adds a project through the daemon, which sends it to the acting coordinator, under `id`; its
  * id as the daemon answers it.
@@ -144,7 +147,7 @@ export function Projects({
                   </button>
                 )}
               </div>
-              <ProjectFactoryControls project={p} factory={factories?.[p.id] ?? { on: false, login: "", paused: false }} />
+              <ProjectFactoryControls project={p} factory={factories?.[p.id] ?? FACTORY_OFF} />
               {remove.isError && remove.variables === p.id && (
                 <p role="alert" className="mt-1 text-xs text-red-400">
                   {remove.error.message}

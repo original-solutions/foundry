@@ -45,10 +45,11 @@ export function FleetSettings({ settings }: { settings: FactorySettings }) {
   }
 
   const save = useMutation({
-    mutationFn: saveFactorySettings,
-    onSuccess: (saved) => {
-      // What the daemon holds now, so a number typed as "05" does not leave the form changed for good.
-      setValues(texts(saved));
+    mutationFn: ({ next }: { next: FactorySettings; sent: Texts }) => saveFactorySettings(next),
+    onSuccess: (saved, { sent }) => {
+      // What the daemon holds now, so a number typed as "05" does not leave the form changed for good;
+      // but typing since the send is kept.
+      setValues((now) => (JSON.stringify(now) === JSON.stringify(sent) ? texts(saved) : now));
       setClean(saved);
       return client.invalidateQueries({ queryKey: factoryKey });
     },
@@ -73,7 +74,7 @@ export function FleetSettings({ settings }: { settings: FactorySettings }) {
     };
     const wrong = checkSettings(next);
     setProblem(wrong);
-    if (wrong === null) save.mutate(next);
+    if (wrong === null) save.mutate({ next, sent: values });
   };
 
   const number = (label: string, key: NumericSetting) => (
@@ -125,23 +126,23 @@ export function FleetSettings({ settings }: { settings: FactorySettings }) {
 export function ProjectFactoryControls({ project, factory }: { project: Project; factory: ProjectFactory }) {
   const client = useQueryClient();
   const [typed, setTyped] = useState<string>();
-  /** What the last accepted change sent, with the setting the props held then; dropped once the props change. */
-  const [sent, setSent] = useState<{ value: ProjectFactory; base: string }>();
-  const now = JSON.stringify(factory);
-  if (sent && sent.base !== now) setSent(undefined);
+  /** What the daemon answered to the last accepted change, with the props it was sent against; dropped once the props are another object. */
+  const [sent, setSent] = useState<{ value: ProjectFactory; base: ProjectFactory }>();
+  if (sent && sent.base !== factory) setSent(undefined);
   const held = sent?.value ?? factory;
   const shown = typed ?? held.login;
   const send = useMutation({
-    mutationFn: async ({ next }: { next: { on: boolean; paused: boolean; login: string | null }; base: string }) => setProjectFactory(project.id, next),
-    onSuccess: (_, { next, base }) => {
-      setTyped(undefined);
-      setSent({ value: { on: next.on, paused: next.paused, login: next.login ?? "" }, base });
+    mutationFn: ({ next }: { next: { on: boolean; paused: boolean; login: string | null }; base: ProjectFactory; login: boolean }) => setProjectFactory(project.id, next),
+    onSuccess: (answer, { base, login }) => {
+      // Typing is cleared when it was what was saved, or the daemon now holds it; unsent typing stays.
+      setTyped((t) => (login || t?.trim() === answer.login ? undefined : t));
+      setSent({ value: answer, base });
       return client.invalidateQueries({ queryKey: factoryKey });
     },
   });
-  const change = (edit: Partial<ProjectFactory>) => {
+  const change = (edit: Partial<ProjectFactory>, login = false) => {
     const next = { on: held.on, paused: held.paused, login: held.login, ...edit };
-    send.mutate({ next: { on: next.on, paused: next.paused, login: next.login.trim() === "" ? null : next.login.trim() }, base: now });
+    send.mutate({ next: { on: next.on, paused: next.paused, login: next.login.trim() === "" ? null : next.login.trim() }, base: factory, login });
   };
 
   return (
@@ -167,7 +168,7 @@ export function ProjectFactoryControls({ project, factory }: { project: Project;
         className={`w-44 ${inlineField}`}
       />
       {typed !== undefined && typed.trim() !== held.login && (
-        <button type="button" disabled={send.isPending} onClick={() => change({ login: typed })} className={button}>
+        <button type="button" disabled={send.isPending} onClick={() => change({ login: typed }, true)} className={button}>
           Save login
         </button>
       )}

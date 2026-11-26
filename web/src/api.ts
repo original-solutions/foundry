@@ -49,7 +49,7 @@ export interface SharedSettings {
   priority: string[];
   projects: Project[];
   limits: Record<string, Limits>;
-  /** The fleet's factory settings, when the daemon sends them. */
+  /** The fleet's factory settings. The UI reads them from GET /api/factory; the socket's copy is declared only to keep the wire type whole. */
   factory?: FactorySettings;
   /** Each project's factory setting by project id; a project not listed has its factory off. */
   project_factory?: Record<string, ProjectFactory>;
@@ -449,8 +449,9 @@ export async function saveFactorySettings(settings: FactorySettings): Promise<Fa
   return json.settings as FactorySettings;
 }
 
-/** Saves a project's factory setting, whole; a blank login names none. */
-export async function setProjectFactory(project: string, factory: { on: boolean; paused: boolean; login: string | null }): Promise<void> {
+/** Saves a project's factory setting, whole; a blank login names none. Gives the setting as the daemon holds it, with the login the coordinator picked when none was named. */
+export async function setProjectFactory(project: string, factory: { on: boolean; paused: boolean; login: string | null }): Promise<ProjectFactory> {
   const { status, json } = await post(`/api/projects/${project}/factory`, factory);
   if (status !== 200) throw refused(status, json);
+  return json.factory as ProjectFactory;
 }

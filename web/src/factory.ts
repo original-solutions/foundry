@@ -68,7 +68,7 @@ export function parseRun(id: string): RunParts | undefined {
 }
 
 /** Where an issue of `owner/repo` lives on GitHub. */
-export function issueUrl(of: { owner: string; repo: string; issue: number }): string {
+export function issueUrl(of: Repo & { issue: number }): string {
   return `https://github.com/${of.owner}/${of.repo}/issues/${of.issue}`;
 }
 

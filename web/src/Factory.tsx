@@ -189,27 +189,20 @@ function Body({ status, repo, machines, name }: { status: FactoryStatus; repo?: 
  * its lease holder says (or why it is idle), the ready queue with each issue's reason, feedback
  * rounds that wait, live runs each with a link to its workspace and a Stop that asks first, runs
  * held up, and the last 20 finished. The statuses the events socket sends win over what the
- * overview read; the overview is read again whenever they or the settings change, so its writer
- * and settings follow the socket.
+ * overview read. The overview is read again whenever `statuses` changes (a state message resets
+ * it, and each status after is a new one) or the settings' seq does, so its writer and settings
+ * follow the socket and a failed read heals on the next one. Claims by another factory are not
+ * listed here; they are an attention item.
  */
 export function Factory({ statuses, settings, machines }: { statuses: Record<string, FactoryStatus> | undefined; settings: SharedSettings; machines: MachineView[] }) {
   const client = useQueryClient();
   const { data: overview, error } = useQuery({ queryKey: factoryKey, queryFn: factoryOverview, retry: false });
   const seen = useRef({ statuses, seq: settings.seq });
-  const held = useRef(overview);
   useEffect(() => {
-    held.current = overview;
-  }, [overview]);
-  useEffect(() => {
+    // Not on mount: the first read is the query's own.
     if (seen.current.statuses === statuses && seen.current.seq === settings.seq) return;
-    const seqMoved = seen.current.seq !== settings.seq;
     seen.current = { statuses, seq: settings.seq };
-    // A status only makes the overview's writer stale when it holds, or holds at another generation, than the status the overview has.
-    const writerStale = Object.values(statuses ?? {}).some((s) => {
-      const believed = held.current?.projects.find((p) => p.id === s.project)?.status;
-      return held.current !== undefined && (!believed || believed.holds !== s.holds || believed.generation !== s.generation);
-    });
-    if (seqMoved || writerStale) void client.invalidateQueries({ queryKey: factoryKey });
+    void client.invalidateQueries({ queryKey: factoryKey });
   }, [client, statuses, settings.seq]);
 
   const name = (id: string) => machines.find((m) => m.id === id)?.name ?? settings.machines.find((m) => m.id === id)?.name ?? id;
