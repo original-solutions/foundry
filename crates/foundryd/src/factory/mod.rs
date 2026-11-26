@@ -470,29 +470,28 @@ async fn pass_task<H: Host>(
         tokio::time::sleep(POLL).await;
     }
     let ledger = ledger::Ledger::new(shared.store.clone(), shared.me, 0, shared.host.hide());
-    let mut memo = pass::Memo::default();
+    // Shared with the blocking thread, so that a pass that dies outside `pass::run` (which
+    // counts its own panics) still leaves the memo, and the failures it counts, as it was.
+    let memo = Arc::new(Mutex::new(pass::Memo::default()));
     loop {
         let looked = shared.clock.now();
-        let (shared2, watched2, lease2, state2, ledger2) = (
+        let (shared2, watched2, lease2, state2, ledger2, memo2) = (
             shared.clone(),
             watched.clone(),
             lease.clone(),
             state.clone(),
             ledger.clone(),
+            memo.clone(),
         );
         let ran = tokio::task::spawn_blocking(move || {
-            let poll = one_pass(&shared2, &watched2, &*lease2, &state2, &ledger2, &mut memo);
-            (memo, poll)
+            let mut memo = lock(&memo2);
+            one_pass(&shared2, &watched2, &*lease2, &state2, &ledger2, &mut memo)
         })
         .await;
         let poll = match ran {
-            Ok((kept, poll)) => {
-                memo = kept;
-                poll
-            }
+            Ok(poll) => poll,
             Err(error) => {
                 tracing::warn!(project = %watched.project, "factory: a pass did not finish: {error}");
-                memo = pass::Memo::default();
                 Duration::from_secs(u64::from(FactorySettings::default().poll_seconds))
             }
         };

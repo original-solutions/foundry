@@ -453,11 +453,30 @@ fn ending(error: RunError) -> Result<String, Ended> {
 }
 
 /// One pass over the project `world` names. See the module's words.
+///
+/// A pass that panics is a failed pass like any other: counted, its status written from the
+/// last good results, idle once [`IDLE_AFTER_FAILURES`] have failed in a row. The memo is kept.
 pub fn run(world: &World<'_>, memo: &mut Memo) -> PassReport {
+    let pass = next_pass(world, memo);
+    let ran =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_pass(world, memo, pass)));
+    match ran {
+        Ok(report) => report,
+        // The panic's own text is left out: it may quote what a call answered.
+        Err(_) => failed(
+            world,
+            memo,
+            PassReport::default(),
+            pass,
+            "the pass panicked".into(),
+        ),
+    }
+}
+
+fn run_pass(world: &World<'_>, memo: &mut Memo, pass: u64) -> PassReport {
     let mut report = PassReport::default();
     let project = world.project.id;
     let ticket = world.book.ticket(project);
-    let pass = next_pass(world, memo);
     if matches!(world.lease, LeaseState::NoToken) {
         let why = NotHolding::NoToken {
             login: world.project.login.clone(),
