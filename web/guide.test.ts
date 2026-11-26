@@ -1,11 +1,11 @@
-/// <reference types="node" />
+// @vitest-environment node
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 // The user guide's pages and images, and every other doc page a guide page may link to, keyed by
 // their path from the repo root.
-const root = join(import.meta.dirname, "../..");
+const root = join(import.meta.dirname, "..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 const markdown = (dir: string): string[] =>
   readdirSync(join(root, dir), { withFileTypes: true }).flatMap((e) =>

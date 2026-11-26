@@ -24,7 +24,7 @@ The project's repo must be a `https://github.com/<owner>/<repo>` URL. If it is n
 
 ![The Projects dialog refusing to turn a factory on because the repo is not a GitHub https URL](images/factory-refusal.png)
 
-The repo also needs a `.dw/config.yml` on its default branch. [Turn a project's factory on](../install.md#turn-a-projects-factory-on) lists what it must hold. If the file does not load, the project stays idle and an item appears on the attention list.
+The repo also needs a `.dw/config.yml` on its default branch. [Turn a project's factory on](../install.md#turn-a-projects-factory-on) lists what it must hold. If the file does not load, the project stays idle and a `factory_idle` item appears on the [attention list](board.md#when-something-needs-you), naming the reason.
 
 ## Settings for the whole fleet
 
