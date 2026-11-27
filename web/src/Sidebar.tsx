@@ -7,7 +7,8 @@ import { Named, Now } from "./Now";
 import { startShell } from "./api";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
-import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
+import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
+import { FactoryMark } from "./FactoryMark";
 import { MachineName } from "./Machines";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
@@ -319,13 +320,14 @@ function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges,
           <ProjectFace project={workspace.project} className="size-[18px] text-[9px]" />
           <span className="truncate font-medium">{workspace.name}</span>
         </button>
+        {workspace.factory && <FactoryMark run={workspace.factory} />}
         {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
       </div>
       {!folded && (
         <>
           <div className="flex items-center gap-2 pl-6 pr-1">
             <span className="min-w-0 flex-1 truncate text-xs text-neutral-500">
-              {workspace.branch} · {workspace.project}
+              {branchOf(workspace)} · {workspace.project}
             </span>
             <div className="flex shrink-0 items-center gap-0.5 pointer-fine:hidden pointer-fine:group-focus-within/ws:flex pointer-fine:group-hover/ws:flex">
               {onChanges && (

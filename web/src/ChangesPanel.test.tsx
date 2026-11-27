@@ -218,6 +218,13 @@ describe("ChangesPanel", () => {
     });
   });
 
+  it("names a workspace on a commit by its commit, as the board does", async () => {
+    mockFetch(json(200, changes));
+    await renderApp(<ChangesPanel workspace={{ ...target, branch: "", base: "fedcba9876543210fedcba9876543210fedcba98" }} onClose={() => {}} />);
+    const panel = await screen.findByRole("dialog", { name: /changes in fix login/i });
+    expect(within(panel).getByText("fedcba9")).toBeDefined();
+  });
+
   describe("comments for Claude", () => {
     const sessions = [
       { id: "s1", model: "opus", name: "opus 1", state: "idle" as const, terminal: "t1" },
@@ -319,6 +326,19 @@ describe("ChangesPanel", () => {
       act(() => FakeSocket.last().end(1011, "terminal gone"));
       await waitFor(() => expect(within(panel).getByRole("alert").textContent).toContain("Could not reach opus 1"));
       expect(within(file).getByRole("row", { name: "Comment on line 6" }).textContent).toContain("call it total");
+    });
+
+    it("says a live factory run's stuck session is quiet, as the board does", async () => {
+      FakeSocket.install();
+      mockFetch(json(200, changes), json(200, changes));
+      const quiet = [{ ...sessions[1], name: "opus", state: "stuck" as const }];
+      await renderApp(<ChangesPanel workspace={{ ...target, sessions: quiet, factory: { run: "o__r__162__1" } }} onClose={() => {}} />);
+      const panel = await screen.findByRole("dialog", { name: /changes in fix login/i });
+      const file = await within(panel).findByRole("region", { name: "src/login.ts" });
+      fireEvent.click(within(file).getByRole("button", { name: "Comment on line 6" }));
+      fireEvent.change(within(file).getByRole("textbox", { name: "Comment on line 6" }), { target: { value: "x" } });
+      fireEvent.keyDown(within(file).getByRole("textbox", { name: "Comment on line 6" }), { key: "Enter", metaKey: true });
+      expect(panel.textContent).toContain("opus is quiet 10+ min");
     });
 
     it("sends nothing while no session is idle, and says why", async () => {

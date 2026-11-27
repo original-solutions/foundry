@@ -1,5 +1,6 @@
-import type { AnyRecord, FactoryStatus, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
-import { busy, plural, sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, urgency, type Glyph } from "./labels";
+import type { AnyRecord, FactoryStatus, HeldUp, ProjectFactory, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
+import { issueUrl, parseRun } from "./factory";
+import { busy, needsYou, plural, sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, urgency, type Glyph } from "./labels";
 
 export interface FleetState {
   records: AnyRecord[];
@@ -83,10 +84,23 @@ export interface ShellView {
 export interface WorkspaceView {
   id: string;
   name: string;
+  /** Empty for a workspace on a commit, whose commit is its `base`. */
   branch: string;
+  /** The branch or commit it started from. */
+  base: string;
+  /** Its project's name. */
   project: string;
+  projectId: string;
   sessions: SessionView[];
   shells: ShellView[];
+  /** The factory run it belongs to, once `withFactory` has read the believed statuses. */
+  factory?: FactoryRun;
+  /**
+   * Its project's factory is on, but no believed status of it is here: none has arrived since the
+   * fleet was last sent whole (a resend drops them all until they follow). Whether a run tends it
+   * is then not known. Off, no status will follow, so it is known that none does.
+   */
+  statusUnknown?: true;
 }
 export interface MachineView {
   id: string;
@@ -157,7 +171,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
   const opened = new Map<string, number>();
   const liveSessions: { id: string; workspace: string; model: string; state: SessionState; terminal: string; name?: string | null }[] = [];
   const liveTerminals: { workspace: string; view: Omit<ShellView, "name"> }[] = [];
-  const workspacesByOwner = new Map<string, { id: string; name: string; branch: string; project: string }[]>();
+  const workspacesByOwner = new Map<string, { id: string; name: string; branch: string; base: string; project: string; projectId: string }[]>();
 
   for (const r of records) {
     switch (r.kind) {
@@ -199,7 +213,9 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
             id: r.body.id,
             name: r.body.name,
             branch: r.body.branch,
+            base: r.body.base,
             project: projectNames.get(r.body.project) ?? r.body.project,
+            projectId: r.body.project,
           });
         }
         break;
@@ -270,6 +286,74 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
   }));
 }
 
+/** The factory run a workspace belongs to: its id, its issue where the id names one, and whether it waits on a person. */
+export interface FactoryRun {
+  run: string;
+  issue?: number;
+  url?: string;
+  held?: HeldUp["kind"];
+}
+
+/**
+ * What a factory session P1 marks stuck says instead: it is quiet, for at least P1's stuck
+ * threshold. A fixed text, so it reads the same on every machine and after a reload.
+ */
+export const QUIET = "Quiet 10+ min";
+
+/**
+ * The factory run each workspace belongs to, as the believed statuses name it: a live run's
+ * workspaces, and a held-up run's. A status names only workspaces of its own project.
+ */
+export function factoryRuns(statuses: Record<string, FactoryStatus> | undefined): (workspace: WorkspaceView) => FactoryRun | undefined {
+  const named = new Map<string, FactoryRun>();
+  for (const status of Object.values(statuses ?? {})) {
+    const runs: { run: string; workspaces: string[]; held?: HeldUp["kind"] }[] = [
+      ...status.runs.map((r) => ({ run: r.run, workspaces: r.workspaces })),
+      ...status.held_up.map((h) => ({ run: h.run, workspaces: h.workspaces ?? [], held: h.kind })),
+    ];
+    for (const { run, workspaces, held } of runs) {
+      const parts = parseRun(run);
+      const mark: FactoryRun = { run, ...(parts && { issue: parts.issue, url: issueUrl(parts) }), ...(held && { held }) };
+      for (const workspace of workspaces) named.set(`${status.project}/${workspace}`, mark);
+    }
+  }
+  return (workspace) => named.get(`${workspace.projectId}/${workspace.id}`);
+}
+
+/** Whether the factory tends a workspace: its run is live, not held up for a person, so nothing in it needs you (G14). */
+export const tendedByFactory = (run: FactoryRun | undefined): boolean => run !== undefined && !run.held;
+
+/**
+ * Whether a terminal showing `glyph` in a workspace of factory run `run` needs you: it waits, is
+ * stuck or failed, and no live run tends it. Every view that counts, sorts or raises what needs you
+ * asks here, so they all agree with the board.
+ */
+export const needsYouIn = (glyph: Glyph, run: FactoryRun | undefined): boolean => needsYou.includes(glyph) && !tendedByFactory(run);
+
+/**
+ * The fleet with each workspace a believed status names marked with its factory run, so every
+ * view that lists its terminals (`rows`) reads them the same way, and each whose project's
+ * factory is on (`factories`) with no status here marked `statusUnknown`. Without statuses, the
+ * fleet as is.
+ */
+export function withFactory(machines: MachineView[], statuses: Record<string, FactoryStatus> | undefined, factories: Record<string, ProjectFactory> = {}): MachineView[] {
+  if (!statuses) return machines;
+  const runOf = factoryRuns(statuses);
+  return machines.map((machine) => ({
+    ...machine,
+    workspaces: machine.workspaces.map((workspace) => {
+      const factory = runOf(workspace);
+      if (factory) return { ...workspace, factory };
+      return workspace.projectId in statuses || !factories[workspace.projectId]?.on ? workspace : { ...workspace, statusUnknown: true as const };
+    }),
+  }));
+}
+
+/** What a workspace shows as its branch: its branch, or the first 7 characters of its commit when it is on one. */
+export function branchOf(workspace: { branch: string; base?: string }): string {
+  return workspace.branch || (workspace.base ?? "").slice(0, 7);
+}
+
 /** Where terminal `id` sits in the fleet, with the name and state the sidebar gives it. */
 export interface Located {
   machine: MachineView;
@@ -327,10 +411,33 @@ export function rows(workspace: WorkspaceView): Row[] {
   return [
     ...workspace.sessions.map((s) => {
       const glyph = sessionGlyph[s.state];
-      return { terminal: s.terminal, session: s.id, name: s.name, title: s.title, now: busy.includes(glyph) ? s.now : undefined, said: rests.includes(glyph) ? s.said : undefined, label: sessionLabel[s.state], glyph };
+      return { terminal: s.terminal, session: s.id, name: s.name, title: s.title, now: busy.includes(glyph) ? s.now : undefined, said: rests.includes(glyph) ? s.said : undefined, label: sessionLabelIn(s.state, workspace.factory), glyph };
     }),
     ...workspace.shells.map((t) => ({ terminal: t.id, name: t.name, label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
   ];
+}
+
+/**
+ * A session's label in a workspace of factory run `run`. A live run's stuck session is quiet, since
+ * the factory watches it; in a held-up run, which waits on a person, it stays stuck. Every view
+ * that names a session's state reads it here. It keeps P1's stuck glyph on purpose: that is P1's
+ * true state, and the label says why it is not urgent. A tended run's waiting session keeps its
+ * label too: the factory answers it.
+ */
+export function sessionLabelIn(state: SessionState, run: FactoryRun | undefined): string {
+  return tendedByFactory(run) && sessionGlyph[state] === "stuck" ? QUIET : sessionLabel[state];
+}
+
+/**
+ * The terminals of `workspace` that need you, most urgent first: those `needsYouIn` says do; or,
+ * in a held-up run none of whose terminals does, its most urgent one, since the run itself waits
+ * on you (G14) and its card opens there. The board's needs-you lane, the tab's count and the
+ * next-up strip all go by it.
+ */
+export function needingRows(workspace: WorkspaceView): Row[] {
+  const sorted = byUrgency(rows(workspace));
+  const need = sorted.filter((r) => needsYouIn(r.glyph, workspace.factory));
+  return need.length > 0 || !workspace.factory?.held ? need : sorted.slice(0, 1);
 }
 
 /** `rows` with what needs a person first, then what is busy, then the rest; ties keep their order. */

@@ -670,6 +670,7 @@ mod tests {
             run: run(7),
             kind: HeldUpKind::Stuck,
             reason: "gate still red".into(),
+            workspaces: vec![],
         }];
         let foreign = vec![ForeignClaim {
             issue: 8,

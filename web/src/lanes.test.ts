@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { Changes } from "./api";
+import type { Changes, HeldUp } from "./api";
 import { glance, lanes, topFiles } from "./lanes";
-import { fleet } from "./fleet";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryRuns, fleet, QUIET, withFactory } from "./fleet";
+import { factoryStatus, ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const machines = fleet(
   [
@@ -81,5 +81,82 @@ describe("topFiles", () => {
       files: [file("a.ts", 1, 0), file("src/big.ts", 40, 2), file("bin.png", null, null), file("docs/mid.md", 5, 5)],
     };
     expect(topFiles(changes, 2)).toEqual({ names: ["src/big.ts", "docs/mid.md"], more: 2 });
+  });
+});
+
+/** A believed status of project `project` with live runs and held-up runs, each naming its workspaces. */
+describe("lanes of factory runs", () => {
+  const records = [
+    sample(ME, 1),
+    workspace(ME, "w1", "fac/162-1"),
+    terminal(ME, "t1", "w1"),
+    session(ME, "s1", "w1", "t1", "stuck"),
+    workspace(ME, "w2", "fac/170-1"),
+    terminal(ME, "t2", "w2"),
+    session(ME, "s2", "w2", "t2", "finished"),
+    workspace(ME, "w3", "by hand"),
+    terminal(ME, "t3", "w3"),
+    session(ME, "s3", "w3", "t3", "stuck"),
+  ];
+  const board = fleet(records, settings({ machines: [] }));
+  const named = (b: ReturnType<typeof lanes>) => b.map((l) => [l.lane, l.cards.map((c) => c.workspace.name)]);
+
+  it("marks a workspace a believed status names with its run and its issue", () => {
+    const statuses = factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1"] });
+    const of = factoryRuns(statuses);
+    const [w1, , w3] = board[0].workspaces;
+    expect(of(w1)).toEqual({ run: "original-solutions__foundry__162__1", issue: 162, url: "https://github.com/original-solutions/foundry/issues/162" });
+    expect(of(w3)).toBeUndefined();
+    const card = lanes(withFactory(board, statuses))
+      .flatMap((l) => l.cards)
+      .find((c) => c.workspace.id === "w1");
+    expect(card?.workspace.factory?.issue).toBe(162);
+  });
+
+  it("marks nothing for a status of another project that names the same workspace id", () => {
+    const of = factoryRuns(factoryStatus("p2", { "o__r__1__1": ["w1"] }));
+    expect(of(board[0].workspaces[0])).toBeUndefined();
+  });
+
+  it("keeps a factory session P1 marks stuck under working, shown as Quiet 10+ min, while a session by hand that is stuck needs you", () => {
+    const result = lanes(withFactory(board, factoryStatus("p1", { "o__r__162__1": ["w1"] })));
+    expect(named(result)).toEqual([
+      ["needs", ["by hand"]],
+      ["working", ["fac/162-1"]],
+      ["quiet", ["fac/170-1"]],
+    ]);
+    const quiet = result[1].cards[0];
+    expect(quiet.rows.map((r) => r.label)).toEqual([QUIET]);
+    expect(QUIET).toBe("Quiet 10+ min");
+    expect(result[0].cards[0].rows.map((r) => r.label)).toEqual(["Stuck"]);
+  });
+
+  it("moves a run's card to needs you when its run is stuck or needs info, and only then", () => {
+    const statuses = factoryStatus("p1", { "o__r__162__1": ["w1"] }, { "o__r__170__1": { kind: "stuck", workspaces: ["w2"] } });
+    expect(named(lanes(withFactory(board, statuses)))).toEqual([
+      ["needs", ["by hand", "fac/170-1"]],
+      ["working", ["fac/162-1"]],
+    ]);
+    const info = factoryStatus("p1", {}, { "o__r__170__1": { kind: "needs_info", workspaces: ["w2"] } });
+    // With no live run, w1's stuck session is P1's to show, so it needs you as any other would.
+    expect(named(lanes(withFactory(board, info)))).toEqual([["needs", ["fac/162-1", "by hand", "fac/170-1"]]]);
+  });
+
+  it("leaves a held-up run's stuck session saying Stuck, on its card under needs you", () => {
+    const result = lanes(withFactory(board, factoryStatus("p1", {}, { "o__r__162__1": { kind: "stuck", workspaces: ["w1"] } })));
+    const card = result[0].cards.find((c) => c.workspace.id === "w1");
+    expect(result[0].lane).toBe("needs");
+    expect(card?.rows.map((r) => r.label)).toEqual(["Stuck"]);
+  });
+
+  it("keeps a live run's session that waits for an answer out of needs you", () => {
+    const asks = fleet([sample(ME, 1), workspace(ME, "w1", "fac/162-1"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "waiting_for_you")], settings({ machines: [] }));
+    expect(named(lanes(withFactory(asks, factoryStatus("p1", { "o__r__162__1": ["w1"] }))))).toEqual([["working", ["fac/162-1"]]]);
+  });
+
+  it("reads statuses from an older peer whose held-up runs name no workspaces", () => {
+    const statuses = factoryStatus("p1", {});
+    statuses.p1.held_up = [{ run: "o__r__170__1", kind: "stuck", reason: "why" } as HeldUp];
+    expect(named(lanes(withFactory(board, statuses)))[0]).toEqual(["needs", ["fac/162-1", "by hand"]]);
   });
 });

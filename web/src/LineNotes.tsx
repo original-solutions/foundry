@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { SessionView } from "./fleet";
+import type { FactoryRun, SessionView } from "./fleet";
 import { button, fieldLook, inlineField, primaryButton } from "./Modal";
 import { review, takers, type Note } from "./notes";
 import { busy, plural } from "./labels";
@@ -75,8 +75,8 @@ const SENT_FOR = 8000;
  * which types them into that session as one message and presses Enter. Only an idle session can
  * take them, so a turn in progress or a question on screen is never answered by accident.
  */
-export function SendBar({ notes, sessions, onSent }: { notes: Note[]; sessions: SessionView[]; onSent: () => void }) {
-  const list = takers(sessions);
+export function SendBar({ notes, sessions, factory, onSent }: { notes: Note[]; sessions: SessionView[]; factory?: FactoryRun; onSent: () => void }) {
+  const list = takers(sessions, factory);
   const [picked, setPicked] = useState<string>();
   const [sending, setSending] = useState(false);
   const [trouble, setTrouble] = useState(false);
