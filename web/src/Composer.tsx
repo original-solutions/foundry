@@ -36,8 +36,8 @@ export interface CreateInput {
  */
 export function useCreateWorkspace() {
   const [step, setStep] = useState<"branch" | "session">("branch");
-  /** The name the create of `input` is on now. */
-  const [trying, setTrying] = useState<{ input: CreateInput; name: string } | null>(null);
+  /** The name the create in hand is on now: set before its observers hear it started. */
+  const [trying, setTrying] = useState("");
   const client = useQueryClient();
   const create = useMutation({
     mutationFn: async (input: CreateInput): Promise<{ session: string | null; warning: string | null }> => {
@@ -46,7 +46,7 @@ export function useCreateWorkspace() {
       const names = [input.name, ...(input.then ?? [])];
       let workspace: Awaited<ReturnType<typeof createWorkspace>> | undefined;
       for (const [i, name] of names.entries()) {
-        setTrying({ input, name });
+        setTrying(name);
         try {
           workspace = await createWorkspace({ project: input.project, base: input.base, name, machine: input.machine, ...session });
           break;
@@ -73,7 +73,7 @@ export function useCreateWorkspace() {
     },
   });
   const made = create.isSuccess || create.error instanceof SessionNotStarted;
-  const name = create.variables && (trying?.input === create.variables ? trying.name : create.variables.name);
+  const name = create.variables && (trying || create.variables.name);
   return { create, step, made, name };
 }
 
