@@ -974,6 +974,8 @@ mod tests {
         for answer in [
             r#"{"status":"error","error":{"code":"PRECONDITION_FAILED"}}"#,
             r#"{"state":"failed","error":"grant not removed"}"#,
+            r#"{"status":"error","message":"grant not found"}"#,
+            r#"{"state":"cancelled"}"#,
         ] {
             let fake = FakeVims::new();
             fake.on("workspace turn-grant put", Reply::ok(answer))
@@ -993,6 +995,28 @@ mod tests {
                 "{answer}"
             );
         }
+    }
+
+    #[test]
+    fn a_grant_with_its_own_id_and_a_state_no_operation_has_is_made() {
+        let fake = FakeVims::new();
+        fake.on(
+            "workspace turn-grant put",
+            Reply::ok(r#"{"id":"tg_1","status":"active","turn":"fetch"}"#),
+        )
+        .on(
+            "workspace turn-grant rm",
+            Reply::ok(r#"{"id":"tg_1","status":"revoked"}"#),
+        );
+        assert_eq!(
+            fake.grant("wsp_1", "fetch", "conn_gh", "30m", "k1")
+                .unwrap(),
+            Change::Done
+        );
+        assert_eq!(
+            fake.ungrant("wsp_1", "fetch", "conn_gh", "k2").unwrap(),
+            Change::Done
+        );
     }
 
     #[test]

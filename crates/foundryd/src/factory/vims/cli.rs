@@ -477,11 +477,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let program = fake_vims(
             dir.path(),
-            "echo 'Error: HOST_COMMAND_TIMEOUT: the command ran past 1800 s' >&2\nexit 1",
+            "echo 'Error: PRECONDITION_FAILED: workspace is paused' >&2\nexit 1",
         );
         let vims = vims_at(&program, Arc::new(SystemClock));
         let error = vims.call(&exec_call()).unwrap_err();
-        assert_eq!(error.code(), Some("HOST_COMMAND_TIMEOUT"));
+        let refusal = error.refusal().expect("a refusal");
+        assert_eq!(refusal.code, "PRECONDITION_FAILED");
+        assert_eq!(refusal.message, "workspace is paused");
     }
 
     #[test]
