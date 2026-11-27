@@ -104,14 +104,28 @@ async fn install(
             "the body must be {\"tag\": \"<the ready tag>\"}".to_owned(),
         ));
     };
-    let installed = tokio::task::spawn_blocking({
+    // In a task of its own: a caller that goes away mid-install drops this handler, and the
+    // stop must still be armed once `current` has moved.
+    let installing = tokio::spawn({
         let held = held.clone();
-        move || update::install_ready(&held.home, &tag, &held.running, &held.exe)
-    })
-    .await;
+        async move {
+            let installed = tokio::task::spawn_blocking({
+                let held = held.clone();
+                move || update::install_ready(&held.home, &tag, &held.running, &held.exe)
+            })
+            .await;
+            if matches!(installed, Ok(Ok(()))) {
+                held.stop.fire_within(held.within);
+            }
+            installed
+        }
+    });
+    let installed = match installing.await {
+        Ok(installed) => installed,
+        Err(stopped) => Err(stopped),
+    };
     match installed {
         Ok(Ok(())) => {
-            held.stop.fire_within(held.within);
             if headers.contains_key(CARRIED) {
                 // The link that carried the call stops this daemon once it has sent the answer.
                 Ok((StatusCode::ACCEPTED, [(STOP_AFTER, "1")]).into_response())

@@ -22,9 +22,10 @@
 //! A route whose answer must leave before this daemon stops, a machine's install, asks for the
 //! stop with [`STOP_AFTER`] on its answer to a carried call. B then fires the [`Stop`] its
 //! peers were given ([`Peers::stop_after_calls`]) once that answer is on the link and A has
-//! closed it, or the link is gone ([`answer`]). The route fires the same stop by itself
-//! [`STOP_WITHIN`] after it asked, so an answer the link cannot take still stops B, and a
-//! [`Stop`] acts only once.
+//! closed it, or the link is gone ([`answer`]). That answer names no version of B's records,
+//! since B stops before it could send them, so A waits for none. The route fires the same stop
+//! by itself [`STOP_WITHIN`] after it asked, so an answer the link cannot take still stops B,
+//! and a [`Stop`] acts only once.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -141,7 +142,7 @@ fn stop_of(me: MachineId) -> Option<Stop> {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Frame {
     /// The owner's API's answer: its status, its body's bytes as hex, and the newest version of
-    /// the owner's own records once it answered.
+    /// the owner's own records once it answered, or 0 when the owner stops after this answer.
     Answer {
         status: u16,
         body: String,
@@ -301,30 +302,36 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, call: Call, conn: C
     let api = *lock(&inner.calls);
     let (status, body, stop) = if machine == inner.me || !listed(inner, machine).await {
         tracing::warn!("sync: refused a call from {machine}: not a peer of this machine");
-        going_on(refusal(
+        refusal(
             403,
             format!("machine {machine} is not a peer of this machine"),
-        ))
+        )
     } else if !crate::api::carries(&call.path) {
-        going_on(refusal(
+        refusal(
             400,
             "a carried call names a route that is not carried".to_owned(),
-        ))
+        )
     } else if let Some(api) = api {
         let _beat = beat(send.clone());
         match unhex(&call.body) {
             Some(body) => run(api, call.path, call.content_type, body).await,
-            None => going_on(refusal(400, "the carried body cannot be read".to_owned())),
+            None => refusal(400, "the carried body cannot be read".to_owned()),
         }
     } else {
-        going_on(refusal(503, "this machine serves no calls".to_owned()))
+        refusal(503, "this machine serves no calls".to_owned())
     };
     let me = inner.me;
-    let version = on_store(&inner.store, move |store| store.versions())
-        .await
-        .ok()
-        .and_then(|versions| versions.get(&me).copied())
-        .unwrap_or(0);
+    // This machine stops once the caller has the answer, before it could send the records it
+    // wrote since: the caller is told to wait for none.
+    let version = if stop {
+        0
+    } else {
+        on_store(&inner.store, move |store| store.versions())
+            .await
+            .ok()
+            .and_then(|versions| versions.get(&me).copied())
+            .unwrap_or(0)
+    };
     let frame = Frame::Answer {
         status,
         body: hex(&body),
@@ -355,11 +362,6 @@ async fn answer(
     if let Some(stop) = stop {
         stop.fire();
     }
-}
-
-/// `(status, body)` as the answer of a route that asked for no stop.
-fn going_on((status, body): (u16, Bytes)) -> (u16, Bytes, bool) {
-    (status, body, false)
 }
 
 /// `builder` as the client a carried call is made to this machine's API with: no proxy,
@@ -401,28 +403,28 @@ async fn run(
     .await;
     match made {
         Ok(Ok(answered)) => answered,
-        Ok(Err(ureq::Error::Timeout(_))) => going_on(refusal(
+        Ok(Err(ureq::Error::Timeout(_))) => refusal(
             504,
             format!("this machine's API did not answer within {CALL_LIMIT:?}"),
-        )),
+        ),
         Ok(Err(error)) => {
             tracing::warn!("sync: a carried call could not reach this machine's API: {error}");
-            going_on(refusal(
+            refusal(
                 502,
                 format!("this machine's API could not be reached: {error}"),
-            ))
+            )
         }
-        Err(_) => going_on(refusal(
+        Err(_) => refusal(
             500,
             "the carried call stopped before it answered".to_owned(),
-        )),
+        ),
     }
 }
 
-/// An answer this end gives itself: `status` with `{"error": message}`.
-fn refusal(status: u16, message: String) -> (u16, Bytes) {
+/// An answer this end gives itself: `status` with `{"error": message}`, asking for no stop.
+fn refusal(status: u16, message: String) -> (u16, Bytes, bool) {
     let body = serde_json::json!({ "error": message }).to_string();
-    (status, Bytes::from(body))
+    (status, Bytes::from(body), false)
 }
 
 #[cfg(test)]
