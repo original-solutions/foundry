@@ -110,18 +110,6 @@ async fn hurry(h: &Harness, by: Duration) {
     }
 }
 
-/// Waits until every daemon hears every other.
-async fn online(h: &Harness) {
-    let ids: Vec<MachineId> = h.fleet.daemons.iter().map(|d| d.id).collect();
-    until(WAIT, "every daemon hears every other", || {
-        h.fleet.daemons.iter().all(|d| {
-            ids.iter()
-                .all(|id| *id == d.id || d.peers.online().contains(id))
-        })
-    })
-    .await;
-}
-
 /// The index of `machine` in the fleet.
 fn index(h: &Harness, machine: MachineId) -> usize {
     h.fleet
@@ -619,11 +607,7 @@ fn a_worker_cut_off_from_the_lease_holder_ends_its_session_and_the_run_resumes_e
         module_path!(),
         "a_worker_cut_off_from_the_lease_holder_ends_its_session_and_the_run_resumes_elsewhere",
         || async {
-            let mut h = Harness::start(Options::default()).await;
-            // The builders run the cut-off, as `foundryd` does: started again, they do.
-            restart(&mut h, 1).await;
-            restart(&mut h, 2).await;
-            online(&h).await;
+            let h = Harness::start(Options::default()).await;
             h.github.pull(PR, "fac/12-1", 12);
             // The build pushes its branch and then works on for ever.
             h.script(
@@ -777,7 +761,9 @@ fn a_gate_whose_machine_goes_offline_is_run_again_on_another() {
                 ),
             );
             h.ready(12, "Make the widgets faster");
-            // The builder shows a session, so the gate goes to the other machine.
+            // The builder shows a session, so the gate goes to the other machine. A gate on a
+            // cut-off build machine is never marked "could not run" (#294): until that is fixed,
+            // this test cuts off a machine that runs the gate alone.
             let build = h.made("fac/12-1").await;
             h.fleet.daemons[index(&h, build.owner)].write(sample(1));
 

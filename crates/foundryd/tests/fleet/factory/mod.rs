@@ -1038,12 +1038,13 @@ impl Machine {
             runtime: tokio::runtime::Handle::current(),
             sent,
         });
+        let clock = clock as Arc<dyn Clock>;
         let factory = Factory::new(
             daemon.store.clone(),
             me,
             host,
             freshness.clone(),
-            clock as Arc<dyn Clock>,
+            clock.clone(),
         );
         let (placing, served) = (api.clone(), api.clone());
         let servers = vec![
@@ -1060,6 +1061,13 @@ impl Machine {
                 axum::serve(listener, api::router(served)).await.unwrap();
             }),
             tokio::spawn(factory.serve()),
+            tokio::spawn(foundryd::factory::cutoff::run(
+                daemon.store.clone(),
+                me,
+                api.sessions.clone(),
+                freshness,
+                clock,
+            )),
         ];
         Machine {
             data,
