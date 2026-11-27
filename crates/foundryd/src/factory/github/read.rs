@@ -1364,6 +1364,83 @@ pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]
     }
 }
 
+/// The approval a claim was made on, judged after the claim removed `ready`: [`judge_approval`]'s
+/// checks, made as of the claim rather than now. Only the label's newest event is judged. A
+/// removal by `project_login` (in any letter case) is the claim's, and the label it took off is
+/// the event before it; a label still on is the approval, as when the claim's removal is not on
+/// the timeline. Any other newest event (a removal by anyone else, a removal after a removal, or
+/// none) approves nothing, refused as [`judge_approval`] refuses a label it does not find. The
+/// text is judged from the label's second on, and a timeline page that may hide a rename in that
+/// second leaves it unjudged.
+pub fn judge_claimed_approval(
+    issue: &ApprovalIssue,
+    ready: &str,
+    project_login: &str,
+    instructors: &[String],
+) -> Approval {
+    // The label's events, newest first: `true` for applied, `false` for removed.
+    let mut events = issue
+        .timeline_items
+        .nodes
+        .iter()
+        .rev()
+        .filter_map(|node| match node {
+            TimelineNode::LabeledEvent(change) if change.label.name == ready => {
+                Some((true, change))
+            }
+            TimelineNode::UnlabeledEvent(change) if change.label.name == ready => {
+                Some((false, change))
+            }
+            _ => None,
+        });
+    let label = match events.next() {
+        Some((true, label)) => Some(label),
+        Some((false, removal))
+            if removal
+                .actor
+                .as_ref()
+                .is_some_and(|actor| actor.login.eq_ignore_ascii_case(project_login)) =>
+        {
+            match events.next() {
+                Some((true, label)) => Some(label),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    // From here this repeats `judge_approval`'s tail, which #308 leaves unchanged and #333
+    // shares, but for the text check's `reaches`: `timeline_reaches` here, where `judge_approval`
+    // assumes `true`. A test holds the two to the same answers everywhere else.
+    let Some(label) = label else {
+        let timeline = &issue.timeline_items;
+        let cut_off =
+            timeline.nodes.len() >= HISTORY_PAGE && timeline.total_count > HISTORY_PAGE as u64;
+        return Approval::Refused(if cut_off {
+            Refusal::LabelHistoryIncomplete
+        } else {
+            Refusal::LabelNotFound
+        });
+    };
+    let labeled_at = label.created_at.clone();
+    let actor = label.actor.as_ref();
+    let Some(applied_by) = actor.filter(|actor| is_human_instructor(Some(actor), instructors))
+    else {
+        return Approval::Refused(Refusal::LabeledByNonInstructor {
+            by: actor.map(|actor| actor.login.clone()),
+            labeled_at,
+        });
+    };
+    let reaches = timeline_reaches(issue, &labeled_at);
+    match text_changes_since(issue, &labeled_at, instructors, reaches) {
+        TextCheck::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
+        TextCheck::Unjudged => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
+        TextCheck::Unchanged => Approval::Approved {
+            labeled_at,
+            labeled_by: applied_by.login.clone(),
+        },
+    }
+}
+
 /// Whether anyone, an instructor included, edited the body or renamed the title at or after
 /// `since`. A timeline page that may hide a rename at or after the moment counts as a change.
 pub fn edited_since(issue: &ApprovalIssue, since: &str) -> bool {
@@ -1823,6 +1900,24 @@ pub fn approval<G: Tracker + ?Sized>(
 ) -> Result<Approval, TrackerError> {
     let found = read_history(gh, repo, issue)?;
     Ok(judge_approval(&found, State::Ready.label(), instructors))
+}
+
+/// The approval a takeover's claim was made on: [`judge_claimed_approval`] over one read of
+/// the issue's history, its timestamps checked.
+pub fn claimed_approval<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    issue: u64,
+    project_login: &str,
+    instructors: &[String],
+) -> Result<Approval, TrackerError> {
+    let found = read_history(gh, repo, issue)?;
+    Ok(judge_claimed_approval(
+        &found,
+        State::Ready.label(),
+        project_login,
+        instructors,
+    ))
 }
 
 /// Whether the issue text is as an instructor left it at `since`.
@@ -4489,6 +4584,389 @@ mod tests {
             &issue_of(reaches_back, &[], None, None),
             LABELED
         ));
+    }
+
+    // ---- judge_claimed_approval: the approval a takeover's claim was made on ----
+
+    /// The project's login in these tests: the claim's removal of the label is by it.
+    const PROJECT: &str = "softfac-bot";
+
+    fn unlabeled_by(at: &str, actor: Option<Actor>) -> TimelineNode {
+        TimelineNode::UnlabeledEvent(LabelChange {
+            created_at: at.into(),
+            actor,
+            label: LabelName { name: READY.into() },
+        })
+    }
+
+    fn labeled_by(at: &str, actor: Option<Actor>) -> TimelineNode {
+        TimelineNode::LabeledEvent(LabelChange {
+            created_at: at.into(),
+            actor,
+            label: LabelName { name: READY.into() },
+        })
+    }
+
+    /// The claim's swap of `factory:ready` for `factory:triage` at `at`, by `login`.
+    fn swap_by(at: &str, login: &str) -> [TimelineNode; 2] {
+        [unlabeled(at, login), labeled(at, login, "factory:triage")]
+    }
+
+    fn claimed(issue: &ApprovalIssue) -> Approval {
+        judge_claimed_approval(issue, READY, PROJECT, &names(&["tom"]))
+    }
+
+    #[test]
+    fn judge_claimed_approval_approves_the_newest_label_in_force() {
+        let issue = issue_of(vec![labeled(LABELED, "Tom", READY)], &[], None, None);
+        assert_eq!(claimed(&issue), approved(LABELED, "Tom"));
+        // Taken off by an instructor and applied again: the newest is in force.
+        let again = issue_of(
+            vec![
+                labeled(BEFORE, "tom", READY),
+                unlabeled(LABELED, "tom"),
+                labeled(AFTER, "tom", READY),
+            ],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(claimed(&again), approved(AFTER, "tom"));
+    }
+
+    #[test]
+    fn judge_claimed_approval_approves_the_label_the_projects_removal_took_off_in_any_case() {
+        for login in [PROJECT, "Softfac-Bot", "SOFTFAC-BOT"] {
+            let mut events = vec![labeled(LABELED, "tom", READY)];
+            events.extend(swap_by(AFTER, login));
+            let issue = issue_of(events, &[], None, None);
+            assert_eq!(claimed(&issue), approved(LABELED, "tom"), "{login}");
+        }
+        // Other labels around the claim change nothing.
+        let mut events = vec![
+            labeled(LABELED, "tom", READY),
+            labeled(LABELED, "eve", "bug"),
+        ];
+        events.extend(swap_by(AFTER, PROJECT));
+        events.push(labeled(LATER, PROJECT, "factory:building"));
+        assert_eq!(
+            claimed(&issue_of(events, &[], None, None)),
+            approved(LABELED, "tom")
+        );
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_the_projects_removal_with_no_label_before_it() {
+        let not_found = refused(Refusal::LabelNotFound);
+        let alone = issue_of(swap_by(AFTER, PROJECT).into(), &[], None, None);
+        assert_eq!(claimed(&alone), not_found);
+        // A removal before it, not a label, is no approval either.
+        let removals = issue_of(
+            vec![unlabeled(LABELED, "tom"), unlabeled(AFTER, PROJECT)],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(claimed(&removals), not_found);
+        // The event just before the claim's removal is an instructor's withdrawal: the label
+        // further back is no approval.
+        let withdrawn = issue_of(
+            vec![
+                labeled(BEFORE, "tom", READY),
+                unlabeled(LABELED, "tom"),
+                unlabeled(AFTER, PROJECT),
+            ],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(claimed(&withdrawn), not_found);
+        // A label applied and taken off again after the claim hides it.
+        let mut events = vec![labeled(BEFORE, "tom", READY)];
+        events.extend(swap_by(LABELED, PROJECT));
+        events.push(labeled(AFTER, "tom", READY));
+        events.push(unlabeled(LATER, "tom"));
+        assert_eq!(claimed(&issue_of(events, &[], None, None)), not_found);
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_a_removal_by_anyone_else() {
+        let not_found = refused(Refusal::LabelNotFound);
+        for actor in [Some(user("tom")), Some(user("eve")), None] {
+            let issue = issue_of(
+                vec![
+                    labeled(LABELED, "tom", READY),
+                    unlabeled_by(AFTER, actor.clone()),
+                ],
+                &[],
+                None,
+                None,
+            );
+            assert_eq!(claimed(&issue), not_found, "{actor:?}");
+        }
+        // A login that only contains the project's is someone else.
+        let issue = issue_of(
+            vec![
+                labeled(LABELED, "tom", READY),
+                unlabeled(AFTER, "softfac-bot-2"),
+            ],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(claimed(&issue), not_found);
+    }
+
+    #[test]
+    fn judge_claimed_approval_with_no_label_event_is_refused_as_judge_approval_refuses_it() {
+        assert_eq!(
+            claimed(&issue_of(vec![], &[], None, None)),
+            refused(Refusal::LabelNotFound)
+        );
+        let page: Vec<TimelineNode> = (0..HISTORY_PAGE).map(|_| renamed(BEFORE, "tom")).collect();
+        assert_eq!(
+            claimed(&issue_of(page, &[], Some(HISTORY_PAGE as u64 + 1), None)),
+            refused(Refusal::LabelHistoryIncomplete)
+        );
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_a_label_with_no_actor() {
+        let in_force = issue_of(vec![labeled_by(LABELED, None)], &[], None, None);
+        assert_eq!(
+            claimed(&in_force),
+            refused(by_non_instructor(None, LABELED))
+        );
+        let mut events = vec![labeled_by(LABELED, None)];
+        events.extend(swap_by(AFTER, PROJECT));
+        assert_eq!(
+            claimed(&issue_of(events, &[], None, None)),
+            refused(by_non_instructor(None, LABELED))
+        );
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_a_label_by_a_non_instructor_or_a_bot() {
+        let app = Actor {
+            typename: Some("Bot".into()),
+            login: "tom".into(),
+        };
+        for (actor, by) in [(user("eve"), "eve"), (app, "tom")] {
+            let in_force = issue_of(
+                vec![labeled_by(LABELED, Some(actor.clone()))],
+                &[],
+                None,
+                None,
+            );
+            assert_eq!(
+                claimed(&in_force),
+                refused(by_non_instructor(Some(by), LABELED)),
+                "{actor:?}"
+            );
+            let mut events = vec![labeled_by(LABELED, Some(actor.clone()))];
+            events.extend(swap_by(AFTER, PROJECT));
+            assert_eq!(
+                claimed(&issue_of(events, &[], None, None)),
+                refused(by_non_instructor(Some(by), LABELED)),
+                "{actor:?}"
+            );
+        }
+        // The project's login is no instructor: its own label approves nothing.
+        let own = issue_of(vec![labeled(LABELED, PROJECT, READY)], &[], None, None);
+        assert_eq!(
+            claimed(&own),
+            refused(by_non_instructor(Some(PROJECT), LABELED))
+        );
+        // A stranger's label in force at the claim, though an instructor's came before it.
+        let mut events = vec![
+            labeled(BEFORE, "tom", READY),
+            unlabeled(BEFORE, "tom"),
+            labeled(LABELED, "eve", READY),
+        ];
+        events.extend(swap_by(AFTER, PROJECT));
+        assert_eq!(
+            claimed(&issue_of(events, &[], None, None)),
+            refused(by_non_instructor(Some("eve"), LABELED))
+        );
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_a_strangers_edit_or_rename_at_or_after_the_label() {
+        let edited = refused(edited_after(LABELED));
+        for at in [LABELED, AFTER] {
+            let mut events = vec![labeled(LABELED, "tom", READY)];
+            events.extend(swap_by(LATER, PROJECT));
+            let edit = issue_of(events.clone(), &[(at, "eve")], None, None);
+            assert_eq!(claimed(&edit), edited, "edit at {at}");
+            let mut renamed_after = events.clone();
+            renamed_after.insert(1, renamed(at, "eve"));
+            let rename = issue_of(renamed_after, &[], None, None);
+            assert_eq!(claimed(&rename), edited, "rename at {at}");
+        }
+        // Before the label, or by an instructor, it approves.
+        let mut events = vec![renamed(BEFORE, "eve"), labeled(LABELED, "tom", READY)];
+        events.push(renamed(AFTER, "tom"));
+        events.extend(swap_by(LATER, PROJECT));
+        let issue = issue_of(events, &[(AFTER, "tom"), (BEFORE, "eve")], None, None);
+        assert_eq!(claimed(&issue), approved(LABELED, "tom"));
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_an_edit_history_it_cannot_judge() {
+        let cut = refused(history_cut(LABELED));
+        let edits: Vec<(&str, &str)> = (0..HISTORY_PAGE).map(|_| (AFTER, "tom")).collect();
+        let mut events = vec![labeled(LABELED, "tom", READY)];
+        events.extend(swap_by(LATER, PROJECT));
+        assert_eq!(claimed(&issue_of(events.clone(), &edits, None, None)), cut);
+        // A total larger than the page shows.
+        assert_eq!(
+            claimed(&issue_of(
+                events.clone(),
+                &[(AFTER, "tom")],
+                None,
+                Some(150)
+            )),
+            cut
+        );
+        // A timeline cut off with the label its oldest event shown: a rename in the same
+        // second could be hidden.
+        let mut page = vec![labeled(LABELED, "tom", READY)];
+        page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        assert_eq!(
+            claimed(&issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None)),
+            cut
+        );
+    }
+
+    /// Until both judges share one tail (#333), they must agree wherever the label in force
+    /// decides: the same label, actor, edit and rename rules, and the same refusals. The one
+    /// known difference is left out: on a cut-off page whose oldest event is the label,
+    /// `judge_approval` assumes the page holds every rename and `judge_claimed_approval` does not.
+    #[test]
+    fn judge_claimed_approval_agrees_with_judge_approval_on_a_label_in_force() {
+        /// A timeline, the body edits, and the edit history's total when it is not their count.
+        type Shape<'a> = (Vec<TimelineNode>, &'a [(&'a str, &'a str)], Option<u64>);
+        let app = Actor {
+            typename: Some("Bot".into()),
+            login: "tom".into(),
+        };
+        let actors = [
+            Some(user("tom")),
+            Some(user("eve")),
+            Some(user(PROJECT)),
+            Some(app),
+            None,
+        ];
+        let full: Vec<(&str, &str)> = (0..HISTORY_PAGE).map(|_| (AFTER, "tom")).collect();
+        let mut cases = Vec::new();
+        for actor in &actors {
+            let label = || labeled_by(LABELED, actor.clone());
+            let shapes: Vec<Shape> = vec![
+                (vec![label()], &[], None),
+                (
+                    vec![renamed(BEFORE, "eve"), label()],
+                    &[(BEFORE, "eve")],
+                    None,
+                ),
+                (vec![label()], &[(LABELED, "eve")], None),
+                (vec![label()], &[(AFTER, "eve")], None),
+                (vec![label()], &[(AFTER, "tom")], None),
+                (vec![label(), renamed(AFTER, "eve")], &[], None),
+                (vec![label(), renamed(LABELED, "tom")], &[], None),
+                (vec![label()], &full, None),
+                (vec![label()], &[(AFTER, "tom")], Some(150)),
+                (
+                    vec![
+                        labeled(BEFORE, "tom", READY),
+                        unlabeled(BEFORE, "tom"),
+                        label(),
+                    ],
+                    &[],
+                    None,
+                ),
+            ];
+            for (events, edits, edits_total) in shapes {
+                cases.push(issue_of(events, edits, None, edits_total));
+            }
+        }
+        // No label at all, on a whole page and on a cut-off one.
+        cases.push(issue_of(vec![renamed(AFTER, "tom")], &[], None, None));
+        let page: Vec<TimelineNode> = (0..HISTORY_PAGE)
+            .map(|_| labeled(LATER, "eve", "bug"))
+            .collect();
+        cases.push(issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None));
+
+        let instructors = names(&["tom"]);
+        let mut seen = Vec::new();
+        for issue in &cases {
+            let fresh = judge_approval(issue, READY, &instructors);
+            assert_eq!(
+                judge_claimed_approval(issue, READY, PROJECT, &instructors),
+                fresh,
+                "{issue:?}"
+            );
+            if !seen.contains(&fresh) {
+                seen.push(fresh);
+            }
+        }
+        // The cases reach every outcome, so agreement is not agreement on one answer.
+        for outcome in [
+            approved(LABELED, "tom"),
+            refused(by_non_instructor(Some("eve"), LABELED)),
+            refused(by_non_instructor(None, LABELED)),
+            refused(edited_after(LABELED)),
+            refused(history_cut(LABELED)),
+            Approval::Refused(Refusal::LabelNotFound),
+            Approval::Refused(Refusal::LabelHistoryIncomplete),
+        ] {
+            assert!(seen.contains(&outcome), "{outcome:?} in {seen:?}");
+        }
+    }
+
+    // ---- claimed_approval ----
+
+    #[test]
+    fn claimed_approval_reads_the_history_once_and_judges_it_as_of_the_claim() {
+        let answer = events_reply(
+            &[
+                ready_on(LABELED, "tom"),
+                ready_off(AFTER, "Softfac-Bot"),
+                label_event("LabeledEvent", AFTER, "Softfac-Bot", "factory:triage"),
+            ],
+            None,
+            &creation_only("eve"),
+        );
+        let fake = FakeTracker::answering([Answer::ok(answer)]);
+        let found = fake
+            .claimed_approval(REPO, 6, PROJECT, &names(&["tom"]))
+            .unwrap();
+        assert_eq!(found, approved(LABELED, "tom"));
+        assert_eq!(fake.calls(), vec![approval_call()]);
+    }
+
+    #[test]
+    fn claimed_approval_with_a_malformed_timestamp_is_a_parse_error() {
+        for at in ["2026-10-04 10:00:00Z", "", "yesterday"] {
+            for answer in [
+                events_reply(
+                    &[ready_on(LABELED, "tom"), ready_off(at, PROJECT)],
+                    None,
+                    &creation_only("tom"),
+                ),
+                events_reply(
+                    &[ready_on(LABELED, "tom")],
+                    Some(e(at, "tom")),
+                    &[e(CREATED, "tom"), e(AFTER, "tom")],
+                ),
+            ] {
+                let fake = FakeTracker::answering([Answer::ok(answer)]);
+                let error = fake
+                    .claimed_approval(REPO, 6, PROJECT, &names(&["tom"]))
+                    .unwrap_err();
+                assert!(is_parse_error_of(Some(error), &approval_call()), "{at:?}");
+                assert_eq!(fake.calls(), vec![approval_call()]);
+            }
+        }
     }
 
     // ---- approval ----
