@@ -1304,8 +1304,9 @@ pub fn judge_claimed_approval(
         }
         _ => None,
     };
-    // From here this repeats `judge_approval`'s tail, which #308 leaves unchanged; #333 shares
-    // it, and a test holds the two to the same answers until then.
+    // From here this repeats `judge_approval`'s tail, which #308 leaves unchanged and #333
+    // shares, but for the text check's `reaches`: `timeline_reaches` here, where `judge_approval`
+    // assumes `true`. A test holds the two to the same answers everywhere else.
     let Some(label) = label else {
         let timeline = &issue.timeline_items;
         let cut_off =
@@ -4575,7 +4576,9 @@ mod tests {
     }
 
     /// Until both judges share one tail (#333), they must agree wherever the label in force
-    /// decides: the same label, actor, edit and rename rules, and the same refusals.
+    /// decides: the same label, actor, edit and rename rules, and the same refusals. The one
+    /// known difference is left out: on a cut-off page whose oldest event is the label,
+    /// `judge_approval` assumes the page holds every rename and `judge_claimed_approval` does not.
     #[test]
     fn judge_claimed_approval_agrees_with_judge_approval_on_a_label_in_force() {
         /// A timeline, the body edits, and the edit history's total when it is not their count.
