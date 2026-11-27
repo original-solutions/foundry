@@ -22,12 +22,13 @@ use foundry_proto::factory::{FactoryBody, FactoryRecord, SessionTurn};
 use foundry_proto::ids::{MachineId, SessionId};
 use foundry_proto::record::{AnyRecord, Record, Session, Workspace};
 use foundryd::api::{self, Api};
-use foundryd::factory::Factory;
 use foundryd::factory::gate::COMMAND_LIMIT;
 use foundryd::factory::messages::TIME_LIMIT;
 use foundryd::factory::runs::progress::LAUNCH_RESENDING;
 use foundryd::factory::runs::resume::CLAIM_MOVED;
+use foundryd::factory::runs::start::LAUNCH_TAKEN;
 use foundryd::factory::status::Freshness;
+use foundryd::factory::{Factory, SCAN};
 use foundryd::secrets::Secrets;
 use foundryd::sessions::{self, Gateway, Sessions};
 use foundryd::store::Applied;
@@ -527,11 +528,24 @@ fn a_turn_that_ends_before_its_session_turn_reaches_the_coordinator_is_not_typed
                     .filter(|s| s.starts_with(LAUNCH_RESENDING))
                     .count()
             };
-            let before = resends();
-            until(WAIT, "the launch is asked for again after the turn", || {
-                resends() >= before + 2
+            // The worker refuses the launch asked for again, since the count rose: the ledger
+            // records it taken, and no later pass asks again while the turn is held back.
+            until(WAIT, "the worker's refusal is recorded", || {
+                steps(&h, 12).iter().any(|s| s.starts_with(LAUNCH_TAKEN))
             })
             .await;
+            let asked = resends();
+            let from = h.clock_now();
+            until(WAIT, "the factory passes over the held run a while", || {
+                h.clock_now() >= from + 6 * SCAN
+            })
+            .await;
+            assert_eq!(
+                resends(),
+                asked,
+                "asked again after it was taken: {:?}",
+                steps(&h, 12)
+            );
             assert_eq!(
                 h.state(12),
                 std::collections::BTreeSet::from(["factory:building".to_owned()])

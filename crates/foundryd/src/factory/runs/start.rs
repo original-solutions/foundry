@@ -43,7 +43,7 @@ use super::progress::{
     APPROVAL_RECHECKED, APPROVED, LAUNCH_BASE, LAUNCH_ENDING_SESSIONS, LAUNCH_MODEL,
     LAUNCH_PULL_REQUEST, LAUNCH_RESENDING, LAUNCH_RESUMING, LAUNCH_SENDING, LAUNCH_SENDING_RESUMED,
     Seen, TIME_LIMIT, UNCONFIRMED_CODE, WORKSPACE_CREATED, WORKSPACE_REQUESTED, build_name,
-    read_progress,
+    read_progress, step_text,
 };
 use super::{
     Closing, Progress, RunContext, RunError, Stop, abandon, as_posted, end_own_merge,
@@ -78,6 +78,11 @@ pub const SETUP_FAILED: &str = "the build workspace's setup failed";
 
 /// The count of prompts a session has had before its launch is typed: none.
 pub const FIRST_PROMPT_COUNT: u64 = 0;
+
+/// The step written when the worker refuses the launch asked for again because the session's
+/// count of prompts rose: `launch-taken <count>`. The launch became a prompt, and the spec's
+/// step 3 sends a message again only when it never did, so it is not asked for again.
+pub const LAUNCH_TAKEN: &str = "launch-taken ";
 
 /// Who holds claims back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1749,13 +1754,29 @@ pub(super) fn launched(
     )?;
     match ctx.send(session, message, Some(FIRST_PROMPT_COUNT)) {
         Ok(_) => Ok(StartStep::Resent { session }),
-        // The worker decides: its count rose, so the message was typed; or the session is not
-        // idle yet, and the next pass looks again.
-        Err(RunError::Send(SendRefused::CountRose { .. } | SendRefused::NotIdle)) => {
+        // The worker decides: its count rose, so the message was typed, and the ledger says so
+        // that no later pass asks again while the session's turn record is late.
+        Err(RunError::Send(SendRefused::CountRose { now })) => {
+            ctx.record_step(
+                run,
+                &format!("{LAUNCH_TAKEN}{now}"),
+                &Cause::new(CauseStep::Start, "launch-taken"),
+            )?;
             Ok(StartStep::Started { session })
         }
+        // The session is not idle yet: the next pass looks again.
+        Err(RunError::Send(SendRefused::NotIdle)) => Ok(StartStep::Started { session }),
         Err(error) => Err(error),
     }
+}
+
+/// Whether the ledger shows the worker refused the launch asked for again because the
+/// session's count rose ([`LAUNCH_TAKEN`]): the launch was typed, and is not asked for again.
+pub(super) fn launch_taken(events: &[RunEvent]) -> bool {
+    events
+        .iter()
+        .filter_map(step_text)
+        .any(|step| step.starts_with(LAUNCH_TAKEN))
 }
 
 #[cfg(test)]
@@ -4188,13 +4209,31 @@ mod tests {
                 assert!(sends(&rig).is_empty());
             }
 
-            /// The worker decides: its count rose, so the message was typed. Nothing more.
+            /// The worker decides: its count rose, so the message was typed. Nothing more, and
+            /// the ledger says so, which `building` reads before it would ask again.
             #[test]
             fn a_refusal_because_the_count_rose_means_it_was_typed() {
                 let (mut rig, run) = started();
                 show_session(&mut rig, SessionState::Idle, None);
                 rig.worker.on_send(Err(SendRefused::CountRose { now: 1 }));
                 assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                let steps = rig.steps(&run);
+                assert_eq!(
+                    steps[steps.len() - 2..],
+                    ["launch-resending 0".to_owned(), "launch-taken 1".to_owned()]
+                );
+                assert!(launch_taken(&rig.events(&run)));
+            }
+
+            /// A refusal because the session is not idle says nothing of the launch: it was
+            /// not taken.
+            #[test]
+            fn a_refusal_because_the_session_is_not_idle_records_no_launch_taken() {
+                let (mut rig, run) = started();
+                show_session(&mut rig, SessionState::Idle, None);
+                rig.worker.on_send(Err(SendRefused::NotIdle));
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert!(!launch_taken(&rig.events(&run)));
             }
 
             #[test]

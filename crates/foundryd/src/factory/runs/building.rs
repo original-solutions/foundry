@@ -15,7 +15,8 @@
 //! launch: when that launch is `start`'s (no interruption, and no feedback round owns the run),
 //! `start`'s check of a launched session runs then ([`BuildStep::Launch`]), which asks for the
 //! launch again by count, since the label moved to `building` with the start and the pass no
-//! longer routes the run to `start`.
+//! longer routes the run to `start`. Once the worker has refused it because the count rose
+//! ([`start::LAUNCH_TAKEN`]), the launch was typed and is not asked for again.
 //!
 //! Where it differs from the runner:
 //!
@@ -289,11 +290,20 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
                 // launch the session may not have taken is asked for again here with `start`'s
                 // check (the spec's step 3), which decides by the session's count. Only
                 // `start`'s own launch: a run that has had an interruption is `resume`'s, and a
-                // session a feedback round launched is the round's, each with its own words.
-                // This pass's guards and reads stand: none of `start`'s own pass is run again.
-                None if seen.interruption.is_none() && !feedback::round_owns(&events) => Ok(
-                    BuildStep::Launch(start::launched(ctx, run, &seen, &mut at)?),
-                ),
+                // session a feedback round launched is the round's, each with its own words. A
+                // launch the worker has refused because the count rose was typed, and is not
+                // asked for again. This pass's guards and reads stand: none of `start`'s own
+                // pass is run again. Each ask comes a full pass after the send before it and the
+                // worker decides, as the spec's step 3 says; P1 documents that a line typed and
+                // not yet counted can still be typed twice (`SendRefused::Failed`).
+                None if seen.interruption.is_none()
+                    && !feedback::round_owns(&events)
+                    && !start::launch_taken(&events) =>
+                {
+                    Ok(BuildStep::Launch(start::launched(
+                        ctx, run, &seen, &mut at,
+                    )?))
+                }
                 None => Ok(BuildStep::Running),
             }
         }
@@ -1046,6 +1056,7 @@ mod tests {
     use foundry_proto::state::SessionState;
 
     use super::super::progress::LAUNCH_RESENDING;
+    use super::super::start::LAUNCH_TAKEN;
     use super::super::testing::*;
     use super::*;
     use crate::factory::github::{Hiding, Tracker, TrackerError};
@@ -5152,16 +5163,28 @@ mod tests {
         }
 
         /// The worker decides: a launch whose count rose was typed, and nothing more is sent.
+        /// The spec's step 3 sends a message again only when it never became a prompt, so the
+        /// refusal is recorded and no later pass asks again, though the turn's record is still
+        /// late and the session still shows idle with no turn ended.
         #[test]
         fn a_launch_the_worker_refuses_with_its_count_risen_is_typed_once() {
             let (mut rig, run) = built();
             show(&mut rig, SessionState::Idle, 0, 0);
             rig.worker.on_send(Err(SendRefused::CountRose { now: 1 }));
+            let before = rig.events(&run).len();
             assert_eq!(
                 pass(&rig, &run),
                 BuildStep::Launch(StartStep::Started { session: session() })
             );
             assert_eq!(sends(&rig), vec![launch_sent_again()]);
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [format!("{LAUNCH_RESENDING}0"), format!("{LAUNCH_TAKEN}1")]
+            );
+            let events = rig.events(&run).len();
+            assert_eq!(pass(&rig, &run), BuildStep::Running);
+            assert_eq!(sends(&rig), vec![launch_sent_again()]);
+            assert_eq!(rig.events(&run).len(), events);
         }
 
         /// The worker finds the session busy after all: nothing was typed, the run goes on, and
