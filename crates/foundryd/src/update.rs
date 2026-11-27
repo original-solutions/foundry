@@ -3932,10 +3932,14 @@ mod tests {
         hand.join().unwrap();
         let error = install.join().unwrap().unwrap_err();
 
-        assert!(
-            matches!(&error, InstallError::NotReady { ready: None, .. }),
-            "{error:?}"
-        );
+        // The hand install cleared the ready tag, so the answer is that it is not the ready
+        // tag (the first rung of the ladder), with no ready tag left to report.
+        match &error {
+            InstallError::NotReady { ready: None, reason } => {
+                assert_eq!(reason, "v0.2.0 is not the ready tag");
+            }
+            other => panic!("{other:?}"),
+        }
         assert_eq!(current(&path), PathBuf::from("versions/0.3.0"));
         assert_eq!(state(&path).unwrap().ready, None);
     }
