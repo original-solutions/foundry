@@ -256,6 +256,7 @@ describe("UpdateBadge", () => {
     fireEvent.click(badge());
     fireEvent.click(within(dialog()).getByRole("checkbox", { name: "laptop v0.9.1" }));
     fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+    await settle();
     act(() => sent.calls[0].answer({ status: 202, json: {} }));
     await settle();
     fireEvent.click(within(dialog()).getByRole("button", { name: "Close" }));
