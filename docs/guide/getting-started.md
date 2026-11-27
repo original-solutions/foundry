@@ -18,7 +18,7 @@ Type the task in the box. Write it the way you would tell a colleague. As you ty
 
 Under the box, from left to right:
 
-- **Project.** One button per project. The first one is picked. Pick the repo the task belongs to. **Projects** next to them opens the project list, described below.
+- **Project.** One button per project, with its face: the two letters and colour its workspaces carry everywhere. The first one is picked. Pick the repo the task belongs to. **Projects** next to them opens the project list, described below.
 - **from.** The base branch the new branch starts from. It starts as `main`.
 - **with.** The model Claude Code runs on. It starts as `opus`. Type another, or pick one from the suggestions: `opus`, `sonnet` and any model a session already runs.
 - **on.** Only appears when the fleet has other machines. Choose **this machine**, **let Foundry choose**, or a machine by name. An offline machine is listed but cannot be picked. With no other machine, the line just says "on this machine".

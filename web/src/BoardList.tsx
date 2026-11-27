@@ -8,6 +8,7 @@ import { Now } from "./Now";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { TerminalMenu } from "./TerminalMenu";
 import { readStored, store } from "./storage";
+import { ProjectFace } from "./ProjectFace";
 
 /** Whether the board draws its workspaces as cards or as a list of one line each, kept for this browser. */
 export type Layout = "cards" | "list";
@@ -108,8 +109,11 @@ export function WorkspaceLine({ card, showMachine, onChanges, arrived = false }:
             </span>
           )}
         </span>
-        <span className="truncate font-mono text-[11px] text-neutral-500">
-          {workspace.project} · {workspace.branch}
+        <span className="flex min-w-0 items-center gap-1.5 font-mono text-[11px] text-neutral-500">
+          <ProjectFace project={workspace.project} className="size-3.5 text-[7px]" />
+          <span className="truncate">
+            {workspace.project} · {workspace.branch}
+          </span>
         </span>
       </span>
       <span className={`col-start-2 row-start-2 flex min-w-0 items-baseline gap-2 text-xs md:col-span-1 md:col-start-3 md:row-start-1 ${none ? "col-span-2" : ""}`}>

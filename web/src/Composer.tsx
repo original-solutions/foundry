@@ -10,6 +10,7 @@ import { makeWorkspace, SessionNotStarted, type CreateInput } from "./launch";
 import { Projects } from "./Projects";
 import { BranchIcon, leftOver, PlannedList, SplitButton, useStartEach, type Planned } from "./SplitTasks";
 import { ITEM, listOf } from "./tasks";
+import { ProjectFace } from "./ProjectFace";
 
 /**
  * Makes a workspace, then starts a session in it, saying which `step` it is on. `made` is true
@@ -255,11 +256,12 @@ export function Composer({
                     return (
                       <label
                         key={p.id}
-                        className={`cursor-pointer rounded-full border px-2.5 py-1 font-medium has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-neutral-400 ${
+                        className={`flex cursor-pointer items-center gap-1.5 rounded-full border py-1 pr-2.5 pl-1 font-medium has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-neutral-400 ${
                           on ? "border-neutral-300 bg-neutral-100 text-neutral-900" : "border-neutral-700 text-neutral-300 hover:border-neutral-500"
                         }`}
                       >
                         <input type="radio" name="project" value={p.id} checked={on} onChange={() => setProjectId(p.id)} className="sr-only" />
+                        <ProjectFace project={p.name} />
                         {p.name}
                       </label>
                     );

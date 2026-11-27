@@ -5,6 +5,7 @@ import { Board } from "./Board";
 // The extension is spelled out: on a case-insensitive disk (macOS) "./Factory" finds factory.ts first.
 import { Factory } from "./Factory.tsx";
 import { FactoryContext } from "./factory";
+import { faces, Faces } from "./face";
 import { ChangesPanel } from "./ChangesPanel";
 import { LinkBanner, Unreachable } from "./Connection";
 import { useCreateWorkspace } from "./Composer";
@@ -60,6 +61,11 @@ import { upNext } from "./needing";
  * (or as one line of a list, for a large fleet), or, switched to its timeline, every session's
  * turns on one clock, with the stretches each waited on you striped and added up in a row over the
  * lanes; a turn opens its terminal with the steps column.
+ *
+ * Every project has a face, two letters on a tile of its own hue drawn from the shared project
+ * list, the same on every machine. A workspace carries it on its card and list line, its sidebar
+ * row, the head of its rail column and its terminal's bar, and the task box's project buttons show
+ * it, so a long list reads by project at a glance.
  *
  * A fleet with no workspaces opens on one question, what Claude should work on, and a box to
  * answer it in: the task names the workspace and its branch, Start makes it and lands in its
@@ -137,6 +143,7 @@ function Layout() {
   const { data: here } = useQuery(machineQuery);
   const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
   const machines = useMemo(() => fleet(state.records, state.settings, briefs, state.online, here), [state.records, state.settings, briefs, state.online, here]);
+  const projectFaces = useMemo(() => faces(state.settings.projects), [state.settings.projects]);
   const [drawer, setDrawer] = useState(false);
   /** Whether the sidebar is collapsed to the rail on a wide screen. */
   const [rail, setRail] = useState(() => loadRail(window.innerWidth));
@@ -303,192 +310,194 @@ function Layout() {
   return (
     // Only the daemon's own settings: a change built from the remembered fleet could overwrite a newer one.
     <FactoryContext.Provider value={sent.synced ? (sent.settings.project_factory ?? {}) : undefined}>
-      <TerminalActions
-        machines={machines}
-        current={terminalId}
-        onOpen={(id) => {
-          setDrawer(false);
-          show(id);
-        }}
-        onBeside={openBeside}
-        onSteps={(id) => {
-          setDrawer(false);
-          setStepsOpen(true);
-          show(id);
-        }}
-        onChanges={openChanges}
-        onFind={() => setFinding((n) => n + 1)}
-        onNewSession={(id, name) => {
-          setDrawer(false);
-          setSessionIn({ id, name });
-        }}
-      >
-        <div className="flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
-          <div className="relative flex min-h-0 flex-1">
-            {rail && (
-              <div {...frozen} className="hidden shrink-0 md:flex">
-                <Rail machines={machines} selected={terminalId} onExpand={flipRail} onJump={openJump} onCreate={() => openCreate()} alerts={<NotifyButton {...notify} />} />
-              </div>
-            )}
-            {sidebar && (
-              <div {...frozen} className={`${place} shrink-0`}>
-                <Sidebar
-                  machines={machines}
-                  onCreate={() => openCreate()}
-                  selected={terminalId}
-                  onNavigate={close}
-                  onClose={close}
-                  onJump={openJump}
-                  onChanges={openChanges}
-                  alerts={<NotifyButton {...notify} />}
-                  onKeys={() => setKeysOpen(true)}
-                  onRail={rail ? undefined : flipRail}
-                />
-              </div>
-            )}
-            <main className="flex min-w-0 flex-1 flex-col">
-              {/* In the flow, so the terminal below gives up the room it takes; none while both are empty, and at most half the screen. */}
-              {narrow && (
-                <div className="flex max-h-[50dvh] shrink-0 flex-col gap-2 overflow-y-auto p-2 empty:hidden">
-                  <AttentionList folded />
-                  <WaitingList folded />
+      <Faces.Provider value={projectFaces}>
+        <TerminalActions
+          machines={machines}
+          current={terminalId}
+          onOpen={(id) => {
+            setDrawer(false);
+            show(id);
+          }}
+          onBeside={openBeside}
+          onSteps={(id) => {
+            setDrawer(false);
+            setStepsOpen(true);
+            show(id);
+          }}
+          onChanges={openChanges}
+          onFind={() => setFinding((n) => n + 1)}
+          onNewSession={(id, name) => {
+            setDrawer(false);
+            setSessionIn({ id, name });
+          }}
+        >
+          <div className="flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
+            <div className="relative flex min-h-0 flex-1">
+              {rail && (
+                <div {...frozen} className="hidden shrink-0 md:flex">
+                  <Rail machines={machines} selected={terminalId} onExpand={flipRail} onJump={openJump} onCreate={() => openCreate()} alerts={<NotifyButton {...notify} />} />
                 </div>
               )}
-              {terminalId && (
-                <div {...frozen} className="flex shrink-0">
-                  {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
-                    <div key={id} className="contents" onPointerDown={focusPane(id)}>
-                      <TerminalHeader
-                        id={id}
-                        located={id === terminalId ? located : locate(machines, id)}
-                        drawerOpen={drawer}
-                        onMenu={() => setDrawer(true)}
+              {sidebar && (
+                <div {...frozen} className={`${place} shrink-0`}>
+                  <Sidebar
+                    machines={machines}
+                    onCreate={() => openCreate()}
+                    selected={terminalId}
+                    onNavigate={close}
+                    onClose={close}
+                    onJump={openJump}
+                    onChanges={openChanges}
+                    alerts={<NotifyButton {...notify} />}
+                    onKeys={() => setKeysOpen(true)}
+                    onRail={rail ? undefined : flipRail}
+                  />
+                </div>
+              )}
+              <main className="flex min-w-0 flex-1 flex-col">
+                {/* In the flow, so the terminal below gives up the room it takes; none while both are empty, and at most half the screen. */}
+                {narrow && (
+                  <div className="flex max-h-[50dvh] shrink-0 flex-col gap-2 overflow-y-auto p-2 empty:hidden">
+                    <AttentionList folded />
+                    <WaitingList folded />
+                  </div>
+                )}
+                {terminalId && (
+                  <div {...frozen} className="flex shrink-0">
+                    {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
+                      <div key={id} className="contents" onPointerDown={focusPane(id)}>
+                        <TerminalHeader
+                          id={id}
+                          located={id === terminalId ? located : locate(machines, id)}
+                          drawerOpen={drawer}
+                          onMenu={() => setDrawer(true)}
+                          onJump={openJump}
+                          onChanges={openChanges}
+                          onSteps={id === terminalId ? () => setStepsOpen(!stepsOpen) : undefined}
+                          stepsOpen={stepsOpen}
+                          onFind={id === terminalId ? () => setFinding(finding ? 0 : 1) : undefined}
+                          finding={finding > 0}
+                          onSplit={pair ? undefined : () => setJump("beside")}
+                          onClosePane={pair ? () => closePane(id) : undefined}
+                          beside={id !== terminalId}
+                          changed={changed}
+                          upNext={id === terminalId ? next : undefined}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="relative min-h-0 flex-1">
+                  {/* In a fixed order, so a pane's element never moves when it is used. */}
+                  {[...attached].sort().map((id) => {
+                    const side = pair && (id === pair.left ? "left" : id === pair.right ? "right" : undefined);
+                    const place = side === "left" ? "inset-y-0 left-0 right-0 md:right-1/2" : side === "right" ? "inset-y-0 right-0 left-0 md:left-1/2 md:border-l md:border-neutral-800" : "inset-0";
+                    const seen = id === terminalId ? "" : side ? "invisible md:visible" : "invisible";
+                    const where = locate(machines, id);
+                    return (
+                      <div key={id} data-testid={`pane-${id}`} onPointerDownCapture={side && focusPane(id)} onFocusCapture={side && focusPane(id)} className={`absolute ${place} ${seen}`}>
+                        <TerminalPane
+                          id={id}
+                          running={terminalRunning(state, id)}
+                          active={id === terminalId}
+                          name={where?.name}
+                          glyph={where?.glyph}
+                          finding={id === terminalId ? finding : 0}
+                          onFindClose={() => setFinding(0)}
+                          here={!!where && where.machine.id === here}
+                          workspace={where?.session ? where.workspace.id : undefined}
+                          changesOf={where?.workspace.id}
+                          onFile={where && ((file) => openChanges(where.workspace.id, file))}
+                        />
+                      </div>
+                    );
+                  })}
+                  {/* Hidden while empty, so it never lies over a terminal. */}
+                  <div {...frozen} className="absolute inset-0 empty:hidden">
+                    {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={started} onMenu={() => setDrawer(true)} />}
+                    {!terminalId && onFactory && state.synced && <Factory statuses={state.factory} settings={state.settings} machines={machines} />}
+                    {/* The board, the timeline and the machines are one element, so their shared head is never remounted. */}
+                    {((board && state.synced) || (!terminalId && onMachines)) && (
+                      <Board
+                        machines={machines}
+                        projects={state.settings.projects}
                         onJump={openJump}
+                        onCreated={started}
                         onChanges={openChanges}
-                        onSteps={id === terminalId ? () => setStepsOpen(!stepsOpen) : undefined}
-                        stepsOpen={stepsOpen}
-                        onFind={id === terminalId ? () => setFinding(finding ? 0 : 1) : undefined}
-                        finding={finding > 0}
-                        onSplit={pair ? undefined : () => setJump("beside")}
-                        onClosePane={pair ? () => closePane(id) : undefined}
-                        beside={id !== terminalId}
-                        changed={changed}
-                        upNext={id === terminalId ? next : undefined}
+                        traced={traced}
+                        onMenu={() => setDrawer(true)}
+                        history={samples}
+                        connected={connected}
+                        onCreate={(machine) => openCreate("", machine)}
+                        onSteps={(id) => {
+                          setStepsOpen(true);
+                          show(id);
+                        }}
                       />
-                    </div>
-                  ))}
+                    )}
+                  </div>
+                </div>
+              </main>
+              {stepsOpen && stepsOf && (
+                <StepsPanel
+                  key={located?.session ?? terminalId}
+                  of={stepsOf}
+                  onClose={() => setStepsOpen(false)}
+                  stale={stale}
+                  onFile={located && ((file) => openChanges(located.workspace.id, file))}
+                />
+              )}
+            </div>
+            <ChangesPanel
+              workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf?.workspace)}
+              file={changesOf?.file}
+              onClose={() => setChangesOf(undefined)}
+            />
+            <JumpPalette
+              machines={machines}
+              open={jump !== undefined}
+              onOpenChange={(open) => setJump(open ? "jump" : undefined)}
+              onCreate={openCreate}
+              current={terminalId && located ? { terminal: terminalId, title: `${located.workspace.name} / ${located.name}` } : undefined}
+              besideOnly={jump === "beside"}
+              onBeside={openBeside}
+              commands={commands}
+            />
+            <NewTask
+              projects={state.settings.projects}
+              workspaces={workspaces}
+              open={create.open}
+              onOpenChange={(open) => setCreate((c) => ({ ...c, open }))}
+              task={create.task}
+              machine={create.machine}
+              onCreated={setLanding}
+            />
+            <KeySheet open={keysOpen} onOpenChange={setKeysOpen} />
+            <Announcer spoken={spoken} />
+            {/* One place on screen for news: what needs a person (on a wide screen), the catch-up, then the cards. */}
+            <div className="pointer-events-none fixed inset-x-2 top-2 z-40 flex flex-col gap-2 md:inset-x-auto md:top-14 md:right-4 md:w-[24rem]">
+              <LinkBanner link={link} remembered={remembering ? memory.at : undefined} />
+              {!narrow && <AttentionList />}
+              {!narrow && <WaitingList />}
+              {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
+              {taskWarning && (
+                <div
+                  role="alert"
+                  aria-label="Task warning"
+                  className="pointer-events-auto flex items-start gap-3 rounded-xl border border-amber-400/40 bg-neutral-900 px-4 py-3 text-sm text-amber-200 shadow-2xl shadow-black/50"
+                >
+                  <span className="min-w-0 flex-1 break-words">{taskWarning}</span>
+                  <button type="button" onClick={() => setTaskWarning(undefined)} className="-my-0.5 shrink-0 rounded px-1.5 py-0.5 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100">
+                    Dismiss
+                  </button>
                 </div>
               )}
-              <div className="relative min-h-0 flex-1">
-                {/* In a fixed order, so a pane's element never moves when it is used. */}
-                {[...attached].sort().map((id) => {
-                  const side = pair && (id === pair.left ? "left" : id === pair.right ? "right" : undefined);
-                  const place = side === "left" ? "inset-y-0 left-0 right-0 md:right-1/2" : side === "right" ? "inset-y-0 right-0 left-0 md:left-1/2 md:border-l md:border-neutral-800" : "inset-0";
-                  const seen = id === terminalId ? "" : side ? "invisible md:visible" : "invisible";
-                  const where = locate(machines, id);
-                  return (
-                    <div key={id} data-testid={`pane-${id}`} onPointerDownCapture={side && focusPane(id)} onFocusCapture={side && focusPane(id)} className={`absolute ${place} ${seen}`}>
-                      <TerminalPane
-                        id={id}
-                        running={terminalRunning(state, id)}
-                        active={id === terminalId}
-                        name={where?.name}
-                        glyph={where?.glyph}
-                        finding={id === terminalId ? finding : 0}
-                        onFindClose={() => setFinding(0)}
-                        here={!!where && where.machine.id === here}
-                        workspace={where?.session ? where.workspace.id : undefined}
-                        changesOf={where?.workspace.id}
-                        onFile={where && ((file) => openChanges(where.workspace.id, file))}
-                      />
-                    </div>
-                  );
-                })}
-                {/* Hidden while empty, so it never lies over a terminal. */}
-                <div {...frozen} className="absolute inset-0 empty:hidden">
-                  {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={started} onMenu={() => setDrawer(true)} />}
-                  {!terminalId && onFactory && state.synced && <Factory statuses={state.factory} settings={state.settings} machines={machines} />}
-                  {/* The board, the timeline and the machines are one element, so their shared head is never remounted. */}
-                  {((board && state.synced) || (!terminalId && onMachines)) && (
-                    <Board
-                      machines={machines}
-                      projects={state.settings.projects}
-                      onJump={openJump}
-                      onCreated={started}
-                      onChanges={openChanges}
-                      traced={traced}
-                      onMenu={() => setDrawer(true)}
-                      history={samples}
-                      connected={connected}
-                      onCreate={(machine) => openCreate("", machine)}
-                      onSteps={(id) => {
-                        setStepsOpen(true);
-                        show(id);
-                      }}
-                    />
-                  )}
-                </div>
-              </div>
-            </main>
-            {stepsOpen && stepsOf && (
-              <StepsPanel
-                key={located?.session ?? terminalId}
-                of={stepsOf}
-                onClose={() => setStepsOpen(false)}
-                stale={stale}
-                onFile={located && ((file) => openChanges(located.workspace.id, file))}
-              />
-            )}
+              <Toasts news={news} machines={machines} here={here} onScreen={pair ? [pair.left, pair.right] : terminalId ? [terminalId] : []} covered={notify.notify.away ? caughtUp : []} onOpen={show} />
+            </div>
+            {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
           </div>
-          <ChangesPanel
-            workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf?.workspace)}
-            file={changesOf?.file}
-            onClose={() => setChangesOf(undefined)}
-          />
-          <JumpPalette
-            machines={machines}
-            open={jump !== undefined}
-            onOpenChange={(open) => setJump(open ? "jump" : undefined)}
-            onCreate={openCreate}
-            current={terminalId && located ? { terminal: terminalId, title: `${located.workspace.name} / ${located.name}` } : undefined}
-            besideOnly={jump === "beside"}
-            onBeside={openBeside}
-            commands={commands}
-          />
-          <NewTask
-            projects={state.settings.projects}
-            workspaces={workspaces}
-            open={create.open}
-            onOpenChange={(open) => setCreate((c) => ({ ...c, open }))}
-            task={create.task}
-            machine={create.machine}
-            onCreated={setLanding}
-          />
-          <KeySheet open={keysOpen} onOpenChange={setKeysOpen} />
-          <Announcer spoken={spoken} />
-          {/* One place on screen for news: what needs a person (on a wide screen), the catch-up, then the cards. */}
-          <div className="pointer-events-none fixed inset-x-2 top-2 z-40 flex flex-col gap-2 md:inset-x-auto md:top-14 md:right-4 md:w-[24rem]">
-            <LinkBanner link={link} remembered={remembering ? memory.at : undefined} />
-            {!narrow && <AttentionList />}
-            {!narrow && <WaitingList />}
-            {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
-            {taskWarning && (
-              <div
-                role="alert"
-                aria-label="Task warning"
-                className="pointer-events-auto flex items-start gap-3 rounded-xl border border-amber-400/40 bg-neutral-900 px-4 py-3 text-sm text-amber-200 shadow-2xl shadow-black/50"
-              >
-                <span className="min-w-0 flex-1 break-words">{taskWarning}</span>
-                <button type="button" onClick={() => setTaskWarning(undefined)} className="-my-0.5 shrink-0 rounded px-1.5 py-0.5 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100">
-                  Dismiss
-                </button>
-              </div>
-            )}
-            <Toasts news={news} machines={machines} here={here} onScreen={pair ? [pair.left, pair.right] : terminalId ? [terminalId] : []} covered={notify.notify.away ? caughtUp : []} onOpen={show} />
-          </div>
-          {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
-        </div>
-      </TerminalActions>
+        </TerminalActions>
+      </Faces.Provider>
     </FactoryContext.Provider>
   );
 }

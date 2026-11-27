@@ -6,11 +6,17 @@ The board is the home of Foundry once any workspace exists. It shows every works
 
 To get back to the board from anywhere, click **Foundry** at the top of the sidebar, or the mark at the top of the rail.
 
+## Project faces
+
+Every project has a face: two letters from its name on a small coloured tile, such as **ST** for storefront and **BA** for billing-api. Its workspaces carry it wherever they show: on a board card and a list line, in the sidebar, at the head of each column on the rail, and beside the workspace name in a terminal's bar. The task box shows it on each project button. So in a long list you can tell which project a workspace belongs to without reading it. Point at a face to see the project's name.
+
+The colours keep clear of the state colours, so a face never reads as a state. Each project keeps its colour when another is added, and every machine shows the same one. With more than six projects, colours repeat, and the letters tell them apart.
+
 ## Reading a card
 
 Each workspace is one card. The coloured bar on its left edge takes the colour of its most urgent terminal.
 
-- **Title.** The workspace name. Click it to open its most urgent terminal. Below it, the project and the branch.
+- **Title.** The workspace name. Click it to open its most urgent terminal. Below it, the project and the branch, led by the project's face.
 - **Machine name.** Shown at the right of the title when the fleet has more than one machine.
 - **Terminals.** One row per session or shell, most urgent first. A row has its state glyph, its name, and its state label. For a session on this machine, the row also has the title it took from its first prompt, and underneath what it is doing right now, such as "Edit src/auth/redirect.ts" or the question it asked you. Click a row to open that terminal. A card shows four rows, then "+N more". A workspace with none says "No terminals".
 - **What Claude said.** When a session on this machine is **Ready** or **Ended**, what Claude said at the end of its last turn shows under its row, three lines at a time. Click it to read it all.
@@ -109,7 +115,7 @@ The sidebar is the same fleet as a list. It sits at the left on a wide screen. F
 
 ### Folding
 
-A folded workspace is one line, its name and a strip of state glyphs, most urgent first. The strip shows six, then "+N". Click a glyph to open that terminal. Click the name, or the arrow, to unfold.
+A folded workspace is one line: its project's face, its name and a strip of state glyphs, most urgent first. The strip shows six, then "+N". Click a glyph to open that terminal. Click the name, or the arrow, to unfold.
 
 An unfolded workspace shows its branch and project, a row of actions, and every terminal with its state label and what it is doing.
 
@@ -154,7 +160,7 @@ On the rail, from the top:
 - The Foundry mark goes to the board, and the factory icon goes to the Factory view. See [The factory](factory.md).
 - **Expand sidebar**, **Jump to** and **New task**.
 - A dot per machine for its status. Click it to open the Machines view.
-- A column of glyphs for each workspace. The workspace you are in is outlined. A glyph is a link to its terminal, and pointing at it names the workspace, terminal and state. A column shows six at most, then "+N".
+- A column for each workspace, headed by its project's face, then its glyphs. Point at the face for the workspace and project names. The workspace you are in is outlined. A glyph is a link to its terminal, and pointing at it names the workspace, terminal and state. A column shows six at most, then "+N".
 - The bell and the theme switch at the bottom.
 
 `Up`, `Down`, `Home` and `End` move along the rail's glyphs.

@@ -143,6 +143,11 @@ async function show(machines: MachineView[], onChanges = vi.fn(), props: Partial
 const card = (name: string) => screen.getByRole("article", { name });
 
 describe("Board", () => {
+  it("marks each card with its project's face beside the project's name", async () => {
+    await show(fleet(records(), settings()));
+    expect(within(card("fix login")).getByTitle("demo").textContent).toBe("DE");
+  });
+
   it("shows every workspace as a card in a lane by what it needs: you, its agents, or nothing", async () => {
     await show(fleet(records(), settings()));
     const needs = screen.getByRole("region", { name: "Needs you" });
@@ -338,6 +343,12 @@ describe("As a list", () => {
     expect(localStorage.getItem("foundry.layout")).toBe("list");
     // A line is one row: no list of its terminals under it.
     expect(within(card("fix login")).queryByRole("list")).toBeNull();
+  });
+
+  it("marks each line with its project's face, as a card is", async () => {
+    await show(fleet(records(), settings()));
+    asList();
+    expect(within(card("fix login")).getByTitle("demo").textContent).toBe("DE");
   });
 
   it("opens each terminal from its glyph and the changes from the line's count", async () => {

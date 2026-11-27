@@ -29,6 +29,7 @@ import { nextKey } from "./NextUp";
 import type { History } from "./samples";
 import { setHome, useHome, type Home } from "./home";
 import { readStored, store } from "./storage";
+import { ProjectFace } from "./ProjectFace";
 
 /** Which of the board and the timeline the home shows, kept for this browser (see `home.ts`). The machines view has its own URL. */
 type View = Home;
@@ -398,8 +399,11 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
             </button>
           )}
         </div>
-        <p className="truncate font-mono text-xs text-neutral-500">
-          {workspace.project} · {workspace.branch}
+        <p className="flex min-w-0 items-center gap-1.5 font-mono text-xs text-neutral-500">
+          <ProjectFace project={workspace.project} />
+          <span className="truncate">
+            {workspace.project} · {workspace.branch}
+          </span>
         </p>
       </header>
       <ul className="flex flex-col px-2 pb-2">

@@ -14,6 +14,7 @@ import { ended } from "./ends";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { SparkIcon } from "./FirstPrompt";
 import { Mark } from "./Mark";
+import { ProjectFace } from "./ProjectFace";
 import { ThemeButton } from "./ThemeButton";
 import { railKey } from "./collapsed";
 import type { MachineSample } from "./api";
@@ -314,6 +315,7 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
           <svg viewBox="0 0 16 16" aria-hidden="true" className={`size-3 shrink-0 text-neutral-500 transition-transform motion-reduce:transition-none ${folded ? "" : "rotate-90"}`} fill="currentColor">
             <path d="M6 3.5l5 4.5-5 4.5z" />
           </svg>
+          <ProjectFace project={workspace.project} className="size-[18px] text-[9px]" />
           <span className="truncate font-medium">{workspace.name}</span>
         </button>
         {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}

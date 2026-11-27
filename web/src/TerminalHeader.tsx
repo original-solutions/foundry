@@ -17,6 +17,7 @@ import { reply } from "./reply";
 import { StepsIcon } from "./StepsPanel";
 import { TabStrip } from "./TabStrip";
 import { TerminalMenuButton } from "./TerminalMenu";
+import { ProjectFace } from "./ProjectFace";
 
 /** The key that opens a terminal beside the open one, or closes the split. */
 export const splitKey = jumpKey === "⌘K" ? "⌘\\" : "Ctrl \\";
@@ -123,6 +124,8 @@ export function TerminalHeader({
         <>
           {/* It shares the room with the tabs beside it (see `TabStrip`), so neither squeezes the other out. */}
           <div className={`flex h-11 min-w-0 flex-1 items-center gap-2 ${apart ? "" : "md:max-w-64 md:grow-0 md:basis-auto"}`}>
+            {/* On a phone the bar is short of room, and the workspace's name matters more than its project's face. */}
+            <ProjectFace project={located.workspace.project} className="size-4 text-[8px] max-md:hidden" />
             <span className="truncate font-medium text-neutral-100" title={`${located.workspace.branch} · ${located.workspace.project}`}>
               {located.workspace.name}
             </span>

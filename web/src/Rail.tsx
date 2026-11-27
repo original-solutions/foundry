@@ -3,6 +3,7 @@ import { useState, type KeyboardEvent, type ReactNode } from "react";
 import { SparkIcon } from "./FirstPrompt";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Mark } from "./Mark";
+import { ProjectFace } from "./ProjectFace";
 import { rows, type MachineView } from "./fleet";
 import { railKey } from "./collapsed";
 import { PanelIcon, stripOf } from "./Sidebar";
@@ -89,6 +90,7 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
                 data-open={open || undefined}
                 className={`flex flex-col items-center gap-px rounded-lg p-0.5 ${open ? "bg-neutral-800/70 ring-1 ring-neutral-700" : ""}`}
               >
+                <ProjectFace project={workspace.project} title={`${workspace.name} · ${workspace.project}`} className="mt-0.5 mb-0.5 size-5 text-[9px]" />
                 {shown.map((row) => {
                   const name = `${workspace.name} / ${row.name}: ${row.label}`;
                   const current = row.terminal === selected;
