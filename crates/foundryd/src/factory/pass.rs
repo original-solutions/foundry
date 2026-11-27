@@ -255,6 +255,8 @@ struct Done {
     /// the order the runs' events put it in, never the wall clock. `None` when not read.
     at: Option<(u64, u64, MachineId)>,
     run: FinishedRun,
+    /// Why a run that finished `stuck` or `needs-info` waits for a person.
+    reason: Option<String>,
 }
 
 /// What one pass did.
@@ -1621,6 +1623,51 @@ impl<'a, 'w> Pass<'a, 'w> {
             }
         }
         self.see_finished(&unfinished)?;
+        // A run that finished stuck or needs-info waits for a person while its issue keeps that
+        // label, when it is the issue's newest run. The label is read only when such a run is.
+        let mut newest: BTreeMap<u64, &RunId> = BTreeMap::new();
+        for run in self.memo.finished.keys().chain(&unfinished) {
+            let slot = newest.entry(run.issue()).or_insert(run);
+            if run.attempt() > slot.attempt() {
+                *slot = run;
+            }
+        }
+        let waiting: Vec<(&Done, HeldUpKind)> = newest
+            .values()
+            .filter_map(|run| {
+                let done = self.memo.finished.get(*run)?.as_ref()?;
+                match done.run.outcome {
+                    RunOutcome::Stuck => Some((done, HeldUpKind::Stuck)),
+                    RunOutcome::NeedsInfo => Some((done, HeldUpKind::NeedsInfo)),
+                    RunOutcome::PrOpen => None,
+                }
+            })
+            .collect();
+        for (kind, state) in [
+            (HeldUpKind::Stuck, State::Stuck),
+            (HeldUpKind::NeedsInfo, State::NeedsInfo),
+        ] {
+            let mut of_kind = waiting.iter().filter(|(_, k)| *k == kind).peekable();
+            if of_kind.peek().is_none() {
+                continue;
+            }
+            let labelled: BTreeSet<u64> = world
+                .tracker
+                .list_issues(&world.project.repo, state)?
+                .items
+                .iter()
+                .map(|issue| issue.number)
+                .collect();
+            for (done, _) in of_kind {
+                if labelled.contains(&done.run.run.issue()) {
+                    self.results.held_up.push(HeldUp {
+                        run: done.run.run.clone(),
+                        kind,
+                        reason: done.reason.clone().unwrap_or_default(),
+                    });
+                }
+            }
+        }
         let mut done: Vec<&Done> = self.memo.finished.values().flatten().collect();
         // Newest first by where the `finished` event stands, then by run id for a tie.
         done.sort_by(|a, b| (&b.at, &b.run.run).cmp(&(&a.at, &a.run.run)));
@@ -1659,6 +1706,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                 &summary.id,
             );
             let id = summary.id.clone();
+            let reason = summary.reason.clone();
             let run = summary.state.map(|state| FinishedRun {
                 title: summary.title.clone().unwrap_or_default(),
                 outcome: match state {
@@ -1672,7 +1720,7 @@ impl<'a, 'w> Pass<'a, 'w> {
             });
             self.memo
                 .finished
-                .insert(id, run.map(|run| Done { at, run }));
+                .insert(id, run.map(|run| Done { at, run, reason }));
         }
         Ok(())
     }
