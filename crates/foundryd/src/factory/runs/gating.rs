@@ -3026,9 +3026,21 @@ mod tests {
 
     /// As [`show`], with the gate's machine offline for `span`.
     fn show_gone(rig: &mut Rig, run: &RunId, turn: u64, gates: &[G], span: Duration) {
+        show_gone_with(rig, run, SessionState::Idle, turn, gates, span);
+    }
+
+    /// As [`show_gone`], with the session shown `state`.
+    fn show_gone_with(
+        rig: &mut Rig,
+        run: &RunId,
+        state: SessionState,
+        turn: u64,
+        gates: &[G],
+        span: Duration,
+    ) {
         let mut view = FleetView::builder()
             .online(builder())
-            .session(session_record(SessionState::Idle))
+            .session(session_record(state))
             .turn(SessionTurn {
                 session: session(),
                 workspace: workspace(),
@@ -3584,7 +3596,6 @@ mod tests {
                 SessionState::Starting,
                 SessionState::Working,
                 SessionState::WaitingForYou,
-                SessionState::Unreachable,
             ] {
                 let (mut rig, run, hub) = built();
                 show(&mut rig, &run, state, 1, &[]);
@@ -3595,6 +3606,16 @@ mod tests {
                 assert_eq!(rig.events(&run).len(), before, "{state:?}");
                 assert_eq!(hub.reads(), Vec::<String>::new(), "{state:?}");
             }
+        }
+
+        #[test]
+        fn the_reported_pull_request_of_a_session_that_cannot_be_reached_is_gated() {
+            // Its last turn stands: the gate needs the pull request, not the session.
+            let (mut rig, run, _hub) = built();
+            show(&mut rig, &run, SessionState::Unreachable, 1, &[]);
+            rig.worker.on_create(Ok(gate_ws(1)));
+            assert_eq!(go(&rig, &run), GateStep::Running);
+            assert!(has_step(&rig, &run, &format!("{GATE_REQUESTED}1 1 {HEAD}")));
         }
 
         #[test]
@@ -5431,6 +5452,46 @@ mod tests {
             rig.worker.on_create(Ok(gate_ws(2)));
             assert_eq!(go(&rig, &run), GateStep::Running);
             assert!(has_step(&rig, &run, &format!("{GATE_REQUESTED}1 2 {HEAD}")));
+        }
+
+        #[test]
+        fn a_gate_on_the_build_machine_cut_off_could_not_run_and_is_tried_again_while_the_session_is_away()
+         {
+            // The gate and the build session are on one machine, which is cut off mid-gate.
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            let cut_off = |rig: &mut Rig, minutes: u64| {
+                show_gone_with(
+                    rig,
+                    &run,
+                    SessionState::Unreachable,
+                    1,
+                    &[running(1)],
+                    Duration::from_secs(minutes * 60),
+                );
+            };
+            cut_off(&mut rig, 4);
+            assert_eq!(go(&rig, &run), GateStep::Running);
+            cut_off(&mut rig, 6);
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
+            assert!(
+                rig.steps(&run).iter().any(
+                    |step| step.starts_with(GATE_COULD_NOT_RUN) && step.contains("unreachable")
+                )
+            );
+            assert!(!gate_running(&rig.events(&run)));
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 0 });
+            // The session is still away: the gate is placed again all the same.
+            show(&mut rig, &run, SessionState::Unreachable, 1, &[]);
+            rig.worker.on_create(Ok(gate_ws(2)));
+            assert_eq!(go(&rig, &run), GateStep::Running);
+            assert!(has_step(&rig, &run, &format!("{GATE_REQUESTED}1 2 {HEAD}")));
+            assert!(
+                !calls(&rig)
+                    .iter()
+                    .any(|call| matches!(call, Call::Send { .. })),
+                "nothing is sent to the session"
+            );
         }
 
         #[test]
