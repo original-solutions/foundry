@@ -166,6 +166,8 @@ export interface Blockers {
   uncommitted: string[];
   unpushed: string[];
   submodules: string[];
+  /** Its folder is no longer a git worktree of its project, so what is in it could not be checked. */
+  detached: boolean;
 }
 
 /**
@@ -315,7 +317,7 @@ export async function archiveWorkspace(workspace: string, force: boolean): Promi
   if (status === 204) return null;
   if (status === 409) {
     const list = (value: unknown) => (Array.isArray(value) ? value.map(String) : []);
-    return { uncommitted: list(json.uncommitted), unpushed: list(json.unpushed), submodules: list(json.submodules) };
+    return { uncommitted: list(json.uncommitted), unpushed: list(json.unpushed), submodules: list(json.submodules), detached: json.detached === true };
   }
   throw refused(status, json);
 }

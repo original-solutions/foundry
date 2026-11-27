@@ -27,9 +27,9 @@ Each workspace is one card. The coloured bar on its left edge takes the colour o
 
 ### The changes line
 
-The footer of each card says what the workspace changed since it left its base branch. It shows lines added and removed, the number of files, how many are uncommitted and how many commits, then the three files with the most changed lines and the newest commit. A card with nothing says "No changes yet". Click the footer to open the full changes sheet for the workspace.
+The footer of each card of a workspace on this machine says what the workspace changed since it left its base branch. It shows lines added and removed, the number of files, how many are uncommitted and how many commits, then the three files with the most changed lines and the newest commit. A card with nothing says "No changes yet". Click the footer to open the full changes sheet for the workspace.
 
-The line reads the changes only while the card is on screen. It reads them when the card comes on screen, whenever one of the workspace's terminals changes state, and every 30 seconds while an agent in it is working. So the end of a turn shows what the turn wrote. Only the machine that holds a workspace can read its changes, so a card for another machine's workspace says "Its changes can't be read from here". A failed read says the same.
+The line reads the changes only while the card is on screen. It reads them when the card comes on screen, whenever one of the workspace's terminals changes state, and every 30 seconds while an agent in it is working. So the end of a turn shows what the turn wrote. Only the machine that holds a workspace can read its changes, so a card for another machine's workspace has no changes line; while that workspace is being archived, its card says "Archiving…" there instead. A failed read says "Its changes can't be read from here". When the daemon answers that it does not have the workspace, its changes are not read again when its terminals change state, nor every 30 seconds.
 
 ### Where the work has got to
 
@@ -71,7 +71,7 @@ A card shows everything above. The list puts each workspace on one line, so a fl
 - **Glyphs.** One per terminal, in the same order as a card's rows. Click one to open that terminal, or right-click it for its menu. With more than three terminals, the line shows two and "+N".
 - **Name.** Click it to open the most urgent terminal. Below it, the project and the branch.
 - **What it is doing.** The most urgent terminal's state, then the question it asks you, the tool it runs, or the first line of what Claude said last. Point at that line to read all of it.
-- **Changes.** Lines added and removed and how many files are uncommitted, or "No changes". Click it to open the changes sheet. It is read the same way as a card's changes line.
+- **Changes.** Lines added and removed and how many files are uncommitted, or "No changes". Click it to open the changes sheet. It is read the same way as a card's changes line, and a line for another machine's workspace says "Not read".
 
 On a phone the line takes two rows: the name on the first, and what it is doing and its changes on the second.
 
