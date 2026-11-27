@@ -2942,6 +2942,7 @@ mod tests {
                 terminal: TerminalId(uuid::Uuid::from_u128(0x5e6)),
                 model: "opus".into(),
                 state,
+                name: None,
             },
         }
     }
@@ -5732,6 +5733,7 @@ mod tests {
                         terminal: TerminalId(uuid::Uuid::from_u128(0x6e6)),
                         model: "opus".into(),
                         state: SessionState::Idle,
+                        name: None,
                     },
                 })
                 .turn(SessionTurn {

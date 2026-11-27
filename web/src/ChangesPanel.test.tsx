@@ -65,6 +65,18 @@ describe("ChangesPanel", () => {
     expect(within(panel).getByRole("region", { name: "docs/notes.md" }).textContent).toMatch(/new/i);
   });
 
+  it("colours a diff as code in the file's language, and marks the words a changed line changed", async () => {
+    const { panel } = await opened(json(200, changes));
+    const file = await within(panel).findByRole("region", { name: "src/login.ts" });
+    const removed = within(file).getByRole("row", { name: /^removed/ });
+    const added = within(file).getAllByRole("row", { name: /^added/ });
+    expect([...removed.querySelectorAll("[data-tone=keyword]")].map((e) => e.textContent)).toEqual(["const"]);
+    expect([...removed.querySelectorAll("mark")].map((e) => e.textContent)).toEqual(["2"]);
+    expect([...added[0].querySelectorAll("mark")].map((e) => e.textContent)).toEqual(["3"]);
+    expect(added[1].querySelector("mark")).toBeNull();
+    expect(added[1].querySelector("[data-tone=number]")?.textContent).toBe("4");
+  });
+
   it("folds a file away and back", async () => {
     const { panel } = await opened(json(200, changes));
     const file = await within(panel).findByRole("region", { name: "src/login.ts" });

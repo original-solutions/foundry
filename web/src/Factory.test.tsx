@@ -309,6 +309,63 @@ describe("Factory", () => {
     expect(await screen.findByText(/No projects yet/)).toBeDefined();
   });
 
+  describe("the line", () => {
+    const off: ProjectFactory = { on: false, login: "", paused: false };
+    const stations = (name: string) => within(screen.getByRole("list", { name })).getAllByRole("listitem").map((li) => li.textContent);
+
+    it("heads the view with what every project that is on has at each station, and each project with its own", async () => {
+      const { project } = await show(overview(), { p1: holding });
+      expect(stations("The line")).toEqual(["2 Ready", "1 Building", "1 Held up", "25 Finished"]);
+      expect(screen.getByText("across 1 project")).toBeDefined();
+      expect(within(project).getByRole("list", { name: "Line for foundry" })).toBeDefined();
+    });
+
+    it("shows the empty line and tells what the factory does and how to start it when no project has it on, with the switch in the project", async () => {
+      const { calls, project } = await show(overview({ factory: off, status: null }), { p1: holding }, [json(400, { error: "the repo is not a GitHub https URL" })]);
+      expect(stations("The line")).toEqual(["0 Ready", "0 Building", "0 Held up", "0 Finished"]);
+      expect(screen.getByText(/builds the GitHub issues labelled/)).toBeDefined();
+      expect(screen.queryByText(/^across/)).toBeNull();
+      expect(within(project).queryByRole("list", { name: "Line for foundry" })).toBeNull();
+
+      fireEvent.click(within(project).getByRole("switch", { name: "Factory for foundry" }));
+      await waitFor(() => expect(calls.filter((c) => c.method === "POST")).toHaveLength(1));
+      expect(calls.find((c) => c.method === "POST")).toMatchObject({ url: "/api/projects/p1/factory", body: { on: true, paused: false, login: null } });
+      expect((await within(project).findByRole("alert")).textContent).toContain("the repo is not a GitHub https URL");
+    });
+
+    it("lays a project's lists out as the line's stations, saying which stand empty", async () => {
+      const some = status({ ready: holding.ready });
+      const { project } = await show(overview({ status: some }), { p1: some });
+      const columns = within(project).getAllByRole("group").map((g) => g.getAttribute("aria-label"));
+      expect(columns).toEqual(["Ready", "Building", "Held up", "Finished"]);
+      expect(within(within(project).getByRole("group", { name: "Ready" })).getByRole("list", { name: "Ready" })).toBeDefined();
+      expect(within(project).getByText("Nothing building")).toBeDefined();
+      expect(within(project).getByText("Nothing held up")).toBeDefined();
+      expect(within(project).getByText("Nothing finished yet")).toBeDefined();
+    });
+
+    it("folds the settings into one line until asked", async () => {
+      await show(overview(), { p1: holding });
+      expect(screen.queryByRole("form", { name: "Factory settings" })).toBeNull();
+      expect(screen.getByText("opus · high effort · 2 runs at once · 3 gates at once · looks every 30s · feedback every 300s")).toBeDefined();
+      const open = screen.getByRole("button", { name: "Settings for every project" });
+      expect(open.getAttribute("aria-expanded")).toBe("false");
+      fireEvent.click(open);
+      expect(open.getAttribute("aria-expanded")).toBe("true");
+      expect(screen.getByRole("form", { name: "Factory settings" })).toBeDefined();
+    });
+
+    it("says when claims are paused, for every project or for one", async () => {
+      const paused = { ...overview(), settings: { ...fleetSettings, paused: true } };
+      await show(paused, { p1: holding });
+      expect(screen.getByText("Claims are paused for every project")).toBeDefined();
+      document.body.innerHTML = "";
+      const { project } = await show(overview({ factory: { on: true, login: "bot", paused: true } }), { p1: holding });
+      expect(screen.queryByText("Claims are paused for every project")).toBeNull();
+      expect(within(project).getByText("Claims paused")).toBeDefined();
+    });
+  });
+
   describe("Stop", () => {
     const live = status({ runs: holding.runs });
     const stops = (calls: { url: string; method: string }[]) => calls.filter((c) => c.method === "POST");

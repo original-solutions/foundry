@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Changes } from "./api";
-import { diffLines, splitPath, totals } from "./changes";
+import { diffLines, leading, splitPath, totals } from "./changes";
 
 const changes: Changes = {
   base: "main",
@@ -36,5 +36,22 @@ describe("changes", () => {
   it("splits a path into its folder and its name", () => {
     expect(splitPath("web/src/App.tsx")).toEqual({ dir: "web/src/", name: "App.tsx" });
     expect(splitPath("README.md")).toEqual({ dir: "", name: "README.md" });
+  });
+});
+
+describe("leading", () => {
+  const lines = diffLines(["@@ -1,4 +1,4 @@", " a", "-b", "-c", "+B", "+C", " d", "\\ No newline at end of file", " e"].join("\n"));
+
+  it("stops once it holds the lines asked for, notes not counted", () => {
+    expect(leading(lines, 2).map((l) => l.text)).toEqual(["@@ -1,4 +1,4 @@", "a"]);
+    expect(leading(lines, 7).map((l) => l.text)).toEqual(["@@ -1,4 +1,4 @@", "a", "b", "c", "B", "C", "d"]);
+  });
+
+  it("carries on to the end of a change it stops inside, so removed lines meet their added ones", () => {
+    expect(leading(lines, 3).map((l) => l.text)).toEqual(["@@ -1,4 +1,4 @@", "a", "b", "c", "B", "C"]);
+  });
+
+  it("is the whole patch when it is shorter than asked", () => {
+    expect(leading(lines, 50)).toEqual(lines);
   });
 });
