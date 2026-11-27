@@ -94,6 +94,9 @@ mod tests {
         "The factory did not start on this issue and has moved it back to `factory:proposed`.";
     const REVIEW_AND_RELABEL: &str = "Review the issue text, then apply `factory:ready` again. An instructor must apply the label, and the text must not be edited afterwards by anyone who is not an instructor.";
     const FILE_A_NEW_ISSUE: &str = "The issue's edit history is too long for the factory to check. File a new issue with the final text and apply `factory:ready` to it.";
+    const CANNOT_READ_BACK_TO_LABEL: &str =
+        "the factory could not read the issue's history back to when factory:ready was applied";
+    const RELABEL: &str = "The issue's recent history is too long for the factory to check from the label. Apply `factory:ready` again.";
 
     fn cases() -> Vec<(Refusal, &'static str, &'static str)> {
         vec![
@@ -136,6 +139,13 @@ mod tests {
                 },
                 CANNOT_READ_HISTORY,
                 FILE_A_NEW_ISSUE,
+            ),
+            (
+                Refusal::TimelineShortOfLabel {
+                    labeled_at: AT.into(),
+                },
+                CANNOT_READ_BACK_TO_LABEL,
+                RELABEL,
             ),
         ]
     }
@@ -191,12 +201,26 @@ mod tests {
     }
 
     #[test]
+    fn unapproved_comment_says_to_relabel_when_the_timeline_stops_short_of_the_label() {
+        assert_eq!(
+            unapproved_comment(&Refusal::TimelineShortOfLabel {
+                labeled_at: AT.into()
+            }),
+            "The factory did not start on this issue and has moved it back to `factory:proposed`.\n\nReason: the factory could not read the issue's history back to when factory:ready was applied\n\nThe issue's recent history is too long for the factory to check from the label. Apply `factory:ready` again."
+        );
+    }
+
+    #[test]
     fn unapproved_comment_quotes_nothing_from_the_issue_or_the_login() {
         let text = unapproved_comment(&Refusal::LabeledByNonInstructor {
             by: Some("mallory".into()),
             labeled_at: AT.into(),
         });
         assert!(!text.contains("mallory"));
+        assert!(!text.contains(AT));
+        let text = unapproved_comment(&Refusal::TimelineShortOfLabel {
+            labeled_at: AT.into(),
+        });
         assert!(!text.contains(AT));
     }
 }
