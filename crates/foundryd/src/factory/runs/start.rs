@@ -264,7 +264,8 @@ fn already_said(
     let labeled_at = match refusal {
         Refusal::LabeledByNonInstructor { labeled_at, .. }
         | Refusal::EditedAfterLabel { labeled_at }
-        | Refusal::EditHistoryIncomplete { labeled_at } => Some(labeled_at),
+        | Refusal::EditHistoryIncomplete { labeled_at }
+        | Refusal::TimelineShortOfLabel { labeled_at } => Some(labeled_at),
         Refusal::LabelNotFound | Refusal::LabelHistoryIncomplete => None,
     };
     Ok(match labeled_at {

@@ -1419,7 +1419,8 @@ pub fn judge_claimed_approval(
 /// `label-history-incomplete` on a full page of a longer history and `label-not-found`
 /// otherwise; a label applied by anyone but a human instructor is refused; and every body edit
 /// and title rename from the label's second on must be an instructor's, with a timeline page
-/// that may hide a rename in that second leaving the text unjudged.
+/// that may hide a rename in that second refused as `timeline-short-of-label` (when the body's
+/// edit history is whole) and a cut-off edit history as `edit-history-incomplete`.
 fn judge_chosen_label(
     issue: &ApprovalIssue,
     label: Option<&LabelChange>,
@@ -1448,6 +1449,10 @@ fn judge_chosen_label(
     let reaches = timeline_reaches(issue, &labeled_at);
     match text_changes_since(issue, &labeled_at, instructors, reaches) {
         TextCheck::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
+        // A cut-off edit history wins: applying the label again does not make it whole.
+        TextCheck::Unjudged if !reaches && edits_whole_since(issue, &labeled_at) => {
+            Approval::Refused(Refusal::TimelineShortOfLabel { labeled_at })
+        }
         TextCheck::Unjudged => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
         TextCheck::Unchanged => Approval::Approved {
             labeled_at,

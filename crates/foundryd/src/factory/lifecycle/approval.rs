@@ -22,6 +22,10 @@ pub enum Refusal {
     EditedAfterLabel { labeled_at: String },
     /// The body's edit history is cut off, so it cannot show every edit.
     EditHistoryIncomplete { labeled_at: String },
+    /// The timeline page is cut off at the label's second, so it may hide a rename in that
+    /// second. The body's edit history is whole. Applying the label again puts a newer label on
+    /// the newest page, which the next claim can judge.
+    TimelineShortOfLabel { labeled_at: String },
 }
 
 /// Whether the factory may build the issue: an instructor applied the label in force, and
@@ -57,6 +61,9 @@ pub fn refusal_reason(refusal: &Refusal) -> &'static str {
         Refusal::EditHistoryIncomplete { .. } => {
             "the factory could not read the full edit history of the issue text"
         }
+        Refusal::TimelineShortOfLabel { .. } => {
+            "the factory could not read the issue's history back to when factory:ready was applied"
+        }
     }
 }
 
@@ -64,9 +71,11 @@ pub fn refusal_reason(refusal: &Refusal) -> &'static str {
 /// from the issue.
 pub fn unapproved_comment(refusal: &Refusal) -> String {
     let what_to_do = match refusal {
-        // Applying the label again cannot help: the history only grows.
         Refusal::EditHistoryIncomplete { .. } => {
             "The issue's edit history is too long for the factory to check. File a new issue with the final text and apply `factory:ready` to it."
+        }
+        Refusal::TimelineShortOfLabel { .. } => {
+            "The issue's recent history is too long for the factory to check from the label. Apply `factory:ready` again."
         }
         _ => {
             "Review the issue text, then apply `factory:ready` again. An instructor must apply the label, and the text must not be edited afterwards by anyone who is not an instructor."
