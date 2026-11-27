@@ -48,7 +48,8 @@ import { upNext } from "./needing";
  *
  * One bar heads the terminal: its workspace, then the workspace's terminals as tabs with their
  * states, a + that starts another session or shell in it, and, when another terminal needs you,
- * the way to the next one (Cmd+J from anywhere; the board's needs-you lane starts it too). The
+ * the way to the next one (Cmd+J from anywhere; the board's needs-you lane starts it too). Short
+ * of room, it gives up what matters least first, keeping the workspace and the open tab. The
  * few terminals shown last (and both sides of a split) keep their pane attached behind the
  * others, so going back to one is instant, from its tab or another workspace; an older one
  * attaches again when shown and gets its screen and scrollback back from the holder.

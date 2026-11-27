@@ -1,10 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
+import { useRef } from "react";
 import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
 import { findKey } from "./FindBar";
 import { totals } from "./changes";
 import type { Located } from "./fleet";
 import { machineQuery } from "./api";
+import { useWidth } from "./media";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { button, pressed } from "./Modal";
 import { NextSteps, offersNext } from "./NextSteps";
@@ -20,6 +22,24 @@ import { TerminalMenuButton } from "./TerminalMenu";
 export const splitKey = jumpKey === "⌘K" ? "⌘\\" : "Ctrl \\";
 
 /**
+ * How much the header holds at its width. Wide holds everything. Snug gives up the next steps,
+ * the machine's name and the next one's workspace, and its buttons keep their icons. Tight folds
+ * changes and steps into More (which holds both), keeps Next to its count and puts two or more
+ * tabs on their own row, so the workspace's name and the open tab keep the room. Wide until the
+ * header has been measured.
+ */
+export type Fit = "wide" | "snug" | "tight";
+
+export function headerFit(width: number | undefined): Fit {
+  if (width === undefined || width >= WIDE) return "wide";
+  return width >= SNUG ? "snug" : "tight";
+}
+
+/** The header's widths, in pixels, from which it is wide or snug. */
+const WIDE = 1120;
+const SNUG = 640;
+
+/**
  * The one bar above a terminal: its workspace and the machine it runs on, then the workspace's
  * terminals as tabs (the open one with its state), and the ways into the workspace's changes, the
  * session's steps, finding text in it and a menu with the rest, ending it included. On a narrow
@@ -28,9 +48,10 @@ export const splitKey = jumpKey === "⌘K" ? "⌘\\" : "Ctrl \\";
  * split, closes its own side. In a split each side has its bar; the side with the keyboard has a
  * lit edge and the other is dimmed. An idle session of this machine offers its workspace's next
  * steps (commit, open a pull request, fix failing checks) in the bar, each sent to it as a prompt;
- * with a mouse on a wide screen and outside a split only, where the bar has room (a phone's key
- * bar offers them). When another terminal needs you, the bar of the side with the keyboard leads
- * the way to it (`NextUp`).
+ * with a mouse, outside a split and while the bar is wide only (a phone's key bar offers them).
+ * When another terminal needs you, the bar of the side with the keyboard leads the way to it
+ * (`NextUp`). The bar never spills out of its box: as it narrows, what matters least gives way
+ * first (`headerFit`).
  */
 export function TerminalHeader({
   id,
@@ -75,10 +96,15 @@ export function TerminalHeader({
   upNext?: { next: Needing; others: number };
 }) {
   const { data: here } = useQuery(machineQuery);
+  const bar = useRef<HTMLElement>(null);
+  const fit = headerFit(useWidth(bar));
+  // Two or more tabs take a row of their own: in a half of a split, and in a tight bar.
+  const apart = !!onClosePane || fit === "tight";
   return (
     <header
+      ref={bar}
       aria-label={beside ? "Terminal beside" : "Open terminal"}
-      className={`relative min-h-11 min-w-0 flex-1 flex-wrap items-center gap-x-3 border-b border-neutral-800 bg-neutral-900 px-3 text-sm ${onClosePane ? "" : "md:flex-nowrap"} ${beside ? "hidden opacity-60 transition-opacity hover:opacity-100 md:flex" : "flex"}`}
+      className={`relative min-h-11 min-w-0 flex-1 flex-wrap items-center ${fit === "tight" ? "gap-x-2" : "gap-x-3"} border-b border-neutral-800 bg-neutral-900 px-3 text-sm ${apart ? "" : "md:flex-nowrap"} ${beside ? "hidden opacity-60 transition-opacity hover:opacity-100 md:flex" : "flex"}`}
     >
       {onClosePane && !beside && <span aria-hidden="true" className="absolute inset-x-0 bottom-0 h-0.5 bg-sky-400/70" />}
       <button
@@ -95,23 +121,26 @@ export function TerminalHeader({
       </button>
       {located ? (
         <>
-          <div className={`flex h-11 min-w-0 shrink items-center gap-2 ${onClosePane ? "flex-1" : "max-md:flex-1 md:max-w-64"}`}>
+          {/* It shares the room with the tabs beside it (see `TabStrip`), so neither squeezes the other out. */}
+          <div className={`flex h-11 min-w-0 flex-1 items-center gap-2 ${apart ? "" : "md:max-w-64 md:grow-0 md:basis-auto"}`}>
             <span className="truncate font-medium text-neutral-100" title={`${located.workspace.branch} · ${located.workspace.project}`}>
               {located.workspace.name}
             </span>
-            <span className="hidden shrink-0 text-xs text-neutral-500 sm:inline" title={`Runs on ${located.machine.name}`}>
-              {located.machine.name}
-            </span>
+            {fit === "wide" && (
+              <span className="shrink-0 text-xs text-neutral-500" title={`Runs on ${located.machine.name}`}>
+                {located.machine.name}
+              </span>
+            )}
           </div>
-          {id ? <TabStrip workspace={located.workspace} machine={located.machine} active={id} changed={changed} apart={!!onClosePane} /> : <span className="flex-1" />}
-          {upNext && !beside && <NextUp next={upNext.next} others={upNext.others} answered={!needsYou.includes(located.glyph)} />}
-          {id && !onClosePane && offersNext(located, here) && (
-            <div className="hidden xl:pointer-fine:contents">
+          {id ? <TabStrip workspace={located.workspace} machine={located.machine} active={id} changed={changed} apart={apart} /> : <span className="flex-1" />}
+          {upNext && !beside && <NextUp next={upNext.next} others={upNext.others} answered={!needsYou.includes(located.glyph)} fit={fit} />}
+          {id && !onClosePane && fit === "wide" && offersNext(located, here) && (
+            <div className="hidden pointer-fine:contents">
               <NextSteps workspace={located.workspace.id} name={located.name} send={(prompt) => reply(id, prompt)} look="header" />
             </div>
           )}
-          <ChangesButton workspace={located.workspace.id} onClick={() => onChanges(located.workspace.id)} />
-          {onSteps && (
+          {fit !== "tight" && <ChangesButton workspace={located.workspace.id} onClick={() => onChanges(located.workspace.id)} worded={fit === "wide"} />}
+          {onSteps && fit !== "tight" && (
             <button
               type="button"
               aria-label="Steps"
@@ -121,7 +150,7 @@ export function TerminalHeader({
               className={`flex shrink-0 items-center gap-1.5 ${button} ${pressed}`}
             >
               <StepsIcon className="size-3.5" />
-              <span className="sr-only sm:not-sr-only">Steps</span>
+              <span className={fit === "wide" ? undefined : "sr-only"}>Steps</span>
             </button>
           )}
           {onFind && (
@@ -189,9 +218,10 @@ const HEADER_EVERY = 15_000;
 
 /**
  * Opens the workspace's changes. Once they have been opened, it shows their size and keeps it
- * fresh; until then it reads nothing, so a header costs the daemon nothing.
+ * fresh; until then it reads nothing, so a header costs the daemon nothing. Its word shows when
+ * `worded`; it is its name either way.
  */
-function ChangesButton({ workspace, onClick }: { workspace: string; onClick: () => void }) {
+function ChangesButton({ workspace, onClick, worded }: { workspace: string; onClick: () => void; worded: boolean }) {
   const leaving = useLeaving(workspace);
   const { data } = useQuery({ ...changesQuery(workspace), enabled: (query) => !leaving && query.state.data !== undefined, refetchInterval: HEADER_EVERY, retry: false });
   const t = data && !leaving && totals(data);
@@ -205,7 +235,7 @@ function ChangesButton({ workspace, onClick }: { workspace: string; onClick: () 
       <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
         <path d="M8 2.5v6M5 5.5h6M5 12.5h6" strokeLinecap="round" />
       </svg>
-      <span className="sr-only sm:not-sr-only">Changes</span>
+      <span className={worded ? undefined : "sr-only"}>Changes</span>
       {t && t.files > 0 && (
         <span className="font-mono">
           <span className="text-emerald-400">+{t.added}</span> <span className={t.removed ? "text-red-400" : "text-neutral-600"}>−{t.removed}</span>

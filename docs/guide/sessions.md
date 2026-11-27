@@ -11,11 +11,13 @@ One bar runs along the top of the terminal. From left to right:
 - The workspace name, then the machine it runs on. Point at the name to see its branch and project.
 - One tab for each terminal in the workspace, sessions first, then shells. Click a tab to switch. The tab you are on shows its state. When a tab in the background changes state, it shows the new state in bold until you open it.
 - A **+** that starts another terminal in this workspace. See [Start a session or a shell](#start-a-session-or-a-shell).
-- **Next**, in amber, when another terminal needs you. It names that terminal's workspace and counts how many others need you. Point at it to read what it asks. Click it, or press `Cmd+J`, to go there. Once the terminal you are on no longer needs you, **Next** fills and glows once. See [Go through what needs you](#go-through-what-needs-you).
+- **Next**, in amber, when another terminal needs you. It counts how many others need you and, when there is room, names that terminal's workspace. Point at it to read what it asks. Click it, or press `Cmd+J`, to go there. Once the terminal you are on no longer needs you, **Next** fills and glows once. See [Go through what needs you](#go-through-what-needs-you).
 - **Changes**, which opens what the workspace changed. Once you have opened it, the button also shows how many lines were added and removed.
 - **Steps**, **Find** and a split button. **More**, the three dots, holds the rest.
 
 On a phone the bar also has a button that opens the workspaces list, and a **Jump to** button.
+
+When the bar is short of room, for example with the sidebar and Steps both open, what you need least gives way first, so nothing spills out of the bar. The next steps go first, then the machine name and the workspace in **Next**. Next, **Changes** and **Steps** shrink to their icons. At its narrowest, as on a phone, **Changes** and **Steps** move into **More**, **Next** keeps only its count, and two or more tabs get a row of their own. The workspace name and the tab you are on always stay.
 
 **+** only shows for workspaces on this machine. For a workspace on another machine, the menu also leaves out the entries that start, end, clear or archive.
 
@@ -128,7 +130,7 @@ When a session on this machine is **Ready**, Foundry looks at its workspace and 
 
 Nothing is offered once the pull request is merged or closed. After you press a chip, all of them stay dimmed until the session starts working, so the same step is never sent twice. If it did not reach the session, **Not sent** appears beside it.
 
-Next steps show in the header only on a wide screen with a mouse, outside a split. On a phone they lead the key bar. They also show under the session's row on [the board](board.md#reading-a-card).
+Next steps show in the header only when it has room, with a mouse and outside a split. On a phone they lead the key bar. They also show under the session's row on [the board](board.md#reading-a-card).
 
 ## Hand a file to Claude
 
