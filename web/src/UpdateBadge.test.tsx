@@ -265,6 +265,53 @@ describe("UpdateBadge", () => {
     expect(within(dialog()).getByText(/this machine is restarting/i)).toBeDefined();
   });
 
+  it("offers no Install while the serving machine's own call is out", async () => {
+    show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+    fireEvent.click(badge());
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+    act(() => sent.calls[0].answer({ status: 202, json: {} }));
+    await settle();
+    expect(sent.calls.map((c) => c.machine)).toEqual([OTHER, ME]);
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Close" }));
+    fireEvent.click(badge());
+    expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(dialog()).getByText(/still out/i)).toBeDefined();
+  });
+
+  it("holds nothing back when the serving machine's call answers anything but 202", async () => {
+    show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+    fireEvent.click(badge());
+    fireEvent.click(within(dialog()).getByRole("checkbox", { name: "laptop v0.9.1" }));
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+    await settle();
+    act(() => sent.calls[0].answer({ status: 500, json: { error: "could not point current" } }));
+    await settle();
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Close" }));
+    fireEvent.click(badge());
+    expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(within(dialog()).queryByText(/restarting/i)).toBeNull();
+  });
+
+  for (const [back, sampled] of [
+    ["runs the tag", { version: "0.9.1" }],
+    ["refused the tag", { version: "0.9.0", update_refused: "v0.9.1" }],
+  ] as const) {
+    it(`offers Install again once the serving machine's sample says it is back and ${back}, with no reload`, async () => {
+      const { update } = show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      fireEvent.click(badge());
+      fireEvent.click(within(dialog()).getByRole("checkbox", { name: "laptop v0.9.1" }));
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+      await settle();
+      act(() => sent.calls[0].answer({ status: 202, json: {} }));
+      await settle();
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Close" }));
+      update([at(ME, 2, sampled), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      fireEvent.click(badge());
+      expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
+      expect(within(dialog()).queryByText(/restarting/i)).toBeNull();
+    });
+  }
+
   it("keeps a row after its machine's update_ready clears, until the checklist is closed", async () => {
     const { update } = show([at(ME, 1, { version: "0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
     fireEvent.click(badge());
