@@ -271,7 +271,7 @@ To go back to an older version by hand, run `install` from that version's folder
 <home>/versions/<version>/foundryd install
 ```
 
-`install` says it went back and names the refused tag. The newer version is then refused, as after a rollback. Export the same variables first, as in the section above, because `install` rewrites the service from your shell. The refusal holds until a higher tag is installed, from the UI or by hand. On Linux, run the `sudo systemctl restart foundryd` line it prints so the service starts the older version.
+`install` says it went back and names the refused tag. The newer version is then refused, as after a rollback. Export the same variables first, as in the section above, because `install` rewrites the service from your shell. The refusal holds until a higher tag is installed. On Linux, run the `sudo systemctl restart foundryd` line it prints so the service starts the older version.
 
 On a Mac, a release from before `secrets.json` reads only the keychain, which still holds the secrets as they were when foundry copied them. Before you go back to one by hand, remove `<home>/secrets.json`. The keychain is then the one store again, and the next hand install copies it afresh. Redo any change made since the copy, such as a machine joining, a revoked key or `foundryd secret set`, because the keychain never saw it. An automatic rollback never goes back past the copy, because an update installed from the UI, or by an older release's own updater, never makes one.
 
