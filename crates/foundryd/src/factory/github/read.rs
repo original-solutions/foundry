@@ -4618,6 +4618,16 @@ mod tests {
             .map(|_| labeled(LATER, "eve", "bug"))
             .collect();
         cases.push(issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None));
+        // A cut-off page that reaches back past the label: it shows every rename after it.
+        for after in [None, Some(renamed(AFTER, "eve"))] {
+            let mut page = vec![
+                labeled(BEFORE, "eve", "bug"),
+                labeled(LABELED, "tom", READY),
+            ];
+            page.extend(after);
+            page.extend((page.len()..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+            cases.push(issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None));
+        }
 
         let instructors = names(&["tom"]);
         let mut seen = Vec::new();
@@ -4645,10 +4655,10 @@ mod tests {
             assert!(seen.contains(&outcome), "{outcome:?} in {seen:?}");
         }
 
-        // Both judges hand the label they chose to one tail, each with its own `reaches`: a
-        // refusal added to the tail reaches both, and one added to a single judge beside it
-        // shows here. The known difference is in it too: on a cut-off page whose oldest event
-        // is the label, each judge still answers as before.
+        // Both judges hand the label they chose to one tail, each with its own `reaches`: this
+        // pins the `reaches` each passes, and a refusal added to a single judge beside the tail
+        // shows wherever a case triggers it. The known difference is in it too: on a cut-off
+        // page whose oldest event is the label, each judge still answers as before.
         let mut oldest = vec![labeled(LABELED, "tom", READY)];
         oldest.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
         let oldest = issue_of(oldest, &[], Some(HISTORY_PAGE as u64 + 5), None);
@@ -4662,7 +4672,7 @@ mod tests {
         );
         cases.push(oldest);
         for issue in &cases {
-            // Every case's label in force is its newest `ready` label.
+            // No case ends in a removal of `ready`, so its label in force is its newest one.
             let label = issue
                 .timeline_items
                 .nodes
