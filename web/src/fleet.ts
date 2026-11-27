@@ -419,6 +419,18 @@ export function sessionLabelIn(state: SessionState, run: FactoryRun | undefined)
   return tendedByFactory(run) && sessionGlyph[state] === "stuck" ? QUIET : sessionLabel[state];
 }
 
+/**
+ * The terminals of `workspace` that need you, most urgent first: those `needsYouIn` says do; or,
+ * in a held-up run none of whose terminals does, its most urgent one, since the run itself waits
+ * on you (G14) and its card opens there. The board's needs-you lane, the tab's count and the
+ * next-up strip all go by it.
+ */
+export function needingRows(workspace: WorkspaceView): Row[] {
+  const sorted = byUrgency(rows(workspace));
+  const need = sorted.filter((r) => needsYouIn(r.glyph, workspace.factory));
+  return need.length > 0 || !workspace.factory?.held ? need : sorted.slice(0, 1);
+}
+
 /** `rows` with what needs a person first, then what is busy, then the rest; ties keep their order. */
 export function byUrgency(list: Row[]): Row[] {
   return [...list].sort((a, b) => urgency.indexOf(a.glyph) - urgency.indexOf(b.glyph));

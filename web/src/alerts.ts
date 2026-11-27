@@ -1,5 +1,5 @@
 import type { SessionState } from "./api";
-import { byUrgency, needsYouIn, rows, tendedByFactory, type MachineView } from "./fleet";
+import { byUrgency, needingRows, needsYouIn, rows, tendedByFactory, type MachineView } from "./fleet";
 import { needsYou, sessionGlyph, type Glyph } from "./labels";
 import { shapes } from "./StateGlyph";
 
@@ -38,9 +38,13 @@ export function alertsFor(before: Seen | undefined, machines: MachineView[]): { 
   for (const workspace of machines.flatMap((m) => m.workspaces)) {
     const tended = tendedByFactory(workspace.factory);
     for (const s of workspace.sessions) {
-      seen.set(s.id, { state: s.state, tended });
-      if (!before) continue;
-      const was = before.get(s.id);
+      const was = before?.get(s.id);
+      // A resend of the fleet drops every factory mark until the statuses follow it, so a tended
+      // session that lost its mark with no change of its own is no news: it stays tended until a
+      // status says otherwise (held up, then it is raised).
+      const unmarked = was?.tended === true && was.state === s.state && workspace.factory === undefined;
+      seen.set(s.id, { state: s.state, tended: tended || unmarked });
+      if (!before || unmarked) continue;
       if (was?.state === s.state && was.tended === tended) continue;
       const phrase = was?.state === "working" && s.state === "idle" ? "finished its turn" : needsYouIn(sessionGlyph[s.state], workspace.factory) ? says[s.state] : undefined;
       if (phrase) alerts.push({ terminal: s.terminal, tag: s.id, glyph: sessionGlyph[s.state], title: workspace.name, body: `${s.name} ${phrase}` });
@@ -58,10 +62,12 @@ export interface Pulse {
 
 /** The fleet's pulse. A live factory run's terminals that would need you are left out, as the board leaves its card under working. */
 export function pulse(machines: MachineView[]): Pulse {
-  // What would need you but a live factory run tends is left out of the count and the glyph alike.
-  const all = machines.flatMap((m) => m.workspaces.flatMap((w) => rows(w).filter((r) => needsYouIn(r.glyph, w.factory) || !needsYou.includes(r.glyph))));
+  const workspaces = machines.flatMap((m) => m.workspaces);
+  // What would need you but a live factory run tends is left out of the glyph; what needs you is
+  // counted as the board's needs-you lane holds it (`needingRows`), a held-up run's card included.
+  const all = workspaces.flatMap((w) => rows(w).filter((r) => needsYouIn(r.glyph, w.factory) || !needsYou.includes(r.glyph)));
   const count = (...glyphs: Glyph[]) => all.filter((r) => glyphs.includes(r.glyph)).length;
-  return { glyph: byUrgency(all)[0]?.glyph, needYou: count(...needsYou), working: count("working") };
+  return { glyph: byUrgency(all)[0]?.glyph, needYou: workspaces.reduce((n, w) => n + needingRows(w).length, 0), working: count("working") };
 }
 
 /** The tab's title: what needs you first, so a narrow tab still shows the count. */

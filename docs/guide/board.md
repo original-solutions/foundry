@@ -45,7 +45,7 @@ On cards of this machine, a line under the changes says how far the branch has t
 - **Working.** An agent is working or starting.
 - **Quiet.** Nothing is happening.
 
-A factory run's card follows its run, not its sessions. While the run is live, the factory tends its sessions, so the card stays under **Working** even when one of them waits or fails, and a session with ten minutes of no output reads **Quiet 10+ min** instead of **Stuck**. The card moves to **Needs you** only when the run itself is stuck or needs answers on its issue. Then a stuck session in it reads **Stuck** again.
+A factory run's card follows its run, not its sessions. While the run is live, the factory tends its sessions, so the card stays under **Working** even when one of them waits or fails, and a session with ten minutes of no output reads **Quiet 10+ min** instead of **Stuck**. The card moves to **Needs you** only when the run itself is stuck or needs answers on its issue, even if none of its sessions waits, and the tab's count and the amber strip count it then too. Then a stuck session in it reads **Stuck** again.
 
 Inside a group, the most urgent card comes first. The amber strip at the top of the page opens the first session that needs you, and from there leads to the rest. See [Go through what needs you](sessions.md#go-through-what-needs-you).
 

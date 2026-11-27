@@ -86,6 +86,18 @@ describe("alertsFor and the factory", () => {
     expect(alertsFor(told.seen, withFactory(world("stuck"), live)).alerts).toEqual([]);
   });
 
+  it("raises nothing while a resend has dropped a tended run's mark, and raises once its run is held up", () => {
+    const tended = alertsFor(alertsFor(undefined, withFactory(world("working"), live)).seen, withFactory(world("stuck"), live));
+    expect(tended.alerts).toEqual([]);
+    // A state resend: the marks are gone until the statuses follow.
+    const bare = alertsFor(tended.seen, world("stuck"));
+    expect(bare.alerts).toEqual([]);
+    expect(alertsFor(bare.seen, withFactory(world("stuck"), live)).alerts).toEqual([]);
+    expect(alertsFor(bare.seen, withFactory(world("stuck"), held)).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
+    // A session that moves on meanwhile is news by the usual rules.
+    expect(alertsFor(bare.seen, world("failed")).alerts.map((a) => a.body)).toEqual(["opus failed"]);
+  });
+
   it("raises a held-up run's session that is stuck, and any session outside a run", () => {
     const { seen } = alertsFor(undefined, withFactory(world("working"), held));
     expect(alertsFor(seen, withFactory(world("stuck"), held)).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
@@ -115,6 +127,13 @@ describe("pulse", () => {
     }
     expect(pulse(withFactory(machines, factoryStatus("p1", {}, { [RUN]: { kind: "stuck", workspaces: ["w1"] } })))).toEqual({ glyph: "stuck", needYou: 1, working: 1 });
     expect(pulse(machines)).toEqual({ glyph: "stuck", needYou: 1, working: 1 });
+  });
+
+  it("counts a held-up run's workspace as needing you though none of its terminals does", () => {
+    const RUN = "original-solutions__foundry__170__1";
+    expect(pulse(withFactory(world("finished"), factoryStatus("p1", {}, { [RUN]: { kind: "stuck", workspaces: ["w1"] } }))).needYou).toBe(1);
+    expect(pulse(withFactory(world("stuck"), factoryStatus("p1", {}, { [RUN]: { kind: "stuck", workspaces: ["w1"] } }))).needYou).toBe(1);
+    expect(pulse(world("finished")).needYou).toBe(0);
   });
 
   it("has no glyph for an empty fleet", () => {
