@@ -4,7 +4,7 @@
 //! fake are read alike. Ported from the reading half of the runner's `src/tracker/github.ts`,
 //! and from `src/tracker/approvalHistory.ts`, the pure half of the approval rule.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::de::DeserializeOwned;
 
@@ -180,6 +180,16 @@ pub struct IssueDetail {
     pub closed: bool,
 }
 
+/// One issue as [`issue_labels`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueLabels {
+    pub number: u64,
+    /// The label names.
+    pub labels: Vec<String>,
+    /// GitHub has the issue closed.
+    pub closed: bool,
+}
+
 /// An open issue that blocks another one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Blocker {
@@ -283,6 +293,29 @@ struct RawIssueSummary {
 enum IssueState {
     Open,
     Closed,
+}
+
+/// The answer to [`issue_labels`]'s query: each alias with the issue it found, or null.
+#[derive(serde::Deserialize)]
+struct RawLabelledAnswer {
+    data: HashMap<String, Option<RawLabelled>>,
+}
+
+/// An issue the batched read found. GitHub answers an empty object for a number it has as
+/// something other than an issue, so every field may be missing.
+#[derive(serde::Deserialize)]
+struct RawLabelled {
+    #[serde(default)]
+    number: Option<u64>,
+    #[serde(default)]
+    state: Option<IssueState>,
+    #[serde(default)]
+    labels: Option<RawLabelNodes>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawLabelNodes {
+    nodes: Vec<RawLabel>,
 }
 
 #[derive(serde::Deserialize)]
@@ -557,6 +590,76 @@ pub fn issue<G: Tracker + ?Sized>(
         closed: raw.state == IssueState::Closed,
         labels,
     })
+}
+
+/// The fragment [`issue_labels`] reads each issue by. GitHub puts at most 100 labels on an
+/// issue, so one page holds them all.
+const LABELLED_FRAGMENT: &str =
+    "fragment Labelled on Issue { number state labels(first: 100) { nodes { name } } }";
+
+/// The labels and open or closed state of each issue numbered, in one GraphQL call; none for
+/// no number. A number GitHub has no issue for is not in the answer: each is looked up by its
+/// URL, which GitHub answers with null, where `issue(number:)` would fail the whole call.
+pub fn issue_labels<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    numbers: &[u64],
+) -> Result<BTreeMap<u64, IssueLabels>, TrackerError> {
+    let numbers: BTreeSet<u64> = numbers.iter().copied().collect();
+    if numbers.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    // The repo is written into the query, so only a plain `owner/name` is.
+    let plain = repo
+        .split_once('/')
+        .is_some_and(|(owner, name)| is_plain_segment(owner) && is_plain_segment(name));
+    if !plain {
+        return Err(invalid_argument(repo, "a repo written as owner/name"));
+    }
+    let asked: Vec<String> = numbers
+        .iter()
+        .map(|n| {
+            format!(
+                "i{n}: resource(url: \"https://github.com/{repo}/issues/{n}\") {{ ...Labelled }}"
+            )
+        })
+        .collect();
+    let args = vec![
+        "api".to_string(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query=query {{ {} }} {LABELLED_FRAGMENT}", asked.join(" ")),
+    ];
+    let answer: RawLabelledAnswer =
+        gh_json(gh, &args, "a GraphQL response with each issue asked for")?;
+    let mut found = BTreeMap::new();
+    for number in numbers {
+        let Some(read) = answer.data.get(&format!("i{number}")) else {
+            return Err(parse_error(
+                &args,
+                &format!("a GraphQL response naming issue {number}"),
+            ));
+        };
+        // Null for no such issue; an object without a number for something other than an issue.
+        let Some(read) = read.as_ref().filter(|read| read.number.is_some()) else {
+            continue;
+        };
+        let (Some(state), Some(labels)) = (&read.state, &read.labels) else {
+            return Err(parse_error(
+                &args,
+                &format!("issue {number} with its state and labels"),
+            ));
+        };
+        found.insert(
+            number,
+            IssueLabels {
+                number,
+                labels: labels.nodes.iter().map(|l| l.name.clone()).collect(),
+                closed: *state == IssueState::Closed,
+            },
+        );
+    }
+    Ok(found)
 }
 
 /// The open issues GitHub's dependency links say block `issue`.
@@ -3001,7 +3104,13 @@ mod tests {
     /// before any call.
     #[test]
     fn issue_labels_refuses_a_repo_not_written_as_owner_name_before_any_call() {
-        for repo in ["rawphp", "rawphp/soft\"fac", "rawphp/softfac/x", "../softfac", "/softfac"] {
+        for repo in [
+            "rawphp",
+            "rawphp/soft\"fac",
+            "rawphp/softfac/x",
+            "../softfac",
+            "/softfac",
+        ] {
             let fake = FakeTracker::new();
             let error = issue_labels(&fake, repo, &[5]).unwrap_err();
             assert!(is_refused(&error), "{repo}: {error}");

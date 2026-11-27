@@ -1650,18 +1650,33 @@ impl<'a, 'w> Pass<'a, 'w> {
             (HeldUpKind::Stuck, State::Stuck),
             (HeldUpKind::NeedsInfo, State::NeedsInfo),
         ] {
-            let mut of_kind = waiting.iter().filter(|(_, k)| *k == kind).peekable();
-            if of_kind.peek().is_none() {
+            let of_kind: Vec<&Done> = waiting
+                .iter()
+                .filter(|(_, k)| *k == kind)
+                .map(|(done, _)| *done)
+                .collect();
+            if of_kind.is_empty() {
                 continue;
             }
-            let labelled: BTreeSet<u64> = world
-                .tracker
-                .list_issues(&world.project.repo, state)?
-                .items
-                .iter()
-                .map(|issue| issue.number)
-                .collect();
-            for (done, _) in of_kind {
+            let repo = &world.project.repo;
+            let listing = world.tracker.list_issues(repo, state)?;
+            let mut labelled: BTreeSet<u64> =
+                listing.items.iter().map(|issue| issue.number).collect();
+            if listing.cut {
+                // A cut listing leaves issues out. Those this kind's runs are on are read in one
+                // call and judged as the listing judges them: open and carrying the label.
+                let missing: Vec<u64> = of_kind
+                    .iter()
+                    .map(|done| done.run.run.issue())
+                    .filter(|issue| !labelled.contains(issue))
+                    .collect();
+                let read = world.tracker.issue_labels(repo, &missing)?;
+                labelled.extend(read.values().filter_map(|issue| {
+                    let carries = issue.labels.iter().any(|label| label == state.label());
+                    (!issue.closed && carries).then_some(issue.number)
+                }));
+            }
+            for done in of_kind {
                 if labelled.contains(&done.run.run.issue()) {
                     // A finished run's events are read only while a person holds it up. One
                     // that cannot be read names no workspace; it is still held up, and the
@@ -5153,6 +5168,8 @@ mod tests {
         fn past_the_cut_a_run_whose_issue_left_the_label_or_was_closed_is_not_held_up() {
             let mut rig = Rig::new();
             fill_the_listing(&rig, "factory:stuck");
+            // A 201st, so the listing is cut without the issues the runs are on.
+            rig.hub.issue(201, &["factory:stuck"]);
             rig.hub.issue(300, &[]);
             rig.hub.issue(301, &["factory:stuck"]);
             rig.hub.edit(301, |issue| issue.closed = true);
@@ -5160,7 +5177,11 @@ mod tests {
             held_up_run(&rig, 301, 1, State::Stuck, "closed");
             let report = rig.pass();
             assert_eq!(report.failed, None, "{report:?}");
-            assert!(rig.status().held_up.is_empty(), "{:?}", rig.status().held_up);
+            assert!(
+                rig.status().held_up.is_empty(),
+                "{:?}",
+                rig.status().held_up
+            );
             assert_eq!(batched_reads(&rig), 1);
         }
 

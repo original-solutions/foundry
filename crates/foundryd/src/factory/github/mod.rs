@@ -30,8 +30,8 @@ pub use fake::FakeTracker;
 pub use gh::{Answer, Gh};
 pub use read::{
     Activity, Blocker, BodyEdit, CheckState, CheckStatus, Comment, DropReason, Dropped, Feedback,
-    FeedbackKind, InlineComment, IssueDetail, IssueSummary, Listing, Mergeable, OpenPullRequest,
-    PullRequest,
+    FeedbackKind, InlineComment, IssueDetail, IssueLabels, IssueSummary, Listing, Mergeable,
+    OpenPullRequest, PullRequest,
 };
 pub use write::{
     Claim, IssueComment, MARKER, STATUS_MARKER, claim_comment, claim_marker, newest_claim,
@@ -134,6 +134,16 @@ pub trait Tracker: Send + Sync {
     /// One issue with its labels, assignees and body.
     fn issue(&self, repo: &str, number: u64) -> Result<IssueDetail, TrackerError> {
         read::issue(self, repo, number)
+    }
+
+    /// The labels and open or closed state of each issue numbered, read in one call; a number
+    /// GitHub has no issue for is not in the answer.
+    fn issue_labels(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+    ) -> Result<std::collections::BTreeMap<u64, IssueLabels>, TrackerError> {
+        read::issue_labels(self, repo, numbers)
     }
 
     /// Whether an instructor applied the `factory:ready` label in force and every edit since
