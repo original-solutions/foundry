@@ -385,6 +385,24 @@ mod tests {
     }
 
     #[test]
+    fn a_machines_install_is_carried_to_the_machine_it_names() {
+        let id = uuid::Uuid::new_v4();
+        let path = format!("/api/machines/{id}/update");
+        assert!(carries(&path));
+        assert!(matches!(target(&path), Some(Target::Machine(m)) if m.0 == id));
+        assert!(worker(&path).is_none());
+        for other in [
+            "/api/machines/not-an-id/update".to_owned(),
+            format!("/api/machines/{id}/remove"),
+            format!("/api/machines/{id}/limits"),
+            format!("/api/machines/{id}/update/more"),
+            "/api/machines/update".to_owned(),
+        ] {
+            assert!(!carries(&other), "{other}");
+        }
+    }
+
+    #[test]
     fn each_mounted_worker_route_is_read_as_its_own_worker_and_carried_only_by_a_run() {
         let id = uuid::Uuid::new_v4();
         let mut read = Vec::new();

@@ -297,7 +297,260 @@ fn refusal(status: u16, message: String) -> (u16, Bytes) {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use foundry_proto::ids::WorkspaceId;
+    use foundry_proto::messages::UPDATES_SINCE;
+    use foundry_proto::settings::{Machine, SharedSettings};
+    use futures::future::BoxFuture;
+    use tokio::sync::mpsc;
+
     use super::*;
+    use crate::store::Store;
+    use crate::sync::Dialer;
+
+    /// Opens a link for each dial and keeps its far end, where the test answers as the owner.
+    struct Opens(Arc<Mutex<Vec<Conn>>>);
+
+    impl Dialer for Opens {
+        fn dial(&self, _: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
+            let (near, far) = Conn::pair();
+            lock(&self.0).push(far);
+            Box::pin(async { Ok(near) })
+        }
+    }
+
+    /// Peers of machine `me` whose machine list also holds `peer`, named `peer`, with the far
+    /// end of each link they dial.
+    fn listing(
+        me: MachineId,
+        peer: MachineId,
+    ) -> (tempfile::TempDir, Peers, Arc<Mutex<Vec<Conn>>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        let settings = SharedSettings {
+            seq: 1,
+            machines: [(me, "me"), (peer, "peer")]
+                .into_iter()
+                .map(|(id, name)| Machine {
+                    id,
+                    name: name.into(),
+                    address: "100.64.0.9".into(),
+                    key: String::new(),
+                })
+                .collect(),
+            ..SharedSettings::default()
+        };
+        assert!(store.apply_settings(settings).unwrap());
+        let dialed = Arc::new(Mutex::new(Vec::new()));
+        let peers = Peers::new(
+            me,
+            Arc::new(std::sync::Mutex::new(store)),
+            Arc::new(Opens(dialed.clone())),
+        );
+        (dir, peers, dialed)
+    }
+
+    #[tokio::test]
+    async fn an_install_is_never_sent_on_a_link_below_updates_since_and_a_workspace_call_still_is()
+    {
+        let (me, old) = (MachineId::random(), MachineId::random());
+        let (_dir, peers, dialed) = listing(me, old);
+        peers.inner.heard_from(old);
+        let (link, _unread) = mpsc::channel(4);
+        let _open = peers.inner.opened(old, UPDATES_SINCE - 1, link);
+
+        let install = format!("/api/machines/{old}/update");
+        let body = br#"{"tag":"v0.9.1"}"#;
+        match peers.call(old, &install, Some("application/json"), body).await {
+            Err(CallError::Older(name)) => assert_eq!(name, "peer"),
+            other => panic!("not refused as older: {other:?}"),
+        }
+        assert!(lock(&dialed).is_empty(), "the install was sent");
+
+        let shells = format!("/api/workspaces/{}/shells", WorkspaceId::random());
+        let calling = tokio::spawn({
+            let (peers, shells) = (peers.clone(), shells.clone());
+            async move { peers.call(old, &shells, None, b"").await }
+        });
+        let mut far = loop {
+            if let Some(far) = lock(&dialed).pop() {
+                break far;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let opened = far.recv.recv().await.unwrap();
+        match serde_json::from_str::<PeerMessage>(&opened).unwrap() {
+            PeerMessage::Call { call, .. } => assert_eq!(call.path, shells),
+            other => panic!("not a call: {other:?}"),
+        }
+        let answer = Frame::Answer {
+            status: 201,
+            body: hex(b"{}"),
+            version: 0,
+        };
+        far.send
+            .send(serde_json::to_string(&answer).unwrap())
+            .await
+            .unwrap();
+        let answered = calling.await.unwrap().unwrap();
+        assert_eq!(answered.status, 201);
+    }
+
+    #[test]
+    fn only_the_install_needs_updates_since_and_every_other_route_calls_since() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(needs(&format!("/api/machines/{id}/update")), UPDATES_SINCE);
+        for other in [
+            "/api/workspaces".to_owned(),
+            format!("/api/workspaces/{id}/sessions"),
+            format!("/api/terminals/{id}/close"),
+            format!("/api/machines/{id}/remove"),
+        ] {
+            assert_eq!(needs(&other), CALLS_SINCE, "{other}");
+        }
+    }
+
+    /// A stop that counts how many times it acted.
+    fn counted() -> (Stop, Arc<AtomicUsize>) {
+        let stops = Arc::new(AtomicUsize::new(0));
+        let counting = stops.clone();
+        let stop = Stop::new(move || {
+            counting.fetch_add(1, Ordering::SeqCst);
+        });
+        (stop, stops)
+    }
+
+    fn accepted() -> Frame {
+        Frame::Answer {
+            status: 202,
+            body: String::new(),
+            version: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_stop_a_carried_answer_asked_for_fires_only_once_the_answer_is_on_the_link() {
+        let (stop, stops) = counted();
+        let (owner, mut caller) = Conn::pair();
+        let answering = tokio::spawn(async move {
+            let Conn { send, mut recv } = owner;
+            answer(&send, &mut recv, &accepted(), Some(stop)).await;
+        });
+
+        let text = caller.recv.recv().await.unwrap();
+        assert!(
+            matches!(
+                serde_json::from_str(&text),
+                Ok(Frame::Answer { status: 202, .. })
+            ),
+            "{text}"
+        );
+        assert_eq!(stops.load(Ordering::SeqCst), 0, "stopped before the answer");
+        drop(caller);
+        answering.await.unwrap();
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_asked_for_no_stop_stops_nothing() {
+        let (stop, stops) = counted();
+        let (owner, caller) = Conn::pair();
+        drop(caller);
+        let Conn { send, mut recv } = owner;
+        answer(&send, &mut recv, &accepted(), None).await;
+        drop(stop);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_the_link_cannot_take_still_stops_within_the_limit_and_once() {
+        let (stop, stops) = counted();
+        // As the route does once the install is made.
+        stop.fire_within(STOP_WITHIN);
+        // A link whose buffer is full and never read: the answer cannot be sent.
+        let (send, _unread) = mpsc::channel(1);
+        send.send("full".to_owned()).await.unwrap();
+        let (_open, mut recv) = mpsc::channel(1);
+        let started = Instant::now();
+        let answering = tokio::spawn(async move {
+            answer(&send, &mut recv, &accepted(), Some(stop)).await;
+        });
+
+        while stops.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(started.elapsed() <= STOP_WITHIN, "{:?}", started.elapsed());
+        answering.await.unwrap();
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "stopped twice");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_already_gone_stops_at_once_and_the_fallback_does_not_stop_again() {
+        let (stop, stops) = counted();
+        stop.fire_within(STOP_WITHIN);
+        let (owner, caller) = Conn::pair();
+        drop(caller);
+        let Conn { send, mut recv } = owner;
+        let started = Instant::now();
+
+        answer(&send, &mut recv, &accepted(), Some(stop.clone())).await;
+
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < STOP_WITHIN, "{:?}", started.elapsed());
+        tokio::time::sleep(STOP_WITHIN * 2).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "stopped twice");
+        assert!(stop.fired());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_asked_for_by_nobody_fires_by_itself_within_its_limit() {
+        let (stop, stops) = counted();
+        stop.fire_within(STOP_WITHIN);
+        tokio::time::sleep(STOP_WITHIN - Duration::from_millis(1)).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 0, "fired early");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        stop.fire();
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "fired twice");
+    }
+
+    #[tokio::test]
+    async fn the_owners_api_asks_for_a_stop_only_with_its_header() {
+        let app = axum::Router::new()
+            .route(
+                "/stops",
+                axum::routing::post(|| async { (axum::http::StatusCode::ACCEPTED, [(STOP_AFTER, "1")]) }),
+            )
+            .route(
+                "/goes-on",
+                axum::routing::post(|| async { axum::http::StatusCode::ACCEPTED }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let stops = run(api, "/stops".into(), None, Bytes::new()).await;
+        let goes_on = run(api, "/goes-on".into(), None, Bytes::new()).await;
+
+        server.abort();
+        assert_eq!((stops.0, stops.1.is_empty(), stops.2), (202, true, true));
+        assert_eq!((goes_on.0, goes_on.2), (202, false));
+    }
+
+    #[test]
+    fn the_stop_of_a_machine_is_the_one_its_peers_were_given() {
+        let (me, other) = (MachineId::random(), MachineId::random());
+        let (_dir, peers, _) = listing(me, other);
+        assert!(stop_of(me).is_none());
+        let (stop, stops) = counted();
+        peers.stop_after_calls(stop);
+        stop_of(me).expect("a stop").fire();
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(stop_of(other).is_none());
+    }
 
     #[tokio::test]
     async fn the_beat_the_owner_sends_reads_as_a_call_links_beat() {

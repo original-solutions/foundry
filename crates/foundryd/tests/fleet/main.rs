@@ -10,6 +10,7 @@ mod factory;
 mod join;
 mod relay;
 mod sync;
+mod update;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
