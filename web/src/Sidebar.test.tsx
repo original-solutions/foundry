@@ -650,6 +650,23 @@ describe("where a workspace's work stands", () => {
     expect(calls).toHaveLength(2);
   });
 
+  it("reads again after a glyph change that lands while an earlier read is still on its way", async () => {
+    let release: (answer: Response) => void = () => {};
+    const held = new Promise<Response>((done) => (release = done));
+    const answers: (() => Response | Promise<Response>)[] = [() => held, () => json(200, ready)];
+    const calls = reads({ w1: () => (answers.shift() ?? (() => json(200, ready)))() as Response });
+    await changing(fleet(mine("working"), both, {}, [ME, OTHER]), fleet(mine("idle"), both, {}, [ME, OTHER]));
+    await waitFor(() => expect(calls).toHaveLength(1));
+
+    // The turn ends (it pushed and opened #88) while the read from before it is still out.
+    fireEvent.click(screen.getByRole("button", { name: "next state" }));
+    await act(() => new Promise((done) => setTimeout(done, 20)));
+    release(json(200, { ...ready, pr: null }));
+
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    expect(calls).toHaveLength(2);
+  });
+
   it("shows the project alone again when a later read fails", async () => {
     const answers = [json(200, ready), json(503, { error: "laptop did not answer" })];
     const calls = reads({ w1: () => answers.shift() ?? json(503, {}) });
