@@ -1,7 +1,7 @@
 import { useMutation, useMutationState, useQuery } from "@tanstack/react-query";
 import { useId, useState, type ReactNode } from "react";
 import { Dialog } from "radix-ui";
-import { archiveWorkspace, type Blockers, type FileChange } from "./api";
+import { ApiError, archiveWorkspace, type Blockers, type FileChange } from "./api";
 import { changesQuery } from "./ChangesPanel";
 import { splitPath } from "./changes";
 import { rows, type MachineView, type WorkspaceView } from "./fleet";
@@ -41,8 +41,9 @@ export function useLeaving(workspace: string): boolean {
  * Asks before archiving `workspace`, and shows what archiving it means before anything is sent:
  * the commits that stay on its branch, the uncommitted files that go with the worktree, and every
  * terminal that stops, with a turn it would cut short. Its changes are read once, as the changes
- * sheet reads them; the daemon still decides, and when it holds the archive up, its list of what
- * would be lost is shown and Archive anyway forces it.
+ * sheet reads them, or the daemon's reason they cannot be; the daemon still decides, and when it
+ * holds the archive up, its list of what would be lost is shown, with a folder that is no longer a
+ * git worktree said so, and Archive anyway forces it. While the archive runs, its button says so.
  *
  * For a workspace on another machine than `here`, the one serving the UI, its changes are not read:
  * that read answers only for this machine's workspaces. The dialog says so, still lists the
@@ -90,7 +91,7 @@ export function ArchiveDialog({
       title={`Archive ${workspace.name}?`}
       description={
         <>
-          Its terminals stop and its worktree is removed. Branch <code className="rounded bg-neutral-800 px-1 font-mono text-xs text-neutral-200">{workspace.branch}</code> stays.
+          Its terminals stop and its worktree is removed. Branch <Branch name={workspace.branch} /> stays.
         </>
       }
     >
@@ -101,7 +102,8 @@ export function ArchiveDialog({
               {words.unreadable}. {machine.name} lists any work that would be lost before it archives.
             </p>
           ) : changes.isError ? (
-            <p className="text-xs text-neutral-500">{words.unreadable}.</p>
+            // The daemon says why it could not read them, as for a folder that is no longer a git worktree.
+            <p className="text-xs text-neutral-500">{changes.error instanceof ApiError ? changes.error.message.trim().replace(/\.$/, "") : words.unreadable}.</p>
           ) : !changes.data ? (
             <p className="text-xs text-neutral-600">Reading what it changed…</p>
           ) : changes.data.commits.length === 0 ? (
@@ -150,6 +152,11 @@ export function ArchiveDialog({
 
         {blockers && (
           <Part title="Archiving now would lose this work" tone="text-red-400" icon="M8 2.5l6 11H2zM8 6.5v3M8 11.5v.01" warn>
+            {blockers.detached && (
+              <p className="text-xs text-neutral-300">
+                Its folder is no longer a git worktree, so what is in it can't be checked. Archive anyway deletes the folder; branch <Branch name={workspace.branch} /> stays.
+              </p>
+            )}
             <Held title="Uncommitted files" items={blockers.uncommitted} />
             <Held title="Unpushed commits" items={blockers.unpushed} />
             <Held title="Submodules" items={blockers.submodules} />
@@ -169,11 +176,16 @@ export function ArchiveDialog({
           disabled={archive.isPending}
           className={risky ? dangerButton : primaryButton}
         >
-          {blockers ? "Archive anyway" : "Archive"}
+          {archive.isPending ? "Archiving…" : blockers ? "Archive anyway" : "Archive"}
         </button>
       </div>
     </Modal>
   );
+}
+
+/** A branch's name, as code. */
+function Branch({ name }: { name: string }) {
+  return <code className="rounded bg-neutral-800 px-1 font-mono text-xs text-neutral-200">{name}</code>;
 }
 
 /** One part of the dialog: a small heading with its icon, then what it says. */

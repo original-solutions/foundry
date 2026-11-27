@@ -3,7 +3,7 @@ import { useState } from "react";
 import { changesQuery } from "./ChangesPanel";
 import type { Located } from "./fleet";
 import { nextSteps, type NextStep } from "./next";
-import { pollEvery } from "./poll";
+import { gone, pollEvery } from "./poll";
 import { CHECKS_EVERY, shippingQuery } from "./Shipping";
 
 /** Next steps are offered to an idle session of this machine (`here`): one that waits for its next prompt, and whose workspace this daemon can read. */
@@ -33,14 +33,17 @@ const looks = {
  * One-tap next steps for an idle session: what its workspace needs to get its work out (commit,
  * push and open a pull request, fix failing checks, answer a review), each sent to the session as
  * a prompt by `send`. Mounted when the session goes idle, so each turn's end reads the workspace's
- * changes and where its branch stands afresh; read again while checks run. A step pressed stays
+ * changes and where its branch stands afresh; read again while checks run. A read the daemon last
+ * answered 404 for is not asked again on a mount. A step pressed stays
  * down until the session starts working and the steps go away, or until the steps change; one
  * that did not reach it says so.
  */
 export function NextSteps({ workspace, name, send, look }: { workspace: string; name: string; send: (prompt: string) => Promise<void> | void; look: keyof typeof looks }) {
-  const { data: changes } = useQuery({ ...changesQuery(workspace), staleTime: 0, retry: false });
+  // A read the daemon last answered 404 for is not asked again: the workspace is another machine's, or gone.
+  const { data: changes } = useQuery({ ...changesQuery(workspace), enabled: (query) => !gone(query.state.error), staleTime: 0, retry: false });
   const { data: shipping } = useQuery({
     ...shippingQuery(workspace),
+    enabled: (query) => !gone(query.state.error),
     staleTime: 0,
     retry: false,
     refetchInterval: (query) => pollEvery(CHECKS_EVERY, query.state.data?.pr?.state === "open" && query.state.data.pr.checks === "pending")(query),
