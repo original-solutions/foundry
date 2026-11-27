@@ -1230,34 +1230,8 @@ pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]
             _ => {}
         }
     }
-    let Some(label) = in_force else {
-        let timeline = &issue.timeline_items;
-        let cut_off =
-            timeline.nodes.len() >= HISTORY_PAGE && timeline.total_count > HISTORY_PAGE as u64;
-        return Approval::Refused(if cut_off {
-            Refusal::LabelHistoryIncomplete
-        } else {
-            Refusal::LabelNotFound
-        });
-    };
-    let labeled_at = label.created_at.clone();
-    let actor = label.actor.as_ref();
-    let Some(applied_by) = actor.filter(|actor| is_human_instructor(Some(actor), instructors))
-    else {
-        return Approval::Refused(Refusal::LabeledByNonInstructor {
-            by: actor.map(|actor| actor.login.clone()),
-            labeled_at,
-        });
-    };
     // The label is on the page, so the renames at or after it are too.
-    match text_changes_since(issue, &labeled_at, instructors, true) {
-        TextCheck::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
-        TextCheck::Unjudged => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
-        TextCheck::Unchanged => Approval::Approved {
-            labeled_at,
-            labeled_by: applied_by.login.clone(),
-        },
-    }
+    judge_chosen_label(issue, in_force, instructors, true)
 }
 
 /// The approval a claim was made on, judged after the claim removed `ready`: [`judge_approval`]'s
@@ -1304,9 +1278,22 @@ pub fn judge_claimed_approval(
         }
         _ => None,
     };
-    // From here this repeats `judge_approval`'s tail, which #308 leaves unchanged and #333
-    // shares, but for the text check's `reaches`: `timeline_reaches` here, where `judge_approval`
-    // assumes `true`. A test holds the two to the same answers everywhere else.
+    // The page may be cut off just after the label, hiding a rename in its second.
+    let reaches = label.is_some_and(|label| timeline_reaches(issue, &label.created_at));
+    judge_chosen_label(issue, label, instructors, reaches)
+}
+
+/// What both judges decide once they have chosen the label (or found none): a missing label is
+/// `label-history-incomplete` on a full page of a longer history and `label-not-found`
+/// otherwise; a label applied by anyone but a human instructor is refused; and every body edit
+/// and title rename from the label's second on must be an instructor's. `reaches` says the
+/// timeline page holds every rename at or after the label.
+fn judge_chosen_label(
+    issue: &ApprovalIssue,
+    label: Option<&LabelChange>,
+    instructors: &[String],
+    reaches: bool,
+) -> Approval {
     let Some(label) = label else {
         let timeline = &issue.timeline_items;
         let cut_off =
@@ -1326,7 +1313,6 @@ pub fn judge_claimed_approval(
             labeled_at,
         });
     };
-    let reaches = timeline_reaches(issue, &labeled_at);
     match text_changes_since(issue, &labeled_at, instructors, reaches) {
         TextCheck::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
         TextCheck::Unjudged => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
@@ -4575,10 +4561,10 @@ mod tests {
         );
     }
 
-    /// Until both judges share one tail (#333), they must agree wherever the label in force
-    /// decides: the same label, actor, edit and rename rules, and the same refusals. The one
-    /// known difference is left out: on a cut-off page whose oldest event is the label,
-    /// `judge_approval` assumes the page holds every rename and `judge_claimed_approval` does not.
+    /// The two judges agree wherever the label in force decides: the same label, actor, edit
+    /// and rename rules, and the same refusals. The one known difference is left out of the
+    /// agreement: on a cut-off page whose oldest event is the label, `judge_approval` assumes the
+    /// page holds every rename and `judge_claimed_approval` does not.
     #[test]
     fn judge_claimed_approval_agrees_with_judge_approval_on_a_label_in_force() {
         /// A timeline, the body edits, and the edit history's total when it is not their count.
