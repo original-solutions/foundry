@@ -972,6 +972,54 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_answered_with_an_error_and_a_state_cannot_be_read() {
+        for answer in [
+            r#"{"status":"error","error":{"code":"PRECONDITION_FAILED"}}"#,
+            r#"{"state":"failed","error":"grant not removed"}"#,
+        ] {
+            let fake = FakeVims::new();
+            fake.on("workspace turn-grant put", Reply::ok(answer))
+                .on("workspace turn-grant rm", Reply::ok(answer));
+            assert!(
+                matches!(
+                    fake.grant("wsp_1", "fetch", "conn_gh", "30m", "k1"),
+                    Err(VimsError::Unknown { .. })
+                ),
+                "{answer}"
+            );
+            assert!(
+                matches!(
+                    fake.ungrant("wsp_1", "fetch", "conn_gh", "k2"),
+                    Err(VimsError::Unknown { .. })
+                ),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grant_answered_with_its_own_id_is_made_and_one_with_a_state_is_an_operation() {
+        let fake = FakeVims::new();
+        fake.on(
+            "workspace turn-grant put",
+            Reply::ok(r#"{"id":"tg_1","turn":"fetch","connection":"conn_gh"}"#),
+        )
+        .on(
+            "workspace turn-grant put",
+            Reply::ok(r#"{"id":"op_3","status":"running"}"#),
+        );
+        assert_eq!(
+            fake.grant("wsp_1", "fetch", "conn_gh", "30m", "k1")
+                .unwrap(),
+            Change::Done
+        );
+        assert!(matches!(
+            fake.grant("wsp_1", "fetch", "conn_gh", "30m", "k2").unwrap(),
+            Change::Operation(operation) if operation.id == "op_3"
+        ));
+    }
+
+    #[test]
     fn a_change_answer_that_names_no_operation_or_workspace_cannot_be_read() {
         for answer in [
             r#"{"error":{"code":"PRECONDITION_FAILED"},"id":"req_1"}"#,

@@ -582,6 +582,19 @@ mod tests {
             ),
             ("echo 'FATAL: connection lost' >&2\nexit 1", None),
             ("echo 'WARNING: retrying' >&2\nexit 1", None),
+            // Each says Vims did, or is doing, the work, so none is "took nothing".
+            (
+                "echo '{\"error\":{\"code\":\"CONFLICT\"}}'\nexit 1",
+                Some("CONFLICT"),
+            ),
+            (
+                "echo '{\"error\":{\"code\":\"ALREADY_EXISTS\"}}'\nexit 1",
+                Some("ALREADY_EXISTS"),
+            ),
+            (
+                "echo 'Error: HOST_COMMAND_TIMEOUT: the command ran past 1800 s' >&2\nexit 1",
+                Some("HOST_COMMAND_TIMEOUT"),
+            ),
         ] {
             let program = fake_vims(dir.path(), script);
             let error = vims_at(&program, Arc::new(SystemClock))
@@ -594,6 +607,7 @@ mod tests {
                 other => panic!("{script}: {other:?}"),
             }
             assert_eq!(error.refusal(), None, "{script}");
+            assert_eq!(error.code(), code, "{script}");
         }
     }
 
@@ -603,7 +617,6 @@ mod tests {
         for code in [
             "IDEMPOTENCY_KEY_REUSED",
             "PRECONDITION_FAILED",
-            "HOST_COMMAND_TIMEOUT",
             "QUOTA_EXCEEDED",
             "NOT_FOUND",
             "UNAUTHORIZED",
@@ -635,7 +648,11 @@ mod tests {
             .call(&exec_call())
             .unwrap_err()
             .to_string();
-        assert!(text.ends_with("éx"), "{text}");
+        // 1001 bytes; the cut at byte 601 falls inside an `é`, so it moves on to 602.
+        assert!(
+            text.ends_with(&format!(": …{}x", "é".repeat(199))),
+            "{text}"
+        );
     }
 
     #[test]
