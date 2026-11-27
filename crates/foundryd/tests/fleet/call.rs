@@ -416,6 +416,31 @@ async fn a_makes_a_workspace_on_b_starts_a_session_and_a_shell_there_and_archive
 }
 
 #[tokio::test]
+async fn a_asks_where_b_workspaces_branch_stands_and_b_answers_unchanged() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let project = project(&fleet, remotes.path());
+    let on_a = Served::of(a).await;
+    let on_b = Served::of(b).await;
+    b.peers.serve_calls(on_b.addr);
+    hears(&a.peers, b.id).await;
+
+    let made = json!({"project": project, "base": "main", "name": "far work", "machine": b.id});
+    let (status, answer) = on_a.post("/api/workspaces", Some(made)).await;
+    assert_eq!(status, 201, "{answer}");
+    let workspace = id_of(&answer);
+    let branch = "far-work";
+
+    let (status, answer) = on_a
+        .post(&format!("/api/workspaces/{workspace}/pr"), None)
+        .await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["branch"], branch, "{answer}");
+    assert_eq!(answer["pushed"], false, "{answer}");
+}
+
+#[tokio::test]
 async fn a_call_for_b_once_the_link_to_b_is_cut_answers_503_naming_b_and_makes_nothing() {
     let fleet = Fleet::start(2);
     let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
