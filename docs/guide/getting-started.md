@@ -56,6 +56,15 @@ Once the first workspace exists, there are three ways to start a task. All three
 
 The dialog opens over whatever you were looking at. **Start** closes it and takes you to the new session. If the daemon has something to say about the workspace's setup, the dialog stays open with the message and a **Close** button. `Esc` closes it without starting anything.
 
+## Start several tasks at once
+
+Write the tasks as a list, one item per line, each starting with `-`, `*` or a number. Indent a line to keep it with the item above it. The box then shows **Split into 3 tasks** (with your count) under it.
+
+- Press it and the box lists the workspace and branch each item makes. **Start 3** makes them one after another, each with Claude at work on its item, in the project, base, model and machine you picked.
+- You stay where you are. The new workspaces show up on the board and in the sidebar as they start.
+- If one cannot be made, the others start all the same. The box keeps that item and says why.
+- Press **Split into 3 tasks** again to make one workspace with the whole list as its task.
+
 ## Projects
 
 A project is a repo and a name, shared by every machine in the fleet. A machine clones the repo the first time it hosts a workspace for that project.

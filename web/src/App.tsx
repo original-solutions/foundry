@@ -72,6 +72,7 @@ import { upNext } from "./needing";
  *
  * A workspace is made one way, from a task box: the first run's, the board's top line, or the
  * New task dialog (the sidebar's button, or the palette with what was typed as the task). It is landed in: once its session shows up, its terminal opens, its setup shell a tab beside it.
+ * A task written as a list can be split into a workspace per item; those are not landed in.
  *
  * A workspace's changes since its base open as a sheet from the header or the workspace's row.
  *

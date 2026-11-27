@@ -195,7 +195,7 @@ A P3 overview on the same read. With no terminal open, the UI shows every worksp
 
 Above the lanes, one line takes the next task, beside the way to jump. Once used it opens into the first run's composer: the task names the workspace (numbered when its project already has that branch; a typed name the project has is refused), Start makes it on this machine, or on another machine picked in the box when the fleet has one, and lands in its session already at work.
 
-That task box is the one way a workspace is made. The sidebar's New task button opens it over any screen, and the jump palette offers what was typed as a new task in it. With no task written, a typed workspace name makes the workspace with its session idle.
+That task box is the one way a workspace is made. The sidebar's New task button opens it over any screen, and the jump palette offers what was typed as a new task in it. With no task written, a typed workspace name makes the workspace with its session idle. A task written as a list of two or more items (each line a dash, star, bullet or number, or indented under the item above) offers to split: each item then names its own workspace and is its session's first prompt, with the box's project, base, model and machine. Start makes them one after another, lands in none of them, and leaves in the box, with why, only the items whose workspace was not made.
 
 On a phone the board is the home too. A line above the task box says how many workspaces need you (or that nothing does), then how many work and rest. A bar at the bottom switches between board, timeline and machines, marks the board with the count that needs you, and opens the workspaces as a drawer; the drawer's title leads back to the board from a terminal.
 
