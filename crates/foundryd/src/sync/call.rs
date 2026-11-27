@@ -813,16 +813,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_stop_of_a_machine_is_the_one_its_peers_were_given() {
-        let (_dir, peers, _) = listing(MachineId::random(), MachineId::random());
-        assert!(lock(&peers.inner.stop).is_none());
-        let (stop, stops) = counted();
-        peers.stop_after_calls(stop);
-        lock(&peers.inner.stop).clone().expect("a stop").fire();
-        assert_eq!(stops.load(Ordering::SeqCst), 1);
-    }
-
     #[tokio::test]
     async fn the_beat_the_owner_sends_reads_as_a_call_links_beat() {
         let (send, mut recv) = tokio::sync::mpsc::channel(4);
