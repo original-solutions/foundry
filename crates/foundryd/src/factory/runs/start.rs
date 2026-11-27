@@ -871,10 +871,12 @@ struct LabelHistoryRepository {
 }
 
 /// The approval a claim was made on, read after the claim removed `factory:ready`: when and by
-/// whom the `factory:ready` label in force at the claim was applied, if an instructor applied
-/// it and the text is as an instructor left it since. The claim's removal is the newest removal
-/// of the label by the project's login; with none on the timeline, the label in force now. These
-/// are `judge_approval`'s checks, made as of the claim rather than now. The text is judged by
+/// whom the label the claim took off was applied, if an instructor applied it and the text is
+/// as an instructor left it since. Only the label's newest event is judged. A removal by the
+/// project's login is the claim's, and the label it took off is the event before it. A label
+/// still on is the approval, as when the claim's removal is not on the timeline. Any other
+/// newest event (a removal by anyone else, or none) approves nothing. These are
+/// `judge_approval`'s checks, made as of the claim rather than now. The text is judged by
 /// `text_check`, which reads the history again and checks its timestamps. `None` when the
 /// approval cannot be confirmed.
 fn claimed_on(ctx: &RunContext<'_>, issue: u64) -> Result<Option<(String, String)>, RunError> {
@@ -882,33 +884,45 @@ fn claimed_on(ctx: &RunContext<'_>, issue: u64) -> Result<Option<(String, String
     let instructors = &ctx.config.instructors;
     let args = issue_query_args(repo, APPROVAL_QUERY, issue)?;
     let history: LabelHistory = gh_json(ctx.tracker, &args, "a GraphQL response with the issue")?;
-    let nodes = history.data.repository.issue.timeline_items.nodes;
-    let ready = |change: &LabelChange| change.label.name == State::Ready.label();
-    let by_login = |change: &LabelChange| {
-        change
-            .actor
-            .as_ref()
-            .is_some_and(|actor| actor.login.eq_ignore_ascii_case(&ctx.project.login))
-    };
-    let claimed = nodes
-        .iter()
-        .rposition(|node| {
-            matches!(node, TimelineNode::UnlabeledEvent(change) if ready(change) && by_login(change))
-        })
-        .unwrap_or(nodes.len());
-    let mut in_force = None;
-    for node in nodes.into_iter().take(claimed) {
-        match node {
-            TimelineNode::LabeledEvent(change) if ready(&change) => in_force = Some(change),
-            TimelineNode::UnlabeledEvent(change) if ready(&change) => in_force = None,
-            _ => {}
+    let ready = State::Ready.label();
+    // The label's events, newest first: `true` for applied, `false` for removed.
+    let mut events = history
+        .data
+        .repository
+        .issue
+        .timeline_items
+        .nodes
+        .into_iter()
+        .rev()
+        .filter_map(|node| match node {
+            TimelineNode::LabeledEvent(change) if change.label.name == ready => {
+                Some((true, change))
+            }
+            TimelineNode::UnlabeledEvent(change) if change.label.name == ready => {
+                Some((false, change))
+            }
+            _ => None,
+        });
+    let label = match events.next() {
+        Some((true, label)) => label,
+        Some((false, removal))
+            if removal
+                .actor
+                .as_ref()
+                .is_some_and(|actor| actor.login.eq_ignore_ascii_case(&ctx.project.login)) =>
+        {
+            match events.next() {
+                Some((true, label)) => label,
+                _ => return Ok(None),
+            }
         }
-    }
-    let Some(LabelChange {
+        _ => return Ok(None),
+    };
+    let LabelChange {
         created_at,
         actor: Some(actor),
         ..
-    }) = in_force
+    } = label
     else {
         return Ok(None);
     };
