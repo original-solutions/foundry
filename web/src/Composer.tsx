@@ -90,6 +90,9 @@ const githubLink = /^https?:\/\/(?:www\.)?github\.com\/[^/]+\/[^/]+\/(pull|issue
 const reference = /^(pr|issue)#(\d+)$/;
 const number = /^#(\d+)$/;
 
+/** `word` without the brackets around it or the punctuation that closes a sentence after it. */
+const bare = (word: string) => word.replace(/^[(<[]+/, "").replace(/[)>\].!?,;:…]+$/u, "");
+
 /**
  * The words of a task's first line a name is made of: a GitHub pull request or issue link is
  * `pr <n>` or `issue <n>`, so are `PR#<n>` and `issue #<n>`, any other link is dropped, and a first
@@ -100,10 +103,10 @@ function nameWords(line: string): string[] {
   if (words[0]?.startsWith("/")) words[0] = words[0].slice(1);
   const kept: string[] = [];
   for (let i = 0; i < words.length; i++) {
-    const word = words[i].replace(/[.!?,;:…]+$/u, "");
+    const word = bare(words[i]);
     const link = githubLink.exec(word);
     const ref = reference.exec(word);
-    const next = number.exec(words[i + 1] ?? "");
+    const next = number.exec(bare(words[i + 1] ?? ""));
     if (link) kept.push(link[1] === "pull" ? "pr" : "issue", link[2]);
     else if (ref) kept.push(ref[1], ref[2]);
     else if ((word === "pr" || word === "issue") && next) {
@@ -140,14 +143,19 @@ function holder(name: string, project: Project | undefined, workspaces: Workspac
 const NAME_TRIES = 20;
 
 /**
- * The names to try for `name`, in turn: `name`, then `name 2`, `name 3`…, skipping those the
- * project already has a workspace on the branch of, 20 at most. Empty for an empty name.
+ * The names to try for `name`, in turn: `name`, then `name 2`, `name 3`…, 20 at most, skipping
+ * those the project already has a workspace on the branch of and those whose branch an earlier
+ * one has (a long name's branch is cut before its number). Empty for an empty name.
  */
 function freeNames(name: string, project: Project | undefined, workspaces: WorkspaceView[]): string[] {
   if (!name) return [];
   const names: string[] = [];
-  for (let n = 1; names.length < NAME_TRIES; n++) {
+  const branches: string[] = [];
+  for (let n = 1; n <= NAME_TRIES + workspaces.length && names.length < NAME_TRIES; n++) {
     const next = n === 1 ? name : `${name} ${n}`;
+    const branch = safeBranch(next);
+    if (branches.some((b) => sameBranch(b, branch))) continue;
+    branches.push(branch);
     if (!holder(next, project, workspaces)) names.push(next);
   }
   return names;

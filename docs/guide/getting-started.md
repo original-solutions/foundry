@@ -24,7 +24,7 @@ Under the box, from left to right:
 - **on.** Only appears when the fleet has other machines. Choose **this machine**, **let Foundry choose**, or a machine by name. An offline machine is listed but cannot be picked. With no other machine, the line just says "on this machine".
 - **Start.** Makes the workspace and starts Claude. `Cmd+Enter` (`Ctrl+Enter` on Windows and Linux) does the same from the box.
 
-The **Workspace** field under the box holds the name. Leave it empty to use the one made from the task, or type your own. Foundry numbers a name made from a task when its branch is taken in the project's repo, by an open workspace or by a branch or worktree left from earlier, so a second "fix the login redirect" becomes `fix the login redirect 2`. It never changes a name you typed. If the project already has a workspace on that name's branch, the branch turns amber, a line asks for another name, and **Start** stays off.
+The **Workspace** field under the box holds the name. Leave it empty to use the one made from the task, or type your own. Foundry numbers a name made from a task when the project already has its branch, so a second "fix the login redirect" becomes `fix the login redirect 2`. It never changes a name you typed. If the project already has a workspace on that name's branch, the branch turns amber, a line asks for another name, and **Start** stays off.
 
 The task is optional. With a name and no task, Foundry makes the workspace and starts Claude with nothing to do yet.
 
