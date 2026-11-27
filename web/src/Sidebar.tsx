@@ -8,7 +8,7 @@ import { startShell } from "./api";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
 import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
-import { factoryRows, factoryRuns, type FactoryRun } from "./lanes";
+import { factoryRuns, runRows, type FactoryRun } from "./lanes";
 import { MachineName } from "./Machines";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
@@ -301,7 +301,7 @@ interface WorkspaceProps {
 function Workspace({ workspace, machine, factory, folded, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
   const terminals = useTerminalActions();
-  const list = factory ? factoryRows(rows(workspace)) : rows(workspace);
+  const list = runRows(workspace, factory);
   const over = ended(workspace);
   return (
     <div role="group" aria-label={workspace.name} className="group/ws">
@@ -459,7 +459,6 @@ function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspa
   );
 }
 
-/** A window with its left column marked: the sidebar, collapsed or expanded. */
 /** Says a workspace is a factory run's, as a link to its issue when the run names one. */
 export function FactoryMark({ run }: { run: FactoryRun }) {
   const text = run.issue === undefined ? "factory" : `factory #${run.issue}`;
@@ -472,6 +471,7 @@ export function FactoryMark({ run }: { run: FactoryRun }) {
   );
 }
 
+/** A window with its left column marked: the sidebar, collapsed or expanded. */
 export function PanelIcon({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">

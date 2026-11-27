@@ -51,8 +51,13 @@ export function factoryRuns(statuses: Record<string, FactoryStatus> | undefined)
   return (workspace) => named.get(`${workspace.projectId}/${workspace.id}`);
 }
 
-/** A factory run's terminals as they show: a session P1 marks stuck is quiet, since the factory watches it. */
-export function factoryRows(list: Row[]): Row[] {
+/**
+ * A workspace's terminals as they show. In a live factory run, a session P1 marks stuck is quiet,
+ * since the factory watches it; in a held-up run, which waits on a person, it stays stuck.
+ */
+export function runRows(workspace: WorkspaceView, run: FactoryRun | undefined): Row[] {
+  const list = rows(workspace);
+  if (!run || run.held) return list;
   return list.map((row) => (row.session && row.glyph === "stuck" ? { ...row, label: QUIET } : row));
 }
 
@@ -81,7 +86,7 @@ export function lanes(machines: MachineView[], statuses?: Record<string, Factory
   const cards = machines.flatMap((machine) =>
     machine.workspaces.map((workspace) => {
       const factory = factoryOf(workspace);
-      const sorted = byUrgency(factory ? factoryRows(rows(workspace)) : rows(workspace));
+      const sorted = byUrgency(runRows(workspace, factory));
       const card: Card = { workspace, machine, rows: sorted, lead: sorted[0], ...(factory && { factory }) };
       return { card, lane: factory ? factoryLane(factory, card.lead?.glyph) : laneOf(card.lead?.glyph) };
     }),
