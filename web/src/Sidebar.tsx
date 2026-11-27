@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named, Now } from "./Now";
@@ -407,19 +407,34 @@ function StandingLine({ workspace, list, readable }: { workspace: WorkspaceView;
   });
   const glyphs = list.map((r) => `${r.terminal}:${r.glyph}`).join(" ");
   const last = useRef(glyphs);
-  useEffect(() => {
+  // Before any passive effect of this commit: what read, if any, was out when the glyph changed.
+  useLayoutEffect(() => {
     if (last.current === glyphs) return;
     last.current = glyphs;
-    // A board card marks the same entry out of date on the same change, before or after this
-    // effect. Waiting a tick lets its read start (or land) first, so the change is read once.
     const { queryKey } = shippingQuery(workspace.id);
-    const before = client.getQueryState(queryKey)?.dataUpdatedAt;
-    const wait = setTimeout(() => {
-      const now = client.getQueryState(queryKey);
-      if (now?.fetchStatus === "fetching" || now?.dataUpdatedAt !== before) return;
-      void client.invalidateQueries({ queryKey, exact: true }, { cancelRefetch: false });
-    }, 0);
-    return () => clearTimeout(wait);
+    const query = () => client.getQueryCache().find({ queryKey, exact: true });
+    const updates = () => (query()?.state.dataUpdateCount ?? 0) + (query()?.state.errorUpdateCount ?? 0);
+    const before = { read: query()?.promise, updates: updates() };
+    // A board card marks the same entry out of date on the same change, before or after this row.
+    // Waiting a tick lets its read start (or land) first, so the change is read once. A read that
+    // was out before the change may have asked before a push, so it does not count: once it lands,
+    // the row reads again unless another read has started since.
+    let live = true;
+    const settle = () => {
+      if (!live) return;
+      const read = query()?.promise;
+      if (read !== undefined && read === before.read) {
+        void read.then(settle, settle);
+        return;
+      }
+      const readSince = read !== undefined || (before.read === undefined && updates() !== before.updates);
+      if (!readSince) void client.invalidateQueries({ queryKey, exact: true });
+    };
+    const wait = setTimeout(settle, 0);
+    return () => {
+      live = false;
+      clearTimeout(wait);
+    };
   }, [glyphs, client, workspace.id]);
 
   const working = list.some((r) => r.glyph === "starting" || r.glyph === "working");
