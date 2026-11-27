@@ -1304,6 +1304,8 @@ pub fn judge_claimed_approval(
         }
         _ => None,
     };
+    // From here this repeats `judge_approval`'s tail, which #308 leaves unchanged; #333 shares
+    // it, and a test holds the two to the same answers until then.
     let Some(label) = label else {
         let timeline = &issue.timeline_items;
         let cut_off =
@@ -4570,6 +4572,89 @@ mod tests {
             claimed(&issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None)),
             cut
         );
+    }
+
+    /// Until both judges share one tail (#333), they must agree wherever the label in force
+    /// decides: the same label, actor, edit and rename rules, and the same refusals.
+    #[test]
+    fn judge_claimed_approval_agrees_with_judge_approval_on_a_label_in_force() {
+        /// A timeline, the body edits, and the edit history's total when it is not their count.
+        type Shape<'a> = (Vec<TimelineNode>, &'a [(&'a str, &'a str)], Option<u64>);
+        let app = Actor {
+            typename: Some("Bot".into()),
+            login: "tom".into(),
+        };
+        let actors = [
+            Some(user("tom")),
+            Some(user("eve")),
+            Some(user(PROJECT)),
+            Some(app),
+            None,
+        ];
+        let full: Vec<(&str, &str)> = (0..HISTORY_PAGE).map(|_| (AFTER, "tom")).collect();
+        let mut cases = Vec::new();
+        for actor in &actors {
+            let label = || labeled_by(LABELED, actor.clone());
+            let shapes: Vec<Shape> = vec![
+                (vec![label()], &[], None),
+                (
+                    vec![renamed(BEFORE, "eve"), label()],
+                    &[(BEFORE, "eve")],
+                    None,
+                ),
+                (vec![label()], &[(LABELED, "eve")], None),
+                (vec![label()], &[(AFTER, "eve")], None),
+                (vec![label()], &[(AFTER, "tom")], None),
+                (vec![label(), renamed(AFTER, "eve")], &[], None),
+                (vec![label(), renamed(LABELED, "tom")], &[], None),
+                (vec![label()], &full, None),
+                (vec![label()], &[(AFTER, "tom")], Some(150)),
+                (
+                    vec![
+                        labeled(BEFORE, "tom", READY),
+                        unlabeled(BEFORE, "tom"),
+                        label(),
+                    ],
+                    &[],
+                    None,
+                ),
+            ];
+            for (events, edits, edits_total) in shapes {
+                cases.push(issue_of(events, edits, None, edits_total));
+            }
+        }
+        // No label at all, on a whole page and on a cut-off one.
+        cases.push(issue_of(vec![renamed(AFTER, "tom")], &[], None, None));
+        let page: Vec<TimelineNode> = (0..HISTORY_PAGE)
+            .map(|_| labeled(LATER, "eve", "bug"))
+            .collect();
+        cases.push(issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None));
+
+        let instructors = names(&["tom"]);
+        let mut seen = Vec::new();
+        for issue in &cases {
+            let fresh = judge_approval(issue, READY, &instructors);
+            assert_eq!(
+                judge_claimed_approval(issue, READY, PROJECT, &instructors),
+                fresh,
+                "{issue:?}"
+            );
+            if !seen.contains(&fresh) {
+                seen.push(fresh);
+            }
+        }
+        // The cases reach every outcome, so agreement is not agreement on one answer.
+        for outcome in [
+            approved(LABELED, "tom"),
+            refused(by_non_instructor(Some("eve"), LABELED)),
+            refused(by_non_instructor(None, LABELED)),
+            refused(edited_after(LABELED)),
+            refused(history_cut(LABELED)),
+            Approval::Refused(Refusal::LabelNotFound),
+            Approval::Refused(Refusal::LabelHistoryIncomplete),
+        ] {
+            assert!(seen.contains(&outcome), "{outcome:?} in {seen:?}");
+        }
     }
 
     // ---- claimed_approval ----
