@@ -4402,6 +4402,19 @@ mod tests {
             None,
         );
         assert_eq!(claimed(&removals), not_found);
+        // The event just before the claim's removal is an instructor's withdrawal: the label
+        // further back is no approval.
+        let withdrawn = issue_of(
+            vec![
+                labeled(BEFORE, "tom", READY),
+                unlabeled(LABELED, "tom"),
+                unlabeled(AFTER, PROJECT),
+            ],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(claimed(&withdrawn), not_found);
         // A label applied and taken off again after the claim hides it.
         let mut events = vec![labeled(BEFORE, "tom", READY)];
         events.extend(swap_by(LABELED, PROJECT));

@@ -3107,9 +3107,9 @@ mod tests {
                 assert_eq!(approval_reads(&rig), 1);
 
                 let rig = Rig::new();
-                rig.worker.on_create(Ok(ws_id()));
-                let run = taken_over(&rig, elsewhere());
-                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                let run = taken_over(&rig, rig.machine);
+                rig.sim.set_approval(removed_by_the_claim("mallory", &[]));
+                goes_stuck_unapproved(&rig, &run);
                 assert_eq!(approval_reads(&rig), 1);
             }
 
