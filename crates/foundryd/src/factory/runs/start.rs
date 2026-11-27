@@ -894,6 +894,9 @@ struct HistoryRepository {
 /// judges the label in force. It must be an instructor's (a person), and no one but an
 /// instructor may have edited or renamed the issue from that second on. `None` when there is no
 /// such label on the newest page of the timeline, or it does not pass.
+///
+/// This mirrors `read_history`'s timestamp checks and `judge_approval`'s instructor and text
+/// checks (in `github/read.rs`), and must change with them.
 fn approved_before_claim(
     ctx: &RunContext<'_>,
     issue: u64,

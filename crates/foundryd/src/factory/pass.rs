@@ -251,6 +251,9 @@ pub struct Memo {
 /// A finished run as the status shows it, with where its `finished` event stands.
 #[derive(Debug)]
 struct Done {
+    /// A listing that was not cut off showed the run's issue without its label: the label
+    /// never comes back for a finished attempt, so the run is not looked for again.
+    released: bool,
     /// Why a run that finished stuck or needing information waits for a person: the summary's
     /// reason, empty for any other run.
     reason: String,
@@ -1637,7 +1640,8 @@ impl<'a, 'w> Pass<'a, 'w> {
     /// is what ends the wait. Only the newest attempt of an issue is held up. The issues with
     /// each label are listed only when such a finished run exists. A listing that fails does not
     /// end the pass, which is no one's step: what the last pass held up of these runs stays held
-    /// up until a listing is read.
+    /// up until a listing is read. A listing that is not cut off and lacks the issue releases
+    /// the run for good, so listings stop once no finished run waits.
     fn hold_up_finished(&mut self, unfinished: &BTreeSet<RunId>) {
         let world = self.world;
         let newest = |run: &RunId| {
@@ -1651,7 +1655,7 @@ impl<'a, 'w> Pass<'a, 'w> {
             .finished
             .values()
             .flatten()
-            .filter(|done| newest(&done.run.run))
+            .filter(|done| !done.released && newest(&done.run.run))
             .filter_map(|done| {
                 let kind = match done.run.outcome {
                     RunOutcome::Stuck => HeldUpKind::Stuck,
@@ -1673,24 +1677,39 @@ impl<'a, 'w> Pass<'a, 'w> {
             if of_kind.is_empty() {
                 continue;
             }
+            let kept = |memo: &Memo, results: &mut PassResults, of_kind: &[&HeldUp]| {
+                let before = memo.last.iter().flat_map(|last| &last.held_up);
+                for held in before {
+                    if of_kind.iter().any(|now| now.run == held.run) {
+                        results.held_up.push(held.clone());
+                    }
+                }
+            };
             match world.tracker.list_issues(&world.project.repo, state) {
                 Ok(listing) => {
                     let carrying: BTreeSet<u64> =
                         listing.items.iter().map(|issue| issue.number).collect();
+                    let mut missing = Vec::new();
                     for held in of_kind {
                         if carrying.contains(&held.run.issue()) {
                             self.results.held_up.push(held.clone());
+                        } else {
+                            missing.push(held);
+                        }
+                    }
+                    if listing.cut {
+                        // A listing cut off at its limit may leave the issue out: no evidence
+                        // that the label is gone, so what the last pass held up stays.
+                        kept(&*self.memo, &mut self.results, &missing);
+                    } else {
+                        for held in missing {
+                            if let Some(Some(done)) = self.memo.finished.get_mut(&held.run) {
+                                done.released = true;
+                            }
                         }
                     }
                 }
-                Err(_) => {
-                    let before = self.memo.last.iter().flat_map(|last| &last.held_up);
-                    for held in before {
-                        if of_kind.iter().any(|now| now.run == held.run) {
-                            self.results.held_up.push(held.clone());
-                        }
-                    }
-                }
+                Err(_) => kept(&*self.memo, &mut self.results, &of_kind),
             }
         }
     }
@@ -1738,9 +1757,15 @@ impl<'a, 'w> Pass<'a, 'w> {
                 pr_url: summary.pr_url.clone(),
                 run: summary.id,
             });
-            self.memo
-                .finished
-                .insert(id, run.map(|run| Done { reason, at, run }));
+            self.memo.finished.insert(
+                id,
+                run.map(|run| Done {
+                    released: false,
+                    reason,
+                    at,
+                    run,
+                }),
+            );
         }
         Ok(())
     }
