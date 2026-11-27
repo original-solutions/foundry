@@ -14,7 +14,6 @@
 //!   syncs apart from the session's own can arrive late.
 //! - [`shorten_command_limit`] makes the gate's 30-minute limit on a command a few seconds.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use foundry_proto::factory::{FactoryBody, FactoryRecord, SessionTurn};
