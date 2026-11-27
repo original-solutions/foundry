@@ -5188,18 +5188,23 @@ mod tests {
         }
 
         /// The worker finds the session busy after all: nothing was typed, the run goes on, and
-        /// the next pass looks again.
+        /// the next pass looks again. Asks in a row that the worker refuses keep one
+        /// `launch-resending` line, so a view that stays behind the worker's does not grow the
+        /// ledger by a line a pass.
         #[test]
         fn a_launch_the_worker_refuses_as_not_idle_leaves_the_run_going() {
             let (mut rig, run) = built();
             show(&mut rig, SessionState::Idle, 0, 0);
             rig.worker.on_send(Err(SendRefused::NotIdle));
+            rig.worker.on_send(Err(SendRefused::NotIdle));
             let before = rig.events(&run).len();
-            assert_eq!(
-                pass(&rig, &run),
-                BuildStep::Launch(StartStep::Started { session: session() })
-            );
-            assert_eq!(sends(&rig), vec![launch_sent_again()]);
+            for _ in 0..2 {
+                assert_eq!(
+                    pass(&rig, &run),
+                    BuildStep::Launch(StartStep::Started { session: session() })
+                );
+            }
+            assert_eq!(sends(&rig), vec![launch_sent_again(), launch_sent_again()]);
             assert_eq!(
                 steps_after(&rig, &run, before),
                 [format!("{LAUNCH_RESENDING}0")]
@@ -5208,7 +5213,8 @@ mod tests {
         }
 
         /// A send that fails otherwise is the pass's error, as a reminder's is: the step is
-        /// written before the send, and the next pass asks again under the same count.
+        /// written before the send, and the next pass asks again under the same count, with
+        /// no second line for it.
         #[test]
         fn a_launch_whose_send_fails_is_the_passs_error_and_asked_again_next_pass() {
             let (mut rig, run) = built();
@@ -5233,6 +5239,10 @@ mod tests {
                 BuildStep::Launch(StartStep::Resent { session: session() })
             );
             assert_eq!(sends(&rig), vec![launch_sent_again(), launch_sent_again()]);
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [format!("{LAUNCH_RESENDING}0")]
+            );
         }
 
         /// The launch is asked for with this pass's own reads: `start`'s pass, with its second

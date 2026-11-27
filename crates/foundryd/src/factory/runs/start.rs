@@ -1672,11 +1672,19 @@ pub(super) fn launched(
     }
     let (base, resumed) = recorded_decision(ctx, run, seen)?;
     let message = launch_message(ctx, run, &base, resumed.as_ref());
-    ctx.record_step(
-        run,
-        &format!("{LAUNCH_RESENDING}{FIRST_PROMPT_COUNT}"),
-        &Cause::new(CauseStep::Start, "launch-resend"),
-    )?;
+    // One line for asks in a row: when the ledger's newest step is this one, the pass before
+    // asked and nothing has happened since (the worker found the session busy, the send failed,
+    // or the view has not caught up), so a view that stays behind does not grow the ledger by a
+    // line a pass. The count guards each send either way.
+    let resending = format!("{LAUNCH_RESENDING}{FIRST_PROMPT_COUNT}");
+    let events = ctx.ledger.read(run)?;
+    if events.iter().rev().find_map(step_text) != Some(resending.as_str()) {
+        ctx.record_step(
+            run,
+            &resending,
+            &Cause::new(CauseStep::Start, "launch-resend"),
+        )?;
+    }
     match ctx.send(session, message, Some(FIRST_PROMPT_COUNT)) {
         Ok(_) => Ok(StartStep::Resent { session }),
         // The worker decides: its count rose, so the message was typed, and the ledger says so
