@@ -56,6 +56,65 @@ describe("Sidebar", () => {
     expect(face.getAttribute("aria-hidden")).toBe("true");
   });
 
+  it("hangs a spine from each workspace's face in its most urgent terminal's fill, as the board's card edge does", async () => {
+    const records = [
+      sample(ME, 1),
+      workspace(ME, "w1", "asks"),
+      terminal(ME, "t1", "w1"),
+      session(ME, "s1", "w1", "t1", "working"),
+      terminal(ME, "t2", "w1"),
+      session(ME, "s2", "w1", "t2", "waiting_for_you"),
+      workspace(ME, "w2", "quiet"),
+      terminal(ME, "t3", "w2"),
+      session(ME, "s3", "w2", "t3", "finished"),
+      terminal(ME, "t4", "w2", "unreachable"),
+      workspace(ME, "w3", "bare"),
+    ];
+    const view = fleet(records, settings({ machines: [{ id: ME, name: "studio", address: "" }] }));
+    await renderApp(<Sidebar machines={view} {...props} />);
+    const spine = (name: string) => screen.getByRole("group", { name }).querySelector<HTMLElement>("[data-spine]")!;
+
+    expect(spine("asks").className).toMatch(/(^| )bg-amber-400( |$)/);
+    expect(spine("quiet").className).toMatch(/(^| )bg-neutral-600( |$)/);
+    expect(spine("bare").className).toMatch(/(^| )bg-neutral-800( |$)/);
+    // It draws what the glyphs already say, so a screen reader skips it.
+    expect(spine("bare").getAttribute("aria-hidden")).toBe("true");
+    // It stays when the workspace unfolds, still one colour for the whole task.
+    unfold("asks");
+    expect(spine("asks").className).toMatch(/(^| )bg-amber-400( |$)/);
+  });
+
+  it("lays a workspace out as its face's column beside one of everything else, the face and name one fold button with no chevron", async () => {
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    const group = screen.getByRole("group", { name: "fix login" });
+    const button = within(group).getByRole("button", { name: "fix login" });
+
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(button.getAttribute("title")).toBe("Unfold");
+    expect(button.contains(within(group).getByText("DE"))).toBe(true);
+    expect(button.querySelector("svg")).toBeNull();
+    expect(within(group).getByText("DE").className).toMatch(/(^| )size-5( |$)/);
+
+    unfold("fix login");
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    expect(button.getAttribute("title")).toBe("Fold");
+    // The name, the standing line, the branch line and the sessions share the content column.
+    const content = button.closest<HTMLElement>(".min-w-0:not(button)")!;
+    expect(content.contains(within(group).getByText(/fix-login/))).toBe(true);
+    const sessions = within(group).getAllByRole("listitem")[0].parentElement!;
+    expect(content.contains(sessions)).toBe(true);
+    expect(content.contains(group.querySelector("[data-spine]"))).toBe(false);
+    // The spine takes the place of the list's own rule.
+    expect(sessions.className).not.toMatch(/border-l/);
+  });
+
+  it("sets the workspaces under a machine 12px apart, so each task reads as one block", async () => {
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    const list = screen.getByRole("group", { name: "fix login" }).parentElement!;
+
+    expect(list.className).toMatch(/(^| )(space-y-3|gap-3)( |$)/);
+  });
+
   it("shows each machine with its state (offline: one session is unreachable) and numbers", async () => {
     await renderApp(<Sidebar machines={machines()} {...props} />);
 
