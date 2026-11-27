@@ -4,7 +4,7 @@
 //! relative link to one of them, which the service runs) and `update.json`. The check every
 //! ten minutes downloads, verifies and unpacks a newer tag into `versions/` and saves it as the
 //! ready tag; it never installs it. [`install_ready`] installs the ready tag when asked, with a
-//! trial record in `update.json`; nothing asks yet, until #274 adds its route. A version
+//! trial record in `update.json`; the machine update route (`api::machine_update`) asks. A version
 //! installed with a trial record is a trial: the daemon that starts from it counts its starts,
 //! and `update::run` calls it healthy once it has run for a minute. A trial that starts three
 //! times without becoming healthy is put back to the previous version and its tag is refused
@@ -246,7 +246,7 @@ fn unrunnable(error: &io::Error) -> bool {
 }
 
 /// A version a trial record in `update.json` names, which has not yet shown it stays up.
-/// [`install_ready`] writes one, once #274 gives it a caller.
+/// [`install_ready`] writes one, when the machine update route (`api::machine_update`) calls it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trial {
     /// The version on trial, like `0.2.0`.
@@ -820,7 +820,7 @@ pub(crate) fn reportable(home: &Path, state: &State, exe: &Path, running: &str) 
 /// its binaries are gone), is not above `running` or is refused, when `exe` is not run from
 /// `<home>/current`, when `current` does not name `running`, or when a trial is on. A refusal
 /// of a tag below `tag` is cleared; a higher one stays. If `current` cannot be pointed the state
-/// is saved back as it was. Nothing calls it yet: #274 adds the route that does.
+/// is saved back as it was. The machine update route (`api::machine_update`) calls it.
 pub fn install_ready(
     home: &Path,
     tag: &str,

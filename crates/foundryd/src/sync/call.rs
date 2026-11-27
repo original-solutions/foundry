@@ -27,10 +27,9 @@
 //! by itself [`STOP_WITHIN`] after it asked, so an answer the link cannot take still stops B,
 //! and a [`Stop`] acts only once.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -128,17 +127,6 @@ impl Stop {
     }
 }
 
-/// The stop each machine's carried calls fire after an answer that asks for one, by machine.
-/// A daemon that gives none stops for no call. A second stop given for the same machine
-/// replaces the first, and none is ever removed. It lives here rather than in the peers' state
-/// only because #274 does not own `sync/mod.rs`; #334 moves it there and deletes this map.
-static STOPS: Mutex<BTreeMap<MachineId, Stop>> = Mutex::new(BTreeMap::new());
-
-/// The stop the peers of machine `me` were given, if any.
-fn stop_of(me: MachineId) -> Option<Stop> {
-    lock(&STOPS).get(&me).cloned()
-}
-
 /// One message on a call link past the call that opened it, owner to caller.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -202,7 +190,7 @@ impl Peers {
     /// on its link. Until this is called, such an answer stops nothing here: the route that
     /// asked stops by itself [`STOP_WITHIN`] later.
     pub fn stop_after_calls(&self, stop: Stop) {
-        lock(&STOPS).insert(self.inner.me, stop);
+        *lock(&self.inner.stop) = Some(stop);
     }
 
     /// Carries a `POST` of `body` to `path`, with `content_type`, to machine `owner`'s API, and
@@ -340,7 +328,7 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, call: Call, conn: C
         version,
     };
     let stop = if stop {
-        let stop = stop_of(me);
+        let stop = lock(&inner.stop).clone();
         if stop.is_none() {
             tracing::warn!("sync: a carried call asked for a stop, and this machine has none");
         }
@@ -827,14 +815,12 @@ mod tests {
 
     #[test]
     fn the_stop_of_a_machine_is_the_one_its_peers_were_given() {
-        let (me, other) = (MachineId::random(), MachineId::random());
-        let (_dir, peers, _) = listing(me, other);
-        assert!(stop_of(me).is_none());
+        let (_dir, peers, _) = listing(MachineId::random(), MachineId::random());
+        assert!(lock(&peers.inner.stop).is_none());
         let (stop, stops) = counted();
         peers.stop_after_calls(stop);
-        stop_of(me).expect("a stop").fire();
+        lock(&peers.inner.stop).clone().expect("a stop").fire();
         assert_eq!(stops.load(Ordering::SeqCst), 1);
-        assert!(stop_of(other).is_none());
     }
 
     #[tokio::test]
