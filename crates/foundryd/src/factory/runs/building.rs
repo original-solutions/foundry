@@ -102,7 +102,6 @@ use foundry_proto::factory::{RunId, SessionTurn};
 use foundry_proto::ids::SessionId;
 use foundry_proto::state::SessionState;
 
-use super::feedback;
 use super::progress::{
     RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, SendTries, TIME_LIMIT as TIME_LIMIT_CODE,
     TURN_READ, pending_relaunch, read_progress,
@@ -114,6 +113,7 @@ use super::{
     progress_from, record_send_typed, recorded_reason, send_once, session_id, stop_session,
     workspace_id,
 };
+use super::{feedback, gating};
 use crate::factory::github::{IssueDetail, OtherKind, PullRequest, TrackerError};
 use crate::factory::ledger::events::{Cause, CauseStep, Event, Outcome};
 use crate::factory::lifecycle::result_line::{
@@ -271,12 +271,19 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
     };
     match state {
         // P1 marks a session stuck after 10 minutes of silence, and a long build is silent for
-        // longer: the factory does nothing, and `limits.minutes` ends the run. A machine that
-        // cannot be reached is `resume`'s to measure.
-        SessionState::Unreachable
-        | SessionState::Stuck
-        | SessionState::Starting
-        | SessionState::Working => Ok(BuildStep::Running),
+        // longer: the factory does nothing, and `limits.minutes` ends the run.
+        SessionState::Stuck | SessionState::Starting | SessionState::Working => {
+            Ok(BuildStep::Running)
+        }
+        // A machine that cannot be reached is `resume`'s to measure until a pull request is
+        // reported. Then the pull request stays with the gate, which reads a gate in flight on
+        // that machine when the session was at rest there. A session that may be at work keeps
+        // the run running, and `limits.minutes` ends it: `resume`'s 15-minute rule does not run
+        // once a pull request is reported (#367).
+        SessionState::Unreachable if gating::at_rest(&seen, turn.as_ref()) => {
+            Ok(step.read_already())
+        }
+        SessionState::Unreachable => Ok(BuildStep::Running),
         SessionState::WaitingForYou => step.waiting(&mut at, turn.as_ref()),
         SessionState::Idle => {
             if waiting(&turn) {
@@ -5487,6 +5494,112 @@ mod tests {
             rig.step(&run, "turn-read 1");
             show(&mut rig, SessionState::Finished, 1, 1);
             assert_eq!(pass(&rig, &run), BuildStep::Interrupted);
+        }
+
+        /// A build machine cut off after its session reported the pull request leaves that pull
+        /// request with the gate, which can mark a gate in flight there could-not-run and place
+        /// the next one. A session at work keeps the run running.
+        #[test]
+        fn a_session_that_cannot_be_reached_after_its_pull_request_was_reported_waits_for_the_gate()
+        {
+            let (mut rig, run) = built();
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+            show(&mut rig, SessionState::Unreachable, 1, 1);
+            let events = rig.events(&run).len();
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate {
+                    pr: 12,
+                    url: URL12.into()
+                }
+            );
+            assert_eq!(rig.events(&run).len(), events);
+            assert_eq!(turn_reads(&rig), 1);
+            assert!(sends(&rig).is_empty());
+            no_writes(&rig);
+            for state in [
+                SessionState::Stuck,
+                SessionState::Starting,
+                SessionState::Working,
+            ] {
+                show(&mut rig, state, 1, 1);
+                assert_eq!(pass(&rig, &run), BuildStep::Running, "{state:?}");
+            }
+        }
+
+        /// A message sent after the report and shown in the prompt count, with the turn it began
+        /// read, does not hold the pull request back from its gate.
+        #[test]
+        fn a_session_that_cannot_be_reached_after_an_earlier_message_was_shown_waits_for_the_gate()
+        {
+            let (mut rig, run) = built();
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+            rig.step(&run, "send-intent forward-comment c1 1");
+            rig.step(&run, "send-typed forward-comment c1");
+            rig.step(&run, "turn-read 2");
+            show(&mut rig, SessionState::Unreachable, 2, 2);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+        }
+
+        /// The fleet shows a session on a machine it cannot reach as it last saw it. One that may
+        /// be at work there after it reported its pull request keeps the run running.
+        #[test]
+        fn a_session_that_cannot_be_reached_and_may_be_at_work_keeps_the_run_running() {
+            let cases: [(&str, u64, u64, bool, Option<&str>); 4] = [
+                ("a prompt after its newest turn", 1, 2, false, None),
+                ("a newer turn not read", 2, 2, false, None),
+                ("a question waiting", 1, 1, true, None),
+                (
+                    "a message sent and not shown yet",
+                    1,
+                    1,
+                    false,
+                    Some("send-intent forward-comment c1 1"),
+                ),
+            ];
+            for (case, turn, prompts, question, step) in cases {
+                let (mut rig, run) = built();
+                end_turn(&mut rig, 1, DONE_MESSAGE);
+                assert!(matches!(
+                    pass(&rig, &run),
+                    BuildStep::ReadyForGate { pr: 12, .. }
+                ));
+                if let Some(step) = step {
+                    rig.step(&run, step);
+                }
+                show_with(&mut rig, SessionState::Unreachable, turn, prompts, question);
+                let events = rig.events(&run).len();
+                assert_eq!(pass(&rig, &run), BuildStep::Running, "{case}");
+                assert_eq!(rig.events(&run).len(), events, "{case}");
+                assert_eq!(turn_reads(&rig), 1, "{case}");
+                assert!(sends(&rig).is_empty(), "{case}");
+            }
+        }
+
+        /// A session at rest when its machine was cut off, with no pull request reported, keeps
+        /// the run running: nothing is read, sent or launched to a machine that cannot answer.
+        #[test]
+        fn a_session_that_cannot_be_reached_with_no_pull_request_reported_keeps_the_run_running() {
+            let (mut rig, run) = built();
+            rig.step(&run, "turn-read 1");
+            show(&mut rig, SessionState::Unreachable, 1, 1);
+            let events = rig.events(&run).len();
+            assert_eq!(pass(&rig, &run), BuildStep::Running);
+            assert_eq!(rig.events(&run).len(), events);
+            assert_eq!(turn_reads(&rig), 0);
+            assert!(sends(&rig).is_empty());
+            no_writes(&rig);
         }
 
         #[test]
