@@ -24,22 +24,35 @@ const overwritten: AttentionItem = {
   terminal: null,
 };
 
+const setupFailed: AttentionItem = {
+  id: "setup_failed:w1",
+  kind: "setup_failed",
+  machine: "m1",
+  machine_name: "trilogy-mac",
+  what: "The setup of /factory-build on trilogy-mac failed (exit code 101)",
+  todo: "Read its setup terminal, fix the workspace by hand, then close that terminal",
+  terminal: "t9",
+};
+
 type Request = { url: string; method: string };
 
 let lists: AttentionItem[][];
 let dismissAnswer: () => Response;
+let closeAnswer: () => Response;
 let requests: Request[];
 
 beforeEach(() => {
   lists = [[]];
   requests = [];
   dismissAnswer = () => new Response(null, { status: 204 });
+  closeAnswer = () => new Response(null, { status: 204 });
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init: RequestInit = {}) => {
       requests.push({ url, method: init.method ?? "GET" });
       if (url === "/api/attention") return json(200, { items: lists.length > 1 ? lists.shift() : lists[0] });
       if (url.endsWith("/dismiss")) return dismissAnswer();
+      if (url.endsWith("/close")) return closeAnswer();
       throw new Error(`unexpected request ${url}`);
     }),
   );
@@ -108,6 +121,25 @@ describe("AttentionList", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
     expect((await screen.findByRole("alert")).textContent).toContain("no link to m3");
     expect(screen.getByText(overwritten.what)).toBeTruthy();
+  });
+
+  it("offers close terminal only on a setup failed item, and reads the list again after it", async () => {
+    lists = [[waiting, setupFailed], [waiting]];
+    await renderApp(<AttentionList />);
+    const close = await screen.findByRole("button", { name: "Close terminal" });
+    expect(screen.getAllByRole("button", { name: "Close terminal" })).toHaveLength(1);
+    fireEvent.click(close);
+    await waitFor(() => expect(screen.queryByText(setupFailed.what)).toBeNull());
+    expect(requests).toContainEqual({ url: "/api/terminals/t9/close", method: "POST" });
+  });
+
+  it("says why closing a setup terminal failed", async () => {
+    lists = [[setupFailed]];
+    closeAnswer = () => json(503, { error: "trilogy-mac is offline" });
+    await renderApp(<AttentionList />);
+    fireEvent.click(await screen.findByRole("button", { name: "Close terminal" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("trilogy-mac is offline");
+    expect(screen.getByText(setupFailed.what)).toBeTruthy();
   });
 
   it("folds to its count and opens again", async () => {

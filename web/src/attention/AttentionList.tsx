@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { pollEvery } from "../poll";
-import { attentionItems, dismissable, dismissItem, kindLabel, type AttentionItem, type AttentionKind } from "./attention";
+import { attentionItems, closable, dismissable, kindLabel, settle, type AttentionItem, type AttentionKind } from "./attention";
 
 /** How often the list is read, so an item shows within 5 seconds of what raised it. */
 export const ATTENTION_EVERY = 2000;
@@ -12,7 +12,8 @@ const key = ["attention"];
 /**
  * What needs a person, across the fleet: a card at the top of the layout's news while anything
  * does, nothing otherwise. Each item says what happened, what to do and on which machine, with its terminal one
- * click away. A "setting overwritten" item is dismissed here; every other clears on its own.
+ * click away. A "setting overwritten" item is dismissed here, and a "setup failed" item clears by closing its
+ * exited terminal here; every other clears on its own.
  * `folded` starts it folded to its count, each time the card shows.
  */
 export function AttentionList({ folded = false }: { folded?: boolean }) {
@@ -29,8 +30,8 @@ export function AttentionList({ folded = false }: { folded?: boolean }) {
 function Items({ items, folded }: { items: AttentionItem[]; folded: boolean }) {
   const client = useQueryClient();
   const [open, setOpen] = useState(!folded);
-  const dismiss = useMutation({
-    mutationFn: (item: AttentionItem) => dismissItem(item.id),
+  const settling = useMutation({
+    mutationFn: settle,
     onSettled: () => client.invalidateQueries({ queryKey: key, exact: true }),
   });
 
@@ -63,28 +64,28 @@ function Items({ items, folded }: { items: AttentionItem[]; folded: boolean }) {
               </p>
               <p className="text-neutral-200">{item.what}</p>
               <p className="text-neutral-400">{item.todo}</p>
-              {(item.terminal || dismissable(item)) && (
+              {(item.terminal || dismissable(item) || closable(item)) && (
                 <p className="flex gap-3 pt-1">
                   {item.terminal && (
                     <Link to="/terminals/$terminalId" params={{ terminalId: item.terminal }} className="text-sky-400 hover:text-sky-300">
                       Open terminal
                     </Link>
                   )}
-                  {dismissable(item) && (
+                  {(dismissable(item) || closable(item)) && (
                     <button
                       type="button"
-                      disabled={dismiss.isPending && dismiss.variables?.id === item.id}
-                      onClick={() => dismiss.mutate(item)}
+                      disabled={settling.isPending && settling.variables?.id === item.id}
+                      onClick={() => settling.mutate(item)}
                       className="text-sky-400 hover:text-sky-300 disabled:text-neutral-500"
                     >
-                      Dismiss
+                      {closable(item) ? "Close terminal" : "Dismiss"}
                     </button>
                   )}
                 </p>
               )}
-              {dismiss.isError && dismiss.variables?.id === item.id && (
+              {settling.isError && settling.variables?.id === item.id && (
                 <p role="alert" className="text-red-400">
-                  {dismiss.error.message}
+                  {settling.error.message}
                 </p>
               )}
             </li>
