@@ -3,12 +3,13 @@
 //! The data directory holds `versions/<version>/{foundryd,foundry-holder}`, `current` (a
 //! relative link to one of them, which the service runs) and `update.json`. The check every
 //! ten minutes downloads, verifies and unpacks a newer tag into `versions/` and saves it as the
-//! ready tag; it never installs it. A version installed with a trial record in `update.json` is
-//! a trial: the daemon that starts from it counts its starts, and `update::run` calls it
-//! healthy once it has run for a minute. A trial that starts three times without becoming
-//! healthy is put back to the previous version and its tag is refused until a higher one
-//! appears. Nothing in this module writes a trial any more: a hand install (`foundryd install`)
-//! starts none. Only a daemon that runs from `<home>/current` takes part in any of this.
+//! ready tag; it never installs it. [`install_ready`] installs the ready tag when asked, with a
+//! trial record in `update.json`; nothing asks yet, until #274 adds its route. A version
+//! installed with a trial record is a trial: the daemon that starts from it counts its starts,
+//! and `update::run` calls it healthy once it has run for a minute. A trial that starts three
+//! times without becoming healthy is put back to the previous version and its tag is refused
+//! until a higher one appears. A hand install (`foundryd install`) starts no trial and clears
+//! the ready tag. Only a daemon that runs from `<home>/current` takes part in any of this.
 //!
 //! `foundryd install` and the daemon are separate processes that both change `update.json`
 //! and `current`, so every change to either is made while holding `<home>/update.lock`.
@@ -90,6 +91,22 @@ const VERSION_LIMIT: Duration = Duration::from_secs(10);
 
 /// Set once this daemon has run long enough to be healthy; the watchdog reads it.
 static HEALTHY: AtomicBool = AtomicBool::new(false);
+
+/// Why the ready tag was not installed. Neither holds a secret.
+#[derive(Debug, thiserror::Error)]
+pub enum InstallError {
+    /// The tag cannot be installed now, and nothing was changed apart from a stranded trial.
+    /// `ready` is the tag the sample's `update_ready` would report, and `reason` says which
+    /// case it was.
+    #[error("{reason}")]
+    NotReady {
+        ready: Option<String>,
+        reason: String,
+    },
+    /// The state could not be read or written, or `current` could not be pointed.
+    #[error(transparent)]
+    Failed(#[from] UpdateError),
+}
 
 /// Why a tag could not be made ready, or a version installed. None of these ever holds a secret.
 #[derive(Debug, thiserror::Error)]
@@ -229,7 +246,7 @@ fn unrunnable(error: &io::Error) -> bool {
 }
 
 /// A version a trial record in `update.json` names, which has not yet shown it stays up.
-/// Nothing in this module writes one now; a record an older release left is still honoured.
+/// [`install_ready`] writes one, once #274 gives it a caller.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trial {
     /// The version on trial, like `0.2.0`.
@@ -308,9 +325,8 @@ pub fn state(home: &Path) -> io::Result<State> {
 /// reads and writes `update.json`, removes or renames directories under `versions/` and moves
 /// `current` (no network, no copy and no child process), so the wait is short. The lock is let
 /// go when the value is dropped. Never take it twice in one thread: a second open of the file
-/// waits for the first. The check swaps a version into `versions/` under it ([`make_ready`]);
-/// a hand install's [`place_version`] still swaps before it takes it, until #273 adds the hand
-/// install's lock.
+/// waits for the first. The check and a hand install swap a version into `versions/` under it
+/// ([`make_ready`], [`place_version`]).
 fn lock(home: &Path) -> io::Result<Flock<File>> {
     let file = OpenOptions::new()
         .write(true)
@@ -582,22 +598,27 @@ pub(crate) fn above(version: &str, running: &str) -> bool {
     matches!((parse(version), parse(running)), (Some(version), Some(running)) if version > running)
 }
 
-/// Records a hand install of `version` over `before` (the version `current` named). It ends
-/// a trial of any other version. When `version` is lower it refuses `v<before>`, as an
-/// automatic rollback does, so the updater does not undo the install until a higher tag
-/// ships; a higher refusal already held stays. Returns the tag that is refused after a
-/// go-back, and `None` when the version did not go down. It takes no lock: `install` calls it
-/// as the `record` of [`commit_version`], which holds one.
+/// Records a hand install of `version` over `before` (the version `current` named). It runs as
+/// the `record` of [`place_version`] or [`commit_version`], both of which hold the lock, so it
+/// takes none. A trial `current` does not name is stranded and is cleared, as is a trial of
+/// any other version; a trial of `version` that `current` names stays, so installing it again
+/// does not stop its rollback. When `version` is lower it refuses `v<before>`, as an automatic
+/// rollback does, so the updater does not undo the install until a higher tag ships; a higher
+/// refusal already held stays. Returns the tag that is refused after a go-back, and `None`
+/// when the version did not go down. It clears the ready tag, whatever version it installs.
 pub fn placed_by_hand(
     home: &Path,
     version: &str,
     before: Option<&str>,
 ) -> io::Result<Option<String>> {
     let mut state = state(home)?;
+    // `current` still names `before` here, so a trial it does not name is one a crash stranded.
+    clear_stranded_trial(home, &mut state);
     // Installing the version that is on trial again must not stop its rollback.
     if state.trial.as_ref().is_some_and(|t| t.version != version) {
         state.trial = None;
     }
+    state.ready = None;
     let went_back = lowered(before, version);
     if let Some(before) = before.filter(|_| went_back) {
         let held = state
@@ -624,9 +645,9 @@ fn pick(tags: &[String], running: &str, refused: Option<&str>) -> Option<String>
 }
 
 /// Makes `versions/<version>` from a fresh stage directory: `fill` puts the files in it,
-/// both binaries must be there and are made executable, then the stage is swapped in and
-/// [`commit_version`] records it and points `current` at it. The swap is made before the lock
-/// is taken; #273 moves it under the lock.
+/// both binaries must be there and are made executable. Then, under one hold of [`lock`], the
+/// stage is swapped in, `record` runs and `current` is pointed at it, so nothing runs between
+/// them. The stage is filled before the lock is taken. `record` must not take the lock itself.
 pub(crate) fn place_version(
     home: &Path,
     version: &str,
@@ -634,8 +655,12 @@ pub(crate) fn place_version(
     record: impl FnOnce() -> io::Result<()>,
 ) -> Result<(), UpdateError> {
     let stage = stage_version(home, version, fill)?;
-    let result =
-        swap_in(home, &stage, version).and_then(|()| commit_version(home, version, record));
+    let result = lock(home)
+        .map_err(io_error("cannot lock the update state"))
+        .and_then(|_lock| {
+            swap_in(home, &stage, version)?;
+            record_and_point(home, version, record)
+        });
     if result.is_err() {
         let _ = fs::remove_dir_all(&stage);
     }
@@ -727,8 +752,133 @@ pub(crate) fn commit_version(
     record: impl FnOnce() -> io::Result<()>,
 ) -> Result<(), UpdateError> {
     let _lock = lock(home).map_err(io_error("cannot lock the update state"))?;
+    record_and_point(home, version, record)
+}
+
+/// The body of [`commit_version`], for a caller that already holds [`lock`].
+fn record_and_point(
+    home: &Path,
+    version: &str,
+    record: impl FnOnce() -> io::Result<()>,
+) -> Result<(), UpdateError> {
     record().map_err(io_error("cannot save the update state"))?;
     point_current(home, version).map_err(io_error("cannot point current at the new version"))
+}
+
+/// The version of `tag` when it could be installed now, apart from a trial that is on: it is the
+/// ready tag, both its binaries are on disk, it is above `running` and not refused, `current`
+/// names `running` and the daemon at `exe` runs from `current`. Otherwise the reason for the
+/// first case that fails. [`install_ready`] refuses by it and [`reportable`] reports by it, so
+/// the two cannot disagree.
+fn installable<'a>(
+    home: &Path,
+    state: &State,
+    tag: &'a str,
+    exe: &Path,
+    running: &str,
+) -> Result<&'a str, String> {
+    let version = tag_version(tag)
+        .filter(|_| state.ready.as_deref() == Some(tag))
+        .ok_or_else(|| format!("{tag} is not the ready tag"))?;
+    if !is_ready(home, tag) {
+        return Err(format!("{tag} is not ready: its binaries are gone"));
+    }
+    if !above(version, running) {
+        return Err(format!("{tag} is not above the running version {running}"));
+    }
+    if state.refused.as_deref() == Some(tag) {
+        return Err(format!("{tag} is refused"));
+    }
+    if current_version(home).as_deref() != Some(running) {
+        return Err(format!(
+            "current does not name the running version {running}"
+        ));
+    }
+    if !from_current(home, exe, running) {
+        return Err(format!(
+            "this daemon is not run from {}",
+            home.join("current").display()
+        ));
+    }
+    Ok(version)
+}
+
+/// The tag the sample's `update_ready` reports for `state`: the ready tag while it is
+/// [`installable`].
+pub(crate) fn reportable(home: &Path, state: &State, exe: &Path, running: &str) -> Option<String> {
+    let ready = state.ready.as_deref()?;
+    installable(home, state, ready, exe, running)
+        .ok()
+        .map(|_| ready.to_string())
+}
+
+/// Installs `tag`, the ready tag, when asked: it saves a trial of its version with `running` as
+/// `previous`, clears the ready tag in the same write, then points `current` at it. It never
+/// stops the daemon; its caller does. The whole call holds [`lock`]. A trial `current` does not
+/// name is cleared first, and stays cleared whatever the call answers. It refuses, with
+/// [`InstallError::NotReady`] and nothing else changed, when `tag` is not the ready tag (or
+/// its binaries are gone), is not above `running` or is refused, when `exe` is not run from
+/// `<home>/current`, when `current` does not name `running`, or when a trial is on. A refusal
+/// of a tag below `tag` is cleared; a higher one stays. If `current` cannot be pointed the state
+/// is saved back as it was. Nothing calls it yet: #274 adds the route that does.
+pub fn install_ready(
+    home: &Path,
+    tag: &str,
+    running: &str,
+    exe: &Path,
+) -> Result<(), InstallError> {
+    install_ready_with(home, tag, running, exe, point_current)
+}
+
+/// [`install_ready`] with the step that points `current` given.
+fn install_ready_with(
+    home: &Path,
+    tag: &str,
+    running: &str,
+    exe: &Path,
+    point: impl FnOnce(&Path, &str) -> io::Result<()>,
+) -> Result<(), InstallError> {
+    let _lock = lock(home).map_err(io_error("cannot lock the update state"))?;
+    let mut held = state(home).map_err(io_error("cannot read the update state"))?;
+    let cleared = clear_stranded_trial(home, &mut held);
+    let ready = reportable(home, &held, exe, running);
+    let verdict =
+        installable(home, &held, tag, exe, running).and_then(|version| match &held.trial {
+            Some(trial) => Err(format!("a trial of {} is on", trial.version)),
+            None => Ok(version),
+        });
+    let version = match verdict {
+        Err(reason) => {
+            if cleared {
+                save(home, &held).map_err(io_error("cannot save the update state"))?;
+            }
+            return Err(InstallError::NotReady { ready, reason });
+        }
+        Ok(version) => version,
+    };
+    let mut next = held.clone();
+    next.trial = Some(Trial {
+        version: version.to_string(),
+        previous: running.to_string(),
+        starts: 0,
+    });
+    next.ready = None;
+    if held
+        .refused
+        .as_deref()
+        .and_then(tag_version)
+        .is_none_or(|refused| above(version, refused))
+    {
+        next.refused = None;
+    }
+    save(home, &next).map_err(io_error("cannot save the update state"))?;
+    if let Err(error) = point(home, version) {
+        if let Err(restore) = save(home, &held) {
+            tracing::warn!("the update state could not be put back: {restore}");
+        }
+        return Err(io_error("cannot point current at the new version")(error).into());
+    }
+    Ok(())
 }
 
 /// Makes `tag` ready: `fetch` puts the release's files in a fresh stage directory, the
@@ -2388,6 +2538,39 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_install_of_the_version_of_a_stranded_trial_starts_no_trial() {
+        let home = installed_home();
+        save(
+            home.path(),
+            &State {
+                trial: Some(Trial {
+                    version: "0.3.0".into(),
+                    previous: "0.1.0".into(),
+                    starts: 0,
+                }),
+                refused: None,
+                ready: None,
+            },
+        )
+        .unwrap();
+        let path = home.path().to_path_buf();
+
+        place_version(
+            home.path(),
+            "0.3.0",
+            |stage| {
+                release(stage, "0.3.0");
+                Ok(())
+            },
+            || placed_by_hand(&path, "0.3.0", Some("0.1.0")).map(drop),
+        )
+        .unwrap();
+
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.3.0"));
+        assert_eq!(state(home.path()).unwrap().trial, None);
+    }
+
+    #[test]
     fn a_hand_install_of_a_lower_version_below_a_lower_refusal_raises_it() {
         let home = tempfile::tempdir().unwrap();
         save(
@@ -2838,6 +3021,40 @@ mod tests {
         drop(held);
         writer.join().unwrap();
         early
+    }
+
+    #[test]
+    fn a_hand_install_swaps_the_new_version_in_only_while_it_holds_the_lock() {
+        let home = installed_home();
+        let path = home.path().to_path_buf();
+        let held = lock(home.path()).unwrap();
+        let (staged_tx, staged) = std::sync::mpsc::channel();
+        let hand = std::thread::spawn(move || {
+            place_version(
+                &path,
+                "0.3.0",
+                |stage| {
+                    release(stage, "0.3.0");
+                    staged_tx.send(stage.to_path_buf()).unwrap();
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        });
+        // The stage is filled while this thread holds the lock: the copy is made outside it.
+        let stage = staged.recv_timeout(Duration::from_secs(10)).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert!(stage.join("foundryd").is_file());
+        assert!(!home.path().join("versions/0.3.0").exists());
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+
+        drop(held);
+        hand.join().unwrap();
+
+        assert!(home.path().join("versions/0.3.0/foundryd").is_file());
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.3.0"));
     }
 
     #[test]
@@ -3427,5 +3644,442 @@ mod tests {
 
         assert!(matches!(error, UpdateError::Fetch(_)), "{error}");
         assert!(error.to_string().contains("not logged in"), "{error}");
+    }
+
+    /// Everything `install_ready` must leave alone when it refuses: `current`, the state and
+    /// what `versions/` holds.
+    fn snapshot(home: &Path) -> (PathBuf, State, Vec<String>) {
+        (current(home), state(home).unwrap(), versions(home))
+    }
+
+    /// A home on 0.1.0 whose daemon runs from `current`, with `v0.2.0` ready and `refused`.
+    fn ready_home(refused: Option<&str>) -> (tempfile::TempDir, PathBuf) {
+        let home = installed_home();
+        let exe = exe_in(home.path(), "0.1.0");
+        with_ready(home.path(), "0.2.0", refused);
+        (home, exe)
+    }
+
+    /// Asks `install_ready` for `tag` and checks it refuses with `ready`, a reason that
+    /// contains `reason`, and the state `after` (the state before when `None`) and nothing else
+    /// changed.
+    fn refuses(
+        home: &Path,
+        exe: &Path,
+        tag: &str,
+        running: &str,
+        ready: Option<&str>,
+        reason: &str,
+        after: Option<State>,
+    ) {
+        let before = snapshot(home);
+        let error = install_ready(home, tag, running, exe).unwrap_err();
+        match &error {
+            InstallError::NotReady {
+                ready: got,
+                reason: why,
+            } => {
+                assert_eq!(got.as_deref(), ready, "{error}");
+                assert!(why.contains(reason), "{why:?} lacks {reason:?}");
+                assert_eq!(error.to_string(), *why);
+            }
+            other => panic!("{other:?}"),
+        }
+        let now = snapshot(home);
+        assert_eq!(now.0, before.0);
+        assert_eq!(now.1, after.unwrap_or(before.1));
+        assert_eq!(now.2, before.2);
+    }
+
+    #[test]
+    fn install_ready_refuses_a_tag_that_is_not_the_ready_tag() {
+        let (home, exe) = ready_home(None);
+        refuses(
+            home.path(),
+            &exe,
+            "v0.3.0",
+            "0.1.0",
+            Some("v0.2.0"),
+            "v0.3.0 is not the ready tag",
+            None,
+        );
+    }
+
+    #[test]
+    fn install_ready_refuses_a_tag_with_binaries_on_disk_that_is_not_the_ready_tag() {
+        let (home, exe) = ready_home(None);
+        let other = home.path().join("versions/0.3.0");
+        fs::create_dir_all(&other).unwrap();
+        release(&other, "0.3.0");
+        refuses(
+            home.path(),
+            &exe,
+            "v0.3.0",
+            "0.1.0",
+            Some("v0.2.0"),
+            "v0.3.0 is not the ready tag",
+            None,
+        );
+    }
+
+    #[test]
+    fn install_ready_refuses_a_ready_tag_whose_binaries_are_gone() {
+        let (home, exe) = ready_home(None);
+        fs::remove_file(home.path().join("versions/0.2.0/foundry-holder")).unwrap();
+        refuses(
+            home.path(),
+            &exe,
+            "v0.2.0",
+            "0.1.0",
+            None,
+            "v0.2.0 is not ready: its binaries are gone",
+            None,
+        );
+    }
+
+    #[test]
+    fn install_ready_refuses_a_tag_not_above_the_running_version() {
+        let home = installed_home();
+        let exe = exe_in(home.path(), "0.1.0");
+        with_ready(home.path(), "0.1.0", None);
+        refuses(
+            home.path(),
+            &exe,
+            "v0.1.0",
+            "0.1.0",
+            None,
+            "not above the running version 0.1.0",
+            None,
+        );
+    }
+
+    #[test]
+    fn a_stale_tag_after_a_hand_install_of_a_higher_version_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        for version in ["0.9.1", "0.9.2"] {
+            fs::create_dir_all(home.path().join("versions").join(version)).unwrap();
+        }
+        point_current(home.path(), "0.9.2").unwrap();
+        let exe = exe_in(home.path(), "0.9.2");
+        with_ready(home.path(), "0.9.1", None);
+        refuses(
+            home.path(),
+            &exe,
+            "v0.9.1",
+            "0.9.2",
+            None,
+            "not above the running version 0.9.2",
+            None,
+        );
+    }
+
+    #[test]
+    fn install_ready_refuses_the_refused_tag() {
+        let (home, exe) = ready_home(Some("v0.2.0"));
+        refuses(
+            home.path(),
+            &exe,
+            "v0.2.0",
+            "0.1.0",
+            None,
+            "v0.2.0 is refused",
+            None,
+        );
+    }
+
+    #[test]
+    fn install_ready_refuses_a_daemon_not_run_from_current() {
+        let (home, _) = ready_home(None);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let exe = elsewhere.path().join("foundryd");
+        script(&exe, "foundryd 0.1.0");
+        refuses(
+            home.path(),
+            &exe,
+            "v0.2.0",
+            "0.1.0",
+            None,
+            "not run from",
+            None,
+        );
+    }
+
+    #[test]
+    fn install_ready_refuses_when_current_does_not_name_the_running_version() {
+        let (home, exe) = ready_home(None);
+        refuses(
+            home.path(),
+            &exe,
+            "v0.2.0",
+            "0.0.9",
+            None,
+            "current does not name the running version 0.0.9",
+            None,
+        );
+    }
+
+    #[test]
+    fn install_ready_refuses_while_a_trial_is_on() {
+        let (home, exe) = ready_home(None);
+        let mut held = state(home.path()).unwrap();
+        held.trial = Some(Trial {
+            version: "0.1.0".into(),
+            previous: "0.0.9".into(),
+            starts: 1,
+        });
+        save(home.path(), &held).unwrap();
+        refuses(
+            home.path(),
+            &exe,
+            "v0.2.0",
+            "0.1.0",
+            Some("v0.2.0"),
+            "a trial of 0.1.0 is on",
+            None,
+        );
+    }
+
+    #[test]
+    fn a_refused_install_still_clears_a_trial_current_does_not_name() {
+        let (home, exe) = ready_home(None);
+        let mut held = state(home.path()).unwrap();
+        held.trial = Some(Trial {
+            version: "0.9.9".into(),
+            previous: "0.1.0".into(),
+            starts: 1,
+        });
+        save(home.path(), &held).unwrap();
+        held.trial = None;
+        refuses(
+            home.path(),
+            &exe,
+            "v0.3.0",
+            "0.1.0",
+            Some("v0.2.0"),
+            "not the ready tag",
+            Some(held),
+        );
+    }
+
+    #[test]
+    fn install_ready_saves_the_trial_and_moves_current() {
+        let (home, exe) = ready_home(Some("v0.1.5"));
+
+        install_ready(home.path(), "v0.2.0", "0.1.0", &exe).unwrap();
+
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+        assert_eq!(
+            state(home.path()).unwrap(),
+            State {
+                trial: Some(Trial {
+                    version: "0.2.0".into(),
+                    previous: "0.1.0".into(),
+                    starts: 0,
+                }),
+                refused: None,
+                ready: None,
+            }
+        );
+    }
+
+    #[test]
+    fn install_ready_holds_the_lock_until_current_is_pointed() {
+        let (home, exe) = ready_home(None);
+        let path = home.path().to_path_buf();
+        let (inside_tx, inside) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let install = std::thread::spawn(move || {
+            install_ready_with(&path, "v0.2.0", "0.1.0", &exe, |home, version| {
+                inside_tx.send(()).unwrap();
+                wait.recv().unwrap();
+                point_current(home, version)
+            })
+        });
+        inside.recv_timeout(Duration::from_secs(10)).unwrap();
+        let path = home.path().to_path_buf();
+        let taken = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = taken.clone();
+        let other = std::thread::spawn(move || {
+            let _held = lock(&path).unwrap();
+            flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert!(
+            !taken.load(Ordering::SeqCst),
+            "the lock was free while install_ready was pointing current"
+        );
+
+        go.send(()).unwrap();
+        install.join().unwrap().unwrap();
+        other.join().unwrap();
+        assert!(taken.load(Ordering::SeqCst));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+    }
+
+    #[test]
+    fn install_ready_clears_a_stranded_trial_with_its_one_save() {
+        let (home, exe) = ready_home(None);
+        let mut held = state(home.path()).unwrap();
+        held.trial = Some(Trial {
+            version: "0.9.9".into(),
+            previous: "0.1.0".into(),
+            starts: 2,
+        });
+        save(home.path(), &held).unwrap();
+
+        install_ready(home.path(), "v0.2.0", "0.1.0", &exe).unwrap();
+
+        let trial = state(home.path()).unwrap().trial.unwrap();
+        assert_eq!((trial.version.as_str(), trial.starts), ("0.2.0", 0));
+    }
+
+    #[test]
+    fn install_ready_restores_the_state_when_it_cannot_point_current() {
+        let (home, exe) = ready_home(Some("v0.1.5"));
+        let before = snapshot(home.path());
+        // A directory with something in it cannot be removed as the old link, so `current`
+        // cannot be pointed.
+        fs::create_dir_all(home.path().join("current.new")).unwrap();
+        fs::write(home.path().join("current.new/in-the-way"), "x").unwrap();
+
+        let error = install_ready(home.path(), "v0.2.0", "0.1.0", &exe).unwrap_err();
+
+        assert!(matches!(error, InstallError::Failed(_)), "{error:?}");
+        assert!(error.to_string().contains("current"), "{error}");
+        assert_eq!(snapshot(home.path()).0, before.0);
+        assert_eq!(snapshot(home.path()).1, before.1);
+    }
+
+    #[test]
+    fn install_ready_keeps_a_stranded_trial_cleared_when_it_cannot_point_current() {
+        let (home, exe) = ready_home(Some("v0.1.5"));
+        let mut held = state(home.path()).unwrap();
+        held.trial = Some(Trial {
+            version: "0.9.9".into(),
+            previous: "0.1.0".into(),
+            starts: 1,
+        });
+        save(home.path(), &held).unwrap();
+        let before = current(home.path());
+        fs::create_dir_all(home.path().join("current.new")).unwrap();
+        fs::write(home.path().join("current.new/in-the-way"), "x").unwrap();
+
+        let error = install_ready(home.path(), "v0.2.0", "0.1.0", &exe).unwrap_err();
+
+        assert!(matches!(error, InstallError::Failed(_)), "{error:?}");
+        assert_eq!(current(home.path()), before);
+        held.trial = None;
+        assert_eq!(state(home.path()).unwrap(), held);
+    }
+
+    #[test]
+    fn install_ready_moves_nothing_when_it_cannot_save_the_trial() {
+        let (home, exe) = ready_home(Some("v0.1.5"));
+        let before = snapshot(home.path());
+        // A directory with something in it cannot be opened as the file the state is written
+        // to, so the save fails. `current` must not have moved ahead of it.
+        let temp = home.path().join("update.json.tmp");
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("in-the-way"), "x").unwrap();
+
+        let error = install_ready(home.path(), "v0.2.0", "0.1.0", &exe).unwrap_err();
+
+        assert!(matches!(error, InstallError::Failed(_)), "{error:?}");
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert_eq!(snapshot(home.path()), before);
+    }
+
+    #[test]
+    fn install_ready_keeps_a_higher_refusal_and_clears_a_lower_one() {
+        // A home on 0.9.0, run from `current`, with `v<ready>` ready and `v0.9.2` refused.
+        let on_090 = |ready: &str| {
+            let home = tempfile::tempdir().unwrap();
+            fs::create_dir_all(home.path().join("versions/0.9.0")).unwrap();
+            point_current(home.path(), "0.9.0").unwrap();
+            let exe = exe_in(home.path(), "0.9.0");
+            with_ready(home.path(), ready, Some("v0.9.2"));
+            (home, exe)
+        };
+
+        let (home, exe) = on_090("0.9.1");
+        install_ready(home.path(), "v0.9.1", "0.9.0", &exe).unwrap();
+        assert_eq!(
+            state(home.path()).unwrap().refused.as_deref(),
+            Some("v0.9.2")
+        );
+
+        let (home, exe) = on_090("0.9.3");
+        install_ready(home.path(), "v0.9.3", "0.9.0", &exe).unwrap();
+        assert_eq!(state(home.path()).unwrap().refused, None);
+    }
+
+    #[test]
+    fn a_hand_install_clears_the_ready_tag_whatever_version_it_installs() {
+        for version in ["0.1.0", "0.2.0", "0.3.0"] {
+            let (home, _) = ready_home(None);
+            commit_version(home.path(), version, || {
+                placed_by_hand(home.path(), version, Some("0.1.0")).map(drop)
+            })
+            .unwrap();
+            assert_eq!(state(home.path()).unwrap().ready, None, "{version}");
+        }
+    }
+
+    #[test]
+    fn install_ready_waits_for_a_hand_install_and_sees_what_it_wrote() {
+        let (home, exe) = ready_home(None);
+        let path = home.path().to_path_buf();
+        let (inside_tx, inside) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let hand = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                place_version(
+                    &path,
+                    "0.3.0",
+                    |stage| {
+                        release(stage, "0.3.0");
+                        Ok(())
+                    },
+                    || {
+                        inside_tx.send(()).unwrap();
+                        wait.recv().unwrap();
+                        placed_by_hand(&path, "0.3.0", Some("0.1.0")).map(drop)
+                    },
+                )
+                .unwrap();
+            })
+        };
+        inside.recv().unwrap();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let install = {
+            let (path, flag) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                let result = install_ready(&path, "v0.2.0", "0.1.0", &exe);
+                flag.store(true, Ordering::SeqCst);
+                result
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!done.load(Ordering::SeqCst), "it did not wait for the lock");
+
+        go.send(()).unwrap();
+        hand.join().unwrap();
+        let error = install.join().unwrap().unwrap_err();
+
+        // The hand install cleared the ready tag, so the answer is that it is not the ready
+        // tag (the first rung of the ladder), with no ready tag left to report.
+        match &error {
+            InstallError::NotReady {
+                ready: None,
+                reason,
+            } => {
+                assert_eq!(reason, "v0.2.0 is not the ready tag");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(current(&path), PathBuf::from("versions/0.3.0"));
+        assert_eq!(state(&path).unwrap().ready, None);
     }
 }
