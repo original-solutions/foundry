@@ -37,6 +37,12 @@ export interface MachineSample {
   free_memory: number;
   free_disk: number;
   sessions: number;
+  /** The tag the machine's updater refused after rolling it back. Absent from an older daemon's sample. */
+  update_refused?: string | null;
+  /** The version the machine's daemon runs, like `0.9.0`. Absent from an older daemon's sample. */
+  version?: string | null;
+  /** The release waiting on the machine to be installed, like `v0.9.1`. Absent from an older daemon's sample. */
+  update_ready?: string | null;
 }
 
 export type AnyRecord =
@@ -414,6 +420,33 @@ export async function sessionTrail(id: string): Promise<Mark[]> {
 /** The id of the machine whose daemon serves the UI: the only one that can end its terminals. */
 export async function thisMachine(): Promise<string> {
   return String((await get("/api/machine")).id);
+}
+
+/**
+ * How long the page waits for an install's answer. The install itself only takes the updater's
+ * lock and writes two files, so a minute is ample; the carry layer's own limit is 15 minutes.
+ */
+const INSTALL_WAIT_MS = 60_000;
+
+/**
+ * Asks `machine` to install `tag`, its waiting release, wherever it is in the fleet. The answer
+ * comes back as it came, status and body, since each status means something to the caller. With
+ * no answer within a minute the call fails, as a dropped connection does: it may still have run.
+ */
+export async function installUpdate(machine: string, tag: string): Promise<{ status: number; json: Record<string, unknown> }> {
+  const stop = new AbortController();
+  const timer = setTimeout(() => stop.abort(), INSTALL_WAIT_MS);
+  try {
+    const response = await fetch(`/api/machines/${machine}/update`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tag }),
+      signal: stop.signal,
+    });
+    return await answered(response);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** The read of which machine serves the UI; it does not change while the page is open. */

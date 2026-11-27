@@ -30,6 +30,7 @@ import { Announcer, NotifyButton, useAlerts } from "./AlertsBell";
 import { KeySheet, useHelpKey } from "./KeySheet";
 import { Away } from "./Away";
 import { Toasts } from "./Toasts";
+import { UpdateBadge } from "./UpdateBadge";
 import { Rail } from "./Rail";
 import { loadRail, saveRail } from "./collapsed";
 import { useMemory } from "./memory";
@@ -367,6 +368,7 @@ function Layout() {
                   </div>
                 )}
                 <main className="flex min-w-0 flex-1 flex-col">
+                  <UpdateBadge machines={machines} here={here} />
                   {/* In the flow, so what is below gives up the room it takes; none while all are empty, and at most half the screen. Folded cards sit beside the strip, an open one takes a row. */}
                   <div className="flex max-h-[50dvh] shrink-0 flex-wrap content-start gap-2 overflow-y-auto p-2 empty:hidden">
                     {next && <NextUp next={next.next} others={next.others} open={standing} />}
