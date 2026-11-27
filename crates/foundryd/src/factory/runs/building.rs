@@ -271,12 +271,13 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
     };
     match state {
         // P1 marks a session stuck after 10 minutes of silence, and a long build is silent for
-        // longer: the factory does nothing, and `limits.minutes` ends the run. A machine that
-        // cannot be reached is `resume`'s to measure.
-        SessionState::Unreachable
-        | SessionState::Stuck
-        | SessionState::Starting
-        | SessionState::Working => Ok(BuildStep::Running),
+        // longer: the factory does nothing, and `limits.minutes` ends the run.
+        SessionState::Stuck | SessionState::Starting | SessionState::Working => {
+            Ok(BuildStep::Running)
+        }
+        // A machine that cannot be reached is `resume`'s to measure, but a pull request it
+        // reported stays with the gate, which reads a gate in flight on that machine.
+        SessionState::Unreachable => Ok(step.read_already()),
         SessionState::WaitingForYou => step.waiting(&mut at, turn.as_ref()),
         SessionState::Idle => {
             if waiting(&turn) {
@@ -5494,7 +5495,7 @@ mod tests {
         /// the next one. A session at work keeps the run running.
         #[test]
         fn a_session_that_cannot_be_reached_after_its_pull_request_was_reported_waits_for_the_gate()
-         {
+        {
             let (mut rig, run) = built();
             end_turn(&mut rig, 1, DONE_MESSAGE);
             assert!(matches!(
