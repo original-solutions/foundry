@@ -141,6 +141,7 @@ Units, each with one job:
 This is a rule for every piece, not only P1: nothing runs without the UI showing that it runs and what state it is in.
 
 - Every session and terminal shows its state in the sidebar and on its tab.
+- Every workspace in the sidebar, folded or unfolded and on any machine, shows under its name its project and where its work stands, read from the machine that owns it: `PR #n merged`, `PR #n closed`, `PR #n · Checks failing`, `PR #n · Changes requested`, `PR #n · Checks running`, `Draft PR #n`, `PR #n · Review required`, `PR #n · Ready to merge`, `Building`, `Pushed`, `Pushed · No PR yet` or `Not pushed` (an open draft reads `Draft PR #n` in place of `PR #n`), its pull request linked to GitHub. A workspace of an offline machine, or one whose owner does not answer, shows its project alone.
 - Every machine shows online or offline, load per core, free memory, free disk and its session count.
 - A machine that has not been heard from for 15 seconds is offline, and its workspaces and sessions show as unreachable. They are never hidden.
 - The gateway's health is on screen, including whether any account is cooling down, read from its management API.
