@@ -52,6 +52,7 @@ pub mod placing;
 pub mod runs;
 pub mod status;
 pub mod text;
+pub mod vims;
 pub mod worker;
 
 use std::collections::{BTreeMap, BTreeSet};
