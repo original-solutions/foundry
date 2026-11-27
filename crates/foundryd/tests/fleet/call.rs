@@ -32,10 +32,10 @@ use crate::*;
 const WAIT: Duration = Duration::from_secs(20);
 
 /// Runs the test `name` of this module in a child process of this test binary whose `HOME` and
-/// global git config are its own and that reads no system git config, which must pass
-/// ([`run_child`]). A test that serves a factory start (every [`Pair`]) runs so: the start checks
-/// the owner's git setup, and the git config of the machine running the tests may rewrite
-/// `https://github.com/`, which refuses every start. `name` is the test function's name.
+/// global git config are its own, which must pass ([`run_child`]). A test that serves a factory
+/// start (every [`Pair`]) runs so: the start checks the owner's git setup, and the global git
+/// config of the machine running the tests may rewrite `https://github.com/`, which refuses every
+/// start. `name` is the test function's name.
 fn isolated<F, Fut>(name: &str, test: F)
 where
     F: FnOnce() -> Fut,
@@ -53,9 +53,7 @@ where
     let home = tempfile::tempdir().unwrap();
     let gitconfig = home.path().join(".gitconfig");
     std::fs::write(&gitconfig, "").unwrap();
-    run_child(module, name, home.path(), &gitconfig, |child| {
-        child.env("GIT_CONFIG_NOSYSTEM", "1");
-    });
+    run_child(module, name, home.path(), &gitconfig, |_| {});
 }
 
 /// `cargo test --workspace` builds the holder and the fake agent beside the test binary's
