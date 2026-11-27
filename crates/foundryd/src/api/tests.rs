@@ -1074,6 +1074,50 @@ async fn archive_with_uncommitted_work_is_refused_listing_it() {
         reply.json()["uncommitted"],
         serde_json::json!(["notes.txt"])
     );
+    assert_eq!(reply.json()["detached"], false, "{}", reply.body);
+    assert!(worktree.exists());
+
+    let reply = daemon
+        .call("POST", &path, Some(serde_json::json!({"force": true})))
+        .await;
+    assert_eq!(reply.status, 204, "{}", reply.body);
+    assert!(!worktree.exists());
+}
+
+/// A workspace whose folder git no longer lists as a worktree: its reads are `404` saying so,
+/// and its archive is `409` with `detached` set, until it is archived anyway.
+#[tokio::test]
+async fn a_detached_workspace_reads_as_not_found_and_its_archive_says_detached() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "adrift").await;
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
+    // The worktree's `.git` file names its admin folder in the clone; without it, git lists no
+    // worktree there.
+    let link = std::fs::read_to_string(worktree.join(".git")).unwrap();
+    let admin = link.trim().strip_prefix("gitdir: ").unwrap();
+    std::fs::remove_dir_all(admin).unwrap();
+
+    let message = format!(
+        "workspace {workspace}'s folder is no longer a git worktree of its project; archive it \
+         to remove the folder"
+    );
+    for read in ["changes", "pr"] {
+        let reply = daemon
+            .call("GET", &format!("/api/workspaces/{workspace}/{read}"), None)
+            .await;
+        assert_eq!(reply.status, 404, "{read}: {}", reply.body);
+        assert_eq!(reply.json()["error"], message.as_str(), "{read}");
+    }
+
+    let path = format!("/api/workspaces/{workspace}/archive");
+    let reply = daemon.call("POST", &path, None).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    let body = reply.json();
+    assert_eq!(body["detached"], true, "{body}");
+    for list in ["uncommitted", "unpushed", "submodules"] {
+        assert_eq!(body[list], serde_json::json!([]), "{list}: {body}");
+    }
     assert!(worktree.exists());
 
     let reply = daemon
@@ -2243,6 +2287,7 @@ async fn an_error_response_hides_the_credentials_in_every_text_it_holds() {
         uncommitted: vec![format!("notes {url}")],
         unpushed: vec![format!("abc123 push to {url}")],
         submodules: vec![format!("sub {url}")],
+        detached: false,
     })))
     .await;
     assert_eq!(status, 409);
