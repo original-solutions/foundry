@@ -5182,6 +5182,30 @@ mod tests {
             assert_eq!(rig.events(&run).len(), events);
         }
 
+        /// A session a feedback round launched is the round's to ask again, with the round's
+        /// first message: the build's launch typed into it would hide the feedback.
+        #[test]
+        fn a_feedback_rounds_session_that_has_not_taken_its_message_is_left_to_the_round() {
+            let (mut rig, run) = built();
+            let round = || Event::FeedbackRelaunching {
+                n: 1,
+                branch: BRANCH.into(),
+                items: vec!["issue-comment:42".into()],
+                message: "Feedback 1 of 1".into(),
+            };
+            rig.moved(&run, State::Building, State::PrOpen);
+            rig.write(&run, round());
+            rig.moved(&run, State::PrOpen, State::Building);
+            rig.write(&run, round());
+            rig.write(&run, launch(Some(BRANCH), Some(BRANCH), Some("main")));
+            show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Ok(0));
+            let events = rig.events(&run).len();
+            assert_eq!(pass(&rig, &run), BuildStep::Running);
+            assert_eq!(calls(&rig), vec![]);
+            assert_eq!(rig.events(&run).len(), events);
+        }
+
         /// The wall clock steps back by minutes while a run builds (review focus 5): the stint
         /// began at 500 minutes by the ledger's stamps and "now" reads 0, so no negative span is
         /// counted, even against a limit of nothing.
