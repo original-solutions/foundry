@@ -159,8 +159,10 @@ mod tests {
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt as _;
 
     use super::*;
 
@@ -169,16 +171,21 @@ mod tests {
     fn ready_home(state: &str) -> (tempfile::TempDir, PathBuf) {
         let home = tempfile::tempdir().unwrap();
         for version in ["0.1.0", "0.2.0"] {
-            let dir = home.path().join("versions").join(version);
-            fs::create_dir_all(&dir).unwrap();
-            for name in ["foundryd", "foundry-holder"] {
-                fs::write(dir.join(name), version).unwrap();
-            }
+            release(home.path(), version);
         }
         update::point_current(home.path(), "0.1.0").unwrap();
         fs::write(home.path().join("update.json"), state).unwrap();
         let exe = home.path().join("versions/0.1.0/foundryd");
         (home, exe)
+    }
+
+    /// Both binaries of `version` under `versions/`.
+    fn release(home: &Path, version: &str) {
+        let dir = home.join("versions").join(version);
+        fs::create_dir_all(&dir).unwrap();
+        for name in ["foundryd", "foundry-holder"] {
+            fs::write(dir.join(name), version).unwrap();
+        }
     }
 
     const READY: &str = r#"{"ready":"v0.2.0"}"#;
@@ -197,6 +204,9 @@ mod tests {
         me: MachineId,
         addr: SocketAddr,
         stops: Arc<AtomicUsize>,
+        /// Set when the stop had fired by the time the route handed a response to the server,
+        /// before any of it was written.
+        early: Arc<AtomicBool>,
         _server: tokio::task::JoinHandle<()>,
     }
 
@@ -208,6 +218,8 @@ mod tests {
             let stop = Stop::new(move || {
                 counting.fetch_add(1, Ordering::SeqCst);
             });
+            let early = Arc::new(AtomicBool::new(false));
+            let (seen, marked) = (stops.clone(), early.clone());
             let app = routes(Held {
                 me,
                 home: home.to_owned(),
@@ -215,7 +227,16 @@ mod tests {
                 exe,
                 stop,
                 within,
-            });
+            })
+            .layer(axum::middleware::map_response(move |response: Response| {
+                let (seen, marked) = (seen.clone(), marked.clone());
+                async move {
+                    if seen.load(Ordering::SeqCst) > 0 {
+                        marked.store(true, Ordering::SeqCst);
+                    }
+                    response
+                }
+            }));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -225,12 +246,17 @@ mod tests {
                 me,
                 addr,
                 stops,
+                early,
                 _server: server,
             }
         }
 
         fn stops(&self) -> usize {
             self.stops.load(Ordering::SeqCst)
+        }
+
+        fn early(&self) -> bool {
+            self.early.load(Ordering::SeqCst)
         }
 
         /// `(status, whether it asked for a stop after it, body)` of a `POST` of `body` to the
@@ -292,11 +318,13 @@ mod tests {
             "not json",
             "[]",
         ] {
-            let (status, asked, text) = served.post(served.me, body, false).await;
-            assert_eq!(status, 400, "{body:?}: {text}");
-            assert!(!asked, "{body:?}");
-            let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert!(answer["error"].as_str().unwrap().contains("tag"), "{text}");
+            for carried in [false, true] {
+                let (status, asked, text) = served.post(served.me, body, carried).await;
+                assert_eq!(status, 400, "{body:?}: {text}");
+                assert!(!asked, "{body:?} asked for a stop");
+                let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert!(answer["error"].as_str().unwrap().contains("tag"), "{text}");
+            }
         }
 
         assert_eq!(snapshot(home.path()), before);
@@ -304,53 +332,107 @@ mod tests {
         assert_eq!(served.stops(), 0);
     }
 
+    /// A state the install refuses `tag` in, with the reason it gives and the ready tag it
+    /// reports.
+    struct Refused {
+        reason: &'static str,
+        state: &'static str,
+        tag: &'static str,
+        ready: Option<&'static str>,
+        /// Changes the home before the call, and gives the program the daemon runs from when it
+        /// is not `versions/0.1.0/foundryd`.
+        arrange: fn(&Path) -> Option<PathBuf>,
+    }
+
     #[tokio::test]
     async fn each_case_the_install_refuses_is_409_with_the_ready_tag_and_stops_nothing() {
-        let other = |home: &Path| home.join("elsewhere");
         let trial =
             r#"{"ready":"v0.2.0","trial":{"version":"0.1.0","previous":"0.0.9","starts":0}}"#;
-        let cases: [(&str, &str, bool, Option<&str>, &str); 4] = [
-            (READY, "v0.3.0", false, Some("v0.2.0"), "not the ready tag"),
-            (READY, "v0.2.0", true, None, "not run from"),
-            (
-                r#"{"ready":"v0.2.0","refused":"v0.2.0"}"#,
-                "v0.2.0",
-                false,
-                None,
-                "refused",
-            ),
-            (
-                trial,
-                "v0.2.0",
-                false,
-                Some("v0.2.0"),
-                "a trial of 0.1.0 is on",
-            ),
+        let cases = [
+            Refused {
+                reason: "v0.3.0 is not the ready tag",
+                state: READY,
+                tag: "v0.3.0",
+                ready: Some("v0.2.0"),
+                arrange: |_| None,
+            },
+            Refused {
+                reason: "its binaries are gone",
+                state: READY,
+                tag: "v0.2.0",
+                ready: None,
+                arrange: |home| {
+                    fs::remove_file(home.join("versions/0.2.0/foundry-holder")).unwrap();
+                    None
+                },
+            },
+            Refused {
+                reason: "not above the running version 0.1.0",
+                state: r#"{"ready":"v0.1.0"}"#,
+                tag: "v0.1.0",
+                ready: None,
+                arrange: |_| None,
+            },
+            Refused {
+                reason: "v0.2.0 is refused",
+                state: r#"{"ready":"v0.2.0","refused":"v0.2.0"}"#,
+                tag: "v0.2.0",
+                ready: None,
+                arrange: |_| None,
+            },
+            // As a hand install of a higher version leaves it, with the ready tag stale.
+            Refused {
+                reason: "current does not name the running version 0.1.0",
+                state: READY,
+                tag: "v0.2.0",
+                ready: None,
+                arrange: |home| {
+                    release(home, "0.3.0");
+                    update::point_current(home, "0.3.0").unwrap();
+                    None
+                },
+            },
+            Refused {
+                reason: "not run from",
+                state: READY,
+                tag: "v0.2.0",
+                ready: None,
+                arrange: |home| {
+                    let elsewhere = home.join("elsewhere");
+                    fs::write(&elsewhere, "0.1.0").unwrap();
+                    Some(elsewhere)
+                },
+            },
+            Refused {
+                reason: "a trial of 0.1.0 is on",
+                state: trial,
+                tag: "v0.2.0",
+                ready: Some("v0.2.0"),
+                arrange: |_| None,
+            },
         ];
-        for (state, tag, elsewhere, ready, reason) in cases {
-            let (home, exe) = ready_home(state);
-            let exe = if elsewhere {
-                fs::write(other(home.path()), "0.1.0").unwrap();
-                other(home.path())
-            } else {
-                exe
-            };
+        for case in cases {
+            let reason = case.reason;
+            let (home, exe) = ready_home(case.state);
+            let exe = (case.arrange)(home.path()).unwrap_or(exe);
             let served = Served::new(home.path(), exe, BRIEF).await;
             let before = snapshot(home.path());
 
-            let body = format!(r#"{{"tag":"{tag}"}}"#);
-            let (status, asked, text) = served.post(served.me, &body, false).await;
+            for carried in [false, true] {
+                let body = format!(r#"{{"tag":"{}"}}"#, case.tag);
+                let (status, asked, text) = served.post(served.me, &body, carried).await;
 
-            assert_eq!(status, 409, "{reason}: {text}");
-            assert!(!asked, "{reason}");
-            let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert!(
-                answer["error"].as_str().unwrap().contains(reason),
-                "{reason}: {text}"
-            );
-            let field = answer.get("ready").expect("a ready field, null or a tag");
-            assert_eq!(field.as_str(), ready, "{reason}: {text}");
-            assert_eq!(snapshot(home.path()), before, "{reason}");
+                assert_eq!(status, 409, "{reason}: {text}");
+                assert!(!asked, "{reason}: asked for a stop");
+                let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert!(
+                    answer["error"].as_str().unwrap().contains(reason),
+                    "{reason}: {text}"
+                );
+                let field = answer.get("ready").expect("a ready field, null or a tag");
+                assert_eq!(field.as_str(), case.ready, "{reason}: {text}");
+                assert_eq!(snapshot(home.path()), before, "{reason}");
+            }
             tokio::time::sleep(BRIEF * 2).await;
             assert_eq!(served.stops(), 0, "{reason}");
         }
@@ -366,16 +448,19 @@ mod tests {
         let served = Served::new(home.path(), exe, BRIEF).await;
         let before = snapshot(home.path());
 
-        let (status, asked, text) = served.post(served.me, r#"{"tag":"v0.2.0"}"#, false).await;
+        for carried in [false, true] {
+            let body = r#"{"tag":"v0.2.0"}"#;
+            let (status, asked, text) = served.post(served.me, body, carried).await;
 
-        assert_eq!(status, 500, "{text}");
-        assert!(!asked);
-        let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert!(
-            answer["error"].as_str().unwrap().contains("current"),
-            "{text}"
-        );
-        assert_eq!(snapshot(home.path()), before);
+            assert_eq!(status, 500, "{text}");
+            assert!(!asked, "asked for a stop");
+            let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(
+                answer["error"].as_str().unwrap().contains("current"),
+                "{text}"
+            );
+            assert_eq!(snapshot(home.path()), before);
+        }
         tokio::time::sleep(BRIEF * 2).await;
         assert_eq!(served.stops(), 0);
     }
@@ -388,6 +473,7 @@ mod tests {
         let (status, asked, text) = served.post(served.me, r#"{"tag":"v0.2.0"}"#, false).await;
 
         assert_eq!((status, asked, text.as_str()), (202, false, ""));
+        assert!(!served.early(), "it stopped before its answer was written");
         assert_eq!(
             fs::read_link(home.path().join("current")).unwrap(),
             Path::new("versions/0.2.0")
@@ -413,6 +499,7 @@ mod tests {
         let (status, asked, text) = served.post(served.me, r#"{"tag":"v0.2.0"}"#, true).await;
 
         assert_eq!((status, asked, text.as_str()), (202, true, ""));
+        assert!(!served.early(), "it stopped before its answer was written");
         assert_eq!(
             served.stops(),
             0,
@@ -427,6 +514,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_install_whose_caller_goes_away_before_it_answers_still_stops_within_the_limit() {
+        let (home, exe) = ready_home(READY);
+        let served = Served::new(home.path(), exe, BRIEF).await;
+        // The install waits on the update lock while this holds it.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(home.path().join("update.lock"))
+            .unwrap();
+        let held = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive).unwrap();
+        let mut caller = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+        let body = r#"{"tag":"v0.2.0"}"#;
+        let request = format!(
+            "POST /api/machines/{}/update HTTP/1.1\r\nHost: {}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            served.me,
+            served.addr,
+            body.len()
+        );
+        caller.write_all(request.as_bytes()).await.unwrap();
+        tokio::time::sleep(BRIEF).await;
+
+        drop(caller);
+        tokio::time::sleep(BRIEF).await;
+        drop(held);
+
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fs::read_link(home.path().join("current")).unwrap() != Path::new("versions/0.2.0") {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "the install did not run"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            served.stopped(1, Duration::from_secs(5)).await,
+            "current moved and the daemon never stopped"
+        );
+        tokio::time::sleep(BRIEF).await;
+        assert_eq!(served.stops(), 1, "it stopped twice");
+    }
+
+    #[tokio::test]
     async fn an_install_naming_another_machine_is_not_carried_on_and_an_id_that_is_none_is_404() {
         let (home, exe) = ready_home(READY);
         let served = Served::new(home.path(), exe, BRIEF).await;
@@ -434,8 +565,9 @@ mod tests {
         let other = MachineId::random();
 
         for carried in [false, true] {
-            let (status, _, text) = served.post(other, r#"{"tag":"v0.2.0"}"#, carried).await;
+            let (status, asked, text) = served.post(other, r#"{"tag":"v0.2.0"}"#, carried).await;
             assert_eq!(status, 421, "{text}");
+            assert!(!asked, "asked for a stop");
             assert!(text.contains(&other.to_string()), "{text}");
         }
         let (status, _, text) = served.post("not-an-id", r#"{"tag":"v0.2.0"}"#, false).await;

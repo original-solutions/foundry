@@ -431,7 +431,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use foundry_proto::ids::WorkspaceId;
+    use foundry_proto::ids::{TerminalId, WorkspaceId};
     use foundry_proto::messages::UPDATES_SINCE;
     use foundry_proto::settings::{Machine, SharedSettings};
     use futures::future::BoxFuture;
@@ -613,7 +613,11 @@ mod tests {
         });
 
         tokio::time::sleep_until(started + STOP_WITHIN + Duration::from_millis(1)).await;
-        assert_eq!(stops.load(Ordering::SeqCst), 1, "not stopped within the limit");
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            1,
+            "not stopped within the limit"
+        );
         answering.await.unwrap();
         assert_eq!(stops.load(Ordering::SeqCst), 1, "stopped twice");
     }
@@ -671,6 +675,125 @@ mod tests {
         server.abort();
         assert_eq!((stops.0, stops.1.is_empty(), stops.2), (202, true, true));
         assert_eq!((goes_on.0, goes_on.2), (202, false));
+    }
+
+    /// An owner's API: the install answers `202` and asks for a stop, a create `201` and a
+    /// terminal's close `409`, neither asking.
+    async fn owners_api() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        let app = axum::Router::new()
+            .route(
+                "/api/machines/{id}/update",
+                post(|| async { (StatusCode::ACCEPTED, [(STOP_AFTER, "1")]) }),
+            )
+            .route("/api/workspaces", post(|| async { StatusCode::CREATED }))
+            .route(
+                "/api/terminals/{id}/close",
+                post(|| async { StatusCode::CONFLICT }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (api, server)
+    }
+
+    /// Opens a call link from `caller` to `owner` that carries a `POST` to `path`, and gives
+    /// back the caller's end of the link once the owner's answer arrived, with its status and
+    /// version.
+    async fn carried(owner: &Peers, caller: MachineId, path: &str) -> (Conn, u16, u64) {
+        let (mut near, far) = Conn::pair();
+        let accepting = owner.clone();
+        tokio::spawn(async move { accepting.accept(far).await });
+        let open = PeerMessage::Call {
+            protocol: PROTOCOL,
+            machine: caller,
+            call: Call {
+                path: path.to_owned(),
+                content_type: None,
+                body: hex(b""),
+            },
+        };
+        near.send
+            .send(serde_json::to_string(&open).unwrap())
+            .await
+            .unwrap();
+        loop {
+            let text = near.recv.recv().await.expect("an answer");
+            if let Ok(Frame::Answer {
+                status, version, ..
+            }) = serde_json::from_str(&text)
+            {
+                return (near, status, version);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_carried_call_stops_its_owner_once_the_caller_has_the_answer_that_asked_and_only_then()
+     {
+        let (me, caller) = (MachineId::random(), MachineId::random());
+        let (_dir, owner, _) = listing(me, caller);
+        {
+            let mut store = lock(&owner.inner.store);
+            let version = store.own_next_version().unwrap();
+            let sample =
+                foundry_proto::record::AnyRecord::MachineSample(foundry_proto::record::Record {
+                    owner: me,
+                    version,
+                    deleted: false,
+                    body: foundry_proto::record::MachineSample {
+                        load_per_core: 0.5,
+                        free_memory: 1,
+                        free_disk: 1,
+                        sessions: 0,
+                        update_refused: None,
+                        version: None,
+                        update_ready: None,
+                    },
+                });
+            store.apply(&sample, me).unwrap();
+        }
+        let (api, server) = owners_api().await;
+        owner.serve_calls(api);
+        let (stop, stops) = counted();
+        owner.stop_after_calls(stop);
+
+        for path in [
+            "/api/workspaces".to_owned(),
+            format!("/api/terminals/{}/close", TerminalId::random()),
+        ] {
+            let (link, status, version) = carried(&owner, caller, &path).await;
+            assert!([201, 409].contains(&status), "{path}: {status}");
+            assert!(version > 0, "{path}: the answer names no records");
+            drop(link);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(stops.load(Ordering::SeqCst), 0, "{path} stopped the owner");
+        }
+
+        let install = format!("/api/machines/{me}/update");
+        let (link, status, version) = carried(&owner, caller, &install).await;
+        assert_eq!(status, 202);
+        // The owner stops before it could send what it wrote since: the caller waits for none.
+        assert_eq!(
+            version, 0,
+            "the caller would wait for records that never come"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            0,
+            "stopped before the caller closed the link"
+        );
+        drop(link);
+        let until = Instant::now() + Duration::from_secs(5);
+        while stops.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < until, "the owner never stopped");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "stopped twice");
+        server.abort();
     }
 
     #[test]

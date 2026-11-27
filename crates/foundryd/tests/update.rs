@@ -186,7 +186,8 @@ fn a_daemon_asked_to_install_its_ready_release_answers_202_and_exits_onto_it_on_
         .send(r#"{"tag":"v999.0.0"}"#);
     let status = match answer {
         Ok(mut answer) => {
-            let body = answer.body_mut().read_to_string().unwrap_or_default();
+            // Read whole, to its last chunk: a stop before the answer was written cuts it off.
+            let body = answer.body_mut().read_to_string().unwrap();
             assert_eq!(answer.status(), 202, "{body}");
             assert_eq!(body, "");
             exited(&mut child, Duration::from_secs(10), &log)
