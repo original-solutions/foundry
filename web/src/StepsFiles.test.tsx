@@ -66,6 +66,14 @@ describe("StepsFiles reading the changes", () => {
     await waitFor(() => expect(reads).toBe(3));
   });
 
+  it("reads the changes again when the session's state changes after a read that failed for another reason", async () => {
+    answer = () => json(500, { error: "daemon hiccup" });
+    await watch();
+    answer = () => json(200, changes);
+    changeState();
+    await waitFor(() => expect(reads).toBe(2));
+  });
+
   it("stops reading a workspace the daemon answered 404, on the timer and when the session's state changes", async () => {
     answer = () => json(404, { error: "workspace w1 is not a live workspace of this machine" });
     await watch();
