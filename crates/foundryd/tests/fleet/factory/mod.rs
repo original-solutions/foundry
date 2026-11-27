@@ -27,7 +27,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,7 +61,7 @@ use tokio::task::JoinHandle;
 
 pub use github::FakeTracker;
 
-use crate::{Daemon, Fleet, lock, sample, until};
+use crate::{Daemon, Fleet, lock, ran_in_child, run_child, sample, until};
 
 /// The project's repo on GitHub.
 pub const REPO: &str = "acme/widgets";
@@ -80,8 +80,6 @@ pub const WAIT: Duration = Duration::from_secs(120);
 /// How long a whole test may run in its child process.
 const CHILD_WAIT: Duration = Duration::from_secs(300);
 
-/// Names the test a child process runs.
-const CHILD: &str = "FOUNDRY_FLEET_FACTORY_TEST";
 /// The folder of bare repos `https://github.com/` stands for, in a child process.
 const ORIGINS: &str = "FOUNDRY_FLEET_FACTORY_ORIGINS";
 
@@ -104,27 +102,18 @@ pub fn config(provision: &[&str], gate: &[&str], gate_retries: u32) -> String {
 
 /// Runs the test `name` of this module path: in this process when it is the child started for
 /// it, else in a child process of this test binary whose `PATH`, `HOME` and git config are the
-/// harness's, which must pass. `name` is the test function's name.
+/// harness's, which must pass ([`run_child`]). `name` is the test function's name.
 pub fn isolated<F, Fut>(module: &str, name: &str, test: F)
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = ()>,
 {
-    let module = module.split_once("::").map_or(module, |(_, rest)| rest);
-    let full = format!("{module}::{name}");
-    if std::env::var(CHILD).ok().as_deref() == Some(full.as_str()) {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.block_on(test());
-        }));
-        // A pass on a blocking thread may wait on the runtime: dropping it would wait for ever.
-        runtime.shutdown_timeout(Duration::from_secs(5));
-        if let Err(panic) = ran {
-            std::panic::resume_unwind(panic);
-        }
+    if ran_in_child(
+        module,
+        name,
+        tokio::runtime::Builder::new_multi_thread(),
+        test,
+    ) {
         return;
     }
     let dir = tempfile::Builder::new()
@@ -160,63 +149,9 @@ where
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let child = Command::new(std::env::current_exe().unwrap())
-        .args([full.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD, &full)
-        .env(ORIGINS, &origins)
-        .env("PATH", path)
-        .env("HOME", &home)
-        .env("GIT_CONFIG_GLOBAL", &gitconfig)
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let out = wait_child(child, CHILD_WAIT);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success() && stdout.contains("1 passed"),
-        "{full} failed in its child process ({:?})\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
-        out.status
-    );
-}
-
-/// The output of `child`, which is killed once `limit` passes.
-fn wait_child(mut child: std::process::Child, limit: Duration) -> std::process::Output {
-    use std::io::Read as _;
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut text = Vec::new();
-        let _ = stdout.read_to_end(&mut text);
-        text
+    run_child(module, name, &home, &gitconfig, CHILD_WAIT, |child| {
+        child.env(ORIGINS, &origins).env("PATH", path);
     });
-    let err = std::thread::spawn(move || {
-        let mut text = Vec::new();
-        let _ = stderr.read_to_end(&mut text);
-        text
-    });
-    let end = std::time::Instant::now() + limit;
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if std::time::Instant::now() > end {
-            let _ = child.kill();
-            break child.wait().unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    std::process::Output {
-        status,
-        stdout: out.join().unwrap(),
-        stderr: err.join().unwrap(),
-    }
 }
 
 /// `name` on `PATH`.
