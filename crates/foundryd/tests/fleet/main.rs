@@ -336,6 +336,9 @@ async fn forward(
 /// Names the one test a child process of this test binary runs ([`run_child`]).
 const CHILD: &str = "FOUNDRY_FLEET_CHILD_TEST";
 
+/// How long a whole test may run in its child process.
+const CHILD_WAIT: Duration = Duration::from_secs(300);
+
 /// The test `name` of the module whose `module_path!()` is `module`, as this binary names it.
 fn test_path(module: &str, name: &str) -> String {
     let module = module.split_once("::").map_or(module, |(_, rest)| rest);
@@ -376,7 +379,7 @@ where
 }
 
 /// Runs the test `name` of `module` (its `module_path!()`) in a child process of this test
-/// binary, which must pass within `limit`. The child's `HOME` is `home` and its global git
+/// binary, which must pass within [`CHILD_WAIT`]. The child's `HOME` is `home` and its global git
 /// config is `gitconfig`; it inherits no `GIT_CONFIG_SYSTEM`, `XDG_CONFIG_HOME` or GitHub token,
 /// and `configure` sets what else it needs. This process's own environment is left as it is.
 pub fn run_child(
@@ -384,7 +387,6 @@ pub fn run_child(
     name: &str,
     home: &Path,
     gitconfig: &Path,
-    limit: Duration,
     configure: impl FnOnce(&mut Command),
 ) {
     let full = test_path(module, name);
@@ -402,7 +404,7 @@ pub fn run_child(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure(&mut child);
-    let out = wait_child(child.spawn().unwrap(), limit);
+    let out = wait_child(child.spawn().unwrap(), CHILD_WAIT);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

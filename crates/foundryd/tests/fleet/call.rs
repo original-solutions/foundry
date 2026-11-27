@@ -31,14 +31,11 @@ use crate::*;
 
 const WAIT: Duration = Duration::from_secs(20);
 
-/// How long a whole test may run in its child process.
-const CHILD_WAIT: Duration = Duration::from_secs(300);
-
 /// Runs the test `name` of this module in a child process of this test binary whose `HOME` and
-/// global git config are its own, which must pass ([`run_child`]). A test that starts a [`Pair`]
-/// runs so: B checks the owner's git setup before a factory start, and the git config of the
-/// machine running the tests may rewrite `https://github.com/`, which refuses every start.
-/// `name` is the test function's name.
+/// global git config are its own and that reads no system git config, which must pass
+/// ([`run_child`]). A test that serves a factory start (every [`Pair`]) runs so: the start checks
+/// the owner's git setup, and the git config of the machine running the tests may rewrite
+/// `https://github.com/`, which refuses every start. `name` is the test function's name.
 fn isolated<F, Fut>(name: &str, test: F)
 where
     F: FnOnce() -> Fut,
@@ -56,7 +53,9 @@ where
     let home = tempfile::tempdir().unwrap();
     let gitconfig = home.path().join(".gitconfig");
     std::fs::write(&gitconfig, "").unwrap();
-    run_child(module, name, home.path(), &gitconfig, CHILD_WAIT, |_| {});
+    run_child(module, name, home.path(), &gitconfig, |child| {
+        child.env("GIT_CONFIG_NOSYSTEM", "1");
+    });
 }
 
 /// `cargo test --workspace` builds the holder and the fake agent beside the test binary's
@@ -137,6 +136,10 @@ impl Served {
         peers: Peers,
         factory: Option<Factory>,
     ) -> Self {
+        assert!(
+            factory.is_none() || in_child(),
+            "a test that serves a factory start runs in its own child process: wrap it in `isolated`"
+        );
         // A Unix socket path is at most about 100 bytes, which the system's own temporary
         // folder on macOS would take most of.
         let data = tempfile::Builder::new()
@@ -1165,10 +1168,6 @@ impl Pair {
     /// A pair whose B refuses sessions for `refused`, when it is given, and starts `holder` for
     /// its terminals, when it is given.
     async fn start_with(refused: Option<&'static str>, holder: Option<PathBuf>) -> Pair {
-        assert!(
-            in_child(),
-            "a test that starts a Pair runs in its own child process: wrap it in `isolated`"
-        );
         let fleet = Fleet::start(2);
         let remotes = tempfile::tempdir().unwrap();
         let project = project(&fleet, remotes.path());

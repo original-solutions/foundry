@@ -77,9 +77,6 @@ pub const HELPER_SECRET: &str = "MachineHelperPassword0123456789qrstuv";
 /// How long a test waits for a step of the factory, on the wall clock.
 pub const WAIT: Duration = Duration::from_secs(120);
 
-/// How long a whole test may run in its child process.
-const CHILD_WAIT: Duration = Duration::from_secs(300);
-
 /// The folder of bare repos `https://github.com/` stands for, in a child process.
 const ORIGINS: &str = "FOUNDRY_FLEET_FACTORY_ORIGINS";
 
@@ -149,7 +146,7 @@ where
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    run_child(module, name, &home, &gitconfig, CHILD_WAIT, |child| {
+    run_child(module, name, &home, &gitconfig, |child| {
         child.env(ORIGINS, &origins).env("PATH", path);
     });
 }
