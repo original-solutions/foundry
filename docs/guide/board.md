@@ -118,9 +118,9 @@ The sidebar is the same fleet as a list. It sits at the left on a wide screen. F
 
 ### Folding
 
-A folded workspace is one line: its project's face, its name and a strip of state glyphs, most urgent first. The strip shows six, then "+N". Click a glyph to open that terminal. Click the name, or the arrow, to unfold.
+A folded workspace is one row: its project's face, its name and a strip of state glyphs, most urgent first. The strip shows six, then "+N". Click a glyph to open that terminal. Click the name, or the arrow, to unfold.
 
-An unfolded workspace shows its branch and project, a row of actions, and every terminal with its state label and what it is doing.
+Under its name, a folded workspace shows its project, then where its work stands, such as "Draft PR #307 · Checks running", "Building", "Pushed · No PR yet" or "PR #9 merged", the pull request a link to it on GitHub. An unfolded workspace shows the same line, then its branch with a row of actions, and every terminal with its state label and what it is doing.
 
 The workspace you are in unfolds by itself and folds again when you leave. One you unfolded yourself stays open. Which are open is kept in this browser.
 

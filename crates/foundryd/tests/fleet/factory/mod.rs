@@ -664,6 +664,7 @@ impl Harness {
                 github.clone(),
                 clock.clone(),
                 sent.clone(),
+                None,
             )
             .await;
             write_held(daemon, i == 0 || builds, builds);
@@ -887,7 +888,11 @@ fn write_held(daemon: &Daemon, token: bool, builds: bool) {
 }
 
 impl Machine {
-    /// The API, sessions and factory service of `daemon`, holding `secrets`.
+    /// The API, sessions and factory service of `daemon`, holding `secrets`, beside the cut-off,
+    /// as `foundryd` runs them. `earlier` is the data folder and home a daemon before it used,
+    /// for a restart: its terminals are reattached, its workspaces swept and its sessions
+    /// adopted before anything is served, in `foundryd`'s order.
+    #[allow(clippy::too_many_arguments)]
     async fn start(
         daemon: &Daemon,
         secrets: Arc<Held>,
@@ -896,14 +901,18 @@ impl Machine {
         github: Arc<FakeTracker>,
         clock: Arc<FakeClock>,
         sent: Arc<Mutex<Vec<Sent>>>,
+        earlier: Option<(TempDir, TempDir)>,
     ) -> Machine {
         let (me, store, peers) = (daemon.id, daemon.store.clone(), daemon.peers.clone());
-        // A Unix socket path is at most about 100 bytes.
-        let data = tempfile::Builder::new()
-            .prefix("fm")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let restarted = earlier.is_some();
+        let (data, home) = earlier.unwrap_or_else(|| {
+            // A Unix socket path is at most about 100 bytes.
+            let data = tempfile::Builder::new()
+                .prefix("fm")
+                .tempdir_in("/tmp")
+                .unwrap();
+            (data, tempfile::tempdir().unwrap())
+        });
         let agent = built("foundry-fake-agent");
         let claude: Vec<String> = [
             "sh".into(),
@@ -921,11 +930,17 @@ impl Machine {
             data.path(),
             built("foundry-holder"),
         ));
+        if restarted {
+            terminals.reattach_all().await.unwrap();
+        }
         let held: Arc<dyn Secrets> = secrets.clone();
         let workspaces = Arc::new(
             Workspaces::new(me, store.clone(), data.path(), terminals.clone())
                 .with_secrets(held.clone()),
         );
+        if restarted {
+            workspaces.sweep().await.unwrap();
+        }
         let hooks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sessions = Arc::new(
             Sessions::new(
@@ -945,6 +960,9 @@ impl Machine {
             )
             .with_secrets(held),
         );
+        if restarted {
+            sessions.adopt().await;
+        }
         let hook_router = sessions.router();
         let api = Api::new(
             store,
@@ -970,12 +988,13 @@ impl Machine {
             runtime: tokio::runtime::Handle::current(),
             sent,
         });
+        let clock = clock as Arc<dyn Clock>;
         let factory = Factory::new(
             daemon.store.clone(),
             me,
             host,
             freshness.clone(),
-            clock as Arc<dyn Clock>,
+            clock.clone(),
         );
         let (placing, served) = (api.clone(), api.clone());
         let servers = vec![
@@ -992,6 +1011,13 @@ impl Machine {
                 axum::serve(listener, api::router(served)).await.unwrap();
             }),
             tokio::spawn(factory.serve()),
+            tokio::spawn(foundryd::factory::cutoff::run(
+                daemon.store.clone(),
+                me,
+                api.sessions.clone(),
+                freshness,
+                clock,
+            )),
         ];
         Machine {
             data,
