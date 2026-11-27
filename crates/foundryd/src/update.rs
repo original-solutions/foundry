@@ -4,12 +4,12 @@
 //! relative link to one of them, which the service runs) and `update.json`. The check every
 //! ten minutes downloads, verifies and unpacks a newer tag into `versions/` and saves it as the
 //! ready tag; it never installs it. [`install_ready`] installs the ready tag when asked, with a
-//! trial record in `update.json`. A version installed with a trial record is a trial: the
-//! daemon that starts from it counts its starts, and `update::run` calls it healthy once it
-//! has run for a minute. A trial that starts three times without becoming healthy is put back
-//! to the previous version and its tag is refused until a higher one appears. A hand install
-//! (`foundryd install`) starts no trial and clears the ready tag. Only a daemon that runs from
-//! `<home>/current` takes part in any of this.
+//! trial record in `update.json`; nothing asks yet, until #274 adds its route. A version
+//! installed with a trial record is a trial: the daemon that starts from it counts its starts,
+//! and `update::run` calls it healthy once it has run for a minute. A trial that starts three
+//! times without becoming healthy is put back to the previous version and its tag is refused
+//! until a higher one appears. A hand install (`foundryd install`) starts no trial and clears
+//! the ready tag. Only a daemon that runs from `<home>/current` takes part in any of this.
 //!
 //! `foundryd install` and the daemon are separate processes that both change `update.json`
 //! and `current`, so every change to either is made while holding `<home>/update.lock`.
@@ -246,7 +246,7 @@ fn unrunnable(error: &io::Error) -> bool {
 }
 
 /// A version a trial record in `update.json` names, which has not yet shown it stays up.
-/// [`install_ready`] writes one.
+/// [`install_ready`] writes one, once #274 gives it a caller.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trial {
     /// The version on trial, like `0.2.0`.
@@ -765,16 +765,51 @@ fn record_and_point(
     point_current(home, version).map_err(io_error("cannot point current at the new version"))
 }
 
-/// The tag the sample's `update_ready` would report for `state`: the ready tag while it is above
-/// `running`, is not refused, has both binaries on disk and the daemon at `exe` runs from
-/// `current`.
-fn reportable(home: &Path, state: &State, exe: &Path, running: &str) -> Option<String> {
+/// The version of `tag` when it could be installed now, apart from a trial that is on: it is the
+/// ready tag, both its binaries are on disk, it is above `running` and not refused, `current`
+/// names `running` and the daemon at `exe` runs from `current`. Otherwise the reason for the
+/// first case that fails. [`install_ready`] refuses by it and [`reportable`] reports by it, so
+/// the two cannot disagree.
+fn installable<'a>(
+    home: &Path,
+    state: &State,
+    tag: &'a str,
+    exe: &Path,
+    running: &str,
+) -> Result<&'a str, String> {
+    let version = tag_version(tag)
+        .filter(|_| state.ready.as_deref() == Some(tag))
+        .ok_or_else(|| format!("{tag} is not the ready tag"))?;
+    if !is_ready(home, tag) {
+        return Err(format!("{tag} is not ready: its binaries are gone"));
+    }
+    if !above(version, running) {
+        return Err(format!("{tag} is not above the running version {running}"));
+    }
+    if state.refused.as_deref() == Some(tag) {
+        return Err(format!("{tag} is refused"));
+    }
+    if current_version(home).as_deref() != Some(running) {
+        return Err(format!(
+            "current does not name the running version {running}"
+        ));
+    }
+    if !from_current(home, exe, running) {
+        return Err(format!(
+            "this daemon is not run from {}",
+            home.join("current").display()
+        ));
+    }
+    Ok(version)
+}
+
+/// The tag the sample's `update_ready` reports for `state`: the ready tag while it is
+/// [`installable`].
+pub(crate) fn reportable(home: &Path, state: &State, exe: &Path, running: &str) -> Option<String> {
     let ready = state.ready.as_deref()?;
-    (tag_version(ready).is_some_and(|version| above(version, running))
-        && state.refused.as_deref() != Some(ready)
-        && is_ready(home, ready)
-        && from_current(home, exe, running))
-    .then(|| ready.to_string())
+    installable(home, state, ready, exe, running)
+        .ok()
+        .map(|_| ready.to_string())
 }
 
 /// Installs `tag`, the ready tag, when asked: it saves a trial of its version with `running` as
@@ -785,7 +820,7 @@ fn reportable(home: &Path, state: &State, exe: &Path, running: &str) -> Option<S
 /// its binaries are gone), is not above `running` or is refused, when `exe` is not run from
 /// `<home>/current`, when `current` does not name `running`, or when a trial is on. A refusal
 /// of a tag below `tag` is cleared; a higher one stays. If `current` cannot be pointed the state
-/// is saved back as it was.
+/// is saved back as it was. Nothing calls it yet: #274 adds the route that does.
 pub fn install_ready(
     home: &Path,
     tag: &str,
@@ -807,28 +842,11 @@ fn install_ready_with(
     let mut held = state(home).map_err(io_error("cannot read the update state"))?;
     let cleared = clear_stranded_trial(home, &mut held);
     let ready = reportable(home, &held, exe, running);
-    let verdict: Result<&str, String> =
-        match tag_version(tag).filter(|_| held.ready.as_deref() == Some(tag)) {
-            None => Err(format!("{tag} is not the ready tag")),
-            Some(_) if !is_ready(home, tag) => {
-                Err(format!("{tag} is not ready: its binaries are gone"))
-            }
-            Some(version) if !above(version, running) => {
-                Err(format!("{tag} is not above the running version {running}"))
-            }
-            Some(_) if held.refused.as_deref() == Some(tag) => Err(format!("{tag} is refused")),
-            Some(_) if current_version(home).as_deref() != Some(running) => Err(format!(
-                "current does not name the running version {running}"
-            )),
-            Some(_) if !from_current(home, exe, running) => Err(format!(
-                "this daemon is not run from {}",
-                home.join("current").display()
-            )),
-            Some(version) => match &held.trial {
-                Some(trial) => Err(format!("a trial of {} is on", trial.version)),
-                None => Ok(version),
-            },
-        };
+    let verdict =
+        installable(home, &held, tag, exe, running).and_then(|version| match &held.trial {
+            Some(trial) => Err(format!("a trial of {} is on", trial.version)),
+            None => Ok(version),
+        });
     let version = match verdict {
         Err(reason) => {
             if cleared {
@@ -3931,6 +3949,28 @@ mod tests {
         assert!(error.to_string().contains("current"), "{error}");
         assert_eq!(snapshot(home.path()).0, before.0);
         assert_eq!(snapshot(home.path()).1, before.1);
+    }
+
+    #[test]
+    fn install_ready_keeps_a_stranded_trial_cleared_when_it_cannot_point_current() {
+        let (home, exe) = ready_home(Some("v0.1.5"));
+        let mut held = state(home.path()).unwrap();
+        held.trial = Some(Trial {
+            version: "0.9.9".into(),
+            previous: "0.1.0".into(),
+            starts: 1,
+        });
+        save(home.path(), &held).unwrap();
+        let before = current(home.path());
+        fs::create_dir_all(home.path().join("current.new")).unwrap();
+        fs::write(home.path().join("current.new/in-the-way"), "x").unwrap();
+
+        let error = install_ready(home.path(), "v0.2.0", "0.1.0", &exe).unwrap_err();
+
+        assert!(matches!(error, InstallError::Failed(_)), "{error:?}");
+        assert_eq!(current(home.path()), before);
+        held.trial = None;
+        assert_eq!(state(home.path()).unwrap(), held);
     }
 
     #[test]
