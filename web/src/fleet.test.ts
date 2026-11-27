@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AnyRecord, FactoryStatus, UiMessage } from "./api";
-import { apply, byUrgency, coordinatorOrder, emptyState, fleet, locate, machineNumbers, machineStats, rows, terminalRunning } from "./fleet";
+import { apply, branchOf, byUrgency, coordinatorOrder, emptyState, fleet, locate, machineNumbers, machineStats, rows, terminalRunning } from "./fleet";
 import type { Glyph } from "./labels";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
@@ -530,6 +530,22 @@ describe("briefs", () => {
     expect(rows(machine.workspaces[0]).map((r) => r.said)).toEqual([undefined, said, undefined, said, undefined]);
   });
 
+  it("shows the name a session was given in place of its first prompt, a peer's session too, and the first prompt once it has none", () => {
+    const named = [
+      ...records.map((r) => (r.kind === "session" && r.body.id === "s1" ? session(ME, "s1", "w1", "t1", "working", { name: "login redirect" }) : r)),
+      terminal(OTHER, "t9", "w9"),
+      workspace(OTHER, "w9", "far"),
+      session(OTHER, "s9", "w9", "t9", "idle", { name: "far work" }),
+    ];
+    const listed = settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "attic", address: "" }] });
+    const view = fleet(named, listed, briefs);
+    const mine = view.find((m) => m.id === ME)!;
+    expect(rows(mine.workspaces[0]).map((r) => r.title)).toEqual(["login redirect", "add a test", undefined]);
+    expect(locate(view, "t1")?.title).toBe("login redirect");
+    const theirs = view.find((m) => m.id === OTHER)!;
+    expect(rows(theirs.workspaces[0])[0].title).toBe("far work");
+  });
+
   it("leaves a session with no brief, as a peer's is, as it was", () => {
     const [machine] = fleet(records, settings());
     expect(rows(machine.workspaces[0]).every((r) => r.title === undefined && r.now === undefined)).toBe(true);
@@ -581,3 +597,21 @@ describe("the coordinator order", () => {
 function sampleOf(owner: string): AnyRecord {
   return sample(owner, 1);
 }
+
+describe("a workspace's base, project and branch", () => {
+  const commitOnly = (): AnyRecord => {
+    const record = workspace(ME, "w1", "review a commit");
+    if (record.kind === "workspace") record.body = { ...record.body, branch: "", base: "0123456789abcdef0123456789abcdef01234567" };
+    return record;
+  };
+
+  it("carries its record's base and its project's id beside the project's name", () => {
+    const [machine] = fleet([sample(ME, 1), workspace(ME, "w1", "fix login")], settings());
+    expect(machine.workspaces[0]).toMatchObject({ project: "demo", projectId: "p1", base: "main" });
+  });
+
+  it("shows its branch, or the first 7 characters of its commit when its branch is empty", () => {
+    const [machine] = fleet([sample(ME, 1), workspace(ME, "w2", "fix login"), commitOnly()], settings());
+    expect(machine.workspaces.map(branchOf)).toEqual(["fix-login", "0123456"]);
+  });
+});

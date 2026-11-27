@@ -1569,6 +1569,14 @@ impl<'a, 'w> Pass<'a, 'w> {
         let world = self.world;
         let known = self.known()?;
         let unfinished: BTreeSet<RunId> = known.iter().map(|k| k.info.id.clone()).collect();
+        // The workspace a run's progress names as its current one, if any.
+        let workspace_of = |seen: &super::runs::progress::Seen| -> Vec<WorkspaceId> {
+            seen.workspace
+                .as_deref()
+                .and_then(|w| w.parse().ok().map(WorkspaceId))
+                .into_iter()
+                .collect()
+        };
         for k in &known {
             let run = k.info.id.clone();
             match k.info.state {
@@ -1582,6 +1590,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                         run,
                         kind,
                         reason: k.seen.stuck.clone().unwrap_or_default(),
+                        workspaces: workspace_of(&k.seen),
                     });
                 }
                 _ if k.info.unreadable || !k.info.confirmed => {}
@@ -1603,13 +1612,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                         machine,
                         gate_retries_used: used,
                         minutes_used: k.seen.worked_ms / 60_000,
-                        workspaces: k
-                            .seen
-                            .workspace
-                            .as_deref()
-                            .and_then(|w| w.parse().ok().map(WorkspaceId))
-                            .into_iter()
-                            .collect(),
+                        workspaces: workspace_of(&k.seen),
                         sessions: k
                             .seen
                             .thread_id
@@ -1660,10 +1663,26 @@ impl<'a, 'w> Pass<'a, 'w> {
                 .collect();
             for (done, _) in of_kind {
                 if labelled.contains(&done.run.run.issue()) {
+                    // A finished run's events are read only while a person holds it up. One
+                    // that cannot be read names no workspace; it is still held up, and the
+                    // failed read is logged so a store that keeps failing shows.
+                    let workspaces = self
+                        .ledger
+                        .read(&done.run.run)
+                        .inspect_err(|error| {
+                            tracing::warn!(
+                                project = %world.project.id,
+                                run = %done.run.run,
+                                "factory: a held-up run's events could not be read, so it names no workspace: {error}"
+                            );
+                        })
+                        .map(|events| workspace_of(&read_progress(&events)))
+                        .unwrap_or_default();
                     self.results.held_up.push(HeldUp {
                         run: done.run.run.clone(),
                         kind,
                         reason: done.reason.clone().unwrap_or_default(),
+                        workspaces,
                     });
                 }
             }
@@ -3401,6 +3420,7 @@ mod tests {
                         terminal: TerminalId(uuid::Uuid::from_u128(0x57)),
                         model: "opus".into(),
                         state: SessionState::Idle,
+                        name: None,
                     },
                 })
                 .turn(SessionTurn {
@@ -4843,11 +4863,27 @@ mod tests {
         use super::*;
         use crate::factory::ledger::events::Outcome;
 
-        /// Attempt `attempt` of `issue`, which went `to` (`stuck` or `needs-info`) saying
-        /// `reason` and finished.
+        /// The workspace attempt `attempt` of `issue` builds in.
+        fn workspace_of(issue: u64, attempt: u32) -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(
+                0xb000 + u128::from(issue) * 0x10 + u128::from(attempt),
+            ))
+        }
+
+        /// Attempt `attempt` of `issue`, which built in [`workspace_of`], went `to` (`stuck` or
+        /// `needs-info`) saying `reason` and finished.
         fn held_up_run(rig: &Rig, issue: u64, attempt: u32, to: State, reason: &str) -> RunId {
             let run = rig.run_in(issue, attempt, State::Building);
             let cause = Cause::new(CauseStep::Start, "test");
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::StepChanged {
+                        step: format!("workspace-created {}", workspace_of(issue, attempt)),
+                    },
+                    &cause,
+                )
+                .unwrap();
             let (said, outcome) = if to == State::Stuck {
                 let said = Event::Stuck {
                     reason: reason.into(),
@@ -4893,6 +4929,7 @@ mod tests {
                     run,
                     kind: HeldUpKind::Stuck,
                     reason: "the gate failed 3 times".into(),
+                    workspaces: vec![workspace_of(5, 1)],
                 }]
             );
         }
@@ -4909,8 +4946,56 @@ mod tests {
                     run,
                     kind: HeldUpKind::NeedsInfo,
                     reason: "Which login?".into(),
+                    workspaces: vec![workspace_of(5, 1)],
                 }]
             );
+        }
+
+        /// A held-up finished run whose events can no longer be read stays held up, naming no
+        /// workspace, and the pass goes on.
+        #[test]
+        fn a_held_up_run_whose_events_cannot_be_read_names_no_workspace() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = held_up_run(&rig, 5, 1, State::Stuck, "the gate failed 3 times");
+            rig.pass();
+            super::a_run_this_build_cannot_read::unreadable_row(&rig, &run);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(
+                rig.status().held_up,
+                vec![HeldUp {
+                    run,
+                    kind: HeldUpKind::Stuck,
+                    reason: "the gate failed 3 times".into(),
+                    workspaces: vec![],
+                }]
+            );
+        }
+
+        /// A run the ledger shows stuck that has not finished yet names its workspace too.
+        #[test]
+        fn a_stuck_run_not_finished_yet_names_its_workspace() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = rig.run_in(5, 1, State::Building);
+            let cause = Cause::new(CauseStep::Start, "test");
+            for event in [
+                Event::StepChanged {
+                    step: format!("workspace-created {}", workspace_of(5, 1)),
+                },
+                Event::StateChanged {
+                    from: State::Building,
+                    to: State::Stuck,
+                },
+            ] {
+                rig.ledger.write(&run, &event, &cause).unwrap();
+            }
+            rig.pass();
+            let held = rig.status().held_up;
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert_eq!(held[0].run, run);
+            assert_eq!(held[0].workspaces, vec![workspace_of(5, 1)]);
         }
 
         #[test]

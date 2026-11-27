@@ -22,7 +22,8 @@ export interface News {
  * once: on the desktop while the page is not in front (when turned on and allowed), else as a card
  * in the page (`news`) while it shows; a click on a desktop alert opens that session's terminal,
  * and coming back to the page takes the alerts it raised off the desktop. Whatever is set, the
- * same news is `spoken`, for `Announcer` to tell a screen reader.
+ * same news is `spoken`, for `Announcer` to tell a screen reader. A live factory run's sessions
+ * (`withFactory`) never need you here, as on the board.
  */
 export function useAlerts(machines: MachineView[], synced: boolean, onOpen: (terminal: string) => void) {
   const [notify, setNotify] = useState(loadNotify);

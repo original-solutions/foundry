@@ -51,8 +51,8 @@ use super::{
     stop_session, workspace_id,
 };
 use crate::factory::github::read::{
-    APPROVAL_QUERY, ApprovalIssue, LabelChange, TimelineNode, gh_json, is_branch_path,
-    is_human_instructor, is_plain_ref_name, is_safe_branch_name, is_utc_second, issue_query_args,
+    gh_json, is_branch_path, is_plain_ref_name, is_safe_branch_name, is_utc_second,
+    issue_query_args,
 };
 use crate::factory::github::{
     Claim, IssueDetail, OpenPullRequest, OtherKind, Tracker, TrackerError, newest_claim,
@@ -840,7 +840,13 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
         }
         None => return skipped(format!("no claim comment names run {run}")),
     };
-    if let Some((labeled_at, labeled_by)) = claimed_on(ctx, issue)? {
+    if let Approval::Approved {
+        labeled_at,
+        labeled_by,
+    } = ctx
+        .tracker
+        .claimed_approval(repo, issue, &ctx.project.login, &ctx.config.instructors)?
+    {
         record_approval(ctx, run, &labeled_at, Some(&labeled_by), CauseStep::Start)?;
     }
     ctx.record(
@@ -852,87 +858,6 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
         &Cause::new(CauseStep::Start, "claim-found"),
     )?;
     Ok(None)
-}
-
-/// GitHub's answer to [`APPROVAL_QUERY`].
-#[derive(Deserialize)]
-struct LabelHistory {
-    data: LabelHistoryData,
-}
-
-#[derive(Deserialize)]
-struct LabelHistoryData {
-    repository: LabelHistoryRepository,
-}
-
-#[derive(Deserialize)]
-struct LabelHistoryRepository {
-    issue: ApprovalIssue,
-}
-
-/// The approval a claim was made on, read after the claim removed `factory:ready`: when and by
-/// whom the label the claim took off was applied, if an instructor applied it and the text is
-/// as an instructor left it since. Only the label's newest event is judged. A removal by the
-/// project's login is the claim's, and the label it took off is the event before it. A label
-/// still on is the approval, as when the claim's removal is not on the timeline. Any other
-/// newest event (a removal by anyone else, or none) approves nothing. These are
-/// `judge_approval`'s checks, made as of the claim rather than now. The text is judged by
-/// `text_check`, which reads the history again and checks its timestamps. `None` when the
-/// approval cannot be confirmed.
-fn claimed_on(ctx: &RunContext<'_>, issue: u64) -> Result<Option<(String, String)>, RunError> {
-    let repo = ctx.repo();
-    let instructors = &ctx.config.instructors;
-    let args = issue_query_args(repo, APPROVAL_QUERY, issue)?;
-    let history: LabelHistory = gh_json(ctx.tracker, &args, "a GraphQL response with the issue")?;
-    let ready = State::Ready.label();
-    // The label's events, newest first: `true` for applied, `false` for removed.
-    let mut events = history
-        .data
-        .repository
-        .issue
-        .timeline_items
-        .nodes
-        .into_iter()
-        .rev()
-        .filter_map(|node| match node {
-            TimelineNode::LabeledEvent(change) if change.label.name == ready => {
-                Some((true, change))
-            }
-            TimelineNode::UnlabeledEvent(change) if change.label.name == ready => {
-                Some((false, change))
-            }
-            _ => None,
-        });
-    let label = match events.next() {
-        Some((true, label)) => label,
-        Some((false, removal))
-            if removal
-                .actor
-                .as_ref()
-                .is_some_and(|actor| actor.login.eq_ignore_ascii_case(&ctx.project.login)) =>
-        {
-            match events.next() {
-                Some((true, label)) => label,
-                _ => return Ok(None),
-            }
-        }
-        _ => return Ok(None),
-    };
-    let LabelChange {
-        created_at,
-        actor: Some(actor),
-        ..
-    } = label
-    else {
-        return Ok(None);
-    };
-    if !is_human_instructor(Some(&actor), instructors) {
-        return Ok(None);
-    }
-    let text = ctx
-        .tracker
-        .text_check(repo, issue, &created_at, instructors)?;
-    Ok((text == TextCheck::Unchanged).then_some((created_at, actor.login)))
 }
 
 /// What a launch continues from.
@@ -2733,6 +2658,7 @@ mod tests {
                     terminal: TerminalId(uuid::Uuid::from_u128(0x5e6)),
                     model: "opus".into(),
                     state,
+                    name: None,
                 },
             }
         }
@@ -3159,6 +3085,58 @@ mod tests {
                     rig.steps(run)
                 );
                 assert!(calls(rig).is_empty());
+            }
+
+            /// The `gh api graphql` approval reads among the calls the rig's GitHub was asked.
+            fn approval_reads(rig: &Rig) -> usize {
+                let query = format!("query={}", crate::factory::github::read::APPROVAL_QUERY);
+                rig.sim
+                    .calls()
+                    .iter()
+                    .filter(|call| call[..2] == ["api", "graphql"] && call.contains(&query))
+                    .count()
+            }
+
+            /// A takeover reads the issue's approval history once, whether it approves or not.
+            #[test]
+            fn a_takeover_reads_the_approval_history_once() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                rig.sim.set_approval(removed_by_the_claim("tom", &[]));
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(approval_reads(&rig), 1);
+
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                rig.sim.set_approval(removed_by_the_claim("mallory", &[]));
+                goes_stuck_unapproved(&rig, &run);
+                assert_eq!(approval_reads(&rig), 1);
+            }
+
+            /// An approval history with a malformed timestamp fails the takeover before it
+            /// records or does anything, even where the label is a stranger's: the read checks
+            /// every timestamp, and a later pass reads it again.
+            #[test]
+            fn a_malformed_timestamp_in_the_history_fails_the_takeover_before_it_records_anything()
+            {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    "2026-10-04 10:00:00Z",
+                    "User",
+                    "mallory",
+                )];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert!(rig.ledger.read(&run).unwrap().is_empty());
+                assert_eq!(rig.sim.labels(), ["factory:triage"]);
+                assert!(calls(&rig).is_empty());
+                assert_eq!(approval_reads(&rig), 1);
             }
 
             /// The claim removed `factory:ready`: the run is approved on the newest label an

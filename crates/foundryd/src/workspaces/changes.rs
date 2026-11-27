@@ -82,7 +82,9 @@ impl Workspaces {
     /// What live workspace `id` has changed since it left its base. Each git call is bounded
     /// as every git call here is. A read an archive's removal of the worktree overlaps, and one
     /// that fails with the worktree gone, is [`WorkspaceError::Unknown`]: there is nothing here
-    /// to read.
+    /// to read. One that fails in a folder git no longer lists as a worktree is
+    /// [`WorkspaceError::Detached`], as is the same failure of [`Workspaces::commit`] and
+    /// [`Workspaces::shipping`].
     pub async fn changes(&self, id: WorkspaceId) -> Result<Changes, WorkspaceError> {
         let (worktree, base) = self.reading(id).await?;
         let read = self.inner.changes(&worktree, &base).await;
@@ -108,18 +110,28 @@ impl Workspaces {
     /// `read` of workspace `id`, or [`WorkspaceError::Unknown`] when an archive's removal of the
     /// worktree overlapped it. Checked after the read: an archive marks the worktree before it
     /// removes any of it and writes its record before it unmarks, so a removal that overlapped
-    /// the read is seen as one or the other.
+    /// the read is seen as one or the other. A read that failed in a folder git no longer lists
+    /// as a worktree is [`WorkspaceError::Detached`]; a read that worked costs no more git.
     pub(super) async fn read<T>(
         &self,
         id: WorkspaceId,
         worktree: &Path,
         read: Result<T, WorkspaceError>,
     ) -> Result<T, WorkspaceError> {
-        if self.inner.removing(id)
-            || self.inner.live(id).await.is_err()
-            || (read.is_err() && !tokio::fs::try_exists(worktree).await.unwrap_or(true))
-        {
+        if self.inner.removing(id) {
             return Err(WorkspaceError::Unknown(id));
+        }
+        let Ok(body) = self.inner.live(id).await else {
+            return Err(WorkspaceError::Unknown(id));
+        };
+        if read.is_err() {
+            if !tokio::fs::try_exists(worktree).await.unwrap_or(true) {
+                return Err(WorkspaceError::Unknown(id));
+            }
+            let clone = self.inner.clone_path(body.project);
+            if let Ok(true) = self.inner.detached(&clone, &body, worktree).await {
+                return Err(WorkspaceError::Detached(id));
+            }
         }
         read
     }

@@ -14,6 +14,7 @@ Each card holds:
 - **Load per core.** The big number is the machine's load divided by its cores. It turns amber from 0.70 and red at 1.00 or more. The graph under it covers the last ten minutes, or the time since you opened the page if that is shorter, and the dashed line is 1.00. The page draws what it has seen since it opened, so a fresh page starts with a short line.
 - **Memory free**, **Disk free** and **Sessions.** Free memory has its own small graph. **Sessions** counts the sessions running on the machine.
 - **Terminals by state.** A bar and a count for each state: needs you, working, ready and so on, most urgent first.
+- **Room for the next task.** **Foundry's pick** if a task Foundry places would go to this machine now, **Has room** if it is online and under its limits, or **Full** with the limits it is at or over, such as `load 1.8 over limit 1.5`. **New task here** opens the New task box set to this machine.
 - **Workspaces.** One row per workspace, with its project and a glyph per terminal. Click a row to open its most urgent terminal.
 
 A machine that goes offline keeps its card, greyed, with the numbers it last reported. Its terminals count as unreachable until the machine is heard from again. A machine that has sent no numbers yet shows **No sample yet**.
@@ -46,7 +47,9 @@ A machine at or over a limit is skipped when you let Foundry choose a machine fo
 
 When the fleet has more than one machine, the New task box has an **on** menu: **this machine**, **let Foundry choose**, or a machine by name. An offline machine is listed but cannot be picked. With **let Foundry choose**, Foundry picks the online machine under all its limits with the lowest load per core. Fewer sessions breaks a tie.
 
-If no machine qualifies, the task waits. A card headed **N waiting for a machine** appears at the top right of the page, or folded at the top on a narrow screen. Each waiting task lists why every machine was passed over, for example `old-mini: offline` or `trilogy-mac: load 1.8 over limit 1.0`, and how long it has waited. Foundry tries again every second, and the task starts as soon as a machine qualifies. Click **Cancel** to drop a waiting task. If the start fails, the card says why and shows **Dismiss** instead. A task that waits more than five minutes also raises a **Placement waiting** item on the attention card.
+With more than one machine, the top of the machines view tells you where such a task would go now, for example `studio takes the next task`, and how many machines have room. If none has, it says **No machine has room** and lists why each was passed over. Its **New task** button opens the New task box set to **let Foundry choose**. It works from each machine's last numbers, so a task already on its way to a machine can still change the pick.
+
+If no machine qualifies, the task waits. A card headed **N waiting for a machine** appears at the top of the page, folded to its count. Click it to unfold it. Each waiting task lists why every machine was passed over, for example `old-mini: offline` or `trilogy-mac: load 1.8 over limit 1.0`, and how long it has waited. Foundry tries again every second, and the task starts as soon as a machine qualifies. Click **Cancel** to drop a waiting task. If the start fails, the card says why and shows **Dismiss** instead. A task that waits more than five minutes also raises a **Placement waiting** item on the attention card.
 
 Only the machine you started the task from holds the waiting list, so only its page shows the card. If that machine's daemon stops, the waiting tasks are dropped.
 
