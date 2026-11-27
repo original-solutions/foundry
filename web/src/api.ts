@@ -29,6 +29,8 @@ export interface Session {
   terminal: string;
   model: string;
   state: SessionState;
+  /** The name a person gave it, shown in place of its first prompt. Absent from an older daemon's record. */
+  name?: string | null;
 }
 export interface MachineSample {
   load_per_core: number;
@@ -422,6 +424,16 @@ export async function sessionBriefs(): Promise<Briefs> {
 /** Ends a terminal: hangs up its child if it still runs and removes it, with its final screen. */
 export async function closeTerminal(id: string): Promise<void> {
   const { status, json } = await post(`/api/terminals/${id}/close`);
+  if (status !== 204) throw refused(status, json);
+}
+
+/**
+ * Names session `id`, shown in place of its first prompt on every machine; an empty name clears it.
+ * The daemon carries it to the machine that owns the session, which cuts it to one line and hides
+ * any secret in it.
+ */
+export async function renameSession(id: string, name: string): Promise<void> {
+  const { status, json } = await post(`/api/sessions/${id}/rename`, { name });
   if (status !== 204) throw refused(status, json);
 }
 

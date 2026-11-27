@@ -1,0 +1,327 @@
+{
+  "about": "Where placement::place sends a task, and why not when it cannot. The daemon's tests (placement.rs) and the machines view's copy of the rule (web/src/room.test.ts) both run every case, so the two cannot drift apart unnoticed.",
+  "cases": [
+    {
+      "about": "the lowest load per core wins among machines under their limits",
+      "machines": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "studio",
+          "online": true,
+          "sample": {
+            "load_per_core": 0.6,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 1
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "name": "vps",
+          "online": true,
+          "sample": {
+            "load_per_core": 0.2,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 3
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "name": "mini",
+          "online": true,
+          "sample": {
+            "load_per_core": 1.4,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 0
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        }
+      ],
+      "pick": "00000000-0000-4000-8000-000000000002"
+    },
+    {
+      "about": "fewer sessions break a tie on load",
+      "machines": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "studio",
+          "online": true,
+          "sample": {
+            "load_per_core": 0.5,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 3
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "name": "vps",
+          "online": true,
+          "sample": {
+            "load_per_core": 0.5,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 1
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        }
+      ],
+      "pick": "00000000-0000-4000-8000-000000000002"
+    },
+    {
+      "about": "the lower id breaks a tie on load and sessions",
+      "machines": [
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "name": "vps",
+          "online": true,
+          "sample": {
+            "load_per_core": 0.5,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 1
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "studio",
+          "online": true,
+          "sample": {
+            "load_per_core": 0.5,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 1
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        }
+      ],
+      "pick": "00000000-0000-4000-8000-000000000001"
+    },
+    {
+      "about": "an offline machine is never picked",
+      "machines": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "old-mini",
+          "online": false,
+          "sample": {
+            "load_per_core": 0.0,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 0
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "name": "vps",
+          "online": true,
+          "sample": {
+            "load_per_core": 0.9,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 2
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        }
+      ],
+      "pick": "00000000-0000-4000-8000-000000000002"
+    },
+    {
+      "about": "a machine with no limits has none to be over",
+      "machines": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "studio",
+          "online": true,
+          "sample": {
+            "load_per_core": 0.1,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 4
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "name": "vps",
+          "online": true,
+          "sample": {
+            "load_per_core": 3.0,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 9
+          },
+          "limits": null
+        }
+      ],
+      "pick": "00000000-0000-4000-8000-000000000002"
+    },
+    {
+      "about": "a machine that sent no numbers is neither picked nor named",
+      "machines": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "new",
+          "online": true,
+          "sample": null,
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "name": "vps",
+          "online": true,
+          "sample": {
+            "load_per_core": 0.7,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 1
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        }
+      ],
+      "pick": "00000000-0000-4000-8000-000000000002"
+    },
+    {
+      "about": "none qualifies: one reason per machine that sent numbers, every limit in the order sessions, load, disk",
+      "machines": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "old-mini",
+          "online": false,
+          "sample": {
+            "load_per_core": 0.0,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 0
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "name": "vps",
+          "online": true,
+          "sample": {
+            "load_per_core": 1.5,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 4
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "name": "studio",
+          "online": true,
+          "sample": {
+            "load_per_core": 1.004,
+            "free_memory": 8000000000,
+            "free_disk": 5200000000,
+            "sessions": 0
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000004",
+          "name": "mini",
+          "online": true,
+          "sample": {
+            "load_per_core": 1.0,
+            "free_memory": 8000000000,
+            "free_disk": 50000000000,
+            "sessions": 5
+          },
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000005",
+          "name": "new",
+          "online": true,
+          "sample": null,
+          "limits": {
+            "max_sessions": 4,
+            "max_load_per_core": 1.0,
+            "min_free_disk": 10000000000
+          }
+        }
+      ],
+      "pick": null,
+      "reasons": [
+        "old-mini: offline",
+        "vps: sessions 4 at limit 4, load 1.5 over limit 1.0",
+        "studio: load 1.004 over limit 1.0, free disk 5.2 GB under limit 10.0 GB",
+        "mini: sessions 5 over limit 4, load 1.0 at limit 1.0"
+      ]
+    }
+  ]
+}
