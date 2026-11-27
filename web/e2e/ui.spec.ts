@@ -60,3 +60,16 @@ test("start a task, use its workspace's shell, and see the same screen after a r
   await expect(again.getByRole("link", { name: /^shell/ })).toBeVisible();
   await expect(rows).toContainText("e2e-42");
 });
+
+test("the Factory view on a daemon with no factory project shows each project's factory off", async ({ page }) => {
+  await page.goto(`${process.env.FOUNDRY_E2E_URL}/factory`);
+  await expect(page.getByRole("heading", { name: "Factory" })).toBeVisible();
+  // The seeded project's factory is off, so it has no lease, queue or runs to show.
+  const demo = page.getByRole("region", { name: "demo" });
+  await expect(demo).toContainText("Factory off");
+  await expect(demo.getByRole("button", { name: /^Stop/ })).toHaveCount(0);
+  // No workspace on the board is a factory run.
+  await page.goto(`${process.env.FOUNDRY_E2E_URL}/`);
+  await expect(page.getByRole("region", { name: "e2e-machine" })).toBeVisible();
+  await expect(page.getByRole("link", { name: /^factory #/ })).toHaveCount(0);
+});

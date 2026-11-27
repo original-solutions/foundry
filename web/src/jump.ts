@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
-import type { MachineView } from "./fleet";
-import { sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, type Glyph } from "./labels";
+import { branchOf, rows, type MachineView } from "./fleet";
+import type { Glyph } from "./labels";
 
 /** Something the palette does besides opening a terminal: going to one of the app's views, or one of its actions. */
 export interface Command {
@@ -32,11 +32,11 @@ export function destinations(machines: MachineView[], commands: Command[] = []):
   const shells: Destination[] = [];
   for (const machine of machines) {
     for (const w of machine.workspaces) {
-      const where = `${w.name} ${w.project} ${w.branch} ${machine.name}`;
+      const where = `${w.name} ${w.project} ${branchOf(w)} ${machine.name}`;
       const add = (terminal: string, name: string, label: string, glyph: Glyph, subtitle?: string) =>
         open.push({ kind: "terminal", key: terminal, terminal, title: `${w.name} / ${name}`, subtitle, label, glyph, machine: machine.name, words: `${where} ${name} ${label} ${subtitle ?? ""}` });
-      for (const s of w.sessions) add(s.terminal, s.name, sessionLabel[s.state], sessionGlyph[s.state], s.title);
-      for (const t of w.shells) add(t.id, t.name, terminalLabel(t.state, t.exitCode), terminalGlyph(t.state, t.exitCode));
+      // As the sidebar lists them, so a factory run's quiet session reads alike here.
+      for (const r of rows(w)) add(r.terminal, r.name, r.label, r.glyph, r.title);
       const title = `New shell in ${w.name}`;
       shells.push({ kind: "shell", key: `new-shell:${w.id}`, workspace: w.id, title, machine: machine.name, words: `${title} ${where}` });
     }

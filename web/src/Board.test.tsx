@@ -7,8 +7,8 @@ import type { AnyRecord, Changes, SessionState, Shipping } from "./api";
 import { archiveOf } from "./Archive";
 import { buttonShape, pressed } from "./Modal";
 import { Board, BOARD_BUSY_EVERY } from "./Board";
-import { fleet, type MachineView } from "./fleet";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { fleet, withFactory, type MachineView } from "./fleet";
+import { factoryStatus, factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { RETRY_EVERY } from "./poll";
 import { TerminalActions } from "./TerminalMenu";
 import { expectButtonShape, FakeSocket, json } from "./test-utils";
@@ -664,5 +664,61 @@ describe("The task bar", () => {
     fireEvent.keyDown(bar(), { key: "Enter", metaKey: true });
     await act(async () => {});
     expect(posts).toEqual([]);
+  });
+});
+
+/** Project p1's believed status: run 162 builds in w1, run 170 is held up in w2. */
+describe("Board and the factory", () => {
+  const factoryRecords = (): AnyRecord[] => [
+    sample(ME, 1),
+    workspace(ME, "w1", "fac 162"),
+    terminal(ME, "t1", "w1"),
+    session(ME, "s1", "w1", "t1", "stuck"),
+    workspace(ME, "w2", "fac 170"),
+    terminal(ME, "t2", "w2"),
+    session(ME, "s2", "w2", "t2", "finished"),
+    onCommit(ME, "w3", "far away"),
+  ];
+  beforeEach(() => {
+    answers["/api/workspaces/w1/changes"] = () => json(200, { base: "main", commits: [], files: [] } satisfies Changes);
+  });
+
+  it("marks a factory run's card and links it to its issue", async () => {
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses()));
+    const mark = within(card("fac 162")).getByRole("link", { name: "factory #162" });
+    expect(mark.getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");
+    expect(within(card("far away")).queryByRole("link", { name: /^factory/ })).toBeNull();
+  });
+
+  it("marks a run whose id names no issue as plain text, with no link", async () => {
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatus("p1", { "not-a-run": ["w1"] })));
+    const run = card("fac 162");
+    expect(within(run).getByText("factory").tagName).toBe("SPAN");
+    expect(within(run).queryByRole("link", { name: /^factory/ })).toBeNull();
+  });
+
+  it("keeps a factory session P1 marks stuck under working, quiet 10+ min, and a held-up run's card under needs you", async () => {
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses()));
+    const working = screen.getByRole("region", { name: "Working" });
+    expect(within(within(working).getByRole("article", { name: "fac 162" })).getByText("Quiet 10+ min")).toBeDefined();
+    expect(within(screen.getByRole("region", { name: "Needs you" })).getByRole("article", { name: "fac 170" })).toBeDefined();
+  });
+
+  it("moves a needs-info run's card under needs you too", async () => {
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses("needs_info")));
+    expect(within(screen.getByRole("region", { name: "Needs you" })).getByRole("article", { name: "fac 170" })).toBeDefined();
+  });
+
+  it("marks a factory run's line and shows a commit's line by its commit in the list too", async () => {
+    localStorage.setItem("foundry.layout", "list");
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses()));
+    expect(within(card("fac 162")).getByRole("link", { name: "factory #162" }).getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");
+    expect(within(card("far away")).queryByRole("link", { name: /^factory/ })).toBeNull();
+    expect(within(card("far away")).getByText("demo · fedcba9")).toBeDefined();
+  });
+
+  it("shows a workspace with no branch by its commit", async () => {
+    await show(fleet(factoryRecords(), settings()));
+    expect(within(card("far away")).getByText("demo · fedcba9")).toBeDefined();
   });
 });

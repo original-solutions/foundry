@@ -4,7 +4,7 @@ import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent, typ
 import { workspaceChanges, workspaceCommit, type Changes, type Commit, type FileChange } from "./api";
 import { diffLines, splitPath, totals } from "./changes";
 import { CodeLine } from "./CodeLine";
-import type { SessionView } from "./fleet";
+import { branchOf, type FactoryRun, type SessionView } from "./fleet";
 import { couldNot, plural } from "./labels";
 import { anchor, onLine, type Anchor, type Note } from "./notes";
 import { lineName, NoteBox, NoteRow, SendBar } from "./LineNotes";
@@ -40,8 +40,12 @@ interface Target {
   id: string;
   name: string;
   branch: string;
+  /** The branch or commit it started from, which names it when it has no branch (`branchOf`). */
+  base?: string;
   /** Its sessions, which can take the comments written on its diff. */
   sessions?: SessionView[];
+  /** The factory run it belongs to, which decides how its sessions read. */
+  factory?: FactoryRun;
 }
 
 /** The comment being written or changed: on a line of a file, and which comment when it is a change. */
@@ -194,7 +198,7 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
             <Dialog.Description asChild>
               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-neutral-400">
                 <span className="font-mono">
-                  <span className="text-neutral-200">{workspace.branch}</span>
+                  <span className="text-neutral-200">{branchOf(workspace)}</span>
                   <span className="px-1.5 text-neutral-600">←</span>
                   {data?.base ?? "…"}
                 </span>
@@ -241,7 +245,7 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
               ))}
             </nav>
             <div ref={body} className="min-w-0 flex-1 space-y-3 overflow-y-auto p-3 md:p-4">
-              {story.length > 0 && <Story commits={story} branch={workspace.branch} picked={picked} onPick={pick} />}
+              {story.length > 0 && <Story commits={story} branch={branchOf(workspace)} picked={picked} onPick={pick} />}
               {reading ? (
                 <>
                   <CommitHead commit={story[picked]} n={picked + 1} of={story.length} changes={commit.data} onPick={(d) => pick(picked + d)} />
@@ -283,7 +287,7 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
             </div>
           </div>
         )}
-        <SendBar notes={notes} sessions={workspace.sessions ?? []} onSent={() => onNotes([])} />
+        <SendBar notes={notes} sessions={workspace.sessions ?? []} factory={workspace.factory} onSent={() => onNotes([])} />
       </Dialog.Content>
     </>
   );

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { fleet } from "./fleet";
+import { fleet, withFactory } from "./fleet";
 import { needing, upNext } from "./needing";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const machines = fleet(
   [
@@ -34,6 +34,23 @@ describe("needing", () => {
       ["asks", "opus 2", "waiting"],
       ["setup broke", "shell", "failed"],
     ]);
+  });
+});
+
+describe("needing and the factory", () => {
+  const records = [
+    sample(ME, 1),
+    workspace(ME, "w1", "fac 162"),
+    terminal(ME, "t1", "w1"),
+    session(ME, "s1", "w1", "t1", "stuck"),
+    workspace(ME, "w2", "fac 170"),
+    terminal(ME, "t2", "w2"),
+    session(ME, "s2", "w2", "t2", "finished"),
+  ];
+
+  it("leads to a held-up run's card by its most urgent terminal, though none of its terminals needs you, and skips a live run's", () => {
+    const run = withFactory(fleet(records, settings()), factoryStatus("p1", { o__r__162__1: ["w1"] }, { o__r__170__1: { kind: "stuck", workspaces: ["w2"] } }));
+    expect(needing(run).map((n) => [n.workspace, n.terminal])).toEqual([["fac 170", "t2"]]);
   });
 });
 
