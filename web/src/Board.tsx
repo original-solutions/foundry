@@ -1,7 +1,7 @@
-import { useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutationState, useQuery } from "@tanstack/react-query";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { Children, useId, useState } from "react";
 import { glance, lanes, topFiles, type Card, type Lane } from "./lanes";
 import { buttonShape, pressed } from "./Modal";
 import { StepChips } from "./NextSteps";
@@ -19,7 +19,9 @@ import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
 import { reply } from "./reply";
 import { Said } from "./Said";
-import { BOARD_BUSY_EVERY, pollEvery } from "./poll";
+import { BOARD_BUSY_EVERY } from "./poll";
+import { useCardChanges, useOnScreen } from "./cardChanges";
+import { LayoutSwitch, loadLayout, saveLayout, WorkspaceLine, type Layout } from "./BoardList";
 import { Timeline } from "./Timeline";
 import { Machines } from "./Machines";
 import { needing, type Needing } from "./needing";
@@ -73,7 +75,8 @@ const laneGlyph: Record<Lane, Glyph> = { needs: "waiting", working: "working", q
  * the machines (`/machines`). The three views share this head, kept mounted, so it never moves and
  * a task half typed survives a change of view. Above the lanes, the cards can be grouped instead by how far each workspace's work
  * has gone on its way to main (`useStaged`), counted and summed; either way an idle session of this
- * machine is offered the step that takes its work further, under it on its card.
+ * machine is offered the step that takes its work further, under it on its card. Beside the
+ * grouping, the cards can be drawn as a list instead, one line per workspace (`WorkspaceLine`).
  *
  * On a phone it is the home: a line above the task box says what needs you, what works and what
  * rests, and a bar at the bottom (`PhoneNav`) takes the switch's place and opens the workspaces.
@@ -132,6 +135,12 @@ export function Board({
     setGroup(next);
     saveGroup(next);
   };
+  const [layout, setLayout] = useState(loadLayout);
+  const relayout = (next: Layout) => {
+    setLayout(next);
+    saveLayout(next);
+  };
+  const Shown = layout === "list" ? WorkspaceLine : WorkspaceCard;
   const leaving = new Set(
     useMutationState({
       filters: { mutationKey: ["archive"], predicate: (m) => m.state.status === "pending" || (m.state.status === "success" && m.state.data === null) },
@@ -168,14 +177,14 @@ export function Board({
             <Timeline machines={machines} traced={traced} onSteps={onSteps} />
           ) : (
             <>
-              <GroupBar group={group} onPick={regroup} staged={staged} />
+              <GroupBar group={group} onPick={regroup} staged={staged} layout={layout} onLayout={relayout} />
               {group === "shipping"
                 ? staged.lanes.map(({ lane, cards }) => {
                     const { name, hint, tone } = shipLanes.find((l) => l.lane === lane)!;
                     return (
-                      <LaneSection key={lane} title={name} hint={hint} tone={tone} icon={<StageMark lane={lane} />} count={cards.length}>
+                      <LaneSection key={lane} title={name} hint={hint} tone={tone} icon={<StageMark lane={lane} />} count={cards.length} list={layout === "list"}>
                         {cards.map((card) => (
-                          <WorkspaceCard key={`${card.workspace.id}:${lane}`} card={card} showMachine={several} onChanges={onChanges} arrived={staged.arrived[card.workspace.id] === lane} />
+                          <Shown key={`${card.workspace.id}:${lane}`} card={card} showMachine={several} onChanges={onChanges} arrived={staged.arrived[card.workspace.id] === lane} />
                         ))}
                       </LaneSection>
                     );
@@ -189,9 +198,10 @@ export function Board({
                       icon={<StateGlyph glyph={laneGlyph[lane]} still />}
                       count={cards.length}
                       action={lane === "needs" && first && <GoThrough first={first} />}
+                      list={layout === "list"}
                     >
                       {cards.map((card) => (
-                        <WorkspaceCard key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
+                        <Shown key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
                       ))}
                     </LaneSection>
                   ))}
@@ -208,7 +218,19 @@ export function Board({
  * The board's grouping, above its lanes: by what each workspace needs (attention), or by how far
  * its work has gone on its way to main (shipping), with the work summed while grouped that way.
  */
-function GroupBar({ group, onPick, staged }: { group: Group; onPick: (group: Group) => void; staged: ReturnType<typeof useStaged> }) {
+function GroupBar({
+  group,
+  onPick,
+  staged,
+  layout,
+  onLayout,
+}: {
+  group: Group;
+  onPick: (group: Group) => void;
+  staged: ReturnType<typeof useStaged>;
+  layout: Layout;
+  onLayout: (layout: Layout) => void;
+}) {
   const { sum, reading } = staged;
   // The work on its way to main, counted stage by stage as a scoreboard, then summed.
   return (
@@ -256,6 +278,7 @@ function GroupBar({ group, onPick, staged }: { group: Group; onPick: (group: Gro
           )}
         </p>
       )}
+      <LayoutSwitch layout={layout} onPick={onLayout} />
     </div>
   );
 }
@@ -273,6 +296,7 @@ function LaneSection({
   icon,
   count,
   action,
+  list = false,
   children,
 }: {
   title: string;
@@ -282,6 +306,8 @@ function LaneSection({
   count: number;
   /** Shown after the lane's count. */
   action?: React.ReactNode;
+  /** Whether its workspaces are lines of one list rather than cards in a grid. */
+  list?: boolean;
   children: React.ReactNode;
 }) {
   const id = useId();
@@ -296,7 +322,15 @@ function LaneSection({
         {action}
         <span aria-hidden="true" className="h-px flex-1 bg-neutral-800" />
       </div>
-      <div className="grid grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] gap-3">{children}</div>
+      {list ? (
+        <ul className="divide-y divide-neutral-800/80 overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900/60">
+          {Children.map(children, (child) => (
+            <li>{child}</li>
+          ))}
+        </ul>
+      ) : (
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] gap-3">{children}</div>
+      )}
     </section>
   );
 }
@@ -318,20 +352,6 @@ function GoThrough({ first }: { first: Needing }) {
       <kbd className="hidden font-sans text-[11px] text-amber-300/70 pointer-fine:inline">{nextKey}</kbd>
     </Link>
   );
-}
-
-/** Whether the element is on screen, or near it; always true where the browser cannot tell. */
-function useOnScreen<T extends Element>() {
-  const ref = useRef<T>(null);
-  const [onScreen, setOnScreen] = useState(() => typeof IntersectionObserver === "undefined");
-  useLayoutEffect(() => {
-    const element = ref.current;
-    if (!element || typeof IntersectionObserver === "undefined") return;
-    const observer = new IntersectionObserver((entries) => setOnScreen(entries[entries.length - 1].isIntersecting), { rootMargin: "200px" });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-  return [ref, onScreen] as const;
 }
 
 function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card: Card; showMachine: boolean; onChanges: (workspace: string) => void; arrived?: boolean }) {
@@ -445,37 +465,9 @@ function CardSteps({ workspace, row }: { workspace: string; row: Card["rows"][nu
   );
 }
 
-/**
- * What the workspace changed since its base, read as the sheet reads it, but only while the card
- * is on screen: when it comes on screen, whenever one of its terminals changes state (so the end
- * of a turn shows what the turn wrote), and every `BOARD_BUSY_EVERY` while an agent in it works.
- * A state change off screen is read when the card comes back. A failed read says so instead of
- * the old numbers and is tried again on the timer; a workspace the daemon does not have (a 404)
- * is not asked again on a timer. Once its workspace is being archived, nothing is read or shown.
- */
+/** What the workspace changed since its base, at the foot of its card, read as `useCardChanges` says. */
 function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boolean; onOpen: () => void }) {
-  const busy = card.rows.some((r) => r.glyph === "working");
-  const workspace = card.workspace.id;
-  const client = useQueryClient();
-  const leaving = useLeaving(workspace);
-  const { data, error } = useQuery({
-    ...changesQuery(workspace),
-    enabled: onScreen && !leaving,
-    staleTime: BOARD_BUSY_EVERY,
-    retry: false,
-    refetchInterval: pollEvery(BOARD_BUSY_EVERY, busy),
-  });
-  const states = card.rows.map((r) => `${r.terminal}:${r.glyph}`).join(" ");
-  const last = useRef(states);
-  useEffect(() => {
-    if (last.current === states) return;
-    last.current = states;
-    if (leaving) return;
-    // Read now if on screen; otherwise marked out of date, and read when it comes on screen.
-    void client.invalidateQueries({ queryKey: changesQuery(workspace).queryKey, exact: true });
-    // A turn that ends may have pushed or opened a pull request.
-    void client.invalidateQueries({ queryKey: shippingQuery(workspace).queryKey, exact: true });
-  }, [states, client, workspace, leaving]);
+  const { data, error, leaving } = useCardChanges(card, onScreen);
 
   let body: React.ReactNode;
   if (leaving) body = <span className="text-neutral-500">Archiving…</span>;

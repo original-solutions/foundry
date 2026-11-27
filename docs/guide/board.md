@@ -53,6 +53,21 @@ Inside a group, the most urgent card comes first. **Go through them**, beside th
 
 Beside the buttons, a line counts each stage and sums the work, for example "3 only here › 1 pushed › 0 in review › 0 merged · +136 −0 · 2 commits". While Foundry is still reading the workspaces it says "Reading where each workspace's work stands…".
 
+## Cards or a list
+
+**Cards** and **List**, at the right of **Group by**, switch how each workspace is drawn. The choice is kept in this browser.
+
+A card shows everything above. The list puts each workspace on one line, so a fleet of dozens fits on a screen, in the same groups and order:
+
+- **Glyphs.** One per terminal, in the same order as a card's rows. Click one to open that terminal, or right-click it for its menu. With more than three terminals, the line shows two and "+N".
+- **Name.** Click it to open the most urgent terminal. Below it, the project and the branch.
+- **What it is doing.** The most urgent terminal's state, then the question it asks you, the tool it runs, or the first line of what Claude said last. Point at that line to read all of it.
+- **Changes.** Lines added and removed and how many files are uncommitted, or "No changes". Click it to open the changes sheet. It is read the same way as a card's changes line.
+
+On a phone the line takes two rows: the name on the first, and what it is doing and its changes on the second.
+
+To reply to Claude, use a next-step button or see the pull request line, switch back to **Cards**.
+
 ## Counts and views
 
 Under the task line, a line counts what the fleet holds, such as "5 sessions · 0 shells · 5 workspaces · 1 machine". When a machine is offline, it adds "1 offline". The line is hidden on a narrow screen.

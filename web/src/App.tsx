@@ -53,8 +53,8 @@ import { upNext } from "./needing";
  * others, so going back to one is instant, from its tab or another workspace; an older one
  * attaches again when shown and gets its screen and scrollback back from the holder.
  *
- * With nothing open, the board shows every workspace as a card with its live states and changes,
- * or, switched to its timeline, every session's turns on one clock; a turn opens its terminal
+ * With nothing open, the board shows every workspace as a card with its live states and changes
+ * (or as one line of a list, for a large fleet), or, switched to its timeline, every session's turns on one clock; a turn opens its terminal
  * with the steps column.
  *
  * A fleet with no workspaces opens on one question, what Claude should work on, and a box to
