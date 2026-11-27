@@ -77,7 +77,7 @@ describe("NextSteps", () => {
     await waitFor(() => expect(send).toHaveBeenCalledTimes(2));
   });
 
-  it("reads again on each mount, but not a read the daemon last answered 404", async () => {
+  it("reads again on each mount, but not a read the daemon last answered 404, even once the cache has let go of its other reads", async () => {
     const urls: string[] = [];
     vi.stubGlobal(
       "fetch",
@@ -89,7 +89,8 @@ describe("NextSteps", () => {
         throw new Error(`unexpected request ${url}`);
       }),
     );
-    const client = new QueryClient();
+    // A cache that lets go of a read as soon as nothing shows it.
+    const client = new QueryClient({ defaultOptions: { queries: { gcTime: 0 } } });
     const tree = (shown: boolean) => (
       <QueryClientProvider client={client}>
         {shown && <NextSteps workspace="w1" name="opus" send={() => {}} look="header" />}
@@ -101,6 +102,8 @@ describe("NextSteps", () => {
     await screen.findByRole("button", { name: "Commit 1 file" });
 
     view.rerender(tree(false));
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(client.getQueryCache().find({ queryKey: ["changes", "w1"], exact: true })).toBeUndefined();
     view.rerender(tree(true));
     await waitFor(() => expect(urls.filter((u) => u === "/api/workspaces/w1/changes")).toHaveLength(2));
     await act(() => new Promise((resolve) => setTimeout(resolve, 20)));

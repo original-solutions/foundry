@@ -37,7 +37,7 @@ const records = (state: SessionState = "working"): AnyRecord[] => [
   session(ME, "s4", "w3", "t4", "idle"),
 ];
 
-const answers: Record<string, () => Response> = {};
+const answers: Record<string, () => Response | Promise<Response>> = {};
 let reads: string[] = [];
 const readsOf = (workspace: string) => reads.filter((u) => u.includes(`/${workspace}/`)).length;
 /** How many times `workspace`'s changes were read, leaving out where its branch stands. */
@@ -547,6 +547,17 @@ describe("Grouped by shipping", () => {
     expect(within(dialog).getByRole("region", { name: "Kept on far-off" }).textContent).toContain("laptop lists any work that would be lost");
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(readsOf("w6")).toBe(0);
+  });
+
+  it("says on the card of a workspace on another machine that it is archiving while its archive runs", async () => {
+    answers["/api/workspaces/w6/archive"] = () => new Promise<Response>(() => {});
+    const { client } = await show(fleet(fleetOf(), listed()), vi.fn(), {}, true);
+    await waitFor(() => expect(within(card("draft login")).getByRole("button", { name: "Changes in draft login" })).toBeDefined());
+    expect(within(card("far off")).queryByText(/archiving/i)).toBeNull();
+
+    void client.getMutationCache().build(client, archiveOf("w6")).execute(false);
+    await waitFor(() => expect(within(card("far off")).getByText("Archiving…")).toBeDefined());
+    expect(readsOf("w6")).toBe(1); // the archive itself
   });
 
   it("moves a card to its new lane when one of its terminals changes state, and lights it up once there", async () => {
