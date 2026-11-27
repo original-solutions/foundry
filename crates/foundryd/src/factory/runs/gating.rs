@@ -2166,6 +2166,9 @@ impl Gate<'_, '_> {
 
     /// The failing command of `attempt`'s gate as the gate's tail names it. With the tail
     /// naming none, the failure is the gate's commands as a whole and the output the whole tail.
+    /// The tail on record was hidden by the ledger, so each command is hidden by the tracker's
+    /// hider before it is looked for there: a secret written into a command is then `***` in
+    /// the failure's command as it is in its output.
     fn command_failure(
         &self,
         log: &Log,
@@ -2178,7 +2181,11 @@ impl Gate<'_, '_> {
             .find(|req| req.attempt == attempt && req.ended.is_some())
             .ok_or_else(|| RunError::Invalid("the gate's verdict is not on record".into()))?;
         let (code, tail) = req.ended.clone().unwrap_or_default();
-        let commands = self.commands();
+        let commands: Vec<String> = self
+            .commands()
+            .iter()
+            .map(|command| self.ctx.tracker.hide(command))
+            .collect();
         match gate::result(TerminalState::Exited, Some(code), &tail, &commands) {
             GateResult::Failed {
                 command,
