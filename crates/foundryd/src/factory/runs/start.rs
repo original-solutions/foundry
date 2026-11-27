@@ -871,33 +871,44 @@ struct LabelHistoryRepository {
 }
 
 /// The approval a claim was made on, read after the claim removed `factory:ready`: when and by
-/// whom the newest `factory:ready` label was applied, if an instructor applied it and the text
-/// is as an instructor left it since. These are `judge_approval`'s checks, except that the
-/// label need not still be in force: the claim's own removal took it off. `None` when that
-/// cannot be confirmed.
+/// whom the `factory:ready` label in force at the claim was applied, if an instructor applied
+/// it and the text is as an instructor left it since. The claim's removal is the newest removal
+/// of the label by the project's login; with none on the timeline, the label in force now. These
+/// are `judge_approval`'s checks, made as of the claim rather than now. The text is judged by
+/// `text_check`, which reads the history again and checks its timestamps. `None` when the
+/// approval cannot be confirmed.
 fn claimed_on(ctx: &RunContext<'_>, issue: u64) -> Result<Option<(String, String)>, RunError> {
     let repo = ctx.repo();
     let instructors = &ctx.config.instructors;
     let args = issue_query_args(repo, APPROVAL_QUERY, issue)?;
     let history: LabelHistory = gh_json(ctx.tracker, &args, "a GraphQL response with the issue")?;
-    let ready = State::Ready.label();
-    let newest = history
-        .data
-        .repository
-        .issue
-        .timeline_items
-        .nodes
-        .into_iter()
-        .rev()
-        .find_map(|node| match node {
-            TimelineNode::LabeledEvent(change) if change.label.name == ready => Some(change),
-            _ => None,
-        });
+    let nodes = history.data.repository.issue.timeline_items.nodes;
+    let ready = |change: &LabelChange| change.label.name == State::Ready.label();
+    let by_login = |change: &LabelChange| {
+        change
+            .actor
+            .as_ref()
+            .is_some_and(|actor| actor.login.eq_ignore_ascii_case(&ctx.project.login))
+    };
+    let claimed = nodes
+        .iter()
+        .rposition(|node| {
+            matches!(node, TimelineNode::UnlabeledEvent(change) if ready(change) && by_login(change))
+        })
+        .unwrap_or(nodes.len());
+    let mut in_force = None;
+    for node in nodes.into_iter().take(claimed) {
+        match node {
+            TimelineNode::LabeledEvent(change) if ready(&change) => in_force = Some(change),
+            TimelineNode::UnlabeledEvent(change) if ready(&change) => in_force = None,
+            _ => {}
+        }
+    }
     let Some(LabelChange {
         created_at,
         actor: Some(actor),
         ..
-    }) = newest
+    }) = in_force
     else {
         return Ok(None);
     };
