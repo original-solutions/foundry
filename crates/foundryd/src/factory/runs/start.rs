@@ -3232,6 +3232,46 @@ mod tests {
                 assert_eq!(rig.steps(&run)[0], format!("approved {LABELED_AT}"));
             }
 
+            /// Comments follow the claim (the factory's own status comment, anyone's): the
+            /// claim's time is the claim comment's, not the newest comment's.
+            #[test]
+            fn ignores_a_label_applied_after_the_claim_when_other_comments_follow_it() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, rig.machine);
+                for _ in 0..5 {
+                    rig.sim.comment_as("someone", "later");
+                }
+                rig.sim.set_approval(label_events(
+                    &[
+                        ("label", LABELED_AT, "tom"),
+                        ("unlabel", "2026-10-04T11:01:40Z", LOGIN),
+                        ("label", "2026-10-04T11:01:42Z", "tom"),
+                        ("unlabel", "2026-10-04T11:01:43Z", "tom"),
+                    ],
+                    &[],
+                ));
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.steps(&run)[0], format!("approved {LABELED_AT}"));
+            }
+
+            /// "At or before": a label in the claim comment's own second counts.
+            #[test]
+            fn accepts_a_label_in_the_second_of_the_claim() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, rig.machine);
+                rig.sim.set_approval(label_events(
+                    &[
+                        ("label", "2026-10-04T11:01:40Z", "tom"),
+                        ("unlabel", "2026-10-04T11:01:50Z", LOGIN),
+                    ],
+                    &[],
+                ));
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.steps(&run)[0], "approved 2026-10-04T11:01:40Z");
+            }
+
             /// The newest label before the claim decides: a stranger's, after an instructor's,
             /// leaves no approval.
             #[test]
