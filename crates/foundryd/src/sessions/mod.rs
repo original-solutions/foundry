@@ -1318,19 +1318,21 @@ mod adopt_tests {
         with_a_session_record(terminal_record, WORKING)
     }
 
-    /// The session's own record: its state, whether it is deleted, and whether a peer owns it
-    /// rather than this machine.
+    /// The session's own record: its state, whether it is deleted, whether a peer owns it
+    /// rather than this machine, and the name it was given.
     #[derive(Clone, Copy)]
     struct Seed {
         state: SessionState,
         deleted: bool,
         peer: bool,
+        name: Option<&'static str>,
     }
 
     const WORKING: Seed = Seed {
         state: SessionState::Working,
         deleted: false,
         peer: false,
+        name: None,
     };
 
     /// [`with_a_session`], with the session's record seeded as `seed` says.
@@ -1371,7 +1373,7 @@ mod adopt_tests {
                 terminal,
                 model: "test-model".into(),
                 state: seed.state,
-                name: None,
+                name: seed.name.map(str::to_owned),
             },
         }));
         for record in &records {
@@ -1538,6 +1540,37 @@ mod adopt_tests {
         let (settings, curl) = sessions.inner.files(id);
         assert!(settings.exists() && curl.exists());
         assert!(!lock(&sessions.inner.live).contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn a_renamed_session_keeps_its_name_through_adoption_and_its_next_state_change() {
+        let named = Seed {
+            name: Some("login redirect"),
+            ..WORKING
+        };
+        let name = |sessions: &Sessions, id| record(sessions, id).unwrap().body.name;
+
+        // Exited while the daemon was down: adoption writes the end.
+        let exited = Some((false, TerminalState::Exited, Some(0)));
+        let (_data, sessions, id) = with_a_session_record(exited, named);
+        sessions.adopt().await;
+        assert_eq!(state(&sessions, id), Some(SessionState::Finished));
+        assert_eq!(name(&sessions, id).as_deref(), Some("login redirect"));
+
+        // Still running: taken up, and the record its next state change writes keeps the name.
+        let running = Some((false, TerminalState::Running, None));
+        let (_data, sessions, id) = with_a_session_record(running, named);
+        sessions.adopt().await;
+        let live = lock(&sessions.inner.live)[&id].clone();
+        let before = record(&sessions, id).unwrap().version;
+        sessions
+            .inner
+            .event(&live, Event::Exited(Some(0)))
+            .await
+            .unwrap();
+        let after = record(&sessions, id).unwrap();
+        assert!(after.version > before, "no new record was written");
+        assert_eq!(after.body.name.as_deref(), Some("login redirect"));
     }
 
     #[tokio::test]

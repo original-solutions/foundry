@@ -1,7 +1,23 @@
 import { Link } from "@tanstack/react-router";
+import { useState } from "react";
 import { jumpKey } from "./JumpPalette";
 import type { Needing } from "./needing";
 import { StateGlyph } from "./StateGlyph";
+
+/**
+ * How the open terminal `terminal` stands for the strip, `needs` saying whether it needs you now:
+ * `"needing"` while it does, `"answered"` once it stopped needing you while open, and nothing when
+ * it has not needed you since it was opened (or no terminal is open).
+ */
+export function useOpenStanding(terminal: string | undefined, needs: boolean): "needing" | "answered" | undefined {
+  // The terminal that needed you while open, until another one is opened.
+  const [asked, setAsked] = useState<string>();
+  const now = needs ? terminal : asked === terminal ? asked : undefined;
+  if (now !== asked) setAsked(now);
+  if (!terminal) return undefined;
+  if (needs) return "needing";
+  return asked === terminal ? "answered" : undefined;
+}
 
 /** The key that goes to the next terminal that needs you, from anywhere. */
 export const nextKey = jumpKey === "⌘K" ? "⌘J" : "Ctrl J";

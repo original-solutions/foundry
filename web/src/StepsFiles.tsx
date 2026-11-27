@@ -13,8 +13,9 @@ export type Lens = "turns" | "files";
  * A session's trail by what it touched instead of when: every file it read or changed, changed
  * ones first, with how often and a strip marking where along the trail; then the commands it ran
  * and its other tools, each once with how often. A file the workspace's changes hold shows its
- * lines and opens its diff. The changes are read once on opening and again when the session's
- * state changes, never on a timer.
+ * lines and opens its diff. The changes are read on opening and again when the session's state
+ * changes. They share the header's query, so once read, the header's changes button reads them
+ * again every 15 seconds while the terminal is open; this view adds no timer of its own.
  */
 export function StepsFiles({ trail, workspace, label, onFile }: { trail: Mark[]; workspace?: string; label: string; onFile?: (path: string) => void }) {
   const client = useQueryClient();

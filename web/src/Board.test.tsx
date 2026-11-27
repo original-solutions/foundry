@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createContext, useContext, type ComponentProps } from "react";
 import type { AnyRecord, Changes, SessionState, Shipping } from "./api";
 import { archiveOf } from "./Archive";
+import { buttonShape, pressed } from "./Modal";
 import { Board, BOARD_BUSY_EVERY } from "./Board";
 import { fleet, type MachineView } from "./fleet";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
@@ -334,6 +335,10 @@ describe("As a list", () => {
     expect(within(screen.getByRole("region", { name: "Working" })).getByRole("article", { name: "fix login" })).toBeDefined();
     expect(within(screen.getByRole("group", { name: "Show workspaces as" })).getByRole("button", { name: "List" }).getAttribute("aria-pressed")).toBe("true");
     expect(localStorage.getItem("foundry.layout")).toBe("list");
+    // The switch is drawn as Group by's is: the shared button with its pressed look.
+    for (const each of within(screen.getByRole("group", { name: "Show workspaces as" })).getAllByRole("button")) {
+      expect(`${buttonShape} ${pressed}`.split(" ").filter((c) => !each.classList.contains(c))).toEqual([]);
+    }
     // A line is one row: no list of its terminals under it.
     expect(within(card("fix login")).queryByRole("list")).toBeNull();
   });
@@ -349,7 +354,7 @@ describe("As a list", () => {
     const { router } = await show(fleet(records(), settings()), onChanges);
     asList();
     const login = card("fix login");
-    fireEvent.click(within(login).getByRole("link", { name: "shell Running" }));
+    fireEvent.click(within(login).getByRole("link", { name: "shell Open" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
     await waitFor(() => expect(within(login).getByText("+34")).toBeDefined());
     expect(within(login).getByText("−5")).toBeDefined();
@@ -363,7 +368,7 @@ describe("As a list", () => {
     await show(fleet([...records(), terminal(ME, "t5", "w1"), terminal(ME, "t6", "w1")], settings()));
     asList();
     const login = card("fix login");
-    expect(within(login).getAllByRole("link", { name: /Running|Working/ })).toHaveLength(2);
+    expect(within(login).getAllByRole("link", { name: /Open|Working/ })).toHaveLength(2);
     expect(within(login).getByText("+2")).toBeDefined();
     expect(within(card("tidy readme")).queryByText(/^\+\d$/)).toBeNull();
   });
@@ -396,9 +401,9 @@ describe("As a list", () => {
   it("opens as a list for a browser that kept it, and goes back to cards", async () => {
     localStorage.setItem("foundry.layout", "list");
     await show(fleet(records(), settings()));
-    expect(within(card("fix login")).queryByText("Running")).toBeNull();
+    expect(within(card("fix login")).queryByText("Open")).toBeNull();
     fireEvent.click(within(screen.getByRole("group", { name: "Show workspaces as" })).getByRole("button", { name: "Cards" }));
-    expect(within(card("fix login")).getByText("Running")).toBeDefined();
+    expect(within(card("fix login")).getByText("Open")).toBeDefined();
     expect(localStorage.getItem("foundry.layout")).toBe("cards");
   });
 });

@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { safeBranch } from "./branch";
 import { makeWorkspace, SessionNotStarted, type CreateInput } from "./launch";
 
@@ -18,12 +18,34 @@ interface Missed {
 }
 
 /**
+ * Where a split start says how it ended when the box that started it closed meanwhile (the dialog
+ * shut, or the page under it changed), so the items that did not start are never lost unseen. The
+ * layout shows it as its task warning.
+ */
+export const SplitEnded = createContext<((text: string) => void) | undefined>(undefined);
+
+/** How a split start ended, in words: how many started, then each item that did not and why, then each warning. */
+export function endedText({ of, missed, warned }: { of: number; missed: Missed[]; warned: string[] }): string {
+  return [`Started ${of - missed.length} of ${of} split tasks.`, ...missed.map((m) => `${m.name}: ${m.why}`), ...warned].join("\n");
+}
+
+/**
  * Starts the items of a split task one after another, each as its own workspace and session, so
  * a project's git is never asked for two worktrees at once. An item that fails does not stop the
  * rest. `at` is the item being made, and `started` holds, for each item done, whether it started.
+ * When the box is gone by the time the last item is done and any did not start cleanly, the
+ * ending goes to [`SplitEnded`] instead.
  */
 export function useStartEach() {
   const client = useQueryClient();
+  const report = useContext(SplitEnded);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const [at, setAt] = useState(0);
   const [started, setStarted] = useState<boolean[]>([]);
   const run = useMutation({
@@ -42,7 +64,9 @@ export function useStartEach() {
           setStarted((done) => [...done, false]);
         }
       }
-      return { of: inputs.length, missed, warned };
+      const ended = { of: inputs.length, missed, warned };
+      if (!mounted.current && (missed.length > 0 || warned.length > 0)) report?.(endedText(ended));
+      return ended;
     },
   });
   return { run, at, started };

@@ -1,5 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import { useId } from "react";
+import { buttonShape, pressed } from "./Modal";
 import { useCardChanges, useOnScreen } from "./cardChanges";
 import { totals } from "./changes";
 import type { Card } from "./lanes";
@@ -30,7 +31,7 @@ const GLYPHS_ROOM = 3;
  */
 export function LayoutSwitch({ layout, onPick }: { layout: Layout; onPick: (layout: Layout) => void }) {
   return (
-    <div role="group" aria-label="Show workspaces as" className="ml-auto flex shrink-0 gap-0.5 rounded-lg border border-neutral-800 bg-neutral-900 p-0.5 text-xs">
+    <div role="group" aria-label="Show workspaces as" className="ml-auto flex shrink-0 items-center gap-1.5 text-xs">
       {(
         [
           ["cards", "Cards", "Each workspace as a card, with its terminals and what Claude said", <CardsIcon key="i" />],
@@ -43,7 +44,7 @@ export function LayoutSwitch({ layout, onPick }: { layout: Layout; onPick: (layo
           title={title}
           aria-pressed={layout === value}
           onClick={() => onPick(value)}
-          className={`flex items-center gap-1.5 rounded-md px-2 py-0.5 font-medium transition-colors ${layout === value ? "bg-neutral-700 text-neutral-50" : "text-neutral-400 hover:text-neutral-200"}`}
+          className={`flex items-center gap-1.5 ${buttonShape} ${pressed} border-neutral-700 text-neutral-300 hover:bg-neutral-800`}
         >
           {icon}
           {name}

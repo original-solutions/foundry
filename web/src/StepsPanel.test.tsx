@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-libra
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Mark } from "./api";
+import { buttonShape, pressed } from "./Modal";
 import { RETRY_EVERY } from "./poll";
 import { STEPS_EVERY, StepsPanel, type StepsOf } from "./StepsPanel";
 import { json, mockFetch, renderApp } from "./test-utils";
@@ -127,6 +128,10 @@ describe("StepsPanel by file", () => {
   it("keeps the choice of turns or files for the next session", async () => {
     await byFile();
     expect(screen.getByRole("button", { name: "Files" }).getAttribute("aria-pressed")).toBe("true");
+    // Turns and Files are drawn as the app's other switches: the shared button with its pressed look.
+    for (const name of ["Turns", "Files"]) {
+      expect(`${buttonShape} ${pressed}`.split(" ").filter((c) => !screen.getByRole("button", { name }).classList.contains(c))).toEqual([]);
+    }
     cleanup();
     mockFetch(json(200, { steps: trail }), json(200, changes));
     await renderApp(<StepsPanel of={inWorkspace} onClose={() => {}} />);

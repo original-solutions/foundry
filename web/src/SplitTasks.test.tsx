@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { fleet } from "./fleet";
 import { Composer, useCreateWorkspace } from "./Composer";
 import { NewTask } from "./NewTask";
+import { SplitEnded } from "./SplitTasks";
 import { ME, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, mockFetch, renderApp } from "./test-utils";
 
@@ -129,6 +130,57 @@ describe("a task written as a list", () => {
     expect(alert.textContent).toContain("Started 1 of 3.");
     expect(alert.textContent).toContain("fix the footer: The workspace was made, but its session did not start: no claude.");
     expect(taskBox(dialog).value).toBe("Add CSV export");
+  });
+
+  it("says how it ended through the layout when the box closed before the last item was done", async () => {
+    mockFetch(json(201, { id: "w7" }), json(201, { id: "s7" }), json(409, { error: "the branch tidy-the-readme exists" }), json(201, { id: "w9" }), json(201, { id: "s9" }));
+    const answered = fetch;
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    // Every create waits until the dialog has closed.
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => (init?.method === "POST" ? held.then(() => answered(url, init)) : answered(url, init))));
+    const report = vi.fn();
+    function Closing() {
+      const [shown, setShown] = useState(true);
+      return (
+        <SplitEnded.Provider value={report}>
+          <button type="button" onClick={() => setShown(false)}>
+            Leave
+          </button>
+          <NewTask projects={projects} workspaces={open} open={shown} onOpenChange={setShown} onCreated={() => {}} />
+        </SplitEnded.Provider>
+      );
+    }
+    await renderApp(<Closing />);
+    const dialog = screen.getByRole("dialog", { name: "New task" });
+
+    fireEvent.change(taskBox(dialog), { target: { value: list } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Split into 3 tasks" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start 3" }));
+    fireEvent.click(screen.getByRole("button", { name: "Leave", hidden: true }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "New task" })).toBeNull());
+    release();
+
+    await waitFor(() => expect(report).toHaveBeenCalledTimes(1));
+    expect(report.mock.calls[0][0]).toBe("Started 2 of 3 split tasks.\ntidy the readme: the branch tidy-the-readme exists");
+  });
+
+  it("says nothing through the layout while the box that started it is still open", async () => {
+    mockFetch(json(201, { id: "w7" }), json(201, { id: "s7" }), json(409, { error: "taken" }), json(201, { id: "w9" }), json(201, { id: "s9" }));
+    const report = vi.fn();
+    await renderApp(
+      <SplitEnded.Provider value={report}>
+        <Harness />
+      </SplitEnded.Provider>,
+    );
+    const dialog = await show();
+
+    fireEvent.change(taskBox(dialog), { target: { value: list } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Split into 3 tasks" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start 3" }));
+
+    expect((await within(dialog).findByRole("alert")).textContent).toContain("Started 2 of 3.");
+    expect(report).not.toHaveBeenCalled();
   });
 
   it("on the board's line, empties the box once every item started, ready for the next task", async () => {

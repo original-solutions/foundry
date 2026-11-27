@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ApiError, sessionTrail, type Mark } from "./api";
+import { buttonShape, pressed } from "./Modal";
 import { addsSteps, busy, type Glyph } from "./labels";
 import { pollEvery } from "./poll";
 import { StateGlyph } from "./StateGlyph";
@@ -69,14 +70,14 @@ export function StepsPanel({ of, onClose, stale, onFile }: { of: StepsOf; onClos
         </button>
       </header>
       {of.kind === "session" && (
-        <div role="group" aria-label="Show steps by" className="flex shrink-0 gap-1 border-b border-neutral-800 px-3 py-1.5">
+        <div role="group" aria-label="Show steps by" className="flex shrink-0 gap-1.5 border-b border-neutral-800 px-3 py-1.5">
           {(["turns", "files"] as const).map((each) => (
             <button
               key={each}
               type="button"
               aria-pressed={lens === each}
               onClick={() => choose(each)}
-              className={`rounded-md px-2.5 py-1 text-xs font-medium ${lens === each ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200"}`}
+              className={`${buttonShape} ${pressed} border-neutral-700 text-neutral-300 hover:bg-neutral-800`}
             >
               {each === "turns" ? "Turns" : "Files"}
             </button>

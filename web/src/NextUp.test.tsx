@@ -1,6 +1,6 @@
-import { screen } from "@testing-library/react";
+import { renderHook, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { NextUp } from "./NextUp";
+import { NextUp, useOpenStanding } from "./NextUp";
 import type { Needing } from "./needing";
 import { renderApp } from "./test-utils";
 
@@ -36,5 +36,28 @@ describe("NextUp", () => {
     await renderApp(<NextUp next={{ ...next, glyph: "stuck", label: "Stuck", now: undefined }} others={1} />);
     const link = await screen.findByRole("link", { name: "Next that needs you: tidy cart styles / opus, 1 needs you" });
     expect(link.textContent).toContain("Stuck");
+  });
+});
+
+describe("useOpenStanding", () => {
+  const standing = (terminal?: string, needs = false) => renderHook(({ terminal, needs }) => useOpenStanding(terminal, needs), { initialProps: { terminal, needs } });
+
+  it("is nothing with no terminal open, and needing while the open one needs you", () => {
+    expect(standing().result.current).toBeUndefined();
+    expect(standing("t1", true).result.current).toBe("needing");
+  });
+
+  it("is nothing over a terminal that never needed you, so the strip does not glow as if you had answered", () => {
+    expect(standing("t1", false).result.current).toBeUndefined();
+  });
+
+  it("is answered once the open terminal stops needing you, and not again after another terminal is opened", () => {
+    const hook = standing("t1", true);
+    hook.rerender({ terminal: "t1", needs: false });
+    expect(hook.result.current).toBe("answered");
+    hook.rerender({ terminal: "t2", needs: false });
+    expect(hook.result.current).toBeUndefined();
+    hook.rerender({ terminal: "t1", needs: false });
+    expect(hook.result.current).toBeUndefined();
   });
 });

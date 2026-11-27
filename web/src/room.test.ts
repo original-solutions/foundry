@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { Limits } from "./api";
 import type { MachineView } from "./fleet";
 import { overLimits, rooms } from "./room";
+// The cases the daemon's placement tests run too (crates/foundryd/src/placement.rs), so the copy cannot drift.
+import shared from "./placement_cases.json?raw";
 
 const limits: Limits = { max_sessions: 4, max_load_per_core: 1.0, min_free_disk: 10_000_000_000 };
 
@@ -70,5 +72,33 @@ describe("rooms", () => {
 
   it("breaks a full tie by the lower id, so the pick never depends on the order given", () => {
     expect(rooms([machine("b"), machine("a")]).pick).toBe("a");
+  });
+});
+
+interface SharedCase {
+  about: string;
+  machines: { id: string; name: string; online: boolean; sample: MachineView["sample"]; limits: Limits | null }[];
+  pick: string | null;
+  reasons?: string[];
+}
+
+describe("rooms, on the daemon's own placement cases", () => {
+  const { cases } = JSON.parse(shared) as { cases: SharedCase[] };
+
+  it("has cases to run", () => expect(cases.length).toBeGreaterThan(0));
+
+  it.each(cases.map((c) => [c.about, c] as const))("%s", (_, c) => {
+    const machines: MachineView[] = c.machines.map((m) => ({
+      id: m.id,
+      name: m.name,
+      listed: true,
+      status: m.online ? "online" : "offline",
+      sample: m.sample,
+      limits: m.limits ?? undefined,
+      workspaces: [],
+    }));
+    const { pick, reasons } = rooms(machines);
+    expect(pick ?? null).toBe(c.pick);
+    if (c.pick === null) expect(reasons).toEqual(c.reasons);
   });
 });

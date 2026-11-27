@@ -1,5 +1,6 @@
+import { useMemo } from "react";
 import type { FileChange } from "./api";
-import { diffLines, splitPath } from "./changes";
+import { diffLines, leading, splitPath } from "./changes";
 import { CodeLine } from "./CodeLine";
 import { paint } from "./paint";
 import { fileStatus, marker, rowTone } from "./ChangesPanel";
@@ -59,10 +60,12 @@ function Address({ url }: { url: string }) {
 function File({ file }: { file: FileChange }) {
   const { dir, name } = splitPath(file.path);
   const s = fileStatus[file.status];
-  const all = file.patch === null ? [] : diffLines(file.patch);
-  const painted = paint(all, file.path);
-  const lines = all.map((line, i) => ({ line, pieces: painted[i] })).filter(({ line }) => line.kind !== "note");
-  const more = lines.length - PEEK_LINES;
+  const all = useMemo(() => (file.patch === null ? [] : diffLines(file.patch)), [file.patch]);
+  // Only the start is shown, so only the start is coloured and compared word by word.
+  const start = useMemo(() => leading(all, PEEK_LINES), [all]);
+  const painted = useMemo(() => paint(start, file.path), [start, file.path]);
+  const lines = start.map((line, i) => ({ line, pieces: painted[i] })).filter(({ line }) => line.kind !== "note");
+  const more = all.filter((line) => line.kind !== "note").length - PEEK_LINES;
   return (
     <>
       <div className="flex items-center gap-2 border-b border-neutral-800 px-3 py-2">

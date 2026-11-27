@@ -50,7 +50,9 @@ export function overLimits(sample: MachineSample, limits: Limits): string[] {
  * limit they have, the lowest load per core, then the fewest sessions, then the lower id. Each
  * machine's `room`, and, as the daemon gives them when none qualifies, one reason per machine
  * that sent numbers and was passed over. Creates still on their way to a machine are not
- * counted, so this is a preview: the daemon decides when the task is sent.
+ * counted, so this is a preview: the daemon decides when the task is sent. The daemon's tests
+ * and this copy's run the same cases (`placement_cases.json` here), so the two rules
+ * cannot change apart without a test failing.
  */
 export function rooms(machines: MachineView[]): { pick?: string; room: Map<string, Room>; reasons: string[] } {
   const room = new Map<string, Room>();
