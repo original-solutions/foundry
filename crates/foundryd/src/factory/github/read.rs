@@ -4985,6 +4985,19 @@ mod tests {
             page.extend((page.len()..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
             cases.push(issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None));
         }
+        // A cut-off page whose oldest event is another one in the label's second: a rename in
+        // that second could still be on the page before it.
+        let mut same_second = vec![
+            labeled(LABELED, "eve", "bug"),
+            labeled(LABELED, "tom", READY),
+        ];
+        same_second.extend((2..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        let same_second = issue_of(same_second, &[], Some(HISTORY_PAGE as u64 + 5), None);
+        assert_eq!(
+            judge_approval(&same_second, READY, &names(&["tom"])),
+            refused(history_cut(LABELED))
+        );
+        cases.push(same_second);
 
         let instructors = names(&["tom"]);
         let mut seen = Vec::new();
@@ -5775,13 +5788,23 @@ mod tests {
 
     #[test]
     fn labels_and_renames_share_the_page_and_the_label_in_force_is_enough() {
-        // The label is the oldest event shown, so every later event, the renames included, is
-        // on the page: events come oldest first and the page is the newest 100. Nothing before
-        // the label matters, whatever the total.
-        let mut events = vec![ready_on(LABELED, "tom")];
-        events.extend(renames_after_label(99));
+        // The oldest event shown is before the label, so every event in or after the label's
+        // second, the renames included, is on the page: events come oldest first and the page
+        // is the newest 100. Nothing before the label matters, whatever the total.
+        let mut events = vec![
+            rename_event("2026-10-04T09:59:59Z", "eve"),
+            ready_on(LABELED, "tom"),
+        ];
+        events.extend(renames_after_label(98));
         let answer = approval_reply(&events, 400, None, &creation_only("eve"));
         assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+
+        // With the label the oldest event shown, a rename in its second could be on the page
+        // before this one.
+        let mut oldest = vec![ready_on(LABELED, "tom")];
+        oldest.extend(renames_after_label(99));
+        let cut = approval_reply(&oldest, 400, None, &creation_only("eve"));
+        assert_eq!(approval_of(&cut, &["tom"]), refused(history_cut(LABELED)));
 
         // A stranger's rename on that page is seen.
         let mut with_stranger = events.clone();
