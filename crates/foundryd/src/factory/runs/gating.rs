@@ -1818,7 +1818,7 @@ impl Gate<'_, '_> {
         if self.archive_gate(&req, Mode::Place)? == Archive::Waiting {
             return Ok(GateStep::NotReady);
         }
-        let (result, commands) = self.read_tail(code, &tail);
+        let (result, commands) = self.read_tail(code, &tail)?;
         let failing = match &result {
             GateResult::Failed { command, .. } => {
                 command.clone().unwrap_or_else(|| commands.join(" && "))
@@ -2178,7 +2178,7 @@ impl Gate<'_, '_> {
             .find(|req| req.attempt == attempt && req.ended.is_some())
             .ok_or_else(|| RunError::Invalid("the gate's verdict is not on record".into()))?;
         let (code, tail) = req.ended.clone().unwrap_or_default();
-        match self.read_tail(code, &tail) {
+        match self.read_tail(code, &tail)? {
             (
                 GateResult::Failed {
                     command,
@@ -2205,15 +2205,28 @@ impl Gate<'_, '_> {
     /// before a secret was held, and hiding a hidden text changes nothing. A command that holds
     /// a secret is then found in the tail as the `***` the tail has in its place, and no secret
     /// reaches the failure's command or its output.
-    fn read_tail(&self, code: i32, tail: &str) -> (GateResult, Vec<String>) {
-        let commands: Vec<String> = self
+    ///
+    /// A store that cannot be read is an error, and nothing is read: the hider then gives its
+    /// placeholder for every text, and a verdict read from that would be recorded and sent for
+    /// good with no command and no output in it. The next pass reads the verdict again.
+    fn read_tail(&self, code: i32, tail: &str) -> Result<(GateResult, Vec<String>), RunError> {
+        let hide = |text: &str| {
+            let hidden = self.ctx.tracker.hide(text);
+            if hidden == crate::secrets::HIDDEN_UNREADABLE && text != hidden {
+                return Err(RunError::Invalid(
+                    "the gate's verdict waits: the secret store could not be read".into(),
+                ));
+            }
+            Ok(hidden)
+        };
+        let commands = self
             .commands()
             .iter()
-            .map(|command| self.ctx.tracker.hide(command))
-            .collect();
-        let tail = self.ctx.tracker.hide(tail);
+            .map(|command| hide(command))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tail = hide(tail)?;
         let result = gate::result(TerminalState::Exited, Some(code), &tail, &commands);
-        (result, commands)
+        Ok((result, commands))
     }
 
     /// The failed checks as the message names them: what is on record, with the result and link
@@ -4146,17 +4159,94 @@ mod tests {
 
         #[test]
         fn a_gate_whose_retries_are_used_up_names_its_command_with_the_secret_hidden() {
-            let (mut rig, run, _hub) = built_hiding();
+            // The ledger recorded the tail while the store did not hold the token yet, so only
+            // the hiding of the tail as it is read keeps the token out of the stuck detail.
+            let (mut rig, run, hub) = built();
+            rig.tracker = Hiding::new(
+                hub.clone(),
+                Arc::new(|text: &str| text.replace(HELD, "***")),
+            );
             rig.config.limits.gate_retries = 0;
             let command = format!("cargo test --token {HELD}");
             rig.config.gate = vec![command.clone()];
-            let tail = format!("$ {command}\nsetup failed: {command} exited 101\n");
+            let tail =
+                format!("$ {command}\nfailed with {HELD}\nsetup failed: {command} exited 101\n");
             let step = gated(&mut rig, &run, 101, &tail);
             let GateStep::Stuck { reason } = &step else {
                 panic!("expected stuck, got {step:?}");
             };
             assert!(reason.contains("cargo test --token ***"), "{reason}");
             assert!(!reason.contains(HELD), "{reason}");
+            let details: Vec<_> = rig
+                .steps(&run)
+                .into_iter()
+                .filter(|step| step.starts_with("stuck-detail "))
+                .collect();
+            assert_eq!(details.len(), 1, "{details:?}");
+            assert!(details[0].contains("failed with ***"), "{details:?}");
+            assert!(!details[0].contains(HELD), "{details:?}");
+        }
+
+        #[test]
+        fn a_passed_gate_read_while_the_secret_store_cannot_be_read_records_no_command() {
+            let (mut rig, run, hub) = built();
+            place(&mut rig, &run, 1, 1);
+            rig.tracker = Hiding::new(
+                hub.clone(),
+                Arc::new(|_: &str| crate::secrets::HIDDEN_UNREADABLE.to_owned()),
+            );
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
+            rig.worker.on_tail(Ok(PASS_TAIL.into()));
+            assert!(try_go(&rig, &run).is_err());
+            assert_eq!(event_count(&rig, &run, "gate_command"), 0);
+            rig.tracker = Hiding::new(hub.clone(), Arc::new(|text: &str| text.to_owned()));
+            assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
+            let recorded: Vec<Value> = rig
+                .events(&run)
+                .into_iter()
+                .filter(|event| event.event == "gate_command")
+                .map(|event| event.data["command"].clone())
+                .collect();
+            let expected: Vec<Value> = rig.config.gate.iter().map(|c| json!(c)).collect();
+            assert_eq!(recorded, expected);
+        }
+
+        #[test]
+        fn a_gate_read_while_the_secret_store_cannot_be_read_records_and_sends_nothing() {
+            let (mut rig, run, hub) = built();
+            let command = format!("cargo test --token {HELD}");
+            rig.config.gate = vec![command.clone()];
+            let tail =
+                format!("$ {command}\nfailed with {HELD}\nsetup failed: {command} exited 101\n");
+            place(&mut rig, &run, 1, 1);
+            // The store cannot be read: the hider gives its placeholder for every text.
+            rig.tracker = Hiding::new(
+                hub.clone(),
+                Arc::new(|_: &str| crate::secrets::HIDDEN_UNREADABLE.to_owned()),
+            );
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 101)]);
+            rig.worker.on_tail(Ok(tail.clone()));
+            assert!(try_go(&rig, &run).is_err());
+            assert_eq!(event_count(&rig, &run, "gate_command"), 0);
+            assert_eq!(sends(&rig), vec![]);
+            // Once it can be read again, the same verdict is read whole.
+            rig.tracker = Hiding::new(
+                hub.clone(),
+                Arc::new(|text: &str| text.replace(HELD, "***")),
+            );
+            assert_eq!(go(&rig, &run), GateStep::SentBack { attempt: 1 });
+            let lines: Vec<_> = rig
+                .events(&run)
+                .into_iter()
+                .filter(|event| event.event == "gate_command")
+                .collect();
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].data["command"], "cargo test --token ***");
+            let expected = messages::gate_failed(
+                &failure_of("cargo test --token ***", 101, "failed with ***\n"),
+                BODY_PATH,
+            );
+            assert_eq!(sends(&rig), vec![sent(1, expected)]);
         }
 
         #[test]
