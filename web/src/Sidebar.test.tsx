@@ -1,12 +1,14 @@
+import { focusManager, useQueryClient } from "@tanstack/react-query";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fleet, withFactory } from "./fleet";
 import { Sidebar } from "./Sidebar";
+import { CHECKS_EVERY } from "./Shipping";
 import { TerminalActions } from "./TerminalMenu";
 import { factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, mockFetch, renderApp } from "./test-utils";
-import type { SessionState } from "./api";
+import type { PullRequest, SessionState, Shipping } from "./api";
 
 const states: [SessionState, string][] = [
   ["starting", "Starting"],
@@ -48,8 +50,8 @@ afterEach(() => {
 describe("Sidebar", () => {
   it("marks each workspace with its project's face, so a long list reads by project", async () => {
     await renderApp(<Sidebar machines={machines()} {...props} />);
-    const face = within(screen.getByRole("group", { name: "fix login" })).getByTitle("demo");
-    expect(face.textContent).toBe("DE");
+    const face = within(screen.getByRole("group", { name: "fix login" })).getByText("DE");
+    expect(face.getAttribute("title")).toBe("demo");
     // It is a picture of what the row says in words once unfolded, so a screen reader skips it.
     expect(face.getAttribute("aria-hidden")).toBe("true");
   });
@@ -463,7 +465,304 @@ describe("Sidebar and the factory", () => {
   it("shows a workspace with no branch by its commit", async () => {
     await renderApp(<Sidebar machines={factoryMachines()} {...props} />);
     unfold("on a commit");
-    expect(within(screen.getByRole("group", { name: "on a commit" })).getByText("fedcba9 · demo")).toBeDefined();
+    expect(within(screen.getByRole("group", { name: "on a commit" })).getByText("fedcba9")).toBeDefined();
+  });
+});
+
+describe("where a workspace's work stands", () => {
+  const both = settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] });
+  const open: PullRequest = { number: 88, title: "Fix the login form", url: "https://github.com/o/r/pull/88", state: "open", draft: false, checks: "passing", review: "none" };
+  const ready: Shipping = { branch: "fix-login", pushed: true, unpushed: 0, pr: open, unreachable: false };
+
+  /** Answers each workspace's `/pr` read from `answers` by its id, and gives back every request sent. */
+  function reads(answers: Record<string, () => Response>) {
+    const calls: { url: string; method: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        calls.push({ url, method: init.method ?? "GET", body: init.body });
+        const id = /^\/api\/workspaces\/([^/]+)\/pr$/.exec(url)?.[1];
+        const answer = id === undefined ? undefined : answers[id];
+        if (!answer) throw new Error(`unexpected request ${url}`);
+        return answer();
+      }),
+    );
+    return calls;
+  }
+
+  const mine = (state: SessionState = "idle") => [sample(ME, 1), workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", state)];
+  const theirs = [sample(OTHER, 1), workspace(OTHER, "w9", "remote job"), terminal(OTHER, "t9", "w9"), session(OTHER, "s9", "w9", "t9", "idle")];
+
+  /** The line under a workspace's name: the element holding its project. */
+  const lineOf = async (name: string, text: string) => {
+    const group = within(screen.getByRole("group", { name }));
+    const line = (await group.findByText("demo", { exact: true })).parentElement as HTMLElement;
+    await waitFor(() => expect(line.textContent).toBe(text));
+    return line;
+  };
+
+  it("shows a folded workspace's project and its pull request, linked to GitHub", async () => {
+    const calls = reads({ w1: () => json(200, ready) });
+    await renderApp(<Sidebar machines={fleet(mine(), both, {}, [ME, OTHER])} {...props} />);
+    expect(screen.getByRole("button", { name: "fix login" }).getAttribute("aria-expanded")).toBe("false");
+
+    const line = await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    expect(line.getAttribute("title")).toBe("demo · PR #88 · Ready to merge");
+    expect(line.className).toContain("truncate");
+    const link = within(line).getByRole("link", { name: "PR #88 · Ready to merge" });
+    expect(link.getAttribute("href")).toBe("https://github.com/o/r/pull/88");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noreferrer");
+    expect(link.getAttribute("title")).toBe("Fix the login form (open on GitHub)");
+    expect(link.className).toContain("text-emerald-400");
+    // Not a stop of its own: the list stays one Tab stop and the arrows pass it by.
+    expect(link.getAttribute("tabindex")).toBe("-1");
+    expect(link.hasAttribute("data-stop")).toBe(false);
+    // The folded line of glyphs is still there beside the name.
+    expect(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /Ready$/ })).toBeDefined();
+    expect(calls).toEqual([{ url: "/api/workspaces/w1/pr", method: "POST", body: undefined }]);
+  });
+
+  it("shows the same line under an unfolded workspace's name, and its branch alone on the line of actions", async () => {
+    reads({ w1: () => json(200, ready) });
+    await renderApp(<Sidebar machines={fleet(mine(), both, {}, [ME, OTHER])} {...props} />);
+    unfold("fix login");
+    const group = within(screen.getByRole("group", { name: "fix login" }));
+
+    const line = await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    expect(within(line).getByRole("link", { name: "PR #88 · Ready to merge" }).getAttribute("href")).toBe("https://github.com/o/r/pull/88");
+    expect(group.getByText("fix-login", { exact: true })).toBeDefined();
+    expect(group.queryByText(/fix-login · demo/)).toBeNull();
+    expect(group.getByRole("button", { name: "New shell" })).toBeDefined();
+  });
+
+  it("reads a workspace on another online machine with a POST, which the daemon carries to its owner", async () => {
+    const calls = reads({ w1: () => json(200, { ...ready, pr: null, pushed: false }), w9: () => json(200, { ...ready, branch: "remote-job", pr: { ...open, number: 307, draft: true, checks: "pending" } }) });
+    await renderApp(<Sidebar machines={fleet([...mine(), ...theirs], both, {}, [ME, OTHER])} {...props} />);
+
+    const line = await lineOf("remote job", "demo · Draft PR #307 · Checks running");
+    expect(within(line).getByRole("link", { name: "Draft PR #307 · Checks running" }).className).toContain("text-amber-300");
+    expect(calls).toContainEqual({ url: "/api/workspaces/w9/pr", method: "POST", body: undefined });
+  });
+
+  it("asks nothing for a workspace of an offline machine, and shows its project alone", async () => {
+    const calls = reads({ w1: () => json(200, ready) });
+    await renderApp(<Sidebar machines={fleet([...mine(), ...theirs], both, {}, [ME])} {...props} />);
+    expect(screen.getByRole("region", { name: "laptop" }).textContent).toContain("offline");
+
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    const line = await lineOf("remote job", "demo");
+    expect(line.getAttribute("title")).toBe("demo");
+    expect(calls.map((c) => c.url)).toEqual(["/api/workspaces/w1/pr"]);
+  });
+
+  it("shows the project alone, and no error, when the read is refused", async () => {
+    const calls = reads({ w9: () => json(400, { error: "no such route" }) });
+    await renderApp(<Sidebar machines={fleet(theirs, both, {}, [ME, OTHER])} {...props} />);
+    await waitFor(() => expect(calls).toHaveLength(1));
+
+    const line = await lineOf("remote job", "demo");
+    expect(within(line).queryByRole("link")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText(/no such route|could not/i)).toBeNull();
+  });
+
+  it("shows the project alone until the read answers", async () => {
+    reads({ w1: () => new Promise<Response>(() => {}) as unknown as Response });
+    await renderApp(<Sidebar machines={fleet(mine(), both, {}, [ME, OTHER])} {...props} />);
+    await lineOf("fix login", "demo");
+  });
+
+  it.each(["working", "starting"] as const)("says Building while a terminal is %s on a branch with no pull request", async (state) => {
+    reads({ w1: () => json(200, { ...ready, pr: null, pushed: false }) });
+    await renderApp(<Sidebar machines={fleet(mine(state), both, {}, [ME, OTHER])} {...props} />);
+    const line = await lineOf("fix login", "demo · Building");
+    expect(within(line).queryByRole("link")).toBeNull();
+  });
+
+  it("reads again when one of the workspace's terminals changes glyph", async () => {
+    const answers = [json(200, { ...ready, pr: null, pushed: false }), json(200, ready)];
+    const calls = reads({ w1: () => answers.shift() ?? json(200, ready) });
+    const working = fleet(mine("working"), both, {}, [ME, OTHER]);
+    const idle = fleet(mine("idle"), both, {}, [ME, OTHER]);
+    function Turning() {
+      const [view, setView] = useState(working);
+      return (
+        <>
+          <button onClick={() => setView(idle)}>turn ends</button>
+          <Sidebar machines={view} {...props} />
+        </>
+      );
+    }
+    await renderApp(<Turning />);
+    await lineOf("fix login", "demo · Building");
+    expect(calls).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "turn ends" }));
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    expect(calls.map((c) => [c.url, c.method])).toEqual([
+      ["/api/workspaces/w1/pr", "POST"],
+      ["/api/workspaces/w1/pr", "POST"],
+    ]);
+  });
+
+  it("reads only the workspace whose terminal changed glyph, not the others beside it", async () => {
+    const calls = reads({ w1: () => json(200, ready), w9: () => json(200, ready) });
+    const before = [sample(OTHER, 1), workspace(OTHER, "w9", "remote job"), terminal(OTHER, "t9", "w9"), session(OTHER, "s9", "w9", "t9", "working")];
+    await changing(fleet([...mine(), ...before], both, {}, [ME, OTHER]), fleet([...mine(), ...theirs], both, {}, [ME, OTHER]));
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    await lineOf("remote job", "demo · PR #88 · Ready to merge");
+    expect(calls).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "next state" }));
+    await waitFor(() => expect(calls).toHaveLength(3));
+    await act(() => new Promise((done) => setTimeout(done, 50)));
+    expect(calls.map((c) => c.url)).toEqual(["/api/workspaces/w1/pr", "/api/workspaces/w9/pr", "/api/workspaces/w9/pr"]);
+  });
+
+  /** Renders the sidebar with `first`, and a button that swaps in `then`, as the socket's next state does. */
+  async function changing(first: ReturnType<typeof fleet>, then: ReturnType<typeof fleet>, beside?: (view: ReturnType<typeof fleet>) => ReactNode, after = false) {
+    function Changing() {
+      const [view, setView] = useState(first);
+      return (
+        <>
+          <button onClick={() => setView(then)}>next state</button>
+          {!after && beside?.(view)}
+          <Sidebar machines={view} {...props} />
+          {after && beside?.(view)}
+        </>
+      );
+    }
+    await renderApp(<Changing />);
+  }
+
+  /** Another reader of the shared entry, as a board card is: it marks it out of date when w1's glyphs change. */
+  function AlsoInvalidates({ view }: { view: ReturnType<typeof fleet> }) {
+    const client = useQueryClient();
+    const glyphs = JSON.stringify(view);
+    const last = useRef(glyphs);
+    useEffect(() => {
+      if (last.current === glyphs) return;
+      last.current = glyphs;
+      void client.invalidateQueries({ queryKey: ["pr", "w1"], exact: true });
+    }, [glyphs, client]);
+    return null;
+  }
+
+  it.each([
+    ["before", false],
+    ["after", true],
+  ])("sends one read for a glyph change that another reader of the entry, %s the sidebar, also marks out of date", async (_, after) => {
+    const answers = [json(200, { ...ready, pr: null, pushed: false })];
+    const calls = reads({ w1: () => answers.shift() ?? json(200, ready) });
+    await changing(fleet(mine("working"), both, {}, [ME, OTHER]), fleet(mine("idle"), both, {}, [ME, OTHER]), (view) => <AlsoInvalidates view={view} />, after);
+    await lineOf("fix login", "demo · Building");
+
+    fireEvent.click(screen.getByRole("button", { name: "next state" }));
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    await act(() => new Promise((done) => setTimeout(done, 50)));
+    expect(calls).toHaveLength(2);
+  });
+
+  it("reads again after a glyph change that lands while an earlier read is still on its way", async () => {
+    let release: (answer: Response) => void = () => {};
+    const held = new Promise<Response>((done) => (release = done));
+    const answers: (() => Response | Promise<Response>)[] = [() => held, () => json(200, ready)];
+    const calls = reads({ w1: () => (answers.shift() ?? (() => json(200, ready)))() as Response });
+    await changing(fleet(mine("working"), both, {}, [ME, OTHER]), fleet(mine("idle"), both, {}, [ME, OTHER]));
+    await waitFor(() => expect(calls).toHaveLength(1));
+
+    // The turn ends (it pushed and opened #88) while the read from before it is still out.
+    fireEvent.click(screen.getByRole("button", { name: "next state" }));
+    await act(() => new Promise((done) => setTimeout(done, 20)));
+    release(json(200, { ...ready, pr: null }));
+
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    expect(calls).toHaveLength(2);
+  });
+
+  it("shows the project alone again when a later read fails", async () => {
+    const answers = [json(200, ready), json(503, { error: "laptop did not answer" })];
+    const calls = reads({ w1: () => answers.shift() ?? json(503, {}) });
+    await changing(fleet(mine("working"), both, {}, [ME, OTHER]), fleet(mine("idle"), both, {}, [ME, OTHER]));
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+
+    fireEvent.click(screen.getByRole("button", { name: "next state" }));
+    await waitFor(() => expect(calls).toHaveLength(2));
+    await lineOf("fix login", "demo");
+    expect(screen.queryByText(/did not answer/)).toBeNull();
+  });
+
+  it("shows the project alone once the workspace's machine goes offline", async () => {
+    const calls = reads({ w9: () => json(200, ready) });
+    await changing(fleet(theirs, both, {}, [ME, OTHER]), fleet(theirs, both, {}, [ME]));
+    await lineOf("remote job", "demo · PR #88 · Ready to merge");
+
+    fireEvent.click(screen.getByRole("button", { name: "next state" }));
+    await lineOf("remote job", "demo");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("does not read again when the window takes focus", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const calls = reads({ w1: () => json(200, ready) });
+      await renderApp(<Sidebar machines={fleet(mine(), both, {}, [ME, OTHER])} {...props} />);
+      await lineOf("fix login", "demo · PR #88 · Ready to merge");
+      await act(() => vi.advanceTimersByTimeAsync(5 * 60_000));
+      act(() => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(calls).toHaveLength(1);
+    } finally {
+      focusManager.setFocused(undefined);
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads a row only once it is on screen", async () => {
+    const watched: { fire: (on: boolean) => void }[] = [];
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        constructor(private callback: (entries: { isIntersecting: boolean }[]) => void) {}
+        observe() {
+          watched.push({ fire: (on) => this.callback([{ isIntersecting: on }]) });
+        }
+        disconnect() {}
+      },
+    );
+    const calls = reads({ w1: () => json(200, ready) });
+    await renderApp(<Sidebar machines={fleet(mine(), both, {}, [ME, OTHER])} {...props} />);
+    await act(() => new Promise((done) => setTimeout(done, 20)));
+    expect(calls).toEqual([]);
+    await lineOf("fix login", "demo");
+
+    act(() => watched.forEach((w) => w.fire(true)));
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("reads an open pull request again on the timer only while its checks run", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const pending: Shipping = { ...ready, pr: { ...open, checks: "pending" } };
+      const answers = [json(200, pending), json(200, ready)];
+      const calls = reads({ w1: () => answers.shift() ?? json(200, ready) });
+      await renderApp(<Sidebar machines={fleet(mine(), both, {}, [ME, OTHER])} {...props} />);
+      await lineOf("fix login", "demo · PR #88 · Checks running");
+
+      await act(() => vi.advanceTimersByTimeAsync(CHECKS_EVERY));
+      await lineOf("fix login", "demo · PR #88 · Ready to merge");
+      expect(calls).toHaveLength(2);
+
+      await act(() => vi.advanceTimersByTimeAsync(CHECKS_EVERY * 3));
+      expect(calls).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
