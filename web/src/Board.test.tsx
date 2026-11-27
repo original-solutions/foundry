@@ -250,6 +250,21 @@ describe("Board", () => {
     expect(readsOf("w3")).toBe(far);
   });
 
+  it("reads a workspace's changes again when a terminal changes state, but not where its branch stands once that answered 404", async () => {
+    answers["/api/workspaces/w1/pr"] = () => json(404, { error: "workspace not found" });
+    const prOf = (workspace: string) => reads.filter((u) => u === `/api/workspaces/${workspace}/pr`).length;
+    const { update } = await show(fleet(records("waiting_for_you"), settings()), vi.fn(), {}, true);
+    await waitFor(() => expect(within(card("fix login")).getByText("+34")).toBeDefined());
+    await waitFor(() => expect(prOf("w1")).toBeGreaterThan(0));
+    const changes = changesOf("w1");
+    const pr = prOf("w1");
+
+    update(fleet(records("failed"), settings()));
+    await waitFor(() => expect(changesOf("w1")).toBe(changes + 1));
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(prOf("w1")).toBe(pr);
+  });
+
   it("reads a card's changes only once the card is on screen", async () => {
     startOnScreen = false;
     await show(fleet(records(), settings()), vi.fn(), {}, true);

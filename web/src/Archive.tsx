@@ -103,6 +103,7 @@ export function ArchiveDialog({
             </p>
           ) : changes.isError ? (
             // The daemon says why it could not read them, as for a folder that is no longer a git worktree.
+            // #323: any refusal's message (a 500's too) shows in place of words.unreadable.
             <p className="text-xs text-neutral-500">{changes.error instanceof ApiError ? changes.error.message.trim().replace(/\.$/, "") : words.unreadable}.</p>
           ) : !changes.data ? (
             <p className="text-xs text-neutral-600">Reading what it changed…</p>

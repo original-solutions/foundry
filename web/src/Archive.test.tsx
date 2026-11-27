@@ -144,6 +144,14 @@ describe("ArchiveDialog", () => {
     expect(kept.textContent).not.toMatch(/can.t be read from here/);
   });
 
+  it("says the daemon's reason in what stays on the branch for any refused read, not only a 404", async () => {
+    stub(() => json(500, { error: "git broke" }));
+    const dialog = await show();
+    const kept = within(dialog).getByRole("region", { name: "Kept on fix-login" });
+    await waitFor(() => expect(kept.textContent).toContain("git broke."));
+    expect(kept.textContent).not.toMatch(/can.t be read from here/);
+  });
+
   it("says it is archiving while the archive runs, and Cancel still closes it", async () => {
     const onClose = vi.fn();
     stub(
