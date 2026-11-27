@@ -118,6 +118,16 @@ describe("UpdateBadge", () => {
     expect(sent.calls.map((c) => c.machine)).toEqual([OTHER, THIRD, ME]);
   });
 
+  it("offers no Install once every machine is unticked", () => {
+    show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+    fireEvent.click(badge());
+    const install = within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement;
+    fireEvent.click(within(dialog()).getByRole("checkbox", { name: "studio v0.9.1" }));
+    expect(install.disabled).toBe(false);
+    fireEvent.click(within(dialog()).getByRole("checkbox", { name: "laptop v0.9.1" }));
+    expect(install.disabled).toBe(true);
+  });
+
   it("waits to install until it knows which machine serves the page", () => {
     show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" })], null);
     fireEvent.click(badge());
@@ -291,6 +301,29 @@ describe("UpdateBadge", () => {
     expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
     expect(within(dialog()).queryByText(/restarting/i)).toBeNull();
   });
+
+  for (const [how, end] of [
+    ["drops", (c: (typeof sent.calls)[number]) => c.drop(new TypeError("Failed to fetch"))],
+    ["answers 504", (c: (typeof sent.calls)[number]) => c.answer({ status: 504, json: { error: "the link went down" } })],
+  ] as const) {
+    it(`offers no Install when the serving machine's own call ${how}, since its install may have run`, async () => {
+      const { update } = show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      fireEvent.click(badge());
+      fireEvent.click(within(dialog()).getByRole("checkbox", { name: "laptop v0.9.1" }));
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+      await settle();
+      act(() => end(sent.calls[0]));
+      await settle();
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Close" }));
+      fireEvent.click(badge());
+      expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(true);
+      expect(within(dialog()).getByText(/may be restarting/i)).toBeDefined();
+      // Its sample then says it runs the tag: it is back, and the hold lifts.
+      update([at(ME, 2, { version: "0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
+      expect(within(dialog()).queryByText(/restarting/i)).toBeNull();
+    });
+  }
 
   for (const [back, sampled] of [
     ["runs the tag", { version: "0.9.1" }],

@@ -99,6 +99,25 @@ describe("installUpdate", () => {
     expect(fetch).toHaveBeenCalledWith("/api/machines/machine-2/update", expect.objectContaining({ method: "POST", body: JSON.stringify({ tag: "v0.9.1" }) }));
   });
 
+  it("stops waiting after a minute with no answer, so the call reads as sent with no answer", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetch = vi.fn(
+        (_path: string, init: RequestInit) =>
+          new Promise<Response>((_answer, fail) => init.signal?.addEventListener("abort", () => fail(new DOMException("timed out", "AbortError")))),
+      );
+      vi.stubGlobal("fetch", fetch);
+      let failed: unknown;
+      void installUpdate("machine-2", "v0.9.1").catch((error: unknown) => (failed = error));
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(failed).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(failed).toBeInstanceOf(DOMException);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("gives back a 202's empty body as {}", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 202 })));
     expect(await installUpdate("machine-2", "v0.9.1")).toEqual({ status: 202, json: {} });
