@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PullRequest, Shipping } from "./api";
-import { ShipLine, shipLine } from "./Shipping";
+import { ShipLine, shipLine, standing } from "./Shipping";
 import { expectButtonShape, json, renderApp } from "./test-utils";
 
 /** Stubs `fetch` to answer each read with `answers` in order, and returns the URLs read. */
@@ -71,6 +71,67 @@ describe("shipLine", () => {
     expect(words(at({ pushed: true, unpushed: 1, pr: pr({ state: "merged" }) }))).toBe("PR #12 merged · 1 commit not pushed");
     expect(after?.done).toBe(false);
     expect(words(at({ pushed: true, pr: pr({ state: "closed" }) }))).toBe("PR #12 closed");
+  });
+});
+
+describe("standing", () => {
+  const says = (s: Shipping, working = false) => standing(s, working)?.text;
+
+  it("names an open pull request by the worst of its checks and review, after its number", () => {
+    expect(says(at({ pushed: true, pr: pr({ number: 307, draft: true, checks: "pending" }) }))).toBe("Draft PR #307 · Checks running");
+    expect(says(at({ pushed: true, pr: pr({ number: 12, checks: "failing", review: "approved" }) }))).toBe("PR #12 · Checks failing");
+    expect(says(at({ pushed: true, pr: pr({ number: 307, draft: true, checks: "passing" }) }))).toBe("Draft PR #307");
+    expect(says(at({ pushed: true, pr: pr({ number: 88, checks: "passing", review: "none" }) }))).toBe("PR #88 · Ready to merge");
+    expect(says(at({ pushed: true, pr: pr({ number: 88, checks: "none", review: "approved" }) }))).toBe("PR #88 · Ready to merge");
+    expect(says(at({ pushed: true, pr: pr({ number: 88, checks: "passing", review: "required" }) }))).toBe("PR #88 · Review required");
+  });
+
+  it("puts failing checks before a requested change, and a requested change before running checks", () => {
+    expect(says(at({ pushed: true, pr: pr({ checks: "failing", review: "changes_requested" }) }))).toBe("PR #12 · Checks failing");
+    expect(says(at({ pushed: true, pr: pr({ checks: "pending", review: "changes_requested" }) }))).toBe("PR #12 · Changes requested");
+    expect(says(at({ pushed: true, pr: pr({ draft: true, review: "changes_requested" }) }))).toBe("Draft PR #12 · Changes requested");
+    expect(says(at({ pushed: true, pr: pr({ draft: true, checks: "failing" }) }))).toBe("Draft PR #12 · Checks failing");
+    expect(says(at({ pushed: true, pr: pr({ draft: true, review: "required" }) }))).toBe("Draft PR #12");
+  });
+
+  it("gives each its tone", () => {
+    const tone = (s: Shipping, working = false) => standing(s, working)?.tone;
+    expect(tone(at({ pushed: true, pr: pr({ state: "merged" }) }))).toBe("merged");
+    expect(tone(at({ pushed: true, pr: pr({ state: "closed" }) }))).toBe("quiet");
+    expect(tone(at({ pushed: true, pr: pr({ checks: "failing" }) }))).toBe("bad");
+    expect(tone(at({ pushed: true, pr: pr({ review: "changes_requested" }) }))).toBe("warn");
+    expect(tone(at({ pushed: true, pr: pr({ checks: "pending" }) }))).toBe("warn");
+    expect(tone(at({ pushed: true, pr: pr({ draft: true }) }))).toBe("quiet");
+    expect(tone(at({ pushed: true, pr: pr({ review: "required" }) }))).toBe("quiet");
+    expect(tone(at({ pushed: true, pr: pr({ checks: "passing" }) }))).toBe("good");
+    expect(tone(at(), true)).toBe("quiet");
+    expect(tone(at({ pushed: true, unreachable: true }))).toBe("quiet");
+    expect(tone(at({ pushed: true }))).toBe("quiet");
+    expect(tone(at({ unpushed: 2 }))).toBe("warn");
+  });
+
+  it("says a merged or closed pull request whatever its checks, and keeps the pull request to link", () => {
+    const merged = standing(at({ pushed: true, pr: pr({ number: 9, state: "merged", checks: "failing" }) }), false);
+    expect(merged?.text).toBe("PR #9 merged");
+    expect(merged?.pr?.url).toBe("https://github.com/o/r/pull/12");
+    expect(says(at({ pushed: true, pr: pr({ state: "closed", checks: "failing" }) }))).toBe("PR #12 closed");
+    expect(standing(at({ pushed: true, pr: pr({ checks: "passing" }) }), false)?.pr?.number).toBe(12);
+  });
+
+  it("says where a branch with no pull request stands, building first", () => {
+    expect(says(at(), true)).toBe("Building");
+    expect(says(at({ pushed: true }), true)).toBe("Building");
+    expect(says(at({ pushed: true, unreachable: true }))).toBe("Pushed");
+    expect(says(at({ pushed: true }))).toBe("Pushed · No PR yet");
+    expect(says(at({ pushed: true, unpushed: 2 }))).toBe("Pushed · No PR yet");
+    expect(says(at({ unpushed: 2 }))).toBe("Not pushed");
+    expect(standing(at({ unpushed: 2 }), false)?.pr).toBeUndefined();
+    expect(standing(at(), false)).toBeUndefined();
+  });
+
+  it("gives an open pull request's text while a terminal works, not Building", () => {
+    expect(says(at({ pushed: true, pr: pr({ number: 88, checks: "passing" }) }), true)).toBe("PR #88 · Ready to merge");
+    expect(says(at({ pushed: true, pr: pr({ number: 307, draft: true, checks: "pending" }) }), true)).toBe("Draft PR #307 · Checks running");
   });
 });
 
