@@ -2997,6 +2997,90 @@ mod tests {
                 assert!(rig.ledger.read(&run_id(1)).unwrap().is_empty());
             }
 
+            /// The approval answer of an issue the claim has already taken `factory:ready` off:
+            /// the label by `by` at `labeled_at`, its removal by the claim after the comment,
+            /// and any body edits `(at, who)` since the label.
+            fn label_taken_off_by_the_claim(
+                labeled_at: &str,
+                by: &str,
+                edits: &[(&str, &str)],
+            ) -> String {
+                let actor = |login: &str| serde_json::json!({"__typename": "User", "login": login});
+                let nodes: Vec<serde_json::Value> = edits
+                    .iter()
+                    .rev()
+                    .map(|(at, who)| serde_json::json!({"editedAt": at, "editor": actor(who)}))
+                    .collect();
+                let last = edits.last();
+                serde_json::json!({"data": {"repository": {"issue": {
+                    "timelineItems": {"totalCount": 2, "nodes": [
+                        {
+                            "__typename": "LabeledEvent",
+                            "createdAt": labeled_at,
+                            "actor": actor(by),
+                            "label": {"name": "factory:ready"},
+                        },
+                        {
+                            "__typename": "UnlabeledEvent",
+                            "createdAt": "2026-10-04T12:00:00Z",
+                            "actor": actor(LOGIN),
+                            "label": {"name": "factory:ready"},
+                        },
+                    ]},
+                    "lastEditedAt": last.map(|(at, _)| *at),
+                    "editor": last.map_or(serde_json::Value::Null, |(_, who)| actor(who)),
+                    "userContentEdits": {"totalCount": nodes.len(), "nodes": nodes},
+                }}}})
+                .to_string()
+            }
+
+            /// The claim removes `factory:ready`, so a coordinator that takes over before the
+            /// run's first event finds no label in force. The approval is the newest label an
+            /// instructor applied before the claim comment.
+            #[test]
+            fn records_the_approval_of_a_label_the_claim_has_removed() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                rig.sim
+                    .set_approval(label_taken_off_by_the_claim(LABELED_AT, "tom", &[]));
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.steps(&run)[0], format!("approved {LABELED_AT}"));
+            }
+
+            #[test]
+            fn records_no_approval_for_a_removed_label_a_stranger_applied() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                rig.sim
+                    .set_approval(label_taken_off_by_the_claim(LABELED_AT, "mallory", &[]));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: CANNOT_CONFIRM.into()
+                    }
+                );
+                assert!(rig.steps(&run).iter().all(|s| !s.starts_with("approved ")));
+            }
+
+            #[test]
+            fn records_no_approval_for_a_removed_label_whose_text_a_stranger_edited_since() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                rig.sim.set_approval(label_taken_off_by_the_claim(
+                    LABELED_AT,
+                    "tom",
+                    &[("2026-10-04T10:30:00Z", "mallory")],
+                ));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: CANNOT_CONFIRM.into()
+                    }
+                );
+                assert!(rig.steps(&run).iter().all(|s| !s.starts_with("approved ")));
+            }
+
             /// The runner's case "with no run goes stuck: the factory cannot confirm what it was
             /// approved on".
             #[test]
