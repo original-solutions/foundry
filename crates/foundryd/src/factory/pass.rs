@@ -5664,6 +5664,43 @@ mod tests {
         }
 
         #[test]
+        fn a_run_whose_issue_was_seen_without_the_label_is_never_listed_for_again() {
+            let mut rig = Rig::new();
+            finished_waiting(&rig, 3, 1, State::Stuck);
+            rig.hub.issue(3, &["factory:stuck"]);
+            rig.pass();
+            assert_eq!(held_up(&rig).len(), 1);
+            rig.hub.edit(3, |issue| issue.labels = vec![]);
+            rig.pass();
+            assert!(held_up(&rig).is_empty());
+            let listed = listed_waiting(&rig);
+            rig.pass();
+            rig.pass();
+            assert_eq!(listed_waiting(&rig), listed, "{:?}", rig.hub.calls());
+            assert!(held_up(&rig).is_empty());
+        }
+
+        #[test]
+        fn a_cut_listing_that_lacks_the_issue_releases_nothing() {
+            let mut rig = Rig::new();
+            finished_waiting(&rig, 500, 1, State::Stuck);
+            rig.hub.issue(500, &["factory:stuck"]);
+            rig.pass();
+            assert_eq!(held_up(&rig).len(), 1);
+            // More than a listing holds, all before issue 500: it is cut off before it.
+            for issue in 1..=201 {
+                rig.hub.issue(issue, &["factory:stuck"]);
+            }
+            rig.pass();
+            assert_eq!(held_up(&rig).len(), 1, "a cut listing is no evidence");
+            for issue in 1..=201 {
+                rig.hub.edit(issue, |i| i.labels = vec![]);
+            }
+            rig.pass();
+            assert_eq!(held_up(&rig).len(), 1, "the label is still on issue 500");
+        }
+
+        #[test]
         fn a_listing_that_fails_does_not_end_the_pass_and_keeps_what_the_last_pass_held_up() {
             let mut rig = Rig::new();
             let run = finished_waiting(&rig, 3, 1, State::Stuck);
