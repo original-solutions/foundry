@@ -10,6 +10,8 @@ import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { TerminalMenu } from "./TerminalMenu";
 import { readStored, store } from "./storage";
 import { ProjectFace } from "./ProjectFace";
+import { branchOf } from "./fleet";
+import { FactoryMark } from "./FactoryMark";
 
 /** Whether the board draws its workspaces as cards or as a list of one line each, kept for this browser. */
 export type Layout = "cards" | "list";
@@ -104,6 +106,7 @@ export function WorkspaceLine({ card, showMachine, onChanges, arrived = false }:
               workspace.name
             )}
           </h3>
+          {workspace.factory && <FactoryMark run={workspace.factory} />}
           {showMachine && (
             <span className="shrink-0 text-[11px] text-neutral-500" title={`Runs on ${machine.id}`}>
               {machine.name}
@@ -113,7 +116,7 @@ export function WorkspaceLine({ card, showMachine, onChanges, arrived = false }:
         <span className="flex min-w-0 items-center gap-1.5 font-mono text-[11px] text-neutral-500">
           <ProjectFace project={workspace.project} className="size-3.5 text-[7px]" />
           <span className="truncate">
-            {workspace.project} · {workspace.branch}
+            {workspace.project} · {branchOf(workspace)}
           </span>
         </span>
       </span>

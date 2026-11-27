@@ -11,8 +11,9 @@ import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
 import { ShipLine, shippingQuery } from "./Shipping";
 import { splitPath, totals } from "./changes";
-import type { MachineView } from "./fleet";
+import { branchOf, type MachineView } from "./fleet";
 import type { Project } from "./api";
+import { FactoryMark } from "./FactoryMark";
 import { Composer, useCreateWorkspace } from "./Composer";
 import { plural, words, type Glyph } from "./labels";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
@@ -353,6 +354,7 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
               workspace.name
             )}
           </h3>
+          {workspace.factory && <FactoryMark run={workspace.factory} />}
           {showMachine && (
             <span className="shrink-0 text-xs text-neutral-500" title={`Runs on ${machine.id}`}>
               {machine.name}
@@ -375,7 +377,7 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
         <p className="flex min-w-0 items-center gap-1.5 font-mono text-xs text-neutral-500">
           <ProjectFace project={workspace.project} />
           <span className="truncate">
-            {workspace.project} · {workspace.branch}
+            {workspace.project} · {branchOf(workspace)}
           </span>
         </p>
       </header>
