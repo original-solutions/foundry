@@ -63,7 +63,8 @@ function rowSays(row: Row, machine: MachineView | undefined): { text: string; to
  * The release waiting on the fleet, in the page's top bar: each waiting tag and how many listed
  * machines wait on it. It opens a checklist that installs the tag shown for each machine ticked,
  * the machine serving the page (`here`) last, so its restart cuts off no other call. One batch is
- * out at a time, and none goes once the serving machine has answered that it restarts. What the
+ * out at a time, and none goes while the serving machine restarts: from its 202 until its sample
+ * runs or refused the tag. What the
  * checklist sent lives only here, until it closes or the page reloads; a batch keeps going when
  * its checklist closes. Nothing shows while no listed machine has a release waiting and the
  * checklist is closed.
@@ -74,8 +75,8 @@ export function UpdateBadge({ machines, here }: { machines: MachineView[]; here:
   const [rows, setRows] = useState<Row[]>();
   /** A batch is out, from this checklist or one closed since: no other may start, so none is cut off by the serving machine's restart. */
   const [busy, setBusy] = useState(false);
-  /** The serving machine answered 202: it restarts, and the page reloads when it is back. */
-  const [restarting, setRestarting] = useState(false);
+  /** The tag the serving machine answered 202 for: it restarts, until its sample runs or refused that tag. */
+  const [restartingTo, setRestartingTo] = useState<string>();
 
   const waiting = machines.flatMap((m) => (m.listed && m.sample?.update_ready ? [{ machine: m, tag: m.sample.update_ready }] : []));
   if (waiting.length === 0 && !open) return null;
@@ -112,11 +113,13 @@ export function UpdateBadge({ machines, here }: { machines: MachineView[]; here:
     if (last) {
       settle(last.id, { kind: "out" });
       const call = await send(last);
-      if (call.kind === "answered" && call.status === 202) setRestarting(true);
+      if (call.kind === "answered" && call.status === 202) setRestartingTo(last.tag);
     }
     setBusy(false);
   };
-  const held = restarting ? "This machine is restarting on the new release. The page reloads when it is back." : busy ? "The last install is still out. Install again once it has answered." : undefined;
+  const served = machines.find((m) => m.id === here)?.sample;
+  const restarting = restartingTo !== undefined && !runs(served?.version, restartingTo) && served?.update_refused !== restartingTo;
+  const held = restarting ? "This machine is restarting on the new release. Install again once it is back." : busy ? "The last install is still out. Install again once it has answered." : undefined;
 
   const trigger = (
     <button
