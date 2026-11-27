@@ -2960,6 +2960,35 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_install_swaps_the_new_version_in_only_while_it_holds_the_lock() {
+        let home = installed_home();
+        let path = home.path().to_path_buf();
+        let held = lock(home.path()).unwrap();
+        let hand = std::thread::spawn(move || {
+            place_version(
+                &path,
+                "0.3.0",
+                |stage| {
+                    release(stage, "0.3.0");
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert!(!home.path().join("versions/0.3.0").exists());
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+
+        drop(held);
+        hand.join().unwrap();
+
+        assert!(home.path().join("versions/0.3.0/foundryd").is_file());
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.3.0"));
+    }
+
+    #[test]
     fn every_change_to_the_update_state_waits_for_the_lock() {
         let home = trial_home();
         let path = home.path().to_path_buf();
