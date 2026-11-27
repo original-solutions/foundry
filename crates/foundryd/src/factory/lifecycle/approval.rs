@@ -105,7 +105,7 @@ mod tests {
     const FILE_A_NEW_ISSUE: &str = "The issue's edit history is too long for the factory to check. File a new issue with the final text and apply `factory:ready` to it.";
     const CANNOT_READ_BACK_TO_LABEL: &str =
         "the factory could not read the issue's history back to when factory:ready was applied";
-    const RELABEL: &str = "The issue's recent history is too long for the factory to check from the label. Apply `factory:ready` again.";
+    const RELABEL: &str = "The issue's recent history is too long for the factory to check from the label. Review the issue text, then apply `factory:ready` again.";
 
     fn cases() -> Vec<(Refusal, &'static str, &'static str)> {
         vec![
@@ -215,7 +215,7 @@ mod tests {
             unapproved_comment(&Refusal::TimelineShortOfLabel {
                 labeled_at: AT.into()
             }),
-            "The factory did not start on this issue and has moved it back to `factory:proposed`.\n\nReason: the factory could not read the issue's history back to when factory:ready was applied\n\nThe issue's recent history is too long for the factory to check from the label. Apply `factory:ready` again."
+            "The factory did not start on this issue and has moved it back to `factory:proposed`.\n\nReason: the factory could not read the issue's history back to when factory:ready was applied\n\nThe issue's recent history is too long for the factory to check from the label. Review the issue text, then apply `factory:ready` again."
         );
     }
 
