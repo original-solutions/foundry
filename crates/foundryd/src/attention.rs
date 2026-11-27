@@ -1208,6 +1208,7 @@ mod tests {
                 terminal,
                 model: "opus".into(),
                 state,
+                name: None,
             };
             self.put_session(owner, body.clone(), false);
             body
@@ -2528,6 +2529,7 @@ mod tests {
             terminal: TerminalId::random(),
             model: "opus".into(),
             state: SessionState::Working,
+            name: None,
         };
         world.put_session(me, session.clone(), false);
         assert_eq!(world.of(Kind::SetupFailed).len(), 1);
@@ -2911,6 +2913,7 @@ mod tests {
                 terminal: TerminalId::random(),
                 model: "opus".into(),
                 state: SessionState::Stuck,
+                name: None,
             },
         });
         {
@@ -2946,6 +2949,7 @@ mod tests {
             terminal: TerminalId::random(),
             model: "opus".into(),
             state: SessionState::Stuck,
+            name: None,
         };
         let record = AnyRecord::Session(Record {
             owner: me,

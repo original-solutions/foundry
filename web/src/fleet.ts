@@ -1,6 +1,6 @@
 import type { AnyRecord, FactoryStatus, HeldUp, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
 import { issueUrl, parseRun } from "./factory";
-import { busy, plural, sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, urgency, type Glyph } from "./labels";
+import { busy, needsYou, plural, sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, urgency, type Glyph } from "./labels";
 
 export interface FleetState {
   records: AnyRecord[];
@@ -67,7 +67,7 @@ export interface SessionView {
   name: string;
   state: SessionState;
   terminal: string;
-  /** Its first prompt, when this machine's daemon has its brief. */
+  /** The name it was given, on any machine, else its first prompt, when this machine's daemon has its brief. */
   title?: string;
   /** The newest step of its turn. */
   now?: Step;
@@ -163,7 +163,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
   // running terminal's record is written when it opens and again only when it exits, so its
   // version keeps the order terminals opened in across reloads.
   const opened = new Map<string, number>();
-  const liveSessions: { id: string; workspace: string; model: string; state: SessionState; terminal: string }[] = [];
+  const liveSessions: { id: string; workspace: string; model: string; state: SessionState; terminal: string; name?: string | null }[] = [];
   const liveTerminals: { workspace: string; view: Omit<ShellView, "name"> }[] = [];
   const workspacesByOwner = new Map<string, { id: string; name: string; branch: string; base: string; project: string; projectId: string }[]>();
 
@@ -270,7 +270,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
           name: sessionNames[i],
           state: s.state,
           terminal: s.terminal,
-          title: briefs[s.id]?.title ?? undefined,
+          title: s.name || (briefs[s.id]?.title ?? undefined),
           now: briefs[s.id]?.now ?? undefined,
           said: briefs[s.id]?.said,
         })),
@@ -318,6 +318,13 @@ export function factoryRuns(statuses: Record<string, FactoryStatus> | undefined)
 export const tendedByFactory = (run: FactoryRun | undefined): boolean => run !== undefined && !run.held;
 
 /**
+ * Whether a terminal showing `glyph` in a workspace of factory run `run` needs you: it waits, is
+ * stuck or failed, and no live run tends it. Every view that counts, sorts or raises what needs you
+ * asks here, so they all agree with the board.
+ */
+export const needsYouIn = (glyph: Glyph, run: FactoryRun | undefined): boolean => needsYou.includes(glyph) && !tendedByFactory(run);
+
+/**
  * The fleet with each workspace a believed status names marked with its factory run, so every
  * view that lists its terminals (`rows`) reads them the same way. Without statuses, the fleet as is.
  */
@@ -345,7 +352,7 @@ export interface Located {
   /** The session it runs, when it is a session's terminal. */
   session?: string;
   name: string;
-  /** A session's first prompt. */
+  /** A session's name, else its first prompt. */
   title?: string;
   label: string;
   glyph: Glyph;
@@ -377,7 +384,7 @@ export interface Row {
   /** The session it runs, when it is a session's terminal. */
   session?: string;
   name: string;
-  /** A session's first prompt, which tells two sessions of one model apart. */
+  /** A session's name, else its first prompt, which tells two sessions of one model apart. */
   title?: string;
   /** What a session is doing, only while it is `busy`: in the middle of a turn. */
   now?: Step;

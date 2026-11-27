@@ -35,14 +35,14 @@ export function session(
   workspaceId: string,
   terminalId: string,
   state: SessionState = "idle",
-  extra: { model?: string; deleted?: boolean; version?: number } = {},
+  extra: { model?: string; deleted?: boolean; version?: number; name?: string } = {},
 ): AnyRecord {
   return {
     kind: "session",
     owner,
     version: extra.version ?? 1,
     deleted: extra.deleted ?? false,
-    body: { id, workspace: workspaceId, terminal: terminalId, model: extra.model ?? "opus", state },
+    body: { id, workspace: workspaceId, terminal: terminalId, model: extra.model ?? "opus", state, ...(extra.name === undefined ? {} : { name: extra.name }) },
   };
 }
 

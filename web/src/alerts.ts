@@ -1,5 +1,5 @@
 import type { SessionState } from "./api";
-import { byUrgency, rows, tendedByFactory, type MachineView } from "./fleet";
+import { byUrgency, needsYouIn, rows, tendedByFactory, type MachineView } from "./fleet";
 import { needsYou, sessionGlyph, type Glyph } from "./labels";
 import { shapes } from "./StateGlyph";
 
@@ -42,7 +42,7 @@ export function alertsFor(before: Seen | undefined, machines: MachineView[]): { 
       if (!before) continue;
       const was = before.get(s.id);
       if (was?.state === s.state && was.tended === tended) continue;
-      const phrase = was?.state === "working" && s.state === "idle" ? "finished its turn" : tended ? undefined : says[s.state];
+      const phrase = was?.state === "working" && s.state === "idle" ? "finished its turn" : needsYouIn(sessionGlyph[s.state], workspace.factory) ? says[s.state] : undefined;
       if (phrase) alerts.push({ terminal: s.terminal, tag: s.id, glyph: sessionGlyph[s.state], title: workspace.name, body: `${s.name} ${phrase}` });
     }
   }
@@ -58,7 +58,8 @@ export interface Pulse {
 
 /** The fleet's pulse. A live factory run's terminals that would need you are left out, as the board leaves its card under working. */
 export function pulse(machines: MachineView[]): Pulse {
-  const all = machines.flatMap((m) => m.workspaces.flatMap((w) => (tendedByFactory(w.factory) ? rows(w).filter((r) => !needsYou.includes(r.glyph)) : rows(w))));
+  // What would need you but a live factory run tends is left out of the count and the glyph alike.
+  const all = machines.flatMap((m) => m.workspaces.flatMap((w) => rows(w).filter((r) => needsYouIn(r.glyph, w.factory) || !needsYou.includes(r.glyph))));
   const count = (...glyphs: Glyph[]) => all.filter((r) => glyphs.includes(r.glyph)).length;
   return { glyph: byUrgency(all)[0]?.glyph, needYou: count(...needsYou), working: count("working") };
 }

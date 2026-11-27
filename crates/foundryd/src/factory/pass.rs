@@ -3420,6 +3420,7 @@ mod tests {
                         terminal: TerminalId(uuid::Uuid::from_u128(0x57)),
                         model: "opus".into(),
                         state: SessionState::Idle,
+                        name: None,
                     },
                 })
                 .turn(SessionTurn {

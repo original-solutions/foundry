@@ -18,7 +18,7 @@ Type the task in the box. Write it the way you would tell a colleague. As you ty
 
 Under the box, from left to right:
 
-- **Project.** One button per project. The first one is picked. Pick the repo the task belongs to. **Projects** next to them opens the project list, described below.
+- **Project.** One button per project, with its face: the two letters and colour its workspaces carry everywhere. The first one is picked. Pick the repo the task belongs to. **Projects** next to them opens the project list, described below.
 - **from.** The base branch the new branch starts from. It starts as `main`.
 - **with.** The model Claude Code runs on. It starts as `opus`. Type another, or pick one from the suggestions: `opus`, `sonnet` and any model a session already runs.
 - **on.** Only appears when the fleet has other machines. Choose **this machine**, **let Foundry choose**, or a machine by name. An offline machine is listed but cannot be picked. With no other machine, the line just says "on this machine".
@@ -29,6 +29,15 @@ The **Workspace** field under the box holds the name. Leave it empty to use the 
 The task is optional. With a name and no task, Foundry makes the workspace and starts Claude with nothing to do yet.
 
 Below the box, the screen explains the three states every session shows: **Working**, **Needs you** and **Ready**. The board, the sidebar, the tab icon and every notification use them. [Session states](sessions.md#session-states) says what each one means and what to do.
+
+### With no project yet
+
+A new fleet has no projects, so the first-run screen starts one step earlier: **Two steps to Claude at work**.
+
+1. **Which repo should Claude work in?** Paste the repo's address, such as `git@github.com:you/shop.git`. Foundry names the project from it (`shop`) and shows the name in the **named** field; type over it to choose another. Press **Add** or `Enter`. If the daemon refuses, a red line says why and what you typed stays.
+2. **What should Claude work on?** Once the project arrives, step 1 gets a tick with the project's face and repo, and the task box opens here with your cursor in it and the new project picked. From here it works as described above.
+
+To add more projects later, use **Projects** in the task box.
 
 ## After you press Start
 
@@ -56,6 +65,17 @@ Once the first workspace exists, there are three ways to start a task. All three
 
 The dialog opens over whatever you were looking at. **Start** closes it and takes you to the new session. If the daemon has something to say about the workspace's setup, the dialog stays open with the message and a **Close** button. `Esc` closes it without starting anything.
 
+## Start several tasks at once
+
+Write the tasks as a list, one item per line, each starting with `-`, `*` or a number. Indent a line to keep it with the item above it. The box then shows **Split into 3 tasks** (with your count) under it.
+
+- Press it and the box lists the workspace and branch each item makes. **Start 3** makes them one after another, each with Claude at work on its item, in the project, base, model and machine you picked.
+- You stay where you are. The new workspaces show up on the board and in the sidebar as they start.
+- An item's name is numbered as a single task's is, so a branch the repo already has does not stop it.
+- If one cannot be made, the others start all the same. The box keeps that item and says why.
+- If you close the box or leave the page before the last one starts and one of them did not start cleanly, the amber card at the top right says which and why, until you press **Dismiss**. When all of them started, no card shows.
+- Press **Split into 3 tasks** again to make one workspace with the whole list as its task.
+
 ## Projects
 
 A project is a repo and a name, shared by every machine in the fleet. A machine clones the repo the first time it hosts a workspace for that project.
@@ -68,7 +88,7 @@ A project is a repo and a name, shared by every machine in the fleet. A machine 
 - **Remove a project.** Press **Remove** beside it, then **Remove from every machine** to confirm. **Cancel** backs out. Foundry refuses while a live workspace made from the project exists, and says so beside the project.
 - **Close** leaves the dialog and clears anything half typed.
 
-With no projects at all, the task box says "No projects yet" and offers **Add a project**.
+With no projects at all, the first-run screen asks for a repo first (see [With no project yet](#with-no-project-yet)), and the New task dialog says "No projects yet" and offers **Add a project**.
 
 Each project row also has the factory controls: a switch, the GitHub login it acts as, and a pause. They are covered in [The factory](factory.md).
 

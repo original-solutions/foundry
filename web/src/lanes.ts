@@ -1,5 +1,5 @@
 import type { Changes } from "./api";
-import { byUrgency, rows, type FactoryRun, type MachineView, type Row, type WorkspaceView } from "./fleet";
+import { byUrgency, needsYouIn, rows, type FactoryRun, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { addsSteps, needsYou, urgency, type Glyph } from "./labels";
 
 /** Where a workspace sits on the board: it needs a person, it is busy, or nothing is happening. */
@@ -15,16 +15,17 @@ export interface Card {
 }
 
 
-const laneOf = (glyph: Glyph | undefined): Lane => (glyph === undefined ? "quiet" : needsYou.includes(glyph) ? "needs" : addsSteps.includes(glyph) ? "working" : "quiet");
-
 /**
- * A factory run's lane: only the run's own state puts it under needs you, when it is stuck or
- * needs info. A live run whose terminals would need a person works, since the factory tends them.
+ * A card's lane by its most urgent terminal, in factory run `run` if it is one's. A held-up run is
+ * under needs you whatever its terminals show: only the run's own state moves a factory card there.
+ * A terminal that needs you (`needsYouIn`) puts it there too; one a live run tends instead works,
+ * with the busy ones. The rest are quiet.
  */
-const factoryLane = (run: FactoryRun, glyph: Glyph | undefined): Lane => {
-  if (run.held) return "needs";
-  const lane = laneOf(glyph);
-  return lane === "needs" ? "working" : lane;
+const laneOf = (glyph: Glyph | undefined, run: FactoryRun | undefined): Lane => {
+  if (run?.held) return "needs";
+  if (glyph === undefined) return "quiet";
+  if (needsYouIn(glyph, run)) return "needs";
+  return needsYou.includes(glyph) || addsSteps.includes(glyph) ? "working" : "quiet";
 };
 
 const rank = (card: Card) => (card.lead ? urgency.indexOf(card.lead.glyph) : urgency.length);
@@ -32,16 +33,15 @@ const rank = (card: Card) => (card.lead ? urgency.indexOf(card.lead.glyph) : urg
 /**
  * Every workspace in the fleet as a card, in lanes by its most urgent terminal: the ones that need
  * a person, the ones working, and the quiet rest. A factory run's workspace (`withFactory`) goes by
- * its run, which decides whether it needs you (`factoryLane`). Within a lane the most urgent comes
+ * its run, which decides whether it needs you (`laneOf`). Within a lane the most urgent comes
  * first; ties keep the sidebar's order. Empty lanes are left out.
  */
 export function lanes(machines: MachineView[]): { lane: Lane; cards: Card[] }[] {
   const cards = machines.flatMap((machine) =>
     machine.workspaces.map((workspace) => {
-      const { factory } = workspace;
       const sorted = byUrgency(rows(workspace));
       const card: Card = { workspace, machine, rows: sorted, lead: sorted[0] };
-      return { card, lane: factory ? factoryLane(factory, card.lead?.glyph) : laneOf(card.lead?.glyph) };
+      return { card, lane: laneOf(card.lead?.glyph, workspace.factory) };
     }),
   );
   return (["needs", "working", "quiet"] as const)

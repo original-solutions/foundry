@@ -109,6 +109,31 @@ export function Peek({ at, machines }: { at: Destination | undefined; machines: 
       </Shell>
     );
   }
+  if (at.kind === "command") {
+    const c = at.command;
+    return (
+      <Shell label={`Preview of ${c.title}`}>
+        <header className="space-y-1.5">
+          <p className="text-[11px] font-medium tracking-wide text-neutral-500 uppercase">{c.group}</p>
+          <h3 className="flex items-center gap-2 text-base font-semibold text-neutral-50 [&_svg]:size-4">
+            {c.icon}
+            {c.title}
+          </h3>
+        </header>
+        <p className="text-xs leading-5 text-neutral-400">{c.about}</p>
+        {(c.hint || c.keys) && (
+          <p className="flex items-center gap-2 text-xs text-neutral-500">
+            {c.hint && <span className="text-neutral-300">{c.hint}</span>}
+            {c.keys && (
+              <span>
+                From anywhere: <kbd className="rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] text-neutral-300">{c.keys}</kbd>
+              </span>
+            )}
+          </p>
+        )}
+      </Shell>
+    );
+  }
   return (
     <Shell label={`Preview of ${at.title}`}>
       <p className="text-sm text-neutral-200">{at.title}</p>

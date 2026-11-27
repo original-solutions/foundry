@@ -1,6 +1,6 @@
 import type { AnyRecord, Mark } from "./api";
-import { rows, tendedByFactory, type MachineView, type Row } from "./fleet";
-import { needsYou, urgency } from "./labels";
+import { needsYouIn, rows, type MachineView, type Row } from "./fleet";
+import { urgency } from "./labels";
 import { turns } from "./trail";
 import { readStoredJson, storeJson, unstore } from "./storage";
 
@@ -45,12 +45,11 @@ export function moved(left: Left, records: AnyRecord[], machines: MachineView[])
   const version = new Map(records.flatMap((r) => (r.kind === "session" && !r.deleted ? [[r.body.id, r.version] as const] : [])));
   const all = machines.flatMap((m) =>
     m.workspaces.flatMap((w) => {
-      const tended = tendedByFactory(w.factory);
       return rows(w).flatMap((row) => {
         if (!row.session) return [];
         const before = left.versions[row.session];
         const changed = before === undefined || (version.get(row.session) ?? 0) > before;
-        const needs = !tended && needsYou.includes(row.glyph);
+        const needs = needsYouIn(row.glyph, w.factory);
         if (!changed && !needs) return [];
         return [{ row: { ...row, session: row.session }, workspace: w.name, changed, fresh: before === undefined, needs }];
       });
