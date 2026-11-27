@@ -59,6 +59,12 @@ struct Held {
 pub fn router(api: Api, home: PathBuf, stop: Stop) -> Router {
     // A program that cannot be found is not run from `current`, which the install refuses.
     let exe = std::env::current_exe().unwrap_or_default();
+    router_running(api, home, stop, exe)
+}
+
+/// [`router`] for a daemon that runs the program `exe`, so a fleet test, whose daemons share
+/// one process, can serve a machine whose install is accepted.
+pub fn router_running(api: Api, home: PathBuf, stop: Stop, exe: PathBuf) -> Router {
     routes(Held {
         me: api.peers.me(),
         home,
@@ -120,10 +126,7 @@ async fn install(
             installed
         }
     });
-    let installed = match installing.await {
-        Ok(installed) => installed,
-        Err(stopped) => Err(stopped),
-    };
+    let installed = installing.await.flatten();
     match installed {
         Ok(Ok(())) => {
             if headers.contains_key(CARRIED) {
