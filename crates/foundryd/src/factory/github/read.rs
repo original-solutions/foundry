@@ -1349,8 +1349,9 @@ pub fn text_changes_since(
 /// Whether the factory may build the issue: an instructor (only ever a `User`) applied the
 /// `ready` label in force now, and every body edit and title rename from that second on was an
 /// instructor's. Only the newest timeline page is read: it holds the label in force and all
-/// after it, and a full page without it is `label-history-incomplete`. Label names match
-/// exactly; times compare as text.
+/// after it, a full page without it is `label-history-incomplete`, and a page that may hide a
+/// rename in the label's second leaves the text unjudged. Label names match exactly; times
+/// compare as text.
 pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]) -> Approval {
     let mut in_force: Option<&LabelChange> = None;
     for event in &issue.timeline_items.nodes {
@@ -1364,8 +1365,9 @@ pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]
             _ => {}
         }
     }
-    // The label is on the page, so the renames at or after it are too.
-    judge_chosen_label(issue, in_force, instructors, true)
+    // The page may be cut off just after the label, hiding a rename in its second.
+    let reaches = in_force.is_some_and(|label| timeline_reaches(issue, &label.created_at));
+    judge_chosen_label(issue, in_force, instructors, reaches)
 }
 
 /// The approval a claim was made on, judged after the claim removed `ready`: [`judge_approval`]'s
