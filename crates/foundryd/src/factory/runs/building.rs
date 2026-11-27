@@ -11,7 +11,12 @@
 //! A turn is acted on once. The last line written for a turn that leaves the run going is the
 //! step `turn-read <n>` ([`TURN_READ`]); every write before it carries its own marker, so a
 //! pass cut short repeats nothing. A session that idles through a gate has its newest turn
-//! read already and is sent nothing.
+//! read already and is sent nothing. A session idle with no turn ended may not have taken its
+//! launch: when that launch is `start`'s (no interruption, and no feedback round owns the run),
+//! `start`'s check of a launched session runs then ([`BuildStep::Launch`]), which asks for the
+//! launch again by count, since the label moved to `building` with the start and the pass no
+//! longer routes the run to `start`. Once the worker has refused it because the count rose
+//! ([`start::LAUNCH_TAKEN`]), the launch was typed and is not asked for again.
 //!
 //! Where it differs from the runner:
 //!
@@ -97,10 +102,12 @@ use foundry_proto::factory::{RunId, SessionTurn};
 use foundry_proto::ids::SessionId;
 use foundry_proto::state::SessionState;
 
+use super::feedback;
 use super::progress::{
     RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, SendTries, TIME_LIMIT as TIME_LIMIT_CODE,
     TURN_READ, pending_relaunch, read_progress,
 };
+use super::start::{self, StartStep};
 use super::{
     ActionPayload, Closing, Progress, RunContext, RunError, Stop, StuckStop, abandon,
     apply_actions, closed_issue, end_own_merge, end_run, finish_building, go_stuck, pending_send,
@@ -161,6 +168,10 @@ pub enum BuildStep {
     /// The run's pull request was merged or closed (or its own merge closed the issue): the run
     /// is ended.
     Ended,
+    /// No turn ended and the session's launch is `start`'s: what `start`'s check of a launched
+    /// session did, which asks for the launch again by count when the session has not taken it
+    /// (the spec's step 3).
+    Launch(StartStep),
 }
 
 /// What [`time_limit`] decided.
@@ -275,7 +286,19 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
                 Some(turn) => step.act(&mut at, &turn),
                 // The newest turn was read already.
                 None if turn.as_ref().is_some_and(|turn| turn.turn > 0) => Ok(step.read_already()),
-                // No turn ended yet: the launch is `start`'s to send again.
+                // No turn ended yet. The label moved to `building` with the start, so the
+                // launch the session may not have taken is asked for again here with `start`'s
+                // check (the spec's step 3), which decides by the session's count. Only
+                // `start`'s own launch: a run that has had an interruption is `resume`'s, and a
+                // session a feedback round launched is the round's, each with its own words.
+                // `start`'s check asks no more once the worker has refused the launch because
+                // the count rose. This pass's guards and reads stand: none of `start`'s own pass
+                // is run again. Each ask comes a full pass after the send before it and the
+                // worker decides, as the spec's step 3 says; P1 documents that a line typed and
+                // not yet counted can still be typed twice (`SendRefused::Failed`).
+                None if seen.interruption.is_none() && !feedback::round_owns(&events) => Ok(
+                    BuildStep::Launch(start::launched(ctx, run, &seen, &events, &mut at)?),
+                ),
                 None => Ok(BuildStep::Running),
             }
         }
@@ -1027,6 +1050,8 @@ mod tests {
     use foundry_proto::record::{Record, Session};
     use foundry_proto::state::SessionState;
 
+    use super::super::progress::LAUNCH_RESENDING;
+    use super::super::start::{LAUNCH_RESENT, LAUNCH_TAKEN};
     use super::super::testing::*;
     use super::*;
     use crate::factory::github::{Hiding, Tracker, TrackerError};
@@ -1040,7 +1065,7 @@ mod tests {
         self, SESSION_GONE, TIME_LIMIT, WRONG_ACCOUNT, WorkLeft, reminder,
     };
     use crate::factory::worker::{Call, FleetView, WorkerError};
-    use crate::sessions::factory::{FactoryStart, SendRefused};
+    use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
     use crate::sessions::turns::TurnText;
 
     const SESSION: &str = "00000000-0000-0000-0000-0000000005e5";
@@ -5102,10 +5127,200 @@ mod tests {
             assert!(matches!(error, RunError::Invalid(_)), "{error}");
         }
 
+        /// The launch the session was started with, which `start` asks for again.
+        fn launch_sent_again() -> Call {
+            Call::Send {
+                session: session(),
+                message: messages::launch(REPO, ISSUE, LOGIN, None, BODY_PATH),
+                only_if_prompts: Some(0),
+            }
+        }
+
+        /// The spec's step 3: a building session idle with no turn ended has not taken its
+        /// launch (a daemon restart lost it before it was typed), and `start` asks for it
+        /// again by count, though the label moved to `building` with the start. Each send the
+        /// worker takes has its own lines: a view still behind a pass later asks again, and the
+        /// ledger shows both.
         #[test]
-        fn a_session_with_no_turn_ended_yet_is_left_to_start() {
+        fn a_session_that_has_not_taken_its_launch_is_asked_for_it_again_by_count() {
             let (mut rig, run) = built();
             show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Ok(0));
+            rig.worker.on_send(Ok(0));
+            let before = rig.events(&run).len();
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Resent { session: session() })
+            );
+            assert_eq!(sends(&rig), vec![launch_sent_again()]);
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [format!("{LAUNCH_RESENDING}0"), format!("{LAUNCH_RESENT}0")]
+            );
+            assert_eq!(rig.sim.labels(), ["factory:building"]);
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Resent { session: session() })
+            );
+            assert_eq!(sends(&rig), vec![launch_sent_again(), launch_sent_again()]);
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [
+                    format!("{LAUNCH_RESENDING}0"),
+                    format!("{LAUNCH_RESENT}0"),
+                    format!("{LAUNCH_RESENDING}0"),
+                    format!("{LAUNCH_RESENT}0"),
+                ]
+            );
+        }
+
+        /// The worker decides: a launch whose count rose was typed, and nothing more is sent.
+        /// The spec's step 3 sends a message again only when it never became a prompt, so the
+        /// refusal is recorded and no later pass asks again, though the turn's record is still
+        /// late and the session still shows idle with no turn ended.
+        #[test]
+        fn a_launch_the_worker_refuses_with_its_count_risen_is_typed_once() {
+            let (mut rig, run) = built();
+            show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Err(SendRefused::CountRose { now: 1 }));
+            let before = rig.events(&run).len();
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Started { session: session() })
+            );
+            assert_eq!(sends(&rig), vec![launch_sent_again()]);
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [format!("{LAUNCH_RESENDING}0"), format!("{LAUNCH_TAKEN}1")]
+            );
+            let events = rig.events(&run).len();
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Started { session: session() })
+            );
+            assert_eq!(sends(&rig), vec![launch_sent_again()]);
+            assert_eq!(rig.events(&run).len(), events);
+        }
+
+        /// The worker finds the session busy after all: nothing was typed, the run goes on, and
+        /// the next pass looks again. Asks in a row that the worker refuses keep one
+        /// `launch-resending` line, so a view that stays behind the worker's does not grow the
+        /// ledger by a line a pass.
+        #[test]
+        fn a_launch_the_worker_refuses_as_not_idle_leaves_the_run_going() {
+            let (mut rig, run) = built();
+            show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Err(SendRefused::NotIdle));
+            rig.worker.on_send(Err(SendRefused::NotIdle));
+            let before = rig.events(&run).len();
+            for _ in 0..2 {
+                assert_eq!(
+                    pass(&rig, &run),
+                    BuildStep::Launch(StartStep::Started { session: session() })
+                );
+            }
+            assert_eq!(sends(&rig), vec![launch_sent_again(), launch_sent_again()]);
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [format!("{LAUNCH_RESENDING}0")]
+            );
+            assert_eq!(rig.sim.labels(), ["factory:building"]);
+        }
+
+        /// A send that fails otherwise is the pass's error, as a reminder's is: the step is
+        /// written before the send, and the next pass asks again under the same count, with
+        /// no second line for it.
+        #[test]
+        fn a_launch_whose_send_fails_is_the_passs_error_and_asked_again_next_pass() {
+            let (mut rig, run) = built();
+            show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Err(SendRefused::Failed {
+                reason: "the terminal gave an error".into(),
+                prompts: Some(0),
+            }));
+            let before = rig.events(&run).len();
+            let error = advance(&rig.ctx(), &run).unwrap_err();
+            assert!(
+                matches!(error, RunError::Send(SendRefused::Failed { .. })),
+                "{error}"
+            );
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [format!("{LAUNCH_RESENDING}0")]
+            );
+            rig.worker.on_send(Ok(0));
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Resent { session: session() })
+            );
+            assert_eq!(sends(&rig), vec![launch_sent_again(), launch_sent_again()]);
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [format!("{LAUNCH_RESENDING}0"), format!("{LAUNCH_RESENT}0")]
+            );
+        }
+
+        /// The launch is asked for with this pass's own reads: `start`'s pass, with its second
+        /// read of the issue and its own checks, is not run again from here.
+        #[test]
+        fn a_launch_asked_for_again_reads_github_no_more_than_a_pass_that_sends_nothing() {
+            let (mut rig, run) = built();
+            show(&mut rig, SessionState::Working, 0, 0);
+            let from = rig.sim.calls().len();
+            assert_eq!(pass(&rig, &run), BuildStep::Running);
+            let quiet = rig.sim.calls()[from..].to_vec();
+            show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Ok(0));
+            let from = rig.sim.calls().len();
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Resent { session: session() })
+            );
+            assert_eq!(rig.sim.calls()[from..].to_vec(), quiet);
+        }
+
+        /// A session whose newest launch is a resume is `resume`'s to ask again, with the
+        /// resume's words: the build's launch is not sent to it.
+        #[test]
+        fn a_resumed_session_that_has_not_taken_its_message_is_left_to_resume() {
+            let (mut rig, run) = built();
+            rig.write(
+                &run,
+                Event::SessionInterrupted {
+                    resumes: 1,
+                    relaunch: false,
+                    run_ordinal: Some(1),
+                    branch: Some(BRANCH.into()),
+                    t3_error: None,
+                    ended_in_pass: 1,
+                },
+            );
+            rig.write(&run, launch(Some(BRANCH), Some(BRANCH), Some("main")));
+            show(&mut rig, SessionState::Idle, 0, 0);
+            let events = rig.events(&run).len();
+            assert_eq!(pass(&rig, &run), BuildStep::Running);
+            assert_eq!(calls(&rig), vec![]);
+            assert_eq!(rig.events(&run).len(), events);
+        }
+
+        /// A session a feedback round launched is the round's to ask again, with the round's
+        /// first message: the build's launch typed into it would hide the feedback.
+        #[test]
+        fn a_feedback_rounds_session_that_has_not_taken_its_message_is_left_to_the_round() {
+            let (mut rig, run) = built();
+            let round = || Event::FeedbackRelaunching {
+                n: 1,
+                branch: BRANCH.into(),
+                items: vec!["issue-comment:42".into()],
+                message: "Feedback 1 of 1".into(),
+            };
+            rig.moved(&run, State::Building, State::PrOpen);
+            rig.write(&run, round());
+            rig.moved(&run, State::PrOpen, State::Building);
+            rig.write(&run, round());
+            rig.write(&run, launch(Some(BRANCH), Some(BRANCH), Some("main")));
+            show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Ok(0));
             let events = rig.events(&run).len();
             assert_eq!(pass(&rig, &run), BuildStep::Running);
             assert_eq!(calls(&rig), vec![]);
