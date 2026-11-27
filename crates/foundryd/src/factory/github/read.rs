@@ -1318,6 +1318,15 @@ fn edits_whole_since(issue: &ApprovalIssue, since: &str) -> bool {
         )
 }
 
+/// [`TextCheck`] with `Unjudged` split by the history that is short, so a refusal can name it.
+/// A cut-off edit history wins when the timeline is short too.
+enum TextVerdict {
+    Unchanged,
+    Changed,
+    EditsCut,
+    TimelineShort,
+}
+
 /// Judges every body edit and title rename with time at or after `since`. A moment in the same
 /// second counts as after, because timestamps have no finer order. `reaches` says the renames
 /// on the timeline page cover everything at or after `since`.
@@ -1327,6 +1336,20 @@ pub fn text_changes_since(
     instructors: &[String],
     reaches: bool,
 ) -> TextCheck {
+    match judge_text(issue, since, instructors, reaches) {
+        TextVerdict::Unchanged => TextCheck::Unchanged,
+        TextVerdict::Changed => TextCheck::Changed,
+        TextVerdict::EditsCut | TextVerdict::TimelineShort => TextCheck::Unjudged,
+    }
+}
+
+/// [`text_changes_since`], saying which history left the text unjudged.
+fn judge_text(
+    issue: &ApprovalIssue,
+    since: &str,
+    instructors: &[String],
+    reaches: bool,
+) -> TextVerdict {
     let edit_by_stranger = issue.user_content_edits.nodes.iter().any(|edit| {
         edit.edited_at.as_str() >= since && !is_human_instructor(edit.editor.as_ref(), instructors)
     });
@@ -1338,11 +1361,13 @@ pub fn text_changes_since(
         _ => false,
     });
     if edit_by_stranger || rename_by_stranger {
-        TextCheck::Changed
-    } else if edits_whole_since(issue, since) && reaches {
-        TextCheck::Unchanged
+        TextVerdict::Changed
+    } else if !edits_whole_since(issue, since) {
+        TextVerdict::EditsCut
+    } else if !reaches {
+        TextVerdict::TimelineShort
     } else {
-        TextCheck::Unjudged
+        TextVerdict::Unchanged
     }
 }
 
@@ -1419,7 +1444,8 @@ pub fn judge_claimed_approval(
 /// `label-history-incomplete` on a full page of a longer history and `label-not-found`
 /// otherwise; a label applied by anyone but a human instructor is refused; and every body edit
 /// and title rename from the label's second on must be an instructor's, with a timeline page
-/// that may hide a rename in that second leaving the text unjudged.
+/// that may hide a rename in that second refused as `timeline-short-of-label` (when the body's
+/// edit history is whole) and a cut-off edit history as `edit-history-incomplete`.
 fn judge_chosen_label(
     issue: &ApprovalIssue,
     label: Option<&LabelChange>,
@@ -1446,10 +1472,13 @@ fn judge_chosen_label(
     };
     // The page may be cut off just after the label, hiding a rename in its second.
     let reaches = timeline_reaches(issue, &labeled_at);
-    match text_changes_since(issue, &labeled_at, instructors, reaches) {
-        TextCheck::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
-        TextCheck::Unjudged => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
-        TextCheck::Unchanged => Approval::Approved {
+    match judge_text(issue, &labeled_at, instructors, reaches) {
+        TextVerdict::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
+        TextVerdict::EditsCut => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
+        TextVerdict::TimelineShort => {
+            Approval::Refused(Refusal::TimelineShortOfLabel { labeled_at })
+        }
+        TextVerdict::Unchanged => Approval::Approved {
             labeled_at,
             labeled_by: applied_by.login.clone(),
         },
@@ -4377,6 +4406,12 @@ mod tests {
         }
     }
 
+    fn timeline_short(labeled_at: &str) -> Refusal {
+        Refusal::TimelineShortOfLabel {
+            labeled_at: labeled_at.into(),
+        }
+    }
+
     fn by_non_instructor(by: Option<&str>, labeled_at: &str) -> Refusal {
         Refusal::LabeledByNonInstructor {
             by: by.map(String::from),
@@ -4618,7 +4653,8 @@ mod tests {
 
     #[test]
     fn judge_approval_refuses_a_cut_off_timeline_whose_oldest_event_is_the_label() {
-        // A rename in the label's second could sit on the page before this one.
+        // A rename in the label's second could sit on the page before this one. Applying the
+        // label again puts a newer label on the newest page, so the refusal says so.
         let mut page = vec![labeled(LABELED, "tom", READY)];
         page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
         assert_eq!(
@@ -4627,8 +4663,43 @@ mod tests {
                 READY,
                 &names(&["tom"])
             ),
+            refused(timeline_short(LABELED))
+        );
+    }
+
+    #[test]
+    fn judge_approval_says_the_edit_history_is_cut_when_the_timeline_is_cut_short_too() {
+        // A cut-off edit history keeps its own refusal, even when the timeline is cut short too.
+        let mut page = vec![labeled(LABELED, "tom", READY)];
+        page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        assert_eq!(
+            judge_approval(
+                &issue_of(
+                    page,
+                    &[(AFTER, "tom")],
+                    Some(HISTORY_PAGE as u64 + 5),
+                    Some(150)
+                ),
+                READY,
+                &names(&["tom"])
+            ),
             refused(history_cut(LABELED))
         );
+    }
+
+    #[test]
+    fn both_judges_say_the_edit_history_is_cut_when_its_newest_entry_is_not_the_last_edit() {
+        // Every edit is on the page by count, but the newest entry is not the issue's last edit,
+        // so the edit history is not whole, and its refusal wins over the short timeline.
+        let mut page = vec![labeled(LABELED, "tom", READY)];
+        page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        let mut issue = issue_of(page, &[(AFTER, "tom")], Some(HISTORY_PAGE as u64 + 5), None);
+        issue.last_edited_at = Some(LATER.into());
+        assert_eq!(
+            judge_approval(&issue, READY, &names(&["tom"])),
+            refused(history_cut(LABELED))
+        );
+        assert_eq!(claimed(&issue), refused(history_cut(LABELED)));
     }
 
     #[test]
@@ -4906,13 +4977,32 @@ mod tests {
             )),
             cut
         );
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_a_cut_off_timeline_whose_oldest_event_is_the_label() {
         // A timeline cut off with the label its oldest event shown: a rename in the same
-        // second could be hidden.
+        // second could be hidden, and applying the label again lets the next claim judge it.
         let mut page = vec![labeled(LABELED, "tom", READY)];
         page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
         assert_eq!(
-            claimed(&issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None)),
-            cut
+            claimed(&issue_of(
+                page.clone(),
+                &[],
+                Some(HISTORY_PAGE as u64 + 5),
+                None
+            )),
+            refused(timeline_short(LABELED))
+        );
+        // With the edit history cut off as well, that refusal wins.
+        assert_eq!(
+            claimed(&issue_of(
+                page,
+                &[(AFTER, "tom")],
+                Some(HISTORY_PAGE as u64 + 5),
+                Some(150)
+            )),
+            refused(history_cut(LABELED))
         );
     }
 
@@ -4992,7 +5082,7 @@ mod tests {
         let same_second = issue_of(same_second, &[], Some(HISTORY_PAGE as u64 + 5), None);
         assert_eq!(
             judge_approval(&same_second, READY, &names(&["tom"])),
-            refused(history_cut(LABELED))
+            refused(timeline_short(LABELED))
         );
         cases.push(same_second);
 
@@ -5016,6 +5106,7 @@ mod tests {
             refused(by_non_instructor(None, LABELED)),
             refused(edited_after(LABELED)),
             refused(history_cut(LABELED)),
+            refused(timeline_short(LABELED)),
             Approval::Refused(Refusal::LabelNotFound),
             Approval::Refused(Refusal::LabelHistoryIncomplete),
         ] {
@@ -5031,11 +5122,11 @@ mod tests {
         let oldest = issue_of(oldest, &[], Some(HISTORY_PAGE as u64 + 5), None);
         assert_eq!(
             judge_approval(&oldest, READY, &instructors),
-            refused(history_cut(LABELED))
+            refused(timeline_short(LABELED))
         );
         assert_eq!(
             judge_claimed_approval(&oldest, READY, PROJECT, &instructors),
-            refused(history_cut(LABELED))
+            refused(timeline_short(LABELED))
         );
         cases.push(oldest);
         for issue in &cases {
@@ -5800,7 +5891,10 @@ mod tests {
         let mut oldest = vec![ready_on(LABELED, "tom")];
         oldest.extend(renames_after_label(99));
         let cut = approval_reply(&oldest, 400, None, &creation_only("eve"));
-        assert_eq!(approval_of(&cut, &["tom"]), refused(history_cut(LABELED)));
+        assert_eq!(
+            approval_of(&cut, &["tom"]),
+            refused(timeline_short(LABELED))
+        );
 
         // A stranger's rename on that page is seen.
         let mut with_stranger = events.clone();

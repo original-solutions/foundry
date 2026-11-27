@@ -264,7 +264,8 @@ fn already_said(
     let labeled_at = match refusal {
         Refusal::LabeledByNonInstructor { labeled_at, .. }
         | Refusal::EditedAfterLabel { labeled_at }
-        | Refusal::EditHistoryIncomplete { labeled_at } => Some(labeled_at),
+        | Refusal::EditHistoryIncomplete { labeled_at }
+        | Refusal::TimelineShortOfLabel { labeled_at } => Some(labeled_at),
         Refusal::LabelNotFound | Refusal::LabelHistoryIncomplete => None,
     };
     Ok(match labeled_at {
@@ -2055,6 +2056,45 @@ mod tests {
                 .set_approval(approval_answer("2026-10-04T23:00:00Z", "mallory", &[]));
             claim_it(&rig).unwrap();
             assert_eq!(rig.sim.comments().len(), 2);
+        }
+
+        /// The same for a timeline page cut off at the label's second: its comment asks for the
+        /// label again, and the refusal after that newer label is explained again.
+        #[test]
+        fn a_short_timeline_after_a_newer_label_is_commented_again() {
+            let rig = Rig::new();
+            rig.sim
+                .set_approval(cut_off_at_label("2026-10-04T10:00:00Z"));
+            claim_it(&rig).unwrap();
+            rig.sim.set_labels(&["factory:ready"]);
+            rig.sim
+                .set_approval(cut_off_at_label("2026-10-04T23:00:00Z"));
+            claim_it(&rig).unwrap();
+            let comments = rig.sim.comments();
+            assert_eq!(comments.len(), 2);
+            for comment in comments {
+                assert!(comment.contains("apply `factory:ready` again"), "{comment}");
+                assert!(comment.contains("recent history"), "{comment}");
+            }
+        }
+
+        /// The approval answer for `tom`'s label at `labeled_at`, the oldest event on a full
+        /// timeline page of a longer history, with no body edits.
+        fn cut_off_at_label(labeled_at: &str) -> String {
+            let mut answer: serde_json::Value =
+                serde_json::from_str(&approval_answer(labeled_at, "tom", &[])).unwrap();
+            let timeline = &mut answer["data"]["repository"]["issue"]["timelineItems"];
+            let later = serde_json::json!({
+                "__typename": "LabeledEvent",
+                "createdAt": "2026-10-04T23:30:00Z",
+                "actor": {"__typename": "User", "login": "eve"},
+                "label": {"name": "bug"},
+            });
+            let nodes = timeline["nodes"].as_array_mut().unwrap();
+            nodes.extend((1..crate::factory::github::read::HISTORY_PAGE).map(|_| later.clone()));
+            timeline["totalCount"] =
+                serde_json::json!(crate::factory::github::read::HISTORY_PAGE + 5);
+            answer.to_string()
         }
 
         /// The runner's case "an issue that is assigned, closed or not ready is skipped with
