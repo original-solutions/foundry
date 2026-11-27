@@ -5,6 +5,7 @@
 //! - `POST /api/workspaces/{id}/sessions`, `/shells` and `/archive` for a workspace another
 //!   machine owns.
 //! - `POST /api/terminals/{id}/close` for a terminal another machine owns.
+//! - `POST /api/sessions/{id}/rename` for a session another machine owns.
 //! - `POST /api/machines/{id}/update` for another machine: it installs that machine's ready
 //!   release ([`super::machine_update`]), and goes only on a link that speaks
 //!   [`UPDATES_SINCE`](foundry_proto::messages::UPDATES_SINCE) or later.
@@ -52,6 +53,7 @@ enum Target {
     Create,
     Workspace(WorkspaceId),
     Terminal(TerminalId),
+    Session(SessionId),
     /// A machine's install, which runs on the machine it names.
     Machine(MachineId),
     /// A factory worker route, which only a run carries.
@@ -113,6 +115,7 @@ fn target(path: &str) -> Option<Target> {
             Some(Target::Workspace(WorkspaceId(id.parse().ok()?)))
         }
         ["terminals", id, "close"] => Some(Target::Terminal(TerminalId(id.parse().ok()?))),
+        ["sessions", id, "rename"] => Some(Target::Session(SessionId(id.parse().ok()?))),
         ["machines", id, "update"] => Some(Target::Machine(MachineId(id.parse().ok()?))),
         ["factory", "workspaces"] => Some(Target::Worker(Worker::Create)),
         ["workspaces", id, "factory", "session"] => {
@@ -281,6 +284,10 @@ async fn owner(api: &Api, target: Target, body: &Bytes) -> Result<Option<Machine
             .filter(|record| !record.deleted && record.owner != me)
             .map(|record| record.owner)),
         Target::Terminal(id) => Ok(api.peers.owner_of(id).await?),
+        Target::Session(id) => Ok(on_store(&api.store, move |store| store.session(id))
+            .await?
+            .filter(|record| !record.deleted && record.owner != me)
+            .map(|record| record.owner)),
         Target::Machine(id) => Ok(Some(id).filter(|id| *id != me)),
         // Never carried by this layer: a run's call finds its owner with `worker_owner`, and
         // a Factory view route's handler carries it itself.
@@ -356,6 +363,8 @@ mod tests {
         }
         let path = format!("/api/terminals/{id}/close");
         assert!(matches!(target(&path), Some(Target::Terminal(t)) if t.0 == id));
+        let path = format!("/api/sessions/{id}/rename");
+        assert!(matches!(target(&path), Some(Target::Session(s)) if s.0 == id));
         let at = |path: String| worker(&path);
         assert_eq!(worker("/api/factory/workspaces"), Some(Worker::Create));
         let (w, s, t) = (WorkspaceId(id), SessionId(id), TerminalId(id));
@@ -385,6 +394,8 @@ mod tests {
             format!("/api/sessions/{id}/trail"),
             format!("/api/sessions/{id}/factory"),
             "/api/sessions/not-an-id/factory/turn".to_owned(),
+            "/api/sessions/not-an-id/rename".to_owned(),
+            format!("/api/sessions/{id}/rename/more"),
             format!("/api/terminals/{id}/tail/more"),
         ] {
             assert!(target(&other).is_none(), "{other}");
@@ -426,6 +437,7 @@ mod tests {
             format!("/api/workspaces/{id}/shells"),
             format!("/api/workspaces/{id}/archive"),
             format!("/api/terminals/{id}/close"),
+            format!("/api/sessions/{id}/rename"),
         ] {
             assert!(carries(&path), "{path}");
             assert!(worker(&path).is_none(), "{path}");

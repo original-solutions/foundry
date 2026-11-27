@@ -8,7 +8,8 @@ const groups: { where: string; keys: [string[], string][] }[] = [
   {
     where: "Anywhere",
     keys: [
-      [[mod, "K"], "Jump to a terminal or workspace, or give Claude a new task"],
+      [[mod, "K"], "Jump to a terminal, a view or an action, or give Claude a new task"],
+      [[mod, "J"], "Go to the next terminal that needs you"],
       [[mod, "F"], "Find in the open terminal"],
       [[mod, "\\"], "Open a terminal beside this one, or close the split"],
       [[mod, "B"], "Collapse the workspaces list to a rail of states, or expand it"],
@@ -63,6 +64,13 @@ const groups: { where: string; keys: [string[], string][] }[] = [
       [["[", "]"], "Earlier or later commit; before the first, all changes"],
       [[mod, "Enter"], "Add the comment on a line"],
       [["Esc"], "Drop the comment being written"],
+    ],
+  },
+  {
+    where: "A name being edited, a machine's or a session's",
+    keys: [
+      [["Enter"], "Save the name; an empty one clears a session's"],
+      [["Esc"], "Put the name back"],
     ],
   },
   {

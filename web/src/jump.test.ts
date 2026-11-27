@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { fleet } from "./fleet";
-import { destinations, newWorkspace, search } from "./jump";
+import { destinations, newWorkspace, search, type Command } from "./jump";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const machines = () =>
@@ -62,5 +62,24 @@ describe("newWorkspace", () => {
   it("names a new workspace with what was typed, and offers none for nothing", () => {
     expect(newWorkspace("  add   search ")).toEqual([expect.objectContaining({ kind: "workspace", name: "add search", title: "New task “add search”" })]);
     expect(newWorkspace("   ")).toEqual([]);
+  });
+});
+
+describe("views and actions in the palette", () => {
+  const command = (key: string, title: string, also = ""): Command => ({ key, title, group: "Go to", about: `About ${title}`, also, run: () => {} });
+  const commands = [command("timeline", "Timeline", "turns clock"), command("factory", "Factory", "issues runs")];
+
+  it("lists them after the fleet's terminals and before the new shells", () => {
+    const all = destinations(machines(), commands);
+    expect(all.map((d) => d.title)).toEqual(["fix login / sonnet", "fix login / shell", "tidy readme / opus", "Timeline", "Factory", "New shell in fix login", "New shell in tidy readme"]);
+    expect(all[3]).toMatchObject({ kind: "command", key: "command:timeline", command: commands[0] });
+  });
+
+  it("finds one by its name or the other words it carries, and puts it first once something is typed", () => {
+    const withFactory = fleet([workspace(ME, "w1", "fix the factory floor"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "idle")], settings());
+    const all = destinations(withFactory, commands);
+    expect(search(all, "turns").map((d) => d.title)).toEqual(["Timeline"]);
+    expect(search(all, "factory").map((d) => d.title)).toEqual(["Factory", "fix the factory floor / opus", "New shell in fix the factory floor"]);
+    expect(search(all, "").map((d) => d.title)).toEqual(["fix the factory floor / opus", "Timeline", "Factory", "New shell in fix the factory floor"]);
   });
 });

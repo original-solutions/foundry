@@ -9,7 +9,7 @@ import type { WorkspaceView } from "./fleet";
  * is made the same way from the sidebar, the jump palette, the board and the first run. The task
  * names the workspace and its branch; with no task, a typed name makes a workspace with Claude
  * idle in it. Start hands the session to `onCreated` and closes, unless the daemon has something
- * to say about the workspace's setup.
+ * to say about the workspace's setup. The machines view opens it set to a machine.
  */
 export function NewTask({
   projects,
@@ -17,6 +17,7 @@ export function NewTask({
   open,
   onOpenChange,
   task = "",
+  machine = "",
   onCreated,
 }: {
   projects: Project[];
@@ -26,6 +27,8 @@ export function NewTask({
   onOpenChange: (open: boolean) => void;
   /** The task it opens with, as typed in the jump palette. */
   task?: string;
+  /** The machine it opens set to: empty for this machine, `"choose"`, or another machine's id. */
+  machine?: string;
   /** Called with the new session's id once it has started, so the layout can open it. */
   onCreated: (session: string) => void;
 }) {
@@ -35,7 +38,7 @@ export function NewTask({
         <Dialog.Overlay className="fixed inset-0 z-40 bg-black/60 backdrop-blur-[2px]" />
         <Dialog.Content className="fixed inset-x-2 top-2 z-50 mx-auto max-h-[calc(100dvh-1rem)] max-w-2xl overflow-y-auto rounded-2xl border border-neutral-700/70 bg-neutral-950 p-4 text-sm text-neutral-100 shadow-2xl shadow-black/60 sm:top-[12vh] sm:p-6">
           {/* Mounted while open, so each opening starts from what it was given. */}
-          <Body projects={projects} workspaces={workspaces} task={task} onCreated={onCreated} close={() => onOpenChange(false)} />
+          <Body projects={projects} workspaces={workspaces} task={task} machine={machine} onCreated={onCreated} close={() => onOpenChange(false)} />
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
@@ -46,12 +49,14 @@ function Body({
   projects,
   workspaces,
   task,
+  machine,
   onCreated,
   close,
 }: {
   projects: Project[];
   workspaces: WorkspaceView[];
   task: string;
+  machine: string;
   onCreated: (session: string) => void;
   close: () => void;
 }) {
@@ -75,6 +80,7 @@ function Body({
         workspaces={workspaces}
         launch={launch}
         initialTask={task}
+        initialMachine={machine}
         onCreated={(session, warning) => {
           onCreated(session);
           if (!warning) close();

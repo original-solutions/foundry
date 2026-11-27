@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createContext, useContext, type ComponentProps } from "react";
 import type { AnyRecord, Changes, SessionState, Shipping } from "./api";
 import { archiveOf } from "./Archive";
+import { buttonShape, pressed } from "./Modal";
 import { Board, BOARD_BUSY_EVERY } from "./Board";
 import { fleet, type MachineView } from "./fleet";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
@@ -143,6 +144,11 @@ async function show(machines: MachineView[], onChanges = vi.fn(), props: Partial
 const card = (name: string) => screen.getByRole("article", { name });
 
 describe("Board", () => {
+  it("marks each card with its project's face beside the project's name", async () => {
+    await show(fleet(records(), settings()));
+    expect(within(card("fix login")).getByTitle("demo").textContent).toBe("DE");
+  });
+
   it("shows every workspace as a card in a lane by what it needs: you, its agents, or nothing", async () => {
     await show(fleet(records(), settings()));
     const needs = screen.getByRole("region", { name: "Needs you" });
@@ -313,6 +319,92 @@ describe("Board", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Board" }));
     expect(screen.getByRole("region", { name: "Working" })).toBeDefined();
     expect(localStorage.getItem("foundry.home")).toBe("board");
+  });
+});
+
+describe("As a list", () => {
+  const asList = () => fireEvent.click(within(screen.getByRole("group", { name: "Show workspaces as" })).getByRole("button", { name: "List" }));
+
+  it("shows each workspace as one line in the same lanes, and keeps the choice for next time", async () => {
+    await show(fleet(records(), settings()));
+    asList();
+    const needs = screen.getByRole("region", { name: "Needs you" });
+    const line = within(needs).getByRole("article", { name: "tidy readme" });
+    expect(within(line).getByRole("link", { name: "tidy readme" }).getAttribute("href")).toBe("/terminals/t3");
+    expect(within(line).getByText("Needs you")).toBeDefined();
+    expect(within(screen.getByRole("region", { name: "Working" })).getByRole("article", { name: "fix login" })).toBeDefined();
+    expect(within(screen.getByRole("group", { name: "Show workspaces as" })).getByRole("button", { name: "List" }).getAttribute("aria-pressed")).toBe("true");
+    expect(localStorage.getItem("foundry.layout")).toBe("list");
+    // The switch is drawn as Group by's is: the shared button with its pressed look.
+    for (const each of within(screen.getByRole("group", { name: "Show workspaces as" })).getAllByRole("button")) {
+      expect(`${buttonShape} ${pressed}`.split(" ").filter((c) => !each.classList.contains(c))).toEqual([]);
+    }
+    // A line is one row: no list of its terminals under it.
+    expect(within(card("fix login")).queryByRole("list")).toBeNull();
+  });
+
+  it("marks each line with its project's face, as a card is", async () => {
+    await show(fleet(records(), settings()));
+    asList();
+    expect(within(card("fix login")).getByTitle("demo").textContent).toBe("DE");
+  });
+
+  it("opens each terminal from its glyph and the changes from the line's count", async () => {
+    const onChanges = vi.fn();
+    const { router } = await show(fleet(records(), settings()), onChanges);
+    asList();
+    const login = card("fix login");
+    fireEvent.click(within(login).getByRole("link", { name: "shell Open" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    await waitFor(() => expect(within(login).getByText("+34")).toBeDefined());
+    expect(within(login).getByText("−5")).toBeDefined();
+    expect(within(login).getByText("1 uncommitted")).toBeDefined();
+    fireEvent.click(within(login).getByRole("button", { name: "Changes in fix login" }));
+    expect(onChanges).toHaveBeenCalledWith("w1");
+    await waitFor(() => expect(within(card("tidy readme")).getByText("No changes")).toBeDefined());
+  });
+
+  it("keeps a line's glyphs to three, and with more shows two and how many others", async () => {
+    await show(fleet([...records(), terminal(ME, "t5", "w1"), terminal(ME, "t6", "w1")], settings()));
+    asList();
+    const login = card("fix login");
+    expect(within(login).getAllByRole("link", { name: /Open|Working/ })).toHaveLength(2);
+    expect(within(login).getByText("+2")).toBeDefined();
+    expect(within(card("tidy readme")).queryByText(/^\+\d$/)).toBeNull();
+  });
+
+  it("says on the line what its first terminal is doing: the question, the tool, or the first line Claude said", async () => {
+    const briefs = {
+      s1: { title: null, now: { kind: "tool" as const, text: "Edit src/login.ts" }, said: undefined },
+      s3: { title: null, now: { kind: "ask" as const, text: "May I run the migration?" } },
+      s4: { title: null, now: null, said: "Fixed the login check.\nAll tests pass." },
+    };
+    await show(fleet(records(), settings(), briefs));
+    asList();
+    expect(within(card("fix login")).getByText("Edit src/login.ts")).toBeDefined();
+    expect(within(card("tidy readme")).getByText("May I run the migration?")).toBeDefined();
+    const said = within(card("far away")).getByText("Fixed the login check.");
+    expect(said.getAttribute("title")).toBe("Fixed the login check.\nAll tests pass.");
+  });
+
+  it("reads a line's changes only once it is on screen, as a card does", async () => {
+    startOnScreen = false;
+    localStorage.setItem("foundry.layout", "list");
+    await show(fleet(records(), settings()));
+    await act(async () => {});
+    expect(reads).toEqual([]);
+    scroll("fix login", true);
+    await waitFor(() => expect(within(card("fix login")).getByText("+34")).toBeDefined());
+    expect(readsOf("w2")).toBe(0);
+  });
+
+  it("opens as a list for a browser that kept it, and goes back to cards", async () => {
+    localStorage.setItem("foundry.layout", "list");
+    await show(fleet(records(), settings()));
+    expect(within(card("fix login")).queryByText("Open")).toBeNull();
+    fireEvent.click(within(screen.getByRole("group", { name: "Show workspaces as" })).getByRole("button", { name: "Cards" }));
+    expect(within(card("fix login")).getByText("Open")).toBeDefined();
+    expect(localStorage.getItem("foundry.layout")).toBe("cards");
   });
 });
 

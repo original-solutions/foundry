@@ -1,9 +1,9 @@
-import { useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutationState, useQuery } from "@tanstack/react-query";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { Children, useId, useState } from "react";
 import { glance, lanes, topFiles, type Card, type Lane } from "./lanes";
-import { buttonShape, pressed } from "./Modal";
+import { buttonShape, pressed, viewLook } from "./Modal";
 import { StepChips } from "./NextSteps";
 import { nextSteps } from "./next";
 import { shipLanes, useStaged, type ShipLane } from "./staged";
@@ -19,18 +19,20 @@ import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
 import { reply } from "./reply";
 import { Said } from "./Said";
-import { BOARD_BUSY_EVERY, pollEvery } from "./poll";
+import { BOARD_BUSY_EVERY } from "./poll";
+import { useCardChanges, useOnScreen } from "./cardChanges";
+import { LayoutSwitch, loadLayout, saveLayout, WorkspaceLine, type Layout } from "./BoardList";
 import { Timeline } from "./Timeline";
 import { Machines } from "./Machines";
 import type { History } from "./samples";
+import { setHome, useHome, type Home } from "./home";
 import { readStored, store } from "./storage";
+import { ProjectFace } from "./ProjectFace";
 
-/** Which of the board and the timeline the home shows, kept for this browser. The machines view has its own URL. */
-type View = "board" | "timeline";
+/** Which of the board and the timeline the home shows, kept for this browser (see `home.ts`). The machines view has its own URL. */
+type View = Home;
+/** Where the home's view is kept: this browser's ship view, from before it became a grouping, is read from it. */
 const VIEW_KEY = "foundry.home";
-function loadView(): View {
-  return readStored(VIEW_KEY) === "timeline" ? "timeline" : "board";
-}
 
 /** How the board groups its cards, kept for this browser: by what they need, or by how far their work has shipped. */
 type Group = "attention" | "shipping";
@@ -44,10 +46,6 @@ function loadGroup(): Group {
 /** Keeps `group` for next time; when not kept, the grouping still changes. */
 function saveGroup(group: Group) {
   store(GROUP_KEY, group);
-}
-/** Keeps `view` as the home's view for next time; when not kept, the view still changes. */
-function saveView(view: View) {
-  store(VIEW_KEY, view);
 }
 
 export { BOARD_BUSY_EVERY };
@@ -71,7 +69,8 @@ const laneGlyph: Record<Lane, Glyph> = { needs: "waiting", working: "working", q
  * the machines (`/machines`). The three views share this head, kept mounted, so it never moves and
  * a task half typed survives a change of view. Above the lanes, the cards can be grouped instead by how far each workspace's work
  * has gone on its way to main (`useStaged`), counted and summed; either way an idle session of this
- * machine is offered the step that takes its work further, under it on its card.
+ * machine is offered the step that takes its work further, under it on its card. Beside the
+ * grouping, the cards can be drawn as a list instead, one line per workspace (`WorkspaceLine`).
  *
  * On a phone it is the home: a line above the task box says what needs you, what works and what
  * rests, and a bar at the bottom (`PhoneNav`) takes the switch's place and opens the workspaces.
@@ -87,6 +86,7 @@ export function Board({
   onMenu,
   history,
   connected,
+  onCreate,
 }: {
   machines: MachineView[];
   /** The fleet's projects, which a new task is started in. */
@@ -105,15 +105,16 @@ export function Board({
   history: History;
   /** Whether the page hears the daemon now, so the machines view can say its numbers stopped. */
   connected: boolean;
+  /** Opens the New task dialog set to a machine, from the machines view. */
+  onCreate?: (machine: string) => void;
 }) {
-  const [kept, setKept] = useState(loadView);
+  const kept = useHome();
   const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
   const view = onMachines ? "machines" : kept;
   const navigate = useNavigate();
   const pick = (next: View | "machines") => {
     if (next === "machines") return void navigate({ to: "/machines" });
-    setKept(next);
-    saveView(next);
+    setHome(next);
     if (onMachines) void navigate({ to: "/" });
   };
   const workspaces = machines.flatMap((m) => m.workspaces);
@@ -129,6 +130,12 @@ export function Board({
     setGroup(next);
     saveGroup(next);
   };
+  const [layout, setLayout] = useState(loadLayout);
+  const relayout = (next: Layout) => {
+    setLayout(next);
+    saveLayout(next);
+  };
+  const Shown = layout === "list" ? WorkspaceLine : WorkspaceCard;
   const leaving = new Set(
     useMutationState({
       filters: { mutationKey: ["archive"], predicate: (m) => m.state.status === "pending" || (m.state.status === "success" && m.state.data === null) },
@@ -160,27 +167,35 @@ export function Board({
             </div>
           </div>
           {view === "machines" ? (
-            <Machines machines={machines} history={history} here={here} connected={connected} />
+            <Machines machines={machines} history={history} here={here} connected={connected} onCreate={onCreate} />
           ) : view === "timeline" ? (
             <Timeline machines={machines} traced={traced} onSteps={onSteps} />
           ) : (
             <>
-              <GroupBar group={group} onPick={regroup} staged={staged} />
+              <GroupBar group={group} onPick={regroup} staged={staged} layout={layout} onLayout={relayout} />
               {group === "shipping"
                 ? staged.lanes.map(({ lane, cards }) => {
                     const { name, hint, tone } = shipLanes.find((l) => l.lane === lane)!;
                     return (
-                      <LaneSection key={lane} title={name} hint={hint} tone={tone} icon={<StageMark lane={lane} />} count={cards.length}>
+                      <LaneSection key={lane} title={name} hint={hint} tone={tone} icon={<StageMark lane={lane} />} count={cards.length} list={layout === "list"}>
                         {cards.map((card) => (
-                          <WorkspaceCard key={`${card.workspace.id}:${lane}`} card={card} showMachine={several} onChanges={onChanges} arrived={staged.arrived[card.workspace.id] === lane} />
+                          <Shown key={`${card.workspace.id}:${lane}`} card={card} showMachine={several} onChanges={onChanges} arrived={staged.arrived[card.workspace.id] === lane} />
                         ))}
                       </LaneSection>
                     );
                   })
                 : board.map(({ lane, cards }) => (
-                    <LaneSection key={lane} title={laneTitle[lane]} hint={laneHint[lane]} tone={laneTone[lane]} icon={<StateGlyph glyph={laneGlyph[lane]} still />} count={cards.length}>
+                    <LaneSection
+                      key={lane}
+                      title={laneTitle[lane]}
+                      hint={laneHint[lane]}
+                      tone={laneTone[lane]}
+                      icon={<StateGlyph glyph={laneGlyph[lane]} still />}
+                      count={cards.length}
+                      list={layout === "list"}
+                    >
                       {cards.map((card) => (
-                        <WorkspaceCard key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
+                        <Shown key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
                       ))}
                     </LaneSection>
                   ))}
@@ -197,7 +212,19 @@ export function Board({
  * The board's grouping, above its lanes: by what each workspace needs (attention), or by how far
  * its work has gone on its way to main (shipping), with the work summed while grouped that way.
  */
-function GroupBar({ group, onPick, staged }: { group: Group; onPick: (group: Group) => void; staged: ReturnType<typeof useStaged> }) {
+function GroupBar({
+  group,
+  onPick,
+  staged,
+  layout,
+  onLayout,
+}: {
+  group: Group;
+  onPick: (group: Group) => void;
+  staged: ReturnType<typeof useStaged>;
+  layout: Layout;
+  onLayout: (layout: Layout) => void;
+}) {
   const { sum, reading } = staged;
   // The work on its way to main, counted stage by stage as a scoreboard, then summed.
   return (
@@ -245,6 +272,7 @@ function GroupBar({ group, onPick, staged }: { group: Group; onPick: (group: Gro
           )}
         </p>
       )}
+      <LayoutSwitch layout={layout} onPick={onLayout} />
     </div>
   );
 }
@@ -255,7 +283,24 @@ function StageMark({ lane }: { lane: ShipLane }) {
   return <span aria-hidden="true" className={`block h-2.5 w-2.5 rounded-sm border-2 border-current ${outline ? "" : "bg-current"}`} />;
 }
 
-function LaneSection({ title, hint, tone, icon, count, children }: { title: string; hint: string; tone: string; icon: React.ReactNode; count: number; children: React.ReactNode }) {
+function LaneSection({
+  title,
+  hint,
+  tone,
+  icon,
+  count,
+  list = false,
+  children,
+}: {
+  title: string;
+  hint: string;
+  tone: string;
+  icon: React.ReactNode;
+  count: number;
+  /** Whether its workspaces are lines of one list rather than cards in a grid. */
+  list?: boolean;
+  children: React.ReactNode;
+}) {
   const id = useId();
   return (
     <section aria-labelledby={id} className="flex flex-col gap-3">
@@ -267,23 +312,17 @@ function LaneSection({ title, hint, tone, icon, count, children }: { title: stri
         <span className="rounded-full bg-neutral-800 px-1.5 text-[11px] text-neutral-400">{count}</span>
         <span aria-hidden="true" className="h-px flex-1 bg-neutral-800" />
       </div>
-      <div className="grid grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] gap-3">{children}</div>
+      {list ? (
+        <ul className="divide-y divide-neutral-800/80 overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900/60">
+          {Children.map(children, (child) => (
+            <li>{child}</li>
+          ))}
+        </ul>
+      ) : (
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] gap-3">{children}</div>
+      )}
     </section>
   );
-}
-
-/** Whether the element is on screen, or near it; always true where the browser cannot tell. */
-function useOnScreen<T extends Element>() {
-  const ref = useRef<T>(null);
-  const [onScreen, setOnScreen] = useState(() => typeof IntersectionObserver === "undefined");
-  useLayoutEffect(() => {
-    const element = ref.current;
-    if (!element || typeof IntersectionObserver === "undefined") return;
-    const observer = new IntersectionObserver((entries) => setOnScreen(entries[entries.length - 1].isIntersecting), { rootMargin: "200px" });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-  return [ref, onScreen] as const;
 }
 
 function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card: Card; showMachine: boolean; onChanges: (workspace: string) => void; arrived?: boolean }) {
@@ -333,8 +372,11 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
             </button>
           )}
         </div>
-        <p className="truncate font-mono text-xs text-neutral-500">
-          {workspace.project} · {workspace.branch}
+        <p className="flex min-w-0 items-center gap-1.5 font-mono text-xs text-neutral-500">
+          <ProjectFace project={workspace.project} />
+          <span className="truncate">
+            {workspace.project} · {workspace.branch}
+          </span>
         </p>
       </header>
       <ul className="flex flex-col px-2 pb-2">
@@ -397,37 +439,9 @@ function CardSteps({ workspace, row }: { workspace: string; row: Card["rows"][nu
   );
 }
 
-/**
- * What the workspace changed since its base, read as the sheet reads it, but only while the card
- * is on screen: when it comes on screen, whenever one of its terminals changes state (so the end
- * of a turn shows what the turn wrote), and every `BOARD_BUSY_EVERY` while an agent in it works.
- * A state change off screen is read when the card comes back. A failed read says so instead of
- * the old numbers and is tried again on the timer; a workspace the daemon does not have (a 404)
- * is not asked again on a timer. Once its workspace is being archived, nothing is read or shown.
- */
+/** What the workspace changed since its base, at the foot of its card, read as `useCardChanges` says. */
 function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boolean; onOpen: () => void }) {
-  const busy = card.rows.some((r) => r.glyph === "working");
-  const workspace = card.workspace.id;
-  const client = useQueryClient();
-  const leaving = useLeaving(workspace);
-  const { data, error } = useQuery({
-    ...changesQuery(workspace),
-    enabled: onScreen && !leaving,
-    staleTime: BOARD_BUSY_EVERY,
-    retry: false,
-    refetchInterval: pollEvery(BOARD_BUSY_EVERY, busy),
-  });
-  const states = card.rows.map((r) => `${r.terminal}:${r.glyph}`).join(" ");
-  const last = useRef(states);
-  useEffect(() => {
-    if (last.current === states) return;
-    last.current = states;
-    if (leaving) return;
-    // Read now if on screen; otherwise marked out of date, and read when it comes on screen.
-    void client.invalidateQueries({ queryKey: changesQuery(workspace).queryKey, exact: true });
-    // A turn that ends may have pushed or opened a pull request.
-    void client.invalidateQueries({ queryKey: shippingQuery(workspace).queryKey, exact: true });
-  }, [states, client, workspace, leaving]);
+  const { data, error, leaving } = useCardChanges(card, onScreen);
 
   let body: React.ReactNode;
   if (leaving) body = <span className="text-neutral-500">Archiving…</span>;
@@ -497,7 +511,7 @@ function ViewSwitch({ view, onPick }: { view: View | "machines"; onPick: (view: 
           role="radio"
           aria-checked={view === v.view}
           onClick={() => onPick(v.view)}
-          className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors ${view === v.view ? "bg-neutral-700 text-neutral-50" : "text-neutral-400 hover:text-neutral-200"}`}
+          className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors ${view === v.view ? viewLook.on : viewLook.off}`}
         >
           {v.icon}
           {v.name}
@@ -548,7 +562,7 @@ function PhoneNav({ view, onPick, needs, onMenu }: { view: View | "machines"; on
   );
 }
 
-function MachinesIcon() {
+export function MachinesIcon() {
   return (
     <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">
       <rect x="2" y="3" width="12" height="4" rx="1" />
@@ -558,7 +572,7 @@ function MachinesIcon() {
   );
 }
 
-function BoardIcon() {
+export function BoardIcon() {
   return (
     <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <rect x="2" y="2.5" width="5" height="11" rx="1" />
@@ -567,7 +581,7 @@ function BoardIcon() {
   );
 }
 
-function TimelineIcon() {
+export function TimelineIcon() {
   return (
     <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">
       <path d="M2 4h6M5 8h8M3 12h4" />
