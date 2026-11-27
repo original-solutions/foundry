@@ -197,7 +197,7 @@ impl Vims for FakeVims {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::factory::vims::{Egress, Exec, Limit, OpState, Vims, VimsError};
+    use crate::factory::vims::{Egress, Exec, Limit, OpState, Outcome, Vims, VimsError};
 
     const NEW_OP: &str = r#"{"id":"op_1","status":"running","workspaceId":"wsp_1"}"#;
 
@@ -308,6 +308,53 @@ mod tests {
             .exec("wsp_1", &exec(&["cat"], b"two"), "k1")
             .unwrap_err();
         assert_eq!(error.code(), Some("IDEMPOTENCY_KEY_REUSED"));
+    }
+
+    #[test]
+    fn a_reused_key_with_another_command_or_argv_is_refused() {
+        let fake = FakeVims::new();
+        fake.on("pause", Reply::ok("{}"))
+            .on("exec", Reply::ok(r#"{"id":"op_5","status":"running"}"#));
+        fake.pause("wsp_1", "k1").unwrap();
+        assert_eq!(
+            fake.start("wsp_1", "k1").unwrap_err().code(),
+            Some("IDEMPOTENCY_KEY_REUSED")
+        );
+        fake.exec("wsp_1", &exec(&["true"], b""), "k2").unwrap();
+        assert_eq!(
+            fake.exec("wsp_1", &exec(&["false"], b""), "k2")
+                .unwrap_err()
+                .code(),
+            Some("IDEMPOTENCY_KEY_REUSED")
+        );
+    }
+
+    #[test]
+    fn a_failure_vims_never_answered_holds_no_key() {
+        let fake = FakeVims::new();
+        fake.on("new", Reply::exit(1, "", "fetch failed: ECONNRESET"))
+            .on(
+                "new",
+                Reply::outcome(Outcome::Exit {
+                    status: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+            )
+            .on("new", Reply::ok(NEW_OP));
+        for _ in 0..2 {
+            assert!(matches!(
+                fake.new_workspace("golden:abc", Egress::Open, "k1"),
+                Err(VimsError::Unknown { .. })
+            ));
+            assert_eq!(fake.operations_by_key("k1").unwrap(), vec![]);
+        }
+        assert_eq!(
+            fake.new_workspace("golden:abc", Egress::Open, "k1")
+                .unwrap()
+                .id,
+            "op_1"
+        );
     }
 
     #[test]

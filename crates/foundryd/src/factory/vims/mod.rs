@@ -836,8 +836,63 @@ mod tests {
             fake.pause("wsp_1", "k1").unwrap(),
             Change::Operation(operation) if operation.id == "op_4"
         ));
-        assert_eq!(fake.pause("wsp_1", "k2").unwrap(), Change::Done);
+        assert!(matches!(
+            fake.pause("wsp_1", "k2").unwrap(),
+            Change::Workspace(workspace) if workspace.state == WorkspaceState::Paused
+        ));
         assert_eq!(fake.pause("wsp_1", "k3").unwrap(), Change::Done);
+    }
+
+    #[test]
+    fn an_operation_at_the_top_of_a_change_is_read_in_each_spelling() {
+        let fake = FakeVims::new();
+        for answer in [
+            r#"{"id":"op_5"}"#,
+            r#"{"operationId":"op_5","status":"queued"}"#,
+            r#"{"operation_id":"op_5","status":"queued"}"#,
+        ] {
+            fake.on("remove", Reply::ok(answer));
+        }
+        for key in ["k1", "k2", "k3"] {
+            assert!(
+                matches!(
+                    fake.remove("wsp_1", key).unwrap(),
+                    Change::Operation(operation) if operation.id == "op_5"
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_workspace_at_the_top_of_a_change_gives_its_state() {
+        let fake = FakeVims::new();
+        fake.on("stop", Reply::ok(r#"{"id":"wsp_1","status":"stopped"}"#))
+            .on("stop", Reply::ok("{}"));
+        assert!(matches!(
+            fake.stop("wsp_1", "k1").unwrap(),
+            Change::Workspace(workspace) if workspace.state == WorkspaceState::Stopped
+        ));
+        assert_eq!(fake.stop("wsp_1", "k2").unwrap(), Change::Done);
+    }
+
+    #[test]
+    fn a_change_answer_that_names_no_operation_or_workspace_cannot_be_read() {
+        for answer in [
+            r#"{"error":{"code":"PRECONDITION_FAILED","message":"paused"}}"#,
+            r#"{"status":"queued","workspaceId":"wsp_1"}"#,
+            r#"{"operation":"op_9"}"#,
+            "null",
+            "[]",
+            "not json",
+        ] {
+            let fake = FakeVims::new();
+            fake.on("remove", Reply::ok(answer));
+            assert!(
+                matches!(fake.remove("wsp_1", "k1"), Err(VimsError::Unknown { .. })),
+                "{answer}"
+            );
+        }
     }
 
     #[test]
@@ -951,6 +1006,20 @@ mod tests {
         assert_eq!(links.login_for("rawphp"), None);
         let one = fake.github().unwrap();
         assert_eq!(one.login_for("anyone"), Some("tomkaczocha"));
+    }
+
+    #[test]
+    fn a_login_at_the_top_is_for_every_owner_only_when_no_owner_is_named() {
+        let fake = FakeVims::new();
+        fake.on(
+            "github",
+            Reply::ok(
+                r#"{"login":"tomkaczocha","installations":[{"account":{"login":"Trilogy-Care"},"login":"tomkaczocha"}]}"#,
+            ),
+        );
+        let links = fake.github().unwrap();
+        assert_eq!(links.login_for("Trilogy-Care"), Some("tomkaczocha"));
+        assert_eq!(links.login_for("rawphp"), None);
     }
 
     #[test]

@@ -482,7 +482,11 @@ mod tests {
             ("VCPU_QUOTA_EXCEEDED", Some(Limit::Quota)),
             ("INSUFFICIENT_CREDIT", Some(Limit::Credit)),
             ("MEMBER_LIMIT_EXCEEDED", Some(Limit::Member)),
+            ("CREDIT_EXHAUSTED", Some(Limit::Credit)),
             ("PRECONDITION_FAILED", None),
+            ("MEMBER_NOT_FOUND", None),
+            ("NOT_A_MEMBER", None),
+            ("CREDIT_CARD_DECLINED", None),
         ] {
             let refusal = Refusal::new(code, "");
             assert_eq!(refusal.limit, limit, "{code}");
@@ -508,14 +512,77 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_that_cannot_find_vims_could_not_run() {
+    fn an_exit_of_126_or_127_from_a_started_vims_is_no_answer_that_can_be_read() {
+        // `vims` is started with no shell between, so these come from it or what it ran.
         let dir = tempfile::tempdir().unwrap();
-        let program = fake_vims(dir.path(), "echo 'vims: not found' >&2\nexit 127");
-        let vims = vims_at(&program, Arc::new(SystemClock));
-        assert!(matches!(
-            vims.call(&exec_call()),
-            Err(VimsError::NotRun { .. })
-        ));
+        for status in [126, 127] {
+            let program = fake_vims(dir.path(), &format!("echo 'not found' >&2\nexit {status}"));
+            let vims = vims_at(&program, Arc::new(SystemClock));
+            assert!(matches!(
+                vims.call(&exec_call()),
+                Err(VimsError::Unknown { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_transport_failure_in_vims_s_error_shape_is_no_answer_that_can_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        for script in [
+            "echo '{\"error\":{\"code\":\"ECONNRESET\",\"message\":\"socket hang up\"}}'\nexit 1",
+            "echo '{\"code\":\"econnreset\"}' >&2\nexit 1",
+            "echo '{\"error\":{\"code\":\"ERR_SOCKET_CONNECTION_TIMEOUT\"}}'\nexit 1",
+            "echo '{\"error\":{\"code\":\"UND_ERR_SOCKET\"}}'\nexit 1",
+            "echo 'Error: UND_ERR_SOCKET: other side closed' >&2\nexit 1",
+            "echo 'Error: EAI_AGAIN: getaddrinfo vims.example' >&2\nexit 1",
+        ] {
+            let program = fake_vims(dir.path(), script);
+            let error = vims_at(&program, Arc::new(SystemClock))
+                .call(&exec_call())
+                .unwrap_err();
+            assert!(
+                matches!(error, VimsError::Unknown { .. }),
+                "{script}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_as_a_bare_error_code_or_after_other_output_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fake_vims(
+            dir.path(),
+            "echo '{\"error\":\"PRECONDITION_FAILED\"}'\nexit 1",
+        );
+        let error = vims_at(&program, Arc::new(SystemClock))
+            .call(&exec_call())
+            .unwrap_err();
+        assert_eq!(error.code(), Some("PRECONDITION_FAILED"));
+        let program = fake_vims(
+            dir.path(),
+            "echo 'connecting...' >&2\necho '{\"error\":{\"code\":\"QUOTA_EXCEEDED\"}}' >&2\nexit 1",
+        );
+        let error = vims_at(&program, Arc::new(SystemClock))
+            .call(&exec_call())
+            .unwrap_err();
+        assert_eq!(error.code(), Some("QUOTA_EXCEEDED"));
+    }
+
+    #[test]
+    fn the_output_an_error_quotes_is_one_line_and_cut_to_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fake_vims(
+            dir.path(),
+            "i=0; while [ $i -lt 2000 ]; do echo \"line $i of the output\"; i=$((i+1)); done\necho 'the end'\nexit 1",
+        );
+        let error = vims_at(&program, Arc::new(SystemClock))
+            .call(&exec_call())
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(matches!(error, VimsError::Unknown { .. }), "{error:?}");
+        assert!(!text.contains('\n'), "{text}");
+        assert!(text.len() < 1000, "{} bytes", text.len());
+        assert!(text.contains("the end"), "{text}");
     }
 
     #[test]
@@ -677,6 +744,39 @@ mod tests {
             "{result:?}"
         );
         assert!(goes_away(pid), "vims outlived the call");
+    }
+
+    #[test]
+    fn a_vims_that_exits_while_a_child_holds_its_output_is_killed_at_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_file = dir.path().join("child");
+        let program = fake_vims(
+            dir.path(),
+            &format!(
+                "sleep 53.4173 &\necho $! > '{}'\nexit 0",
+                child_file.display()
+            ),
+        );
+        let clock = Arc::new(FakeClock::new());
+        let vims = vims_at(&program, clock.clone());
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(vims.call(&Call::new("show").arg("wsp_1")));
+        });
+        let child = pid_in(&child_file);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "answered while a child held the output"
+        );
+        clock.advance(LIMIT);
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("killed once 30 s passed on the clock");
+        assert!(
+            matches!(result, Err(VimsError::Timeout { .. })),
+            "{result:?}"
+        );
+        assert!(goes_away(child), "the child outlived the call");
     }
 
     #[test]
