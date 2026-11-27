@@ -5489,6 +5489,41 @@ mod tests {
             assert_eq!(pass(&rig, &run), BuildStep::Interrupted);
         }
 
+        /// A build machine cut off after its session reported the pull request leaves that pull
+        /// request with the gate, which can mark a gate in flight there could-not-run and place
+        /// the next one. A session at work keeps the run running.
+        #[test]
+        fn a_session_that_cannot_be_reached_after_its_pull_request_was_reported_waits_for_the_gate()
+         {
+            let (mut rig, run) = built();
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+            show(&mut rig, SessionState::Unreachable, 1, 1);
+            let events = rig.events(&run).len();
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate {
+                    pr: 12,
+                    url: URL12.into()
+                }
+            );
+            assert_eq!(rig.events(&run).len(), events);
+            assert_eq!(turn_reads(&rig), 1);
+            assert!(sends(&rig).is_empty());
+            no_writes(&rig);
+            for state in [
+                SessionState::Stuck,
+                SessionState::Starting,
+                SessionState::Working,
+            ] {
+                show(&mut rig, state, 1, 1);
+                assert_eq!(pass(&rig, &run), BuildStep::Running, "{state:?}");
+            }
+        }
+
         #[test]
         fn a_relaunch_decided_for_a_gate_failure_is_resumes() {
             let (rig, run) = built();
