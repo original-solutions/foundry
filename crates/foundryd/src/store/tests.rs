@@ -58,6 +58,7 @@ fn session(owner: MachineId, version: u64) -> AnyRecord {
             terminal: TerminalId(uuid::Uuid::from_u128(3)),
             model: "claude-opus-5-5".into(),
             state: SessionState::Working,
+            name: None,
         },
     })
 }
@@ -937,6 +938,7 @@ fn live_session_count_counts_only_live_sessions_of_that_owner() {
                     terminal: TerminalId(uuid::Uuid::from_u128(3)),
                     model: "opus".into(),
                     state,
+                    name: None,
                 },
             })
         };

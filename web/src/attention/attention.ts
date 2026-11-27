@@ -41,6 +41,12 @@ export const kindLabel: Record<AttentionKind, string> = {
   update_refused: "Update refused",
 };
 
+/**
+ * A session's question, stall or failure. The page already leads to each from its state (the strip
+ * at its head, the board's needs-you lane, the sidebar), so the card leaves these out.
+ */
+export const aboutASession = (item: AttentionItem) => item.kind === "session_waiting" || item.kind === "session_stuck" || item.kind === "session_failed";
+
 /** Only these clear when a person says so; every other item clears on its own. */
 export const dismissable = (item: AttentionItem) => item.kind === "setting_overwritten";
 
@@ -57,9 +63,10 @@ export async function settle(item: AttentionItem): Promise<void> {
   return dismissItem(item.id);
 }
 
+/** What needs a person and is not a session's (`aboutASession`). */
 export async function attentionItems(): Promise<AttentionItem[]> {
   const json = await get("/api/attention");
-  return Array.isArray(json.items) ? (json.items as AttentionItem[]) : [];
+  return Array.isArray(json.items) ? (json.items as AttentionItem[]).filter((item) => !aboutASession(item)) : [];
 }
 
 export async function dismissItem(id: string): Promise<void> {

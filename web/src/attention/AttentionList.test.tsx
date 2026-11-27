@@ -14,6 +14,16 @@ const waiting: AttentionItem = {
   terminal: "t1",
 };
 
+const offline: AttentionItem = {
+  id: "machine_offline:m3",
+  kind: "machine_offline",
+  machine: "m3",
+  machine_name: "build-box",
+  what: "build-box has not been heard from for 15 seconds",
+  todo: "Check that it is on, on the tailnet and running foundryd",
+  terminal: null,
+};
+
 const overwritten: AttentionItem = {
   id: "setting_overwritten:project:p1",
   kind: "setting_overwritten",
@@ -73,39 +83,58 @@ describe("AttentionList", () => {
   });
 
   it("shows each item with what happened, what to do and its machine", async () => {
-    lists = [[waiting, overwritten]];
+    lists = [[offline, overwritten]];
     await renderApp(<AttentionList />);
     const list = await screen.findByRole("region", { name: "Needs attention" });
     expect(within(list).getByRole("button", { name: /2 need attention/ })).toBeTruthy();
-    for (const item of [waiting, overwritten]) {
+    for (const item of [offline, overwritten]) {
       expect(within(list).getByText(item.what)).toBeTruthy();
       expect(within(list).getByText(item.todo)).toBeTruthy();
       expect(within(list).getByText(item.machine_name)).toBeTruthy();
     }
-    expect(within(list).getByText("Waiting for you")).toBeTruthy();
+    expect(within(list).getByText("Machine offline")).toBeTruthy();
     expect(within(list).getByText("Setting overwritten")).toBeTruthy();
   });
 
   it("shows a new item within 5 seconds of it being raised", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    lists = [[], [waiting]];
+    lists = [[], [offline]];
     await renderApp(<AttentionList />);
     await waitFor(() => expect(reads()).toBe(1));
-    expect(screen.queryByText(waiting.what)).toBeNull();
+    expect(screen.queryByText(offline.what)).toBeNull();
     expect(ATTENTION_EVERY).toBeLessThan(5000);
     await act(() => vi.advanceTimersByTimeAsync(ATTENTION_EVERY + 100));
-    expect(await screen.findByText(waiting.what)).toBeTruthy();
+    expect(await screen.findByText(offline.what)).toBeTruthy();
   });
 
   it("links an item to its terminal", async () => {
-    lists = [[waiting]];
+    lists = [[setupFailed]];
     await renderApp(<AttentionList />);
     const link = await screen.findByRole("link", { name: "Open terminal" });
-    expect(link.getAttribute("href")).toBe("/terminals/t1");
+    expect(link.getAttribute("href")).toBe("/terminals/t9");
+  });
+
+  it("leaves a session's question, stall or failure to the strip that leads to it and the board's lane, listing only the rest", async () => {
+    const stuck = { ...waiting, id: "session_stuck:s2", kind: "session_stuck", terminal: "t2" };
+    const failed = { ...waiting, id: "session_failed:s3", kind: "session_failed", terminal: "t3" };
+    lists = [[waiting, stuck, failed, offline]];
+    await renderApp(<AttentionList />);
+    const list = await screen.findByRole("region", { name: "Needs attention" });
+    expect(within(list).getByRole("button", { name: /1 needs attention/ })).toBeTruthy();
+    expect(within(list).getByText(offline.what)).toBeTruthy();
+    expect(within(list).queryByText(waiting.what)).toBeNull();
+    expect(within(list).queryByRole("link", { name: "Open terminal" })).toBeNull();
+  });
+
+  it("shows nothing while only sessions need you", async () => {
+    lists = [[waiting]];
+    const { container } = await renderApp(<AttentionList />);
+    await waitFor(() => expect(reads()).toBe(1));
+    expect(container.querySelector("section")).toBeNull();
   });
 
   it("offers dismiss only on a setting overwritten item, and reads the list again after it", async () => {
-    lists = [[waiting, overwritten], []];
+    lists = [[offline, overwritten], []];
     await renderApp(<AttentionList />);
     const dismiss = await screen.findByRole("button", { name: "Dismiss" });
     expect(screen.getAllByRole("button", { name: "Dismiss" })).toHaveLength(1);
@@ -124,7 +153,7 @@ describe("AttentionList", () => {
   });
 
   it("offers close terminal only on a setup failed item, and reads the list again after it", async () => {
-    lists = [[waiting, setupFailed], [waiting]];
+    lists = [[offline, setupFailed], [offline]];
     await renderApp(<AttentionList />);
     const close = await screen.findByRole("button", { name: "Close terminal" });
     expect(screen.getAllByRole("button", { name: "Close terminal" })).toHaveLength(1);
@@ -152,48 +181,48 @@ describe("AttentionList", () => {
   });
 
   it("folds to its count and opens again", async () => {
-    lists = [[waiting]];
+    lists = [[offline]];
     await renderApp(<AttentionList />);
     const toggle = await screen.findByRole("button", { name: /1 needs attention/ });
     fireEvent.click(toggle);
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(screen.queryByText(waiting.what)).toBeNull();
+    expect(screen.queryByText(offline.what)).toBeNull();
     fireEvent.click(toggle);
-    expect(screen.getByText(waiting.what)).toBeTruthy();
+    expect(screen.getByText(offline.what)).toBeTruthy();
   });
 
   it("starts folded when told to, and opens to its items", async () => {
-    lists = [[waiting]];
+    lists = [[offline]];
     await renderApp(<AttentionList folded />);
     const toggle = await screen.findByRole("button", { name: /1 needs attention/ });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(screen.queryByText(waiting.what)).toBeNull();
+    expect(screen.queryByText(offline.what)).toBeNull();
     fireEvent.click(toggle);
-    expect(screen.getByText(waiting.what)).toBeTruthy();
+    expect(screen.getByText(offline.what)).toBeTruthy();
   });
 
   it("starts folded again when the list empties and then fills, as the waiting list does", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    lists = [[waiting], [], [waiting]];
+    lists = [[offline], [], [offline]];
     await renderApp(<AttentionList folded />);
     fireEvent.click(await screen.findByRole("button", { name: /1 needs attention/ }));
-    expect(screen.getByText(waiting.what)).toBeTruthy();
+    expect(screen.getByText(offline.what)).toBeTruthy();
     await act(() => vi.advanceTimersByTimeAsync(ATTENTION_EVERY + 100));
     await waitFor(() => expect(screen.queryByRole("region", { name: "Needs attention" })).toBeNull());
     await act(() => vi.advanceTimersByTimeAsync(ATTENTION_EVERY + 100));
     const toggle = await screen.findByRole("button", { name: /1 needs attention/ });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(screen.queryByText(waiting.what)).toBeNull();
+    expect(screen.queryByText(offline.what)).toBeNull();
   });
 
   it("shows an item of a kind this build does not know by its kind", async () => {
-    lists = [[{ ...waiting, id: "lease_lost:p1", kind: "lease_lost", terminal: null }]];
+    lists = [[{ ...offline, id: "lease_lost:p1", kind: "lease_lost", terminal: null }]];
     await renderApp(<AttentionList />);
     expect(await screen.findByText("lease_lost")).toBeTruthy();
   });
 
   it("names a placement waiting item", async () => {
-    lists = [[{ ...waiting, id: "placement_waiting:r1", kind: "placement_waiting", terminal: null }]];
+    lists = [[{ ...offline, id: "placement_waiting:r1", kind: "placement_waiting", terminal: null }]];
     await renderApp(<AttentionList />);
     expect(await screen.findByText("Placement waiting")).toBeTruthy();
   });
