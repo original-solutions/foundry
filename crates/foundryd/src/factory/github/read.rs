@@ -4618,6 +4618,21 @@ mod tests {
     }
 
     #[test]
+    fn judge_approval_refuses_a_cut_off_timeline_whose_oldest_event_is_the_label() {
+        // A rename in the label's second could sit on the page before this one.
+        let mut page = vec![labeled(LABELED, "tom", READY)];
+        page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        assert_eq!(
+            judge_approval(
+                &issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None),
+                READY,
+                &names(&["tom"])
+            ),
+            refused(history_cut(LABELED))
+        );
+    }
+
+    #[test]
     fn edited_since_counts_anyones_edit_or_rename_at_or_after_the_moment() {
         assert!(!edited_since(
             &issue_of(vec![renamed(BEFORE, "tom")], &[(BEFORE, "tom")], None, None),
@@ -4903,9 +4918,8 @@ mod tests {
     }
 
     /// The two judges agree wherever the label in force decides: the same label, actor, edit
-    /// and rename rules, and the same refusals. The one known difference is left out of the
-    /// agreement: on a cut-off page whose oldest event is the label, `judge_approval` assumes the
-    /// page holds every rename and `judge_claimed_approval` does not.
+    /// and rename rules, and the same refusals, a cut-off page whose oldest event is the label
+    /// included.
     #[test]
     fn judge_claimed_approval_agrees_with_judge_approval_on_a_label_in_force() {
         /// A timeline, the body edits, and the edit history's total when it is not their count.
@@ -4996,16 +5010,16 @@ mod tests {
             assert!(seen.contains(&outcome), "{outcome:?} in {seen:?}");
         }
 
-        // Both judges hand the label they chose to one tail, each with its own `reaches`: this
-        // pins the `reaches` each passes, and a refusal added to a single judge beside the tail
-        // shows wherever a case triggers it. The known difference is in it too: on a cut-off
-        // page whose oldest event is the label, each judge still answers as before.
+        // Both judges hand the label they chose to one tail with the same `reaches`: this pins
+        // the `reaches` each passes, and a refusal added to a single judge beside the tail shows
+        // wherever a case triggers it. On a cut-off page whose oldest event is the label, a
+        // rename in its second could be hidden, so both refuse it.
         let mut oldest = vec![labeled(LABELED, "tom", READY)];
         oldest.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
         let oldest = issue_of(oldest, &[], Some(HISTORY_PAGE as u64 + 5), None);
         assert_eq!(
             judge_approval(&oldest, READY, &instructors),
-            approved(LABELED, "tom")
+            refused(history_cut(LABELED))
         );
         assert_eq!(
             judge_claimed_approval(&oldest, READY, PROJECT, &instructors),
@@ -5028,7 +5042,7 @@ mod tests {
             let reaches = label.is_some_and(|label| timeline_reaches(issue, &label.created_at));
             assert_eq!(
                 judge_approval(issue, READY, &instructors),
-                judge_chosen_label(issue, label, &instructors, true),
+                judge_chosen_label(issue, label, &instructors, reaches),
                 "{issue:?}"
             );
             assert_eq!(
