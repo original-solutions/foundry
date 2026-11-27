@@ -10,7 +10,7 @@ export const shippingQuery = (workspace: string) => ({ queryKey: ["pr", workspac
 /** How often a pull request whose checks still run is read again while it is shown. */
 export const CHECKS_EVERY = 60_000;
 
-type Tone = "quiet" | "warn" | "bad" | "good" | "merged";
+export type Tone = "quiet" | "warn" | "bad" | "good" | "merged";
 
 interface Note {
   text: string;
@@ -65,7 +65,43 @@ export function shipLine(s: Shipping): Line | undefined {
   return { lead: "Pushed", tone: "quiet", notes: [{ text: "No PR yet", tone: "quiet" }, ...unpushed], done: false };
 }
 
-const text: Record<Tone, string> = {
+/** Where a workspace's work stands, in the few words a list row has room for. */
+export interface Standing {
+  text: string;
+  tone: Tone;
+  /** Its pull request on GitHub, when it has one. */
+  pr?: PullRequest;
+}
+
+/**
+ * Where a workspace's work stands in a few words, or nothing when there is nothing to say: its pull
+ * request by the one thing that holds it up (failing checks, then a requested change, then checks
+ * still running), else whether it is ready; without one, `Building` while `working` (any of its
+ * terminals starting or working), else whether the branch reached GitHub. The first rule that
+ * matches wins.
+ */
+export function standing(s: Shipping, working: boolean): Standing | undefined {
+  const { pr } = s;
+  if (pr?.state === "merged") return { text: `PR #${pr.number} merged`, tone: "merged", pr };
+  if (pr?.state === "closed") return { text: `PR #${pr.number} closed`, tone: "quiet", pr };
+  if (pr) {
+    const lead = `${pr.draft ? "Draft PR" : "PR"} #${pr.number}`;
+    if (pr.checks === "failing") return { text: `${lead} · Checks failing`, tone: "bad", pr };
+    if (pr.review === "changes_requested") return { text: `${lead} · Changes requested`, tone: "warn", pr };
+    if (pr.checks === "pending") return { text: `${lead} · Checks running`, tone: "warn", pr };
+    if (pr.draft) return { text: lead, tone: "quiet", pr };
+    if (pr.review === "required") return { text: `${lead} · Review required`, tone: "quiet", pr };
+    return { text: `${lead} · Ready to merge`, tone: "good", pr };
+  }
+  if (working) return { text: "Building", tone: "quiet" };
+  if (s.pushed && s.unreachable) return { text: "Pushed", tone: "quiet" };
+  if (s.pushed) return { text: "Pushed · No PR yet", tone: "quiet" };
+  if (s.unpushed > 0) return { text: "Not pushed", tone: "warn" };
+  return undefined;
+}
+
+/** The text colour of each tone. */
+export const toneText: Record<Tone, string> = {
   quiet: "text-neutral-400",
   warn: "text-amber-300",
   bad: "text-red-400",
@@ -129,12 +165,12 @@ export function ShipLine({
           target="_blank"
           rel="noreferrer"
           title={`${line.pr.title} (open on GitHub)`}
-          className={`flex shrink-0 items-center gap-1.5 rounded hover:underline hover:underline-offset-4 ${text[line.tone]}`}
+          className={`flex shrink-0 items-center gap-1.5 rounded hover:underline hover:underline-offset-4 ${toneText[line.tone]}`}
         >
           {lead}
         </a>
       ) : (
-        <span className={`flex shrink-0 items-center gap-1.5 ${text[line.tone]}`} title={`Branch ${data.branch}`}>
+        <span className={`flex shrink-0 items-center gap-1.5 ${toneText[line.tone]}`} title={`Branch ${data.branch}`}>
           {lead}
         </span>
       )}
@@ -144,7 +180,7 @@ export function ShipLine({
             <span aria-hidden="true" className="text-neutral-600">
               {" · "}
             </span>
-            <span className={text[n.tone]}>{n.text}</span>
+            <span className={toneText[n.tone]}>{n.text}</span>
           </span>
         ))}
         {line.pr && <span className="pl-1.5 text-neutral-500">{line.pr.title}</span>}

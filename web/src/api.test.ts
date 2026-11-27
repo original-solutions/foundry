@@ -50,15 +50,17 @@ describe("the reads", () => {
 describe("workspaceShipping", () => {
   it("posts with no body, so another machine's workspace is carried to its owner, and gives back where the branch stands", async () => {
     const shipping = { branch: "fix-login", pushed: true, unpushed: 0, pr: null, unreachable: false };
-    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => json(200, shipping));
-    vi.stubGlobal("fetch", fetch);
+    const sent: { url: string; method?: string; body?: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        sent.push({ url, method: init.method, body: init.body });
+        return json(200, shipping);
+      }),
+    );
 
     expect(await workspaceShipping("w1")).toEqual(shipping);
-    expect(fetch).toHaveBeenCalledTimes(1);
-    const [url, init] = fetch.mock.calls[0];
-    expect(url).toBe("/api/workspaces/w1/pr");
-    expect(init?.method).toBe("POST");
-    expect(init?.body).toBeUndefined();
+    expect(sent).toEqual([{ url: "/api/workspaces/w1/pr", method: "POST", body: undefined }]);
   });
 
   it("refuses any status but 200, as an owner on an older build answers 400", async () => {

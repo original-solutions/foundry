@@ -1,6 +1,6 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named, Now } from "./Now";
@@ -19,6 +19,8 @@ import { Mark } from "./Mark";
 import { ProjectFace } from "./ProjectFace";
 import { ThemeButton } from "./ThemeButton";
 import { railKey } from "./collapsed";
+import { pollEvery } from "./poll";
+import { CHECKS_EVERY, shippingQuery, standing, toneText } from "./Shipping";
 import type { MachineSample } from "./api";
 
 const statusColour = { online: "text-neutral-400", offline: "text-red-400", unknown: "text-neutral-400" };
@@ -239,6 +241,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                     key={workspace.id}
                     workspace={workspace}
                     folded={!unfolded.has(workspace.id)}
+                    readable={machine.status !== "offline"}
                     onFold={(on) => fold([workspace.id], on)}
                     selected={selected}
                     onNavigate={onNavigate}
@@ -287,6 +290,8 @@ function LoadMeter({ sample }: { sample: MachineSample }) {
 interface WorkspaceProps {
   workspace: WorkspaceView;
   folded: boolean;
+  /** Whether its machine may be asked where its work stands: any but an offline one. */
+  readable: boolean;
   onFold: (on: boolean) => void;
   selected?: string;
   onNavigate?: () => void;
@@ -295,7 +300,7 @@ interface WorkspaceProps {
   tab: (id: string) => { tabIndex: number; onFocus: () => void };
 }
 
-function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
+function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
   const terminals = useTerminalActions();
   const list = rows(workspace);
@@ -323,11 +328,12 @@ function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges,
         {workspace.factory && <FactoryMark run={workspace.factory} />}
         {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
       </div>
+      <StandingLine workspace={workspace} list={list} enabled={readable} />
       {!folded && (
         <>
           <div className="flex items-center gap-2 pl-6 pr-1">
             <span className="min-w-0 flex-1 truncate text-xs text-neutral-500">
-              {branchOf(workspace)} · {workspace.project}
+              {branchOf(workspace)}
             </span>
             <div className="flex shrink-0 items-center gap-0.5 pointer-fine:hidden pointer-fine:group-focus-within/ws:flex pointer-fine:group-hover/ws:flex">
               {onChanges && (
@@ -370,6 +376,62 @@ function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges,
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * The line under a workspace's name: its project, then where its work stands (`standing`) in its
+ * tone, the pull request linked to GitHub. Read through the cache entry the board shares, once when
+ * shown, again when one of its terminals changes glyph (a turn that ends may have pushed or opened a
+ * pull request), and every `CHECKS_EVERY` only while its pull request's checks run. Not read while
+ * `enabled` is off (its machine is offline). A read that fails or has not answered leaves the
+ * project alone, and says nothing of why.
+ */
+function StandingLine({ workspace, list, enabled }: { workspace: WorkspaceView; list: Row[]; enabled: boolean }) {
+  const client = useQueryClient();
+  const { data, isError } = useQuery({
+    ...shippingQuery(workspace.id),
+    enabled,
+    staleTime: 30_000,
+    retry: false,
+    refetchInterval: (query) => {
+      const pending = query.state.data?.pr?.state === "open" && query.state.data.pr.checks === "pending";
+      return pollEvery(CHECKS_EVERY, enabled && pending)(query);
+    },
+  });
+  const glyphs = list.map((r) => `${r.terminal}:${r.glyph}`).join(" ");
+  const last = useRef(glyphs);
+  useEffect(() => {
+    if (last.current === glyphs) return;
+    last.current = glyphs;
+    void client.invalidateQueries({ queryKey: shippingQuery(workspace.id).queryKey, exact: true });
+  }, [glyphs, client, workspace.id]);
+
+  const working = list.some((r) => r.glyph === "starting" || r.glyph === "working");
+  const stands = enabled && data && !isError ? standing(data, working) : undefined;
+  return (
+    <p title={stands ? `${workspace.project} · ${stands.text}` : workspace.project} className="truncate pl-6 pr-1 text-xs text-neutral-500">
+      <span>{workspace.project}</span>
+      {stands && (
+        <>
+          <span className="text-neutral-600"> · </span>
+          {stands.pr ? (
+            <a
+              href={stands.pr.url}
+              target="_blank"
+              rel="noreferrer"
+              title={`${stands.pr.title} (open on GitHub)`}
+              tabIndex={-1}
+              className={`rounded hover:underline hover:underline-offset-4 ${toneText[stands.tone]}`}
+            >
+              {stands.text}
+            </a>
+          ) : (
+            <span className={toneText[stands.tone]}>{stands.text}</span>
+          )}
+        </>
+      )}
+    </p>
   );
 }
 

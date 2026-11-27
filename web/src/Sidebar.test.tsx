@@ -49,8 +49,8 @@ afterEach(() => {
 describe("Sidebar", () => {
   it("marks each workspace with its project's face, so a long list reads by project", async () => {
     await renderApp(<Sidebar machines={machines()} {...props} />);
-    const face = within(screen.getByRole("group", { name: "fix login" })).getByTitle("demo");
-    expect(face.textContent).toBe("DE");
+    const face = within(screen.getByRole("group", { name: "fix login" })).getByText("DE");
+    expect(face.getAttribute("title")).toBe("demo");
     // It is a picture of what the row says in words once unfolded, so a screen reader skips it.
     expect(face.getAttribute("aria-hidden")).toBe("true");
   });

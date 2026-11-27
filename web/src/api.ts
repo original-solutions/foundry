@@ -375,8 +375,15 @@ export interface Shipping {
   unreachable: boolean;
 }
 
+/**
+ * Where a workspace's branch stands. A POST with no body, so the daemon carries the read to the
+ * machine that owns the workspace; an owner on an older build refuses it (`400`), and one that
+ * cannot be reached is `503` or `504`.
+ */
 export async function workspaceShipping(workspace: string): Promise<Shipping> {
-  return (await get(`/api/workspaces/${workspace}/pr`)) as unknown as Shipping;
+  const { status, json } = await post(`/api/workspaces/${workspace}/pr`);
+  if (status !== 200) throw refused(status, json);
+  return json as unknown as Shipping;
 }
 
 /** The newest step of a session's turn: a prompt, a tool about to run, or a question for you. */
