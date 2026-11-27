@@ -5,7 +5,7 @@ import { taskName, useCreateWorkspace } from "./Composer";
 import { Launchpad } from "./Launchpad";
 import { primaryButton } from "./Modal";
 import { settings } from "./test-fixtures";
-import { json, mockFetch, renderApp } from "./test-utils";
+import { json, mockFetch, renderApp, type Call } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -19,6 +19,8 @@ function Harness(props: Partial<ComponentProps<typeof Launchpad>>) {
 
 const promptBox = () => screen.getByLabelText("What should Claude work on?");
 const start = () => screen.getByRole("button", { name: /^Start/ }) as HTMLButtonElement;
+/** The name each request sent, if it sent one. */
+const sentNames = (calls: Call[]) => calls.map((c) => (c.body as { name?: string } | undefined)?.name);
 
 describe("taskName", () => {
   it("names a task by the first words of its first line, lower case, without closing punctuation", () => {
@@ -133,7 +135,7 @@ describe("Launchpad", () => {
     fireEvent.click(start());
 
     await waitFor(() => expect(created).toHaveBeenCalledWith("s1", null));
-    expect(calls.map((c) => c.body?.name)).toEqual(["review-loop pr 1181", "review-loop pr 1181 2", undefined]);
+    expect(sentNames(calls)).toEqual(["review-loop pr 1181", "review-loop pr 1181 2", undefined]);
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.getByLabelText("Branch").textContent).toBe("review-loop-pr-1181-2");
     expect((screen.getByLabelText("Workspace name") as HTMLInputElement).placeholder).toBe("review-loop pr 1181 2");
@@ -147,7 +149,7 @@ describe("Launchpad", () => {
     fireEvent.click(start());
 
     expect((await screen.findByRole("alert")).textContent).toMatch(/already exists in this project/);
-    expect(calls.map((c) => c.body?.name)).toEqual(["fix it", ...Array.from({ length: 19 }, (_, i) => `fix it ${i + 2}`)]);
+    expect(sentNames(calls)).toEqual(["fix it", ...Array.from({ length: 19 }, (_, i) => `fix it ${i + 2}`)]);
   });
 
   it("does not number a typed name the daemon refuses as taken", async () => {
@@ -159,7 +161,7 @@ describe("Launchpad", () => {
     fireEvent.click(start());
 
     expect((await screen.findByRole("alert")).textContent).toMatch(/a branch or worktree named login already exists/);
-    expect(calls.map((c) => c.body?.name)).toEqual(["login"]);
+    expect(sentNames(calls)).toEqual(["login"]);
   });
 
   it("does not number a suggested name refused for another reason", async () => {
@@ -170,7 +172,7 @@ describe("Launchpad", () => {
     fireEvent.click(start());
 
     expect((await screen.findByRole("alert")).textContent).toMatch(/no base branch dev/);
-    expect(calls.map((c) => c.body?.name)).toEqual(["fix it"]);
+    expect(sentNames(calls)).toEqual(["fix it"]);
   });
 
   it("says there is no project to work in when the fleet has none, and starts nothing", async () => {

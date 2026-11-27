@@ -14,7 +14,7 @@ The first-run screen asks one question: **What should Claude work on?**
 
 ![The first-run screen: one question, a task box with project, base branch and model, and the three states below](images/getting-started-first-run.png)
 
-Type the task in the box. Write it the way you would tell a colleague. As you type, Foundry names the workspace and its branch from your words, and shows the branch under the box. "Fix the login redirect" becomes the workspace `fix the login redirect` on the branch `fix-the-login-redirect`.
+Type the task in the box. Write it the way you would tell a colleague. As you type, Foundry names the workspace and its branch from your words, and shows the branch under the box. "Fix the login redirect" becomes the workspace `fix the login redirect` on the branch `fix-the-login-redirect`. A link to a GitHub pull request or issue becomes `pr` or `issue` and its number, other links are left out, and a slash command loses its slash: "/review-loop https://github.com/o/people-hub/pull/1181" becomes `review-loop pr 1181`, numbered `review-loop pr 1181 2` when the repo already has the branch `review-loop-pr-1181`.
 
 Under the box, from left to right:
 
@@ -24,7 +24,7 @@ Under the box, from left to right:
 - **on.** Only appears when the fleet has other machines. Choose **this machine**, **let Foundry choose**, or a machine by name. An offline machine is listed but cannot be picked. With no other machine, the line just says "on this machine".
 - **Start.** Makes the workspace and starts Claude. `Cmd+Enter` (`Ctrl+Enter` on Windows and Linux) does the same from the box.
 
-The **Workspace** field under the box holds the name. Leave it empty to use the one made from the task, or type your own. Foundry numbers a name made from a task when the project already has its branch, so a second "fix the login redirect" becomes `fix the login redirect 2`. It never changes a name you typed. If the project already has a workspace on that name's branch, the branch turns amber, a line asks for another name, and **Start** stays off.
+The **Workspace** field under the box holds the name. Leave it empty to use the one made from the task, or type your own. Foundry numbers a name made from a task when its branch is taken in the project's repo, by an open workspace or by a branch or worktree left from earlier, so a second "fix the login redirect" becomes `fix the login redirect 2`. It never changes a name you typed. If the project already has a workspace on that name's branch, the branch turns amber, a line asks for another name, and **Start** stays off.
 
 The task is optional. With a name and no task, Foundry makes the workspace and starts Claude with nothing to do yet.
 
