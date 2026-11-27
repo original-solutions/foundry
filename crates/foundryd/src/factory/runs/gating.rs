@@ -22,7 +22,8 @@
 //!    with no pull request reported are [`GateStep::NotReady`]. A session that cannot be reached
 //!    and was at rest when last seen ([`at_rest`]) is not at work: its reported pull request is
 //!    gated, and a gate in flight on its machine is read, so a cut-off build machine's gate could
-//!    not run as any other's. One that may be at work there is waited for.
+//!    not run as any other's. One that may be at work there is waited for, and with its pull
+//!    request reported nothing interrupts it: `limits.minutes` ends the run (#367).
 //!    A session the fleet does not show is stuck (`session-gone`).
 //! 3. A pull request that is gone, from a fork, off the base or off the run's branches is stuck
 //!    (`pr-not-bound`); one that was merged or closed before a pass is recorded ends the run

@@ -275,9 +275,11 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
         SessionState::Stuck | SessionState::Starting | SessionState::Working => {
             Ok(BuildStep::Running)
         }
-        // A machine that cannot be reached is `resume`'s to measure, but a pull request its
-        // session reported stays with the gate, which reads a gate in flight on that machine,
-        // unless the session may be at work there.
+        // A machine that cannot be reached is `resume`'s to measure until a pull request is
+        // reported. Then the pull request stays with the gate, which reads a gate in flight on
+        // that machine when the session was at rest there. A session that may be at work keeps
+        // the run running, and `limits.minutes` ends it: `resume`'s 15-minute rule does not run
+        // once a pull request is reported (#367).
         SessionState::Unreachable if gating::at_rest(&seen, turn.as_ref()) => {
             Ok(step.read_already())
         }
