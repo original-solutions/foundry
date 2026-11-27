@@ -309,6 +309,10 @@ describe("UpdateBadge", () => {
       fireEvent.click(badge());
       expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
       expect(within(dialog()).queryByText(/restarting/i)).toBeNull();
+      // A later release reaches it from elsewhere: the hold, lifted once, stays lifted.
+      update([at(ME, 3, { version: "0.9.2" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
+      expect(within(dialog()).queryByText(/restarting/i)).toBeNull();
     });
   }
 
