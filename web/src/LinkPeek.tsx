@@ -1,5 +1,7 @@
 import type { FileChange } from "./api";
 import { diffLines, splitPath } from "./changes";
+import { CodeLine } from "./CodeLine";
+import { paint } from "./paint";
 import { fileStatus, marker, rowTone } from "./ChangesPanel";
 import { jumpKey } from "./JumpPalette";
 
@@ -57,7 +59,9 @@ function Address({ url }: { url: string }) {
 function File({ file }: { file: FileChange }) {
   const { dir, name } = splitPath(file.path);
   const s = fileStatus[file.status];
-  const lines = file.patch === null ? [] : diffLines(file.patch).filter((l) => l.kind !== "note");
+  const all = file.patch === null ? [] : diffLines(file.patch);
+  const painted = paint(all, file.path);
+  const lines = all.map((line, i) => ({ line, pieces: painted[i] })).filter(({ line }) => line.kind !== "note");
   const more = lines.length - PEEK_LINES;
   return (
     <>
@@ -79,7 +83,7 @@ function File({ file }: { file: FileChange }) {
       {file.patch !== null ? (
         lines.length > 0 && (
         <div className="overflow-hidden py-1 font-mono text-[11px] leading-[18px]">
-          {lines.slice(0, PEEK_LINES).map((line, i) =>
+          {lines.slice(0, PEEK_LINES).map(({ line, pieces }, i) =>
             line.kind === "hunk" ? (
               <div key={i} className="truncate bg-sky-500/5 px-3 text-sky-300/70">
                 {line.text}
@@ -87,7 +91,9 @@ function File({ file }: { file: FileChange }) {
             ) : (
               <div key={i} className={`flex ${rowTone[line.kind as keyof typeof rowTone]}`}>
                 <span className="w-5 shrink-0 select-none text-center opacity-70">{marker[line.kind as keyof typeof marker]}</span>
-                <span className="truncate whitespace-pre pr-3">{line.text}</span>
+                <span className="truncate whitespace-pre pr-3">
+                  <CodeLine pieces={pieces} kind={line.kind as "added" | "removed" | "same"} />
+                </span>
               </div>
             ),
           )}

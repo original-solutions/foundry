@@ -93,7 +93,7 @@ On a narrow screen there is no Find button in the header. Use **Find in scrollba
 
 Only the machine that holds a workspace can read its changes. For a workspace on another machine, the sheet says it could not read them. Open that machine's own UI to see them.
 
-The top shows the branch and its base, the lines added and removed, the file count, how many files are **uncommitted** and how many commits there are. Below it is a list of files and each file's diff. A letter beside each file says whether it was added, modified, deleted or renamed, or is new and not yet in git.
+The top shows the branch and its base, the lines added and removed, the file count, how many files are **uncommitted** and how many commits there are. Below it is a list of files and each file's diff. A letter beside each file says whether it was added, modified, deleted or renamed, or is new and not yet in git. Each diff is coloured as code in its file's language. Where a line was changed rather than added, the words that changed are marked on the old line and the new one.
 
 Once the branch has something to say, one line under the title tells where it stands. It reads **Not pushed** with how many commits are only on this machine, **Pushed**, a draft or open **PR #n** with its checks and review, or **PR #n merged**. Checks read **Checks running**, **Checks pass** or **Checks failing**. The review reads **Review required**, **Approved** or **Changes requested**. The pull request's number links to GitHub.
 
