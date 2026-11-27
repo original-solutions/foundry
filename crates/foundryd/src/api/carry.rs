@@ -3,7 +3,8 @@
 //!
 //! - `POST /api/workspaces` whose `machine` names another machine.
 //! - `POST /api/workspaces/{id}/sessions`, `/shells`, `/archive` and `/pr` for a workspace
-//!   another machine owns.
+//!   another machine owns. An owner on a build from before `/pr` was carried answers it `400`,
+//!   as it answers any route it does not carry.
 //! - `POST /api/terminals/{id}/close` for a terminal another machine owns.
 //!
 //! Each goes to its owner over [`Peers::call`](crate::sync::Peers::call), its body passed as
