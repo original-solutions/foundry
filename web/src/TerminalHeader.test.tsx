@@ -1,6 +1,7 @@
-import { screen, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Changes, Shipping } from "./api";
+import { changesQuery, GLANCE_EVERY } from "./ChangesPanel";
 import { fleet, locate } from "./fleet";
 import { headerFit, TerminalHeader } from "./TerminalHeader";
 import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
@@ -97,5 +98,41 @@ describe("TerminalHeader", () => {
     expect(within(bar).queryByRole("button", { name: "Steps" })).toBeNull();
     expect(within(bar).getByRole("button", { name: "Find" })).toBeTruthy();
     expect(within(bar).getByRole("tablist").className.split(" ")).toContain("order-last");
+  });
+
+  it("keeps the opened changes' size fresh, and stops reading them once the daemon answers 404", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      layOut(1400);
+      let answer = () => json(200, dirty);
+      let reads = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          if (url === "/api/machine") return json(200, { id: ME });
+          if (url === "/api/workspaces/w1/pr") return json(200, quiet);
+          if (url !== "/api/workspaces/w1/changes") throw new Error(`unexpected request ${url}`);
+          reads += 1;
+          return answer();
+        }),
+      );
+      const { client } = await renderApp(
+        <TerminalHeader id="t1" located={located()} drawerOpen={false} onMenu={() => {}} onJump={() => {}} onChanges={() => {}} onSteps={() => {}} onFind={() => {}} />,
+      );
+      // The changes have been opened once: the header reads them from then on.
+      act(() => client.setQueryData(changesQuery("w1").queryKey, dirty));
+      const changes = await screen.findByRole("button", { name: /^Changes/ });
+      await waitFor(() => expect(changes.textContent).toContain("+2"));
+      await waitFor(() => expect(reads).toBe(1));
+      await act(() => vi.advanceTimersByTimeAsync(GLANCE_EVERY + 100));
+      expect(reads).toBe(2);
+      answer = () => json(404, { error: "workspace w1 is not a live workspace of this machine" });
+      await act(() => vi.advanceTimersByTimeAsync(GLANCE_EVERY));
+      expect(reads).toBe(3);
+      await act(() => vi.advanceTimersByTimeAsync(GLANCE_EVERY * 5));
+      expect(reads).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
