@@ -3191,13 +3191,13 @@ mod tests {
                 assert!(calls(&rig).is_empty());
             }
 
-            /// The approval is the label in force when the claim took it off: a label applied
-            /// and removed again after the claim does not replace it.
+            /// The claim's removal must be the label's newest event: a label applied and removed
+            /// again after the claim hides it, and without the claim comment's time the factory
+            /// cannot tell that from an approval withdrawn, so the run goes stuck.
             #[test]
-            fn a_label_applied_and_removed_after_the_claim_does_not_replace_its_approval() {
+            fn a_label_applied_and_removed_after_the_claim_goes_stuck() {
                 let rig = Rig::new();
-                rig.worker.on_create(Ok(ws_id()));
-                let run = taken_over(&rig, elsewhere());
+                let run = taken_over(&rig, rig.machine);
                 let mut nodes = vec![label_event(
                     "LabeledEvent",
                     "factory:ready",
@@ -3221,8 +3221,7 @@ mod tests {
                     "mallory",
                 ));
                 rig.sim.set_approval(timeline_of(nodes, &[]));
-                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
-                assert_eq!(rig.steps(&run)[0], format!("approved {LABELED_AT}"));
+                goes_stuck_unapproved(&rig, &run);
             }
 
             /// A stranger's label in force at the claim is no approval, though an instructor's
@@ -3312,6 +3311,128 @@ mod tests {
                     150.into();
                 rig.sim.set_approval(answer.to_string());
                 goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// `pass` on `run` is carried on, approved on the label applied at `labeled_at`.
+            fn carried_on_approved_at(rig: &Rig, run: &RunId, labeled_at: &str) {
+                assert_eq!(pass(rig, run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.steps(run)[0], format!("approved {labeled_at}"));
+            }
+
+            /// An earlier attempt's claim took the label off once; the label an instructor put
+            /// back and took off again before this claim could is no approval.
+            #[test]
+            fn a_label_withdrawn_after_an_earlier_attempts_claim_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    LABELED_AT,
+                    "User",
+                    "tom",
+                )];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                nodes.push(label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    "2026-10-04T11:00:00Z",
+                    "User",
+                    "tom",
+                ));
+                nodes.push(label_event(
+                    "UnlabeledEvent",
+                    "factory:ready",
+                    "2026-10-04T11:05:00Z",
+                    "User",
+                    "tom",
+                ));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// A second attempt is approved on the label put back after the first went stuck,
+            /// not on the first attempt's.
+            #[test]
+            fn a_second_attempt_is_approved_on_the_label_its_own_claim_took_off() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                let again = "2026-10-04T11:00:00Z";
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    LABELED_AT,
+                    "User",
+                    "tom",
+                )];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                nodes.push(label_event(
+                    "UnlabeledEvent",
+                    "factory:triage",
+                    "2026-10-04T10:30:00Z",
+                    "User",
+                    LOGIN,
+                ));
+                nodes.push(label_event(
+                    "LabeledEvent",
+                    "factory:stuck",
+                    "2026-10-04T10:30:00Z",
+                    "User",
+                    LOGIN,
+                ));
+                nodes.push(label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    again,
+                    "User",
+                    "tom",
+                ));
+                nodes.extend(claim_swap("2026-10-04T11:05:00Z"));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                carried_on_approved_at(&rig, &run, again);
+            }
+
+            /// Other labels applied or removed around the claim, by anyone, change nothing.
+            #[test]
+            fn other_labels_around_the_claim_leave_its_approval_as_it_was() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                let mut nodes = vec![
+                    label_event("LabeledEvent", "factory:ready", LABELED_AT, "User", "tom"),
+                    label_event(
+                        "UnlabeledEvent",
+                        "factory:proposed",
+                        LABELED_AT,
+                        "User",
+                        "tom",
+                    ),
+                    label_event(
+                        "LabeledEvent",
+                        "bug",
+                        "2026-10-04T10:01:00Z",
+                        "Bot",
+                        "triage-bot",
+                    ),
+                ];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                nodes.push(label_event(
+                    "UnlabeledEvent",
+                    "factory:triage",
+                    "2026-10-04T10:06:00Z",
+                    "User",
+                    LOGIN,
+                ));
+                nodes.push(label_event(
+                    "LabeledEvent",
+                    "factory:building",
+                    "2026-10-04T10:06:00Z",
+                    "User",
+                    LOGIN,
+                ));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                carried_on_approved_at(&rig, &run, LABELED_AT);
             }
         }
 
