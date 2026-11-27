@@ -3119,6 +3119,37 @@ mod tests {
                 assert!(rig.ledger.read(&run_id(1)).unwrap().is_empty());
             }
 
+            /// The approval answer of an issue whose label events are `labels` (oldest first:
+            /// `"label"` or `"unlabel"`, when, by whom, always `factory:ready`), with the body
+            /// edits `(at, who)` the issue has had.
+            fn label_events(labels: &[(&str, &str, &str)], edits: &[(&str, &str)]) -> String {
+                let actor = |login: &str| serde_json::json!({"__typename": "User", "login": login});
+                let nodes: Vec<serde_json::Value> = edits
+                    .iter()
+                    .rev()
+                    .map(|(at, who)| serde_json::json!({"editedAt": at, "editor": actor(who)}))
+                    .collect();
+                let last = edits.last();
+                let timeline: Vec<serde_json::Value> = labels
+                    .iter()
+                    .map(|(kind, at, who)| {
+                        serde_json::json!({
+                            "__typename": if *kind == "label" { "LabeledEvent" } else { "UnlabeledEvent" },
+                            "createdAt": at,
+                            "actor": actor(who),
+                            "label": {"name": "factory:ready"},
+                        })
+                    })
+                    .collect();
+                serde_json::json!({"data": {"repository": {"issue": {
+                    "timelineItems": {"totalCount": timeline.len(), "nodes": timeline},
+                    "lastEditedAt": last.map(|(at, _)| *at),
+                    "editor": last.map_or(serde_json::Value::Null, |(_, who)| actor(who)),
+                    "userContentEdits": {"totalCount": nodes.len(), "nodes": nodes},
+                }}}})
+                .to_string()
+            }
+
             /// The approval answer of an issue the claim has already taken `factory:ready` off:
             /// the label by `by` at `labeled_at`, its removal by the claim after the comment,
             /// and any body edits `(at, who)` since the label.
@@ -3127,33 +3158,13 @@ mod tests {
                 by: &str,
                 edits: &[(&str, &str)],
             ) -> String {
-                let actor = |login: &str| serde_json::json!({"__typename": "User", "login": login});
-                let nodes: Vec<serde_json::Value> = edits
-                    .iter()
-                    .rev()
-                    .map(|(at, who)| serde_json::json!({"editedAt": at, "editor": actor(who)}))
-                    .collect();
-                let last = edits.last();
-                serde_json::json!({"data": {"repository": {"issue": {
-                    "timelineItems": {"totalCount": 2, "nodes": [
-                        {
-                            "__typename": "LabeledEvent",
-                            "createdAt": labeled_at,
-                            "actor": actor(by),
-                            "label": {"name": "factory:ready"},
-                        },
-                        {
-                            "__typename": "UnlabeledEvent",
-                            "createdAt": "2026-10-04T12:00:00Z",
-                            "actor": actor(LOGIN),
-                            "label": {"name": "factory:ready"},
-                        },
-                    ]},
-                    "lastEditedAt": last.map(|(at, _)| *at),
-                    "editor": last.map_or(serde_json::Value::Null, |(_, who)| actor(who)),
-                    "userContentEdits": {"totalCount": nodes.len(), "nodes": nodes},
-                }}}})
-                .to_string()
+                label_events(
+                    &[
+                        ("label", labeled_at, by),
+                        ("unlabel", "2026-10-04T12:00:00Z", LOGIN),
+                    ],
+                    edits,
+                )
             }
 
             /// The claim removes `factory:ready`, so a coordinator that takes over before the
@@ -3168,6 +3179,77 @@ mod tests {
                     .set_approval(label_taken_off_by_the_claim(LABELED_AT, "tom", &[]));
                 assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
                 assert_eq!(rig.steps(&run)[0], format!("approved {LABELED_AT}"));
+            }
+
+            /// A retry: attempt 1 claimed and went stuck, a stranger edited the body, the
+            /// instructor read the edit and applied the label again, and attempt 2 claimed. The
+            /// approval is the label between the claims, not the one before attempt 1.
+            #[test]
+            fn takes_the_newest_claim_and_the_newest_label_before_it() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.sim.set_labels(&["factory:triage"]);
+                rig.sim.set_assignees(&[LOGIN]);
+                rig.foundry_claim(&run_id(1), rig.machine);
+                // Comment ids are seconds on the sim's clock: the second claim is 10 s later.
+                for _ in 0..9 {
+                    rig.sim.comment_as("someone", "noise");
+                }
+                rig.foundry_claim(&run_id(2), rig.machine);
+                rig.sim.set_approval(label_events(
+                    &[
+                        ("label", LABELED_AT, "tom"),
+                        ("unlabel", "2026-10-04T11:01:40Z", LOGIN),
+                        ("label", "2026-10-04T11:01:45Z", "tom"),
+                        ("unlabel", "2026-10-04T11:01:50Z", LOGIN),
+                    ],
+                    &[("2026-10-04T11:01:42Z", "mallory")],
+                ));
+                let run = run_id(2);
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.steps(&run)[0], "approved 2026-10-04T11:01:45Z");
+            }
+
+            /// A label put on after the claim (and taken off again) is no approval.
+            #[test]
+            fn ignores_a_label_applied_after_the_claim() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, rig.machine);
+                rig.sim.set_approval(label_events(
+                    &[
+                        ("label", LABELED_AT, "tom"),
+                        ("unlabel", "2026-10-04T11:01:40Z", LOGIN),
+                        ("label", "2026-10-04T12:30:00Z", "tom"),
+                        ("unlabel", "2026-10-04T12:31:00Z", "tom"),
+                    ],
+                    &[],
+                ));
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.steps(&run)[0], format!("approved {LABELED_AT}"));
+            }
+
+            /// The newest label before the claim decides: a stranger's, after an instructor's,
+            /// leaves no approval.
+            #[test]
+            fn records_no_approval_when_a_stranger_labelled_after_an_instructor_before_the_claim() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                rig.sim.set_approval(label_events(
+                    &[
+                        ("label", LABELED_AT, "tom"),
+                        ("label", "2026-10-04T10:30:00Z", "mallory"),
+                        ("unlabel", "2026-10-04T12:00:00Z", LOGIN),
+                    ],
+                    &[],
+                ));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: CANNOT_CONFIRM.into()
+                    }
+                );
+                assert!(rig.steps(&run).iter().all(|s| !s.starts_with("approved ")));
             }
 
             #[test]
