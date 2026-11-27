@@ -21,6 +21,7 @@ import { ThemeButton } from "./ThemeButton";
 import { railKey } from "./collapsed";
 import { pollEvery } from "./poll";
 import { CHECKS_EVERY, shippingQuery, standing, toneText } from "./Shipping";
+import { useOnScreen } from "./cardChanges";
 import type { MachineSample } from "./api";
 
 const statusColour = { online: "text-neutral-400", offline: "text-red-400", unknown: "text-neutral-400" };
@@ -328,7 +329,7 @@ function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, 
         {workspace.factory && <FactoryMark run={workspace.factory} />}
         {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
       </div>
-      <StandingLine workspace={workspace} list={list} enabled={readable} />
+      <StandingLine workspace={workspace} list={list} readable={readable} />
       {!folded && (
         <>
           <div className="flex items-center gap-2 pl-6 pr-1">
@@ -381,19 +382,24 @@ function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, 
 
 /**
  * The line under a workspace's name: its project, then where its work stands (`standing`) in its
- * tone, the pull request linked to GitHub. Read through the cache entry the board shares, once when
- * shown, again when one of its terminals changes glyph (a turn that ends may have pushed or opened a
- * pull request), and every `CHECKS_EVERY` only while its pull request's checks run. Not read while
- * `enabled` is off (its machine is offline). A read that fails or has not answered leaves the
- * project alone, and says nothing of why.
+ * tone, the pull request linked to GitHub. Read through the cache entry the board shares, once the
+ * row is on screen, again when one of its terminals changes glyph (a turn that ends may have pushed
+ * or opened a pull request), and every `CHECKS_EVERY` only while its pull request's checks run;
+ * never on window focus or reconnect, since each read runs git and asks GitHub on the owner. Not
+ * read while `readable` is off (its machine is offline). A read that fails or has not answered
+ * leaves the project alone, and says nothing of why.
  */
-function StandingLine({ workspace, list, enabled }: { workspace: WorkspaceView; list: Row[]; enabled: boolean }) {
+function StandingLine({ workspace, list, readable }: { workspace: WorkspaceView; list: Row[]; readable: boolean }) {
   const client = useQueryClient();
+  const [ref, onScreen] = useOnScreen<HTMLParagraphElement>();
+  const enabled = readable && onScreen;
   const { data, isError } = useQuery({
     ...shippingQuery(workspace.id),
     enabled,
     staleTime: 30_000,
     retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
     refetchInterval: (query) => {
       const pending = query.state.data?.pr?.state === "open" && query.state.data.pr.checks === "pending";
       return pollEvery(CHECKS_EVERY, enabled && pending)(query);
@@ -404,13 +410,22 @@ function StandingLine({ workspace, list, enabled }: { workspace: WorkspaceView; 
   useEffect(() => {
     if (last.current === glyphs) return;
     last.current = glyphs;
-    void client.invalidateQueries({ queryKey: shippingQuery(workspace.id).queryKey, exact: true });
+    // A board card marks the same entry out of date on the same change, before or after this
+    // effect. Waiting a tick lets its read start (or land) first, so the change is read once.
+    const { queryKey } = shippingQuery(workspace.id);
+    const before = client.getQueryState(queryKey)?.dataUpdatedAt;
+    const wait = setTimeout(() => {
+      const now = client.getQueryState(queryKey);
+      if (now?.fetchStatus === "fetching" || now?.dataUpdatedAt !== before) return;
+      void client.invalidateQueries({ queryKey, exact: true }, { cancelRefetch: false });
+    }, 0);
+    return () => clearTimeout(wait);
   }, [glyphs, client, workspace.id]);
 
   const working = list.some((r) => r.glyph === "starting" || r.glyph === "working");
-  const stands = enabled && data && !isError ? standing(data, working) : undefined;
+  const stands = readable && data && !isError ? standing(data, working) : undefined;
   return (
-    <p title={stands ? `${workspace.project} · ${stands.text}` : workspace.project} className="truncate pl-6 pr-1 text-xs text-neutral-500">
+    <p ref={ref} title={stands ? `${workspace.project} · ${stands.text}` : workspace.project} className="truncate pl-6 pr-1 text-xs text-neutral-500">
       <span>{workspace.project}</span>
       {stands && (
         <>
