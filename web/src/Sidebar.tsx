@@ -232,7 +232,6 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                 <Workspace
                   key={workspace.id}
                   workspace={workspace}
-                  machine={machine.id}
                   folded={!unfolded.has(workspace.id)}
                   onFold={(on) => fold([workspace.id], on)}
                   selected={selected}
@@ -280,8 +279,6 @@ function LoadMeter({ sample }: { sample: MachineSample }) {
 
 interface WorkspaceProps {
   workspace: WorkspaceView;
-  /** The machine it is on. */
-  machine: string;
   folded: boolean;
   onFold: (on: boolean) => void;
   selected?: string;
@@ -291,7 +288,7 @@ interface WorkspaceProps {
   tab: (id: string) => { tabIndex: number; onFocus: () => void };
 }
 
-function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
+function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
   const terminals = useTerminalActions();
   const list = rows(workspace);
@@ -342,7 +339,7 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
                   <path d="M11.5 2l-3 6M4 8h7l1 5.5H3zM6 10.5v3M9 10.5v3" />
                 </Action>
               )}
-              {terminals?.here === machine && (
+              {terminals && (
                 <Action label="Archive" title={words.archive} onClick={() => terminals.archive(workspace.id)}>
                   <path d={ARCHIVE_ICON} />
                 </Action>
