@@ -1512,6 +1512,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         ("GET", &changes, None, false),
         ("GET", &commit, None, false),
         ("GET", &shipping, None, false),
+        ("POST", &shipping, None, false),
     ];
     for (method, path, body, upgrade) in routes {
         for (name, value) in [

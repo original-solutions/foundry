@@ -438,6 +438,8 @@ async fn a_asks_where_b_workspaces_branch_stands_and_b_answers_unchanged() {
     assert_eq!(status, 200, "{answer}");
     assert_eq!(answer["branch"], branch, "{answer}");
     assert_eq!(answer["pushed"], false, "{answer}");
+    let there = on_b.get(&format!("/api/workspaces/{workspace}/pr")).await;
+    assert_eq!(answer, there, "A answers as B does");
 }
 
 #[tokio::test]
