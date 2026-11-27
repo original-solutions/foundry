@@ -60,7 +60,9 @@ You may also see **Starting**, before the session has reported anything, and **S
 
 Each turn is a card. It starts with your prompt, then lists every tool call and every question Claude asked, each with how long ago it happened. Earlier turns fold up to their prompt, a count such as "2 edits · 1 read · 1 command" and how long they took. Click a card to open or fold it. The newest turn stays open and grows as Claude works, and the column keeps the newest step in view unless you scroll up.
 
-Each step has a small mark: `$` for a command, `±` for an edit or write, `R` for a read, `S` for a search, `W` for a web look-up, `A` for a sub-agent and `?` for a question.
+Each step has a small mark: `$` for a command, `±` for an edit or write, `R` for a read, `S` for a search, `W` for a web look-up, `A` for a sub-agent and `?` for a question. Click an edit to open that file's diff in **Changes**.
+
+Switch from **Turns** to **Files** to see the same steps by what they touched. Every file Claude read or changed is listed once, changed files first, with how many edits and reads. A file with changes shows its lines added and removed, and clicking it opens its diff. Below the files come the commands Claude ran and its other tools, each once, with how many times. Each row has a strip with a tick wherever along the session it was touched, and a gap where a new turn starts, so a file edited early and again at the end, or a test run four times, shows at a glance. Your choice of **Turns** or **Files** is kept in this browser.
 
 A shell has no steps. Open a session to follow what it does. On a phone Steps takes the whole screen.
 

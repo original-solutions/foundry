@@ -77,8 +77,9 @@ import { upNext } from "./needing";
  * A workspace's changes since its base open as a sheet from the header or the workspace's row.
  *
  * The header's Steps button shows, in a column at the right (the whole screen on a narrow one),
- * every prompt, tool call and question of the session with the keyboard, turn by turn. It follows
- * whichever terminal is open until it is closed.
+ * every prompt, tool call and question of the session with the keyboard, turn by turn, or, switched
+ * to its files, every file it read or changed and every command it ran, each once; an edit opens
+ * its file's diff in the changes sheet. It follows whichever terminal is open until it is closed.
  *
  * Cmd+F (Ctrl+F outside the terminal) or the header's Find button finds text in the whole
  * scrollback of the terminal with the keyboard; the bar follows it as the steps column does.
@@ -164,7 +165,7 @@ function Layout() {
   const stepsOf: StepsOf | undefined = !located
     ? undefined
     : located.session
-      ? { kind: "session", id: located.session, name: located.name, title: located.title, glyph: located.glyph, label: located.label }
+      ? { kind: "session", id: located.session, name: located.name, title: located.title, glyph: located.glyph, label: located.label, workspace: located.workspace.id }
       : { kind: "shell", name: located.name };
 
   const gone = useMemo(() => new Set(state.records.flatMap((r) => (r.kind === "terminal" && r.deleted ? [r.body.id] : []))), [state.records]);
@@ -411,7 +412,15 @@ function Layout() {
                 </div>
               </div>
             </main>
-            {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} stale={stale} />}
+            {stepsOpen && stepsOf && (
+              <StepsPanel
+                key={located?.session ?? terminalId}
+                of={stepsOf}
+                onClose={() => setStepsOpen(false)}
+                stale={stale}
+                onFile={located && ((file) => openChanges(located.workspace.id, file))}
+              />
+            )}
           </div>
           <ChangesPanel
             workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf?.workspace)}

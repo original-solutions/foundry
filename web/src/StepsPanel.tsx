@@ -4,13 +4,25 @@ import { ApiError, sessionTrail, type Mark } from "./api";
 import { addsSteps, busy, type Glyph } from "./labels";
 import { pollEvery } from "./poll";
 import { StateGlyph } from "./StateGlyph";
+import { StepsFiles, type Lens } from "./StepsFiles";
+import { readStored, store } from "./storage";
+import { pathOf } from "./touched";
 import { ago, kindOf, tally, took, turns, type StepKind, type Turn } from "./trail";
 
 /** How often an open panel reads a working session's trail again. */
 export const STEPS_EVERY = 2000;
 
 /** What the panel shows the steps of: a session, or a shell, which has none. */
-export type StepsOf = { kind: "session"; id: string; name: string; title?: string; glyph: Glyph; label: string } | { kind: "shell"; name: string };
+export type StepsOf =
+  | { kind: "session"; id: string; name: string; title?: string; glyph: Glyph; label: string; /** Its workspace, whose changes its files are read against. */ workspace?: string }
+  | { kind: "shell"; name: string };
+
+/** Whether Steps shows turns or files, kept in this browser so the next session opens the same way. */
+const LENS = "foundry.steps";
+
+function loadLens(): Lens {
+  return readStored(LENS) === "files" ? "files" : "turns";
+}
 
 
 const chip: Record<StepKind, { mark: string; tone: string }> = {
@@ -30,8 +42,17 @@ const chip: Record<StepKind, { mark: string; tone: string }> = {
  * ago. Earlier turns fold to their prompt, what they did ("3 commands · 1 edit") and how long they
  * took; the newest stays open and grows live while the session works, keeping its newest step in
  * view. On a wide screen it is a column at the right; on a narrow one it takes the screen.
+ *
+ * Its switch turns the same steps into what they touched: the files read and changed, the
+ * commands run and the other tools, each once (see `StepsFiles`). An edit, in either, opens that
+ * file's diff in the changes sheet through `onFile`.
  */
-export function StepsPanel({ of, onClose, stale }: { of: StepsOf; onClose: () => void; stale?: boolean }) {
+export function StepsPanel({ of, onClose, stale, onFile }: { of: StepsOf; onClose: () => void; stale?: boolean; onFile?: (path: string) => void }) {
+  const [lens, setLens] = useState<Lens>(loadLens);
+  const choose = (next: Lens) => {
+    setLens(next);
+    store(LENS, next);
+  };
   return (
     <aside aria-label="Steps" data-fleet data-stale={stale || undefined} className="fixed inset-0 z-30 flex flex-col bg-neutral-950 text-sm text-neutral-100 md:static md:z-auto md:w-[22rem] md:shrink-0 md:border-l md:border-neutral-800 motion-safe:md:animate-sheet-in">
       <header className="flex h-11 shrink-0 items-center gap-2 border-b border-neutral-800 bg-neutral-900 px-3 md:h-9 md:bg-neutral-950">
@@ -47,7 +68,22 @@ export function StepsPanel({ of, onClose, stale }: { of: StepsOf; onClose: () =>
           </svg>
         </button>
       </header>
-      {of.kind === "shell" ? <Note>A shell has no hooks, so it has no steps to show. Open a session to follow what it does.</Note> : <Trail session={of} />}
+      {of.kind === "session" && (
+        <div role="group" aria-label="Show steps by" className="flex shrink-0 gap-1 border-b border-neutral-800 px-3 py-1.5">
+          {(["turns", "files"] as const).map((each) => (
+            <button
+              key={each}
+              type="button"
+              aria-pressed={lens === each}
+              onClick={() => choose(each)}
+              className={`rounded-md px-2.5 py-1 text-xs font-medium ${lens === each ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200"}`}
+            >
+              {each === "turns" ? "Turns" : "Files"}
+            </button>
+          ))}
+        </div>
+      )}
+      {of.kind === "shell" ? <Note>A shell has no hooks, so it has no steps to show. Open a session to follow what it does.</Note> : <Trail session={of} lens={lens} onFile={onFile} />}
     </aside>
   );
 }
@@ -56,7 +92,7 @@ function Note({ children }: { children: React.ReactNode }) {
   return <p className="p-4 text-neutral-500">{children}</p>;
 }
 
-function Trail({ session }: { session: Extract<StepsOf, { kind: "session" }> }) {
+function Trail({ session, lens, onFile }: { session: Extract<StepsOf, { kind: "session" }>; lens: Lens; onFile?: (path: string) => void }) {
   const client = useQueryClient();
   const { data, error, isPending } = useQuery({
     queryKey: ["trail", session.id],
@@ -86,6 +122,7 @@ function Trail({ session }: { session: Extract<StepsOf, { kind: "session" }> }) 
     return <Note>{elsewhere ? "Steps are kept by the machine that runs it, and that is not this one, or its daemon restarted since it started." : error.message}</Note>;
   }
   if (isPending) return <Note>Reading steps…</Note>;
+  if (lens === "files" && data.length > 0) return <StepsFiles trail={data} workspace={session.workspace} label={session.label} onFile={onFile} />;
   const all = turns(data);
   if (all.length === 0) return <Note>No steps yet. Each prompt you send, tool it runs and question it asks shows here as it happens.</Note>;
   return (
@@ -99,14 +136,14 @@ function Trail({ session }: { session: Extract<StepsOf, { kind: "session" }> }) 
     >
       <ol className="space-y-2">
         {all.map((turn, i) => (
-          <TurnCard key={`${turn.start}-${i}`} turn={turn} newest={i === all.length - 1} session={session} now={now} />
+          <TurnCard key={`${turn.start}-${i}`} turn={turn} newest={i === all.length - 1} session={session} now={now} onFile={onFile} />
         ))}
       </ol>
     </div>
   );
 }
 
-function TurnCard({ turn, newest, session, now }: { turn: Turn; newest: boolean; session: Extract<StepsOf, { kind: "session" }>; now: number }) {
+function TurnCard({ turn, newest, session, now, onFile }: { turn: Turn; newest: boolean; session: Extract<StepsOf, { kind: "session" }>; now: number; onFile?: (path: string) => void }) {
   const [open, setOpen] = useState(newest);
   const [wasNewest, setWasNewest] = useState(newest);
   // A turn that stops being the newest folds, so only the one in progress stays open.
@@ -137,7 +174,7 @@ function TurnCard({ turn, newest, session, now }: { turn: Turn; newest: boolean;
           {turn.steps.length > 0 && (
             <ol aria-label="Steps of this turn" className="ml-1.5 border-l border-neutral-800 pl-3">
               {turn.steps.map((step, i) => (
-                <StepRow key={i} step={step} now={now} />
+                <StepRow key={i} step={step} now={now} onFile={onFile} />
               ))}
             </ol>
           )}
@@ -148,18 +185,29 @@ function TurnCard({ turn, newest, session, now }: { turn: Turn; newest: boolean;
   );
 }
 
-export function StepRow({ step, now }: { step: Mark; now: number }) {
+/** A step of a turn. An edit, given `onFile`, opens its file's diff. */
+export function StepRow({ step, now, onFile }: { step: Mark; now: number; onFile?: (path: string) => void }) {
   const kind = kindOf(step);
   const look = chip[kind];
   const text = kind === "command" ? step.text.slice(2) : step.text;
+  const path = kind === "edit" && onFile ? pathOf(step) : undefined;
   return (
     <li className="relative flex items-start gap-2 py-0.5">
       <span aria-hidden="true" className={`mt-px grid size-4 shrink-0 place-items-center rounded font-mono text-[10px] leading-none font-semibold ${look.tone}`}>
         {look.mark}
       </span>
-      <span className={`min-w-0 flex-1 text-xs leading-5 break-words ${kind === "ask" ? "text-amber-300" : "font-mono text-[11px] text-neutral-300"}`}>
-        {text}
-      </span>
+      {path !== undefined ? (
+        <button
+          type="button"
+          aria-label={`${text}: open its diff`}
+          onClick={() => onFile!(path)}
+          className="min-w-0 flex-1 rounded-sm text-left font-mono text-[11px] leading-5 break-words text-neutral-300 underline decoration-neutral-700 underline-offset-2 hover:text-neutral-100 hover:decoration-amber-300"
+        >
+          {text}
+        </button>
+      ) : (
+        <span className={`min-w-0 flex-1 text-xs leading-5 break-words ${kind === "ask" ? "text-amber-300" : "font-mono text-[11px] text-neutral-300"}`}>{text}</span>
+      )}
       <span className="shrink-0 text-[11px] leading-5 text-neutral-600">{ago(step.at, now)}</span>
     </li>
   );

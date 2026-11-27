@@ -1,4 +1,4 @@
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Mark } from "./api";
@@ -70,6 +70,85 @@ describe("StepsPanel", () => {
     const { onClose, panel } = await opened(session, json(200, { steps: [] }));
     fireEvent.click(within(panel).getByRole("button", { name: "Close steps" }));
     expect(onClose).toHaveBeenCalled();
+  });
+});
+
+describe("StepsPanel by file", () => {
+  afterEach(() => localStorage.clear());
+
+  const changes = {
+    base: "main",
+    commits: [],
+    files: [{ path: "src/login.test.ts", from: null, status: "added", added: 12, removed: 0, uncommitted: true, patch: "" }],
+  };
+  const inWorkspace: StepsOf = { ...session, workspace: "w1" };
+
+  async function byFile(onFile = vi.fn()) {
+    const calls = mockFetch(json(200, { steps: trail }), json(200, changes));
+    await renderApp(<StepsPanel of={inWorkspace} onClose={() => {}} onFile={onFile} />);
+    const panel = screen.getByRole("complementary", { name: "Steps" });
+    fireEvent.click(within(panel).getByRole("button", { name: "Files" }));
+    return { calls, panel, onFile };
+  }
+
+  it("turns the trail into the files the session touched, with what it did to each, and the commands it ran", async () => {
+    const { calls, panel } = await byFile();
+    const files = await within(panel).findByRole("list", { name: "Files" });
+    const rows = within(files).getAllByRole("listitem").map((li) => li.textContent);
+    expect(rows[0]).toContain("login.test.ts");
+    expect(rows[0]).toContain("1 edit");
+    expect(rows[1]).toContain("login.ts");
+    expect(rows[1]).toContain("1 read");
+    const commands = within(panel).getByRole("list", { name: "Commands" });
+    expect(commands.textContent).toContain("npm test");
+    expect(within(panel).queryByText(/needs your permission/)).toBeNull();
+    await waitFor(() => expect(calls.map((c) => c.url)).toContain("/api/workspaces/w1/changes"));
+  });
+
+  it("shows a changed file's lines from the workspace's changes, and opens its diff", async () => {
+    const { panel, onFile } = await byFile();
+    const open = await within(panel).findByRole("button", { name: /src\/login\.test\.ts/ });
+    expect(open.textContent).toContain("+12");
+    fireEvent.click(open);
+    expect(onFile).toHaveBeenCalledWith("src/login.test.ts");
+    // A file only read, and not in the changes, has no diff to open.
+    expect(within(panel).queryByRole("button", { name: /src\/login\.ts/ })).toBeNull();
+  });
+
+  it("says when an edited file holds no change any more, and offers no diff for it", async () => {
+    mockFetch(json(200, { steps: trail }), json(200, { ...changes, files: [] }));
+    await renderApp(<StepsPanel of={inWorkspace} onClose={() => {}} onFile={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+    const files = await screen.findByRole("list", { name: "Files" });
+    await waitFor(() => expect(within(files).getAllByRole("listitem")[0].textContent).toContain("no change now"));
+    expect(within(files).queryByRole("button")).toBeNull();
+  });
+
+  it("keeps the choice of turns or files for the next session", async () => {
+    await byFile();
+    expect(screen.getByRole("button", { name: "Files" }).getAttribute("aria-pressed")).toBe("true");
+    cleanup();
+    mockFetch(json(200, { steps: trail }), json(200, changes));
+    await renderApp(<StepsPanel of={inWorkspace} onClose={() => {}} />);
+    expect(await screen.findByRole("list", { name: "Files" })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Turns" }));
+    expect(await screen.findByRole("listitem", { name: /now add a test/ })).toBeDefined();
+  });
+
+  it("opens an edit's diff from its step in a turn", async () => {
+    const onFile = vi.fn();
+    mockFetch(json(200, { steps: trail }));
+    await renderApp(<StepsPanel of={inWorkspace} onClose={() => {}} onFile={onFile} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Edit src\/login\.test\.ts/ }));
+    expect(onFile).toHaveBeenCalledWith("src/login.test.ts");
+    // A read is not a change: it opens nothing.
+    fireEvent.click(within(screen.getByRole("listitem", { name: /fix the login bug/ })).getByRole("button", { expanded: false }));
+    expect(screen.queryByRole("button", { name: /Read src\/login\.ts/ })).toBeNull();
+  });
+
+  it("offers no files for a shell", async () => {
+    await opened({ kind: "shell", name: "shell" });
+    expect(screen.queryByRole("button", { name: "Files" })).toBeNull();
   });
 });
 
