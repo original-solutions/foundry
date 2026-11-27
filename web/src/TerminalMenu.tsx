@@ -30,7 +30,7 @@ interface Actions {
 export type Place = "row" | "tab";
 
 export interface Context extends Actions {
-  /** The machine serving the UI, once known: only its workspaces get new terminals or are archived from here. */
+  /** The machine serving the UI, once known: only its workspaces get new terminals from here. */
   here?: string;
   /** The session name being edited, by its terminal, and where. */
   renaming?: { terminal: string; place: Place };
@@ -62,7 +62,8 @@ const Terminals = createContext<Context | undefined>(undefined);
  * terminals too: one that still runs is ended after asking, one that already ended is cleared at
  * once, and a request the daemon refuses says why at the foot of the screen. The daemon carries
  * an ending to the machine that owns the terminal, so any reachable machine's terminals are ended
- * from here. Only the machine serving the UI is offered new terminals in its workspaces.
+ * from here, and so is archiving a workspace. Only the machine serving the UI is offered new
+ * terminals in its workspaces.
  */
 export function TerminalActions({ children, ...actions }: Actions & { children: ReactNode }) {
   const [asking, setAsking] = useState<string>();
@@ -104,12 +105,13 @@ export function TerminalActions({ children, ...actions }: Actions & { children: 
     stopRenaming: () => setRenaming(undefined),
   };
   const target = asking ? locate(actions.machines, asking) : undefined;
-  const leaving = archiving ? actions.machines.flatMap((m) => m.workspaces).find((w) => w.id === archiving) : undefined;
+  const owner = archiving ? actions.machines.find((m) => m.workspaces.some((w) => w.id === archiving)) : undefined;
+  const leaving = owner?.workspaces.find((w) => w.id === archiving);
   return (
     <Terminals.Provider value={context}>
       {children}
       {asking && target && <EndDialog key={asking} id={asking} found={target} onDone={() => setAsking(undefined)} />}
-      {leaving && <ArchiveDialog key={leaving.id} workspace={leaving} onClose={() => setArchiving(undefined)} onArchived={(name, branch) => setArchived({ name, branch })} />}
+      {owner && leaving && <ArchiveDialog key={leaving.id} workspace={leaving} machine={owner} here={here} onClose={() => setArchiving(undefined)} onArchived={(name, branch) => setArchived({ name, branch })} />}
       {archived && (
         <p
           role="status"
@@ -201,8 +203,8 @@ export interface Act {
 /**
  * What can be done with terminal `id` from here, in menu order: going to it or to what belongs to
  * it, and renaming a session, starting something new beside it, and ending it. Any reachable
- * machine's terminals can be ended and its sessions renamed; only this machine's workspaces get
- * new terminals or are archived.
+ * machine's terminals can be ended, its sessions renamed and its workspaces archived; only this
+ * machine's workspaces get new terminals.
  */
 export function actsFor(id: string, at: Context, found: Located, roomy = wide()): Act[] {
   const mine = found.machine.id === at.here;
@@ -234,7 +236,7 @@ export function actsFor(id: string, at: Context, found: Located, roomy = wide())
       run: () => at.clear(rest),
       group: "end",
     },
-    mine && { key: "archive", label: `Archive ${name}…`, icon: ARCHIVE_ICON, run: () => at.archive(workspace), group: "end" },
+    { key: "archive", label: `Archive ${name}…`, icon: ARCHIVE_ICON, run: () => at.archive(workspace), group: "end" },
   ];
   return acts.filter((act): act is Act => !!act);
 }

@@ -114,7 +114,7 @@ describe("Sidebar", () => {
       const link = within(group).getByRole("link", { name: new RegExp(`model-${i}.*${label}$`) });
       expect(link.getAttribute("href")).toBe(`/terminals/st${i}`);
     });
-    expect(within(group).getByRole("link", { name: /Running/ }).getAttribute("href")).toBe("/terminals/sh1");
+    expect(within(group).getByRole("link", { name: /Open/ }).getAttribute("href")).toBe("/terminals/sh1");
     expect(within(group).getByRole("link", { name: /Failed · exit 1/ }).getAttribute("href")).toBe("/terminals/sh2");
     expect(within(group).getAllByRole("link", { name: /Unreachable/ })).toHaveLength(2);
     for (const name of ["New session", "New shell"]) {
@@ -126,6 +126,25 @@ describe("Sidebar", () => {
     fireEvent.click(within(group).getByRole("button", { name: "New session" }));
     expect(onNewSession).toHaveBeenCalledWith("w1", "fix login");
     expect(screen.getByRole("group", { name: "empty" })).toBeDefined();
+  });
+
+  it("offers Archive for a workspace on another machine, which the daemon carries to it, and opens its dialog", async () => {
+    mockFetch(json(200, { id: ME }));
+    const view = fleet(
+      [sample(ME, 1), sample(OTHER, 1), workspace(OTHER, "w9", "remote job"), terminal(OTHER, "t9", "w9", "running")],
+      settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] }),
+    );
+    const noop = () => {};
+    await renderApp(
+      <TerminalActions machines={view} onOpen={noop} onBeside={noop} onSteps={noop} onChanges={noop} onFind={noop} onNewSession={noop}>
+        <Sidebar machines={view} {...props} />
+      </TerminalActions>,
+    );
+    unfold("remote job");
+
+    const group = screen.getByRole("group", { name: "remote job" });
+    fireEvent.click(await within(group).findByRole("button", { name: "Archive" }));
+    expect(await screen.findByRole("dialog", { name: "Archive remote job?" })).toBeDefined();
   });
 
   it("names each session by its first prompt and says what a working one is doing", async () => {
@@ -148,7 +167,7 @@ describe("Sidebar", () => {
     await renderApp(<Sidebar machines={machines()} selected="sh2" {...props} />);
 
     expect(screen.getByRole("link", { name: /Failed · exit 1/ }).getAttribute("aria-current")).toBe("true");
-    expect(screen.getByRole("link", { name: /Running/ }).getAttribute("aria-current")).toBeNull();
+    expect(screen.getByRole("link", { name: /Open/ }).getAttribute("aria-current")).toBeNull();
   });
 
   it("offers a new task", async () => {
@@ -276,7 +295,7 @@ describe("Sidebar", () => {
 
     const strip = within(screen.getByRole("group", { name: "fix login" })).getAllByRole("link");
     expect(strip).toHaveLength(6);
-    expect(strip[5].getAttribute("aria-label")).toBe("shell 1 Running");
+    expect(strip[5].getAttribute("aria-label")).toBe("shell 1 Open");
     expect(strip[5].getAttribute("aria-current")).toBe("true");
   });
 

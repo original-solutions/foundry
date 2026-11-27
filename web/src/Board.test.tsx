@@ -177,7 +177,7 @@ describe("Board", () => {
     const { router } = await show(fleet(records(), settings()));
     const login = card("fix login");
     expect(within(login).getByText("Working")).toBeDefined();
-    expect(within(login).getByText("Running")).toBeDefined();
+    expect(within(login).getByText("Open")).toBeDefined();
     fireEvent.click(within(login).getByRole("link", { name: /^shell/ }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
   });
@@ -502,6 +502,20 @@ describe("Grouped by shipping", () => {
     await waitFor(() => expect(within(card("push docs")).getByText("Document the API")).toBeDefined());
     expect(within(card("push docs")).queryByRole("group", { name: /Next for/ })).toBeNull();
     expect(within(card("far off")).queryByRole("group", { name: /Next for/ })).toBeNull();
+  });
+
+  it("offers Archive on the card of a workspace on another machine, and opens its dialog without reading its changes", async () => {
+    answers["/api/workspaces/w6/changes"] = () => json(404, { error: "workspace w6 is not a live workspace of this machine" });
+    await show(fleet(fleetOf(), listed()), vi.fn(), {}, true);
+    const far = card("far off");
+    const button = await within(far).findByRole("button", { name: "Archive far off" });
+    // Its card asks this machine's daemon, which does not have it; the dialog asks nothing.
+    await waitFor(() => expect(readsOf("w6")).toBe(1));
+    fireEvent.click(button);
+    const dialog = await screen.findByRole("dialog", { name: "Archive far off?" });
+    expect(within(dialog).getByRole("region", { name: "Kept on far-off" }).textContent).toContain("laptop lists any work that would be lost");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(readsOf("w6")).toBe(1);
   });
 
   it("moves a card to its new lane when one of its terminals changes state, and lights it up once there", async () => {

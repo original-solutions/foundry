@@ -1322,7 +1322,7 @@ describe("App", () => {
     expect((await screen.findByRole("alert")).textContent).toMatch(/^Could not clear the terminal: no such terminal\./);
   });
 
-  it("ends and clears another machine's terminals, which the daemon carries to it, from a menu that offers no start or archive there", async () => {
+  it("ends and clears another machine's terminals, which the daemon carries to it, from a menu that offers no start there", async () => {
     const calls = mockActions(new Response(null, { status: 204 }), new Response(null, { status: 204 }));
     await open("/terminals/t1", {
       ...ended,
@@ -1343,14 +1343,14 @@ describe("App", () => {
         .map((item) => item.textContent);
     };
 
-    const running = within(remote).getByRole("link", { name: /Running$/ });
+    const running = within(remote).getByRole("link", { name: /Open$/ });
     const name = running.getAttribute("data-name");
-    expect(await entries(running)).toEqual(["Open", "Open beside", "Changes in remote job", `End ${name}…`, "Clear 1 ended in remote job"]);
+    expect(await entries(running)).toEqual(["Open", "Open beside", "Changes in remote job", `End ${name}…`, "Clear 1 ended in remote job", "Archive remote job…"]);
     fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
 
     const failed = within(remote).getByRole("link", { name: /Failed · exit 101$/ });
-    expect(await entries(failed)).toEqual(["Open", "Open beside", "Changes in remote job", "Clear"]);
+    expect(await entries(failed)).toEqual(["Open", "Open beside", "Changes in remote job", "Clear", "Archive remote job…"]);
     fireEvent.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: "Clear" }));
     await waitFor(() => expect(calls).toEqual([{ url: "/api/terminals/t9/close", method: "POST", body: undefined }]));
 
@@ -1395,18 +1395,17 @@ describe("App", () => {
     expect(calls).toEqual([]);
   });
 
-  it("offers archiving only for this machine's workspaces", async () => {
+  it("offers archiving for a workspace on any machine, which the daemon carries to its owner", async () => {
     mockActions();
     await open("/", {
       ...live,
       records: [...live.records, sample(OTHER, 1), workspace(OTHER, "w9", "remote job"), terminal(OTHER, "t9", "w9", "running")],
       settings: settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "attic", address: "10.0.0.2" }] }),
     });
-    expect(within(screen.getByRole("article", { name: "remote job" })).queryByRole("button", { name: /^Archive/ })).toBeNull();
+    expect(within(screen.getByRole("article", { name: "remote job" })).getByRole("button", { name: "Archive remote job" })).toBeDefined();
     // On the board every sidebar workspace is one line; its actions show once it is unfolded.
     for (const name of ["remote job", "fix login"]) fireEvent.click(within(screen.getByRole("group", { name })).getByRole("button", { name }));
-    expect(within(screen.getByRole("group", { name: "remote job" })).queryByRole("button", { name: "Archive" })).toBeNull();
-    expect(within(screen.getByRole("group", { name: "fix login" })).getByRole("button", { name: "Archive" })).toBeDefined();
+    for (const name of ["remote job", "fix login"]) expect(within(screen.getByRole("group", { name })).getByRole("button", { name: "Archive" })).toBeDefined();
   });
 
   it("does not end or clear anything when the button that opened the menu is let go over that item", async () => {

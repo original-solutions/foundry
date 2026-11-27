@@ -4,7 +4,7 @@ import { Dialog } from "radix-ui";
 import { archiveWorkspace, type Blockers, type FileChange } from "./api";
 import { changesQuery } from "./ChangesPanel";
 import { splitPath } from "./changes";
-import { rows, type WorkspaceView } from "./fleet";
+import { rows, type MachineView, type WorkspaceView } from "./fleet";
 import { couldNot, plural, words, type Glyph } from "./labels";
 import { button, dangerButton, Modal, primaryButton } from "./Modal";
 import { Named } from "./Now";
@@ -43,11 +43,31 @@ export function useLeaving(workspace: string): boolean {
  * terminal that stops, with a turn it would cut short. Its changes are read once, as the changes
  * sheet reads them; the daemon still decides, and when it holds the archive up, its list of what
  * would be lost is shown and Archive anyway forces it.
+ *
+ * For a workspace on another machine than `here`, the one serving the UI, its changes are not read:
+ * that read answers only for this machine's workspaces. The dialog says so, still lists the
+ * terminals that stop, and relies on the owning machine, which the daemon carries the archive to,
+ * to refuse when work would be lost. While `here` is not known, the changes are read as for this machine.
  */
-export function ArchiveDialog({ workspace, onClose, onArchived }: { workspace: WorkspaceView; onClose: () => void; onArchived: (name: string, branch: string) => void }) {
+export function ArchiveDialog({
+  workspace,
+  machine,
+  here,
+  onClose,
+  onArchived,
+}: {
+  workspace: WorkspaceView;
+  /** The machine that owns the workspace. */
+  machine: Pick<MachineView, "id" | "name">;
+  /** The machine serving the UI, once known. */
+  here?: string;
+  onClose: () => void;
+  onArchived: (name: string, branch: string) => void;
+}) {
   const [blockers, setBlockers] = useState<Blockers | null>(null);
   const leaving = useLeaving(workspace.id);
-  const changes = useQuery({ ...changesQuery(workspace.id), enabled: !leaving, retry: false });
+  const elsewhere = here !== undefined && machine.id !== here;
+  const changes = useQuery({ ...changesQuery(workspace.id), enabled: !leaving && !elsewhere, retry: false });
   const archive = useMutation({
     ...archiveOf(workspace.id),
     onSuccess: (held) => {
@@ -76,7 +96,11 @@ export function ArchiveDialog({ workspace, onClose, onArchived }: { workspace: W
     >
       <div className="mt-4 flex max-h-[min(60dvh,32rem)] flex-col gap-4 overflow-y-auto">
         <Part title={`Kept on ${workspace.branch}`} tone="text-emerald-400" icon="M4 2.5v11M4 5.5c0 2 1.5 3 4 3h1.5M11.5 8.5a1.5 1.5 0 1 0 3 0 1.5 1.5 0 0 0-3 0">
-          {changes.isError ? (
+          {elsewhere ? (
+            <p className="text-xs text-neutral-500">
+              {words.unreadable}. {machine.name} lists any work that would be lost before it archives.
+            </p>
+          ) : changes.isError ? (
             <p className="text-xs text-neutral-500">{words.unreadable}.</p>
           ) : !changes.data ? (
             <p className="text-xs text-neutral-600">Reading what it changed…</p>
