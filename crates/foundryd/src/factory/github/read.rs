@@ -1449,7 +1449,8 @@ fn judge_chosen_label(
     let reaches = timeline_reaches(issue, &labeled_at);
     match text_changes_since(issue, &labeled_at, instructors, reaches) {
         TextCheck::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
-        // A cut-off edit history wins: applying the label again does not make it whole.
+        // The timeline alone is short: the edit history is whole. A cut-off edit history keeps its
+        // own refusal, even when the timeline is cut short too.
         TextCheck::Unjudged if !reaches && edits_whole_since(issue, &labeled_at) => {
             Approval::Refused(Refusal::TimelineShortOfLabel { labeled_at })
         }
@@ -4645,8 +4646,7 @@ mod tests {
 
     #[test]
     fn judge_approval_says_the_edit_history_is_cut_when_the_timeline_is_cut_short_too() {
-        // Applying the label again does not make a cut-off edit history whole, so that refusal
-        // wins.
+        // A cut-off edit history keeps its own refusal, even when the timeline is cut short too.
         let mut page = vec![labeled(LABELED, "tom", READY)];
         page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
         assert_eq!(
