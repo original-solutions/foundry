@@ -4005,6 +4005,93 @@ mod tests {
             assert_eq!(line.data["exit_code"], 2);
         }
 
+        /// A token the machine holds, and how its hider shows it.
+        const HELD: &str = "ghp_heldtoken123";
+
+        /// A built run whose ledger and tracker hide [`HELD`] as the machine's hider does.
+        fn built_hiding() -> (Rig, RunId, Arc<Hub>) {
+            let hider: crate::factory::ledger::Hide =
+                Arc::new(|text: &str| text.replace(HELD, "***"));
+            let mut rig = Rig::new();
+            let (dir, store) = crate::factory::ledger::testing::open_store();
+            rig.ledger = crate::factory::ledger::Ledger::new(
+                store,
+                MachineId(uuid::Uuid::from_u128(0x1)),
+                1,
+                hider.clone(),
+            )
+            .with_wall(crate::factory::ledger::testing::ticking(
+                crate::factory::ledger::testing::T0,
+                1000,
+            ));
+            rig._dir = dir;
+            let (mut rig, run, hub) = built_on(rig);
+            rig.tracker = Hiding::new(hub.clone(), hider);
+            (rig, run, hub)
+        }
+
+        fn sent_bodies(rig: &Rig) -> Vec<String> {
+            sends(rig)
+                .into_iter()
+                .filter_map(|call| match call {
+                    Call::Send { message, .. } => message.body,
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_failed_command_that_holds_a_known_secret_is_sent_with_it_hidden() {
+            let (mut rig, run, _hub) = built_hiding();
+            let command = format!("cargo test -- --token {HELD}");
+            rig.config.gate = vec!["cargo fmt".into(), command.clone()];
+            let tail = format!("$ {command}\ntest failed\nsetup failed: {command} exited 101\n");
+            assert_eq!(
+                gated(&mut rig, &run, 101, &tail),
+                GateStep::SentBack { attempt: 1 }
+            );
+            let expected = messages::gate_failed(
+                &failure_of("cargo test -- --token ***", 101, "test failed\n"),
+                BODY_PATH,
+            );
+            assert_eq!(sends(&rig), vec![sent(1, expected)]);
+            assert!(sent_bodies(&rig).iter().all(|body| !body.contains(HELD)));
+        }
+
+        #[test]
+        fn a_failed_gate_naming_no_command_hides_a_known_secret_in_the_commands_it_shows() {
+            let (mut rig, run, _hub) = built_hiding();
+            rig.config.gate = vec!["cargo fmt".into(), format!("cargo test --token {HELD}")];
+            assert_eq!(
+                gated(&mut rig, &run, 2, "garbage the code printed\n"),
+                GateStep::SentBack { attempt: 1 }
+            );
+            let expected = messages::gate_failed(
+                &failure_of(
+                    "cargo fmt && cargo test --token ***",
+                    2,
+                    "garbage the code printed\n",
+                ),
+                BODY_PATH,
+            );
+            assert_eq!(sends(&rig), vec![sent(1, expected)]);
+            assert!(sent_bodies(&rig).iter().all(|body| !body.contains(HELD)));
+        }
+
+        #[test]
+        fn a_failed_command_with_no_secret_is_sent_unchanged_under_a_hider() {
+            let (mut rig, run, _hub) = built_hiding();
+            rig.config.gate = vec!["cargo fmt".into(), "cargo test".into()];
+            let tail = "$ cargo fmt\nDiff in main.rs\nsetup failed: cargo fmt exited 1\n";
+            assert_eq!(
+                gated(&mut rig, &run, 1, tail),
+                GateStep::SentBack { attempt: 1 }
+            );
+            let expected =
+                messages::gate_failed(&failure_of("cargo fmt", 1, "Diff in main.rs\n"), BODY_PATH);
+            assert_eq!(sends(&rig), vec![sent(1, expected)]);
+        }
+
         #[test]
         fn a_failed_provision_goes_back_into_the_session_like_a_failed_gate() {
             let (mut rig, run, _hub) = built();
