@@ -106,8 +106,9 @@ import { upNext } from "./needing";
  * that finishes its turn or needs you is told once: as a card at the top right while you are at
  * the page, or as a desktop alert while you are not; coming back after a while, a catch-up card
  * heads the same stack. The sidebar's bell sets all three in one place; a screen reader hears the
- * news whatever it is set to. On a narrow screen what needs a person and the creates waiting for a
- * machine head the page instead, folded, above an open terminal's header, so they never lie over it.
+ * news whatever it is set to. What needs a person and the creates waiting for a machine head the
+ * page instead, folded, in its flow above the board, the machines, the factory or an open terminal's
+ * header, so they never lie over a control, folded or open; the steps column keeps its own height.
  *
  * ? (outside a field or the terminal) or the sidebar's Keyboard button lists every key the app
  * answers. The sidebar's list is one Tab stop that the arrows walk.
@@ -355,13 +356,11 @@ function Layout() {
                 </div>
               )}
               <main className="flex min-w-0 flex-1 flex-col">
-                {/* In the flow, so the terminal below gives up the room it takes; none while both are empty, and at most half the screen. */}
-                {narrow && (
-                  <div className="flex max-h-[50dvh] shrink-0 flex-col gap-2 overflow-y-auto p-2 empty:hidden">
-                    <AttentionList folded />
-                    <WaitingList folded />
-                  </div>
-                )}
+                {/* In the flow, so what is below gives up the room it takes; none while both are empty, and at most half the screen. */}
+                <div className="flex max-h-[50dvh] shrink-0 flex-col gap-2 overflow-y-auto p-2 empty:hidden">
+                  <AttentionList folded />
+                  <WaitingList folded />
+                </div>
                 {terminalId && (
                   <div {...frozen} className="flex shrink-0">
                     {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
@@ -474,11 +473,9 @@ function Layout() {
             />
             <KeySheet open={keysOpen} onOpenChange={setKeysOpen} />
             <Announcer spoken={spoken} />
-            {/* One place on screen for news: what needs a person (on a wide screen), the catch-up, then the cards. */}
+            {/* One place on screen for news: the link, the catch-up, then the cards. */}
             <div className="pointer-events-none fixed inset-x-2 top-2 z-40 flex flex-col gap-2 md:inset-x-auto md:top-14 md:right-4 md:w-[24rem]">
               <LinkBanner link={link} remembered={remembering ? memory.at : undefined} />
-              {!narrow && <AttentionList />}
-              {!narrow && <WaitingList />}
               {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
               {taskWarning && (
                 <div

@@ -221,11 +221,11 @@ Come back to the page after two minutes or more, in another tab or app, or after
 
 ## When something needs you
 
-Some things need a person and are not a session's question. They gather in a card at the top right, headed with a count, such as "1 needs attention". Click the header to fold it.
+Some things need a person and are not a session's question. They gather in a card at the top of the page, folded to a count such as "1 needs attention". It takes its own room above the board, the machines, the factory or an open terminal, so it never covers a button. Click the header to unfold it, and again to fold it.
 
 Each item has a title, the machine it is about, what happened, and what to do. Items with a terminal have **Open terminal**. The titles are Machine offline, Session stuck, Waiting for you, Session failed, Setup failed, Gateway unhealthy, Disk low, Placement waiting, Setting overwritten and Update refused. [The factory](factory.md) adds five more, which show as a raw id instead of a title: `run_stuck` (a run is stuck), `run_needs_info` (a run asked questions on its issue), `gate_infra` (a run's gate could not run at all), `foreign_claim` (an issue is in a factory label under a claim that is not Foundry's) and `factory_idle` (a project's factory is on but idle, or has gone 10 minutes without word from the machine that holds it). They clear themselves when the cause is gone. Only **Setting overwritten** has a **Dismiss** button. **Setup failed** has **Close terminal**: its setup terminal has already exited, so closing it clears the item and stops nothing. Like **Clear**, it does not ask first, and the setup output goes with the terminal, so read it before you close.
 
-A second card, "N waiting for a machine", lists the tasks you asked Foundry to place that no machine can take yet. [Let Foundry choose a machine](machines.md#let-foundry-choose-a-machine) explains it.
+A second card under it, "N waiting for a machine", lists the tasks you asked Foundry to place that no machine can take yet. [Let Foundry choose a machine](machines.md#let-foundry-choose-a-machine) explains it.
 
 ## Theme
 
@@ -250,6 +250,6 @@ On a phone, the board is the home and the sidebar is a drawer.
 
 - A line above the task box sums the fleet, such as "2 need you · 2 working · 1 quiet".
 - A bar at the bottom has **Board**, **Timeline**, **Machines** and **Workspaces**. The first three do what the switch does. **Board** carries a badge with how many workspaces need you. **Workspaces** opens the sidebar as a drawer, and the close button or `Esc` shuts it.
-- What needs you and the tasks waiting for a machine sit at the top of the page, folded, so they never cover a terminal.
+- What needs you and the tasks waiting for a machine sit at the top of the page, folded, as on a wide screen.
 - Toasts appear at the top.
 - Open a terminal and its header opens the drawer too. See [On a phone](sessions.md#on-a-phone).
