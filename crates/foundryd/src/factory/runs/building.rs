@@ -12,9 +12,10 @@
 //! step `turn-read <n>` ([`TURN_READ`]); every write before it carries its own marker, so a
 //! pass cut short repeats nothing. A session that idles through a gate has its newest turn
 //! read already and is sent nothing. A session idle with no turn ended may not have taken its
-//! launch: the run is `start`'s pass then ([`BuildStep::Launch`]), which asks for the launch
-//! again by count, since the label moved to `building` with the start and the pass no longer
-//! routes the run to `start`.
+//! launch: when that launch is `start`'s (no interruption, and no feedback round owns the run),
+//! the run is `start`'s pass then ([`BuildStep::Launch`]), which asks for the launch again by
+//! count, since the label moved to `building` with the start and the pass no longer routes the
+//! run to `start`.
 //!
 //! Where it differs from the runner:
 //!
@@ -100,6 +101,7 @@ use foundry_proto::factory::{RunId, SessionTurn};
 use foundry_proto::ids::SessionId;
 use foundry_proto::state::SessionState;
 
+use super::feedback;
 use super::progress::{
     RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, SendTries, TIME_LIMIT as TIME_LIMIT_CODE,
     TURN_READ, pending_relaunch, read_progress,
@@ -284,9 +286,10 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
                 None if turn.as_ref().is_some_and(|turn| turn.turn > 0) => Ok(step.read_already()),
                 // No turn ended yet. The label moved to `building` with the start, so the
                 // launch the session may not have taken is asked for again by `start` from here
-                // (the spec's step 3), which decides by the session's count. A session whose
-                // newest launch is a resume is `resume`'s, which sends the resume's words.
-                None if seen.interruption.is_none() => {
+                // (the spec's step 3), which decides by the session's count. Only `start`'s own
+                // launch: a run that has had an interruption is `resume`'s, and a session a
+                // feedback round launched is the round's, each with its own words.
+                None if seen.interruption.is_none() && !feedback::round_owns(&events) => {
                     Ok(BuildStep::Launch(start::advance(ctx, run)?))
                 }
                 None => Ok(BuildStep::Running),
