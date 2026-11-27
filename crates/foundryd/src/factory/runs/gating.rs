@@ -1150,16 +1150,12 @@ impl Gate<'_, '_> {
     ) -> Result<Duration, RunError> {
         let generation = self.ctx.held()?;
         let now = u64::try_from(self.ctx.clock.now().as_millis()).unwrap_or(u64::MAX);
-        match since {
-            Some((from, at)) if from == generation && now >= at => {
-                Ok(Duration::from_millis(now - at))
-            }
-            _ => {
-                let reason = prefix.split(' ').next().unwrap_or(prefix);
-                self.step(&format!("{prefix}{generation} {now}"), reason, attempt)?;
-                Ok(Duration::ZERO)
-            }
+        if let Some(waited) = super::time_waited(since, generation, now) {
+            return Ok(waited);
         }
+        let reason = prefix.split(' ').next().unwrap_or(prefix);
+        self.step(&format!("{prefix}{generation} {now}"), reason, attempt)?;
+        Ok(Duration::ZERO)
     }
 
     /// The run is stuck: a workspace of it can never be archived, which the issue's acceptance

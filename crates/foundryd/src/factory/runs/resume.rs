@@ -1197,20 +1197,16 @@ fn probe_failed(
     turn: u64,
 ) -> Result<bool, RunError> {
     let now = u64::try_from(ctx.clock.now().as_millis()).unwrap_or(u64::MAX);
-    match since {
-        Some((from, at)) if from == generation && now >= at => {
-            Ok(Duration::from_millis(now - at) >= TURN_FAILING_FOR)
-        }
-        _ => {
-            note(
-                ctx,
-                run,
-                &format!("{TURN_FAILING}{session} {turn} {generation} {now}"),
-                "resume-turn-failing",
-            )?;
-            Ok(false)
-        }
+    if let Some(waited) = super::time_waited(since, generation, now) {
+        return Ok(waited >= TURN_FAILING_FOR);
     }
+    note(
+        ctx,
+        run,
+        &format!("{TURN_FAILING}{session} {turn} {generation} {now}"),
+        "resume-turn-failing",
+    )?;
+    Ok(false)
 }
 
 /// An answer to the probe of turn `turn` of `session` that is not `Failed` breaks the
