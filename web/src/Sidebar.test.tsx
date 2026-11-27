@@ -56,7 +56,7 @@ describe("Sidebar", () => {
     expect(face.getAttribute("aria-hidden")).toBe("true");
   });
 
-  it("hangs a spine from each workspace's face in its most urgent terminal's fill, as the board's card edge does", async () => {
+  it("hangs a spine from each workspace's face in its most urgent terminal's fill, grey with no terminals", async () => {
     const records = [
       sample(ME, 1),
       workspace(ME, "w1", "asks"),
@@ -93,7 +93,9 @@ describe("Sidebar", () => {
     expect(button.getAttribute("title")).toBe("Unfold");
     expect(button.contains(within(group).getByText("DE"))).toBe(true);
     expect(button.querySelector("svg")).toBeNull();
+    // Drawn over its own column, left of the content, while it stays part of the button.
     expect(within(group).getByText("DE").className).toMatch(/(^| )size-5( |$)/);
+    expect(within(group).getByText("DE").className).toMatch(/(^| )absolute( |$)/);
 
     unfold("fix login");
     expect(button.getAttribute("aria-expanded")).toBe("true");
@@ -104,8 +106,8 @@ describe("Sidebar", () => {
     const sessions = within(group).getAllByRole("listitem")[0].parentElement!;
     expect(content.contains(sessions)).toBe(true);
     expect(content.contains(group.querySelector("[data-spine]"))).toBe(false);
-    // The spine takes the place of the list's own rule.
-    expect(sessions.className).not.toMatch(/border-l/);
+    // The spine takes the place of the list's own rule, and the rows' own padding lines their glyphs up with the name.
+    expect(sessions.className).not.toMatch(/border-l|(^| )-?m[lx]-|(^| )p[lx]-/);
   });
 
   it("sets the workspaces under a machine 12px apart, so each task reads as one block", async () => {
