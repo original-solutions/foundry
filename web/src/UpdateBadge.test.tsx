@@ -316,6 +316,22 @@ describe("UpdateBadge", () => {
     });
   }
 
+  it("lifts the restart hold while the badge is hidden, so a release made ready later can be installed", async () => {
+    const { update } = show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1, { version: "0.9.1" })]);
+    fireEvent.click(badge());
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+    await settle();
+    act(() => sent.calls[0].answer({ status: 202, json: {} }));
+    await settle();
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Close" }));
+    update([at(ME, 2, { version: "0.9.1" }), at(OTHER, 1, { version: "0.9.1" })]);
+    expect(screen.queryByRole("button", { name: /waiting/i })).toBeNull();
+    update([at(ME, 3, { version: "0.9.2", update_ready: "v0.9.3" }), at(OTHER, 1, { version: "0.9.1" })]);
+    fireEvent.click(badge());
+    expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(within(dialog()).queryByText(/restarting/i)).toBeNull();
+  });
+
   it("keeps a row after its machine's update_ready clears, until the checklist is closed", async () => {
     const { update } = show([at(ME, 1, { version: "0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
     fireEvent.click(badge());
