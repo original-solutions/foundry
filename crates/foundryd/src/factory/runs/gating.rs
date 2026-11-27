@@ -17,9 +17,11 @@
 //!    owing (the build session ended, the build workspace archived: see 7).
 //! 2. A send owed from an earlier pass (`gate-sending` with no `gate_sent_back`) is finished
 //!    first, under the turn it was begun for, whatever the session or the head is doing now.
-//!    Then a session still at work (starting, working, waiting for a person, or
-//!    unreachable), one with no turn record, one that has run no turn since a failure was sent
-//!    under the newest, and a run with no pull request reported are [`GateStep::NotReady`].
+//!    Then a session still at work (starting, working, or waiting for a person), one with no
+//!    turn record, one that has run no turn since a failure was sent under the newest, and a run
+//!    with no pull request reported are [`GateStep::NotReady`]. A session that cannot be reached
+//!    is not at work: its reported pull request is gated, and a gate in flight on its machine is
+//!    read, so a cut-off build machine's gate could not run as any other's.
 //!    A session the fleet does not show is stuck (`session-gone`).
 //! 3. A pull request that is gone, from a fork, off the base or off the run's branches is stuck
 //!    (`pr-not-bound`); one that was merged or closed before a pass is recorded ends the run
@@ -952,13 +954,18 @@ fn can_take_a_message(state: SessionState) -> bool {
     state == SessionState::Idle
 }
 
-/// Whether the session is at work, or cannot be reached, so that nothing is gated or read of it
-/// yet. A session that finished or failed is not: its last turn stands and is gated. Whether it can
-/// be sent a message is `can_take_a_message`'s, which is stricter.
+/// Whether the session is at work, so that nothing is gated or read of it yet. A session that
+/// finished or failed is not: its last turn stands and is gated. Nor is one that cannot be
+/// reached: the gate needs the pull request it reported, not the session, and a gate in flight on
+/// its machine must be read to be found gone. Whether it can be sent a message is
+/// `can_take_a_message`'s, which is stricter.
 fn busy(state: SessionState) -> bool {
     !matches!(
         state,
-        SessionState::Idle | SessionState::Finished | SessionState::Failed
+        SessionState::Idle
+            | SessionState::Finished
+            | SessionState::Failed
+            | SessionState::Unreachable
     )
 }
 
