@@ -16,7 +16,8 @@ export type Lens = "turns" | "files";
  * and its other tools, each once with how often. A file the workspace's changes hold shows its
  * lines and opens its diff. The changes are read on opening, when the session's state changes,
  * and every `GLANCE_EVERY` while this view is open, the header's pace, whether or not the header
- * has room for its changes button. A workspace the daemon answered 404 for is not asked again.
+ * has room for its changes button. A workspace the daemon answered 404 for is not asked again, on
+ * the timer or when the session's state changes.
  */
 export function StepsFiles({ trail, workspace, label, onFile }: { trail: Mark[]; workspace?: string; label: string; onFile?: (path: string) => void }) {
   const client = useQueryClient();
@@ -26,7 +27,7 @@ export function StepsFiles({ trail, workspace, label, onFile }: { trail: Mark[];
     if (last.current === label || workspace === undefined) return;
     last.current = label;
     const { queryKey } = changesQuery(workspace);
-    // A workspace the daemon last answered 404 for is not asked again: it is another machine's, or gone.
+    // A workspace the daemon last answered 404 for is not asked again when the state changes: it is another machine's, or gone.
     if (gone(client.getQueryState(queryKey)?.error)) return;
     void client.invalidateQueries({ queryKey, exact: true });
   }, [label, workspace, client]);

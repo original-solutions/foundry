@@ -211,8 +211,9 @@ const none = new Set<string>();
 
 /**
  * Opens the workspace's changes. Once they have been opened, it shows their size and keeps it
- * fresh, until the daemon answers 404 for them. Until they are opened it reads nothing, so a header
- * costs the daemon nothing. Its word shows when `worded`; it is its name either way.
+ * fresh on a timer, which stops once the daemon answers 404 for them. Until they are opened it
+ * reads nothing, so a header costs the daemon nothing. Its word shows when `worded`; it is its name
+ * either way.
  */
 function ChangesButton({ workspace, onClick, worded }: { workspace: string; onClick: () => void; worded: boolean }) {
   const leaving = useLeaving(workspace);
