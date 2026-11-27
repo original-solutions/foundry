@@ -844,6 +844,22 @@ fn the_coordinator_killed_during_a_build_and_the_next_carries_the_run_on_with_it
                     .any(|e| e.event == "session_launched")
             })
             .await;
+            // The launch ends on the move to `building`, written after `session_launched`, and
+            // the old coordinator then writes nothing until the session reports. Every machine
+            // still running must hold all it wrote before it dies: a machine takes a record
+            // only from its owner, so an event a dead machine sent to one peer and not the
+            // other is never carried on, and the two could never hold the same events.
+            until(
+                WAIT,
+                "the machines still running hold every event of the old coordinator's",
+                || {
+                    let written = rig.events_by(0, &run, 0);
+                    caused_by(&written, "session-started")
+                        && rig.events_by(1, &run, 0) == written
+                        && rig.events_by(2, &run, 0) == written
+                },
+            )
+            .await;
             let old = rig.lease_held_by(0).await;
 
             rig.kill(0).await;
