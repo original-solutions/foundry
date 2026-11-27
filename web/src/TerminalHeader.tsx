@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useRef } from "react";
 import { useLeaving } from "./Archive";
-import { changesQuery } from "./ChangesPanel";
+import { changesQuery, GLANCE_EVERY } from "./ChangesPanel";
 import { findKey } from "./FindBar";
 import { totals } from "./changes";
 import type { Located } from "./fleet";
@@ -208,9 +208,6 @@ export function TerminalHeader({
 
 const none = new Set<string>();
 
-/** How often the header reads a workspace's changes again, once they have been opened. */
-const HEADER_EVERY = 15_000;
-
 /**
  * Opens the workspace's changes. Once they have been opened, it shows their size and keeps it
  * fresh; until then it reads nothing, so a header costs the daemon nothing. Its word shows when
@@ -218,7 +215,7 @@ const HEADER_EVERY = 15_000;
  */
 function ChangesButton({ workspace, onClick, worded }: { workspace: string; onClick: () => void; worded: boolean }) {
   const leaving = useLeaving(workspace);
-  const { data } = useQuery({ ...changesQuery(workspace), enabled: (query) => !leaving && query.state.data !== undefined, refetchInterval: HEADER_EVERY, retry: false });
+  const { data } = useQuery({ ...changesQuery(workspace), enabled: (query) => !leaving && query.state.data !== undefined, refetchInterval: GLANCE_EVERY, retry: false });
   const t = data && !leaving && totals(data);
   return (
     <button

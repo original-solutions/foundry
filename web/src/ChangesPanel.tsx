@@ -23,6 +23,9 @@ const SHIPPING_EVERY = 30_000;
 const FOLDED_PAST = 400;
 
 /** The query an open panel keeps fresh. The header reads its cached counts. */
+/** How often a glance at a workspace's changes reads them again: the header's count and Steps' Files view. */
+export const GLANCE_EVERY = 15_000;
+
 export const changesQuery = (workspace: string) => ({ queryKey: ["changes", workspace], queryFn: () => workspaceChanges(workspace) });
 
 export const fileStatus: Record<FileChange["status"], { letter: string; title: string; tone: string }> = {

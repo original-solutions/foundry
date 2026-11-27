@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-libra
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Mark } from "./api";
+import { GLANCE_EVERY } from "./ChangesPanel";
 import { buttonShape, pressed } from "./Modal";
 import { RETRY_EVERY } from "./poll";
 import { STEPS_EVERY, StepsPanel, type StepsOf } from "./StepsPanel";
@@ -104,6 +105,30 @@ describe("StepsPanel by file", () => {
     expect(commands.textContent).toContain("npm test");
     expect(within(panel).queryByText(/needs your permission/)).toBeNull();
     await waitFor(() => expect(calls.map((c) => c.url)).toContain("/api/workspaces/w1/changes"));
+  });
+
+  it("reads the workspace's changes again every GLANCE_EVERY while Files is open, with no header beside it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let reads = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          if (url.endsWith("/changes")) {
+            reads += 1;
+            return json(200, changes);
+          }
+          return json(200, { steps: trail });
+        }),
+      );
+      await renderApp(<StepsPanel of={inWorkspace} onClose={() => {}} />);
+      fireEvent.click(screen.getByRole("button", { name: "Files" }));
+      await waitFor(() => expect(reads).toBe(1));
+      await act(() => vi.advanceTimersByTimeAsync(GLANCE_EVERY + 100));
+      expect(reads).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("shows a changed file's lines from the workspace's changes, and opens its diff", async () => {

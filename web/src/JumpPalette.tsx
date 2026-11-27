@@ -5,6 +5,7 @@ import { Fragment, useEffect, useMemo, useRef, useState, type MutableRefObject }
 import { startShell } from "./api";
 import { couldNot } from "./labels";
 import { locate, type MachineView } from "./fleet";
+import { viewLook } from "./Modal";
 import { destinations, newWorkspace, search, type Command, type Destination } from "./jump";
 import { Peek, useWide } from "./Peek";
 import { StateGlyph } from "./StateGlyph";
@@ -263,7 +264,7 @@ function Panel({
                       c.run();
                     }}
                     className={`flex min-w-0 flex-1 flex-col items-center gap-1 rounded-lg border px-1 py-2 text-[11px] font-medium transition-colors sm:flex-none sm:flex-row sm:gap-1.5 sm:rounded-full sm:px-3 sm:py-1 sm:text-xs [&_svg]:size-4 sm:[&_svg]:size-3.5 ${
-                      here ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300" : "border-neutral-700 text-neutral-300 hover:border-neutral-500 hover:bg-neutral-800 hover:text-neutral-50"
+                      here ? `border-transparent ${viewLook.on}` : `border-neutral-700 ${viewLook.off} hover:border-neutral-500 hover:bg-neutral-800`
                     }`}
                   >
                     {c.icon}
@@ -327,7 +328,7 @@ function Panel({
                     </span>
                     {d.kind === "terminal" && <span className="shrink-0 text-xs text-neutral-400">{d.label}</span>}
                     {d.kind === "command" && d.command.hint && (
-                      <span className={`shrink-0 text-xs ${d.command.hint === "Here" ? "text-emerald-400" : "text-neutral-400"}`}>{d.command.hint}</span>
+                      <span className={`shrink-0 text-xs ${d.command.hint === "Here" ? "text-neutral-200" : "text-neutral-400"}`}>{d.command.hint}</span>
                     )}
                     {d.kind === "command" && d.command.keys && (
                       <kbd className="hidden shrink-0 rounded border border-neutral-700 px-1.5 py-0.5 font-sans text-[10px] text-neutral-400 sm:block">{d.command.keys}</kbd>

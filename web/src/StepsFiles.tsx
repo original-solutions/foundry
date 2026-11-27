@@ -2,7 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 import type { FileChange, Mark } from "./api";
 import { splitPath } from "./changes";
-import { changesQuery, fileStatus } from "./ChangesPanel";
+import { changesQuery, fileStatus, GLANCE_EVERY } from "./ChangesPanel";
 import { plural } from "./labels";
 import { touched, type FileTouch, type Ran, type Touch } from "./touched";
 
@@ -13,13 +13,13 @@ export type Lens = "turns" | "files";
  * A session's trail by what it touched instead of when: every file it read or changed, changed
  * ones first, with how often and a strip marking where along the trail; then the commands it ran
  * and its other tools, each once with how often. A file the workspace's changes hold shows its
- * lines and opens its diff. The changes are read on opening and again when the session's state
- * changes. They share the header's query, so once read, the header's changes button reads them
- * again every 15 seconds while the terminal is open; this view adds no timer of its own.
+ * lines and opens its diff. The changes are read on opening, when the session's state changes,
+ * and every `GLANCE_EVERY` while this view is open, the header's pace, whether or not the header
+ * has room for its changes button.
  */
 export function StepsFiles({ trail, workspace, label, onFile }: { trail: Mark[]; workspace?: string; label: string; onFile?: (path: string) => void }) {
   const client = useQueryClient();
-  const { data } = useQuery({ ...changesQuery(workspace ?? ""), enabled: workspace !== undefined, retry: false });
+  const { data } = useQuery({ ...changesQuery(workspace ?? ""), enabled: workspace !== undefined, refetchInterval: GLANCE_EVERY, retry: false });
   const last = useRef(label);
   useEffect(() => {
     if (last.current === label || workspace === undefined) return;

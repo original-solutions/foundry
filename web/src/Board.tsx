@@ -3,7 +3,7 @@ import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { Children, useId, useState } from "react";
 import { glance, lanes, topFiles, type Card, type Lane } from "./lanes";
-import { buttonShape, pressed } from "./Modal";
+import { buttonShape, pressed, viewLook } from "./Modal";
 import { StepChips } from "./NextSteps";
 import { nextSteps } from "./next";
 import { shipLanes, useStaged, type ShipLane } from "./staged";
@@ -511,7 +511,7 @@ function ViewSwitch({ view, onPick }: { view: View | "machines"; onPick: (view: 
           role="radio"
           aria-checked={view === v.view}
           onClick={() => onPick(v.view)}
-          className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors ${view === v.view ? "bg-neutral-700 text-neutral-50" : "text-neutral-400 hover:text-neutral-200"}`}
+          className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors ${view === v.view ? viewLook.on : viewLook.off}`}
         >
           {v.icon}
           {v.name}

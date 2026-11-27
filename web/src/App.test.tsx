@@ -5,7 +5,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { machineQuery, type Briefs, type Changes, type Shipping, type UiMessage } from "./api";
 import { router, routeTree } from "./App";
-import { button, dangerButton, pressed } from "./Modal";
+import { button, dangerButton, pressed, viewLook } from "./Modal";
 import { keep, KEEP_AFTER, recall } from "./memory";
 import { nextSteps } from "./next";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
@@ -1027,6 +1027,11 @@ describe("App", () => {
     const views = within(palette).getByRole("navigation", { name: "Views" });
     expect(within(views).getAllByRole("button").map((b) => b.textContent)).toEqual(["Board", "Timeline", "Machines", "Factory"]);
     expect(within(views).getByRole("button", { name: "Board" }).getAttribute("aria-current")).toBe("page");
+    // The view you are on looks as it does in the board's own View switch.
+    const lacks = (el: Element, look: string) => look.split(" ").filter((c) => !el.classList.contains(c));
+    expect(lacks(within(views).getByRole("button", { name: "Board" }), viewLook.on)).toEqual([]);
+    expect(lacks(within(views).getByRole("button", { name: "Timeline" }), viewLook.off)).toEqual([]);
+    expect(lacks(screen.getByRole("radio", { name: "Board", hidden: true }), viewLook.on)).toEqual([]);
     // With nothing typed the views are only in the strip, so the list starts with the fleet.
     expect(within(palette).queryByRole("option", { name: /^Machines/ })).toBeNull();
 
