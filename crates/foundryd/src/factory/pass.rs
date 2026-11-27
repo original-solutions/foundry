@@ -5633,7 +5633,7 @@ mod tests {
         }
 
         #[test]
-        fn a_finished_run_whose_issue_lost_the_label_is_not_held_up() {
+        fn a_finished_run_whose_issue_lost_the_label_is_not_held_up_once_the_label_is_read_again() {
             let mut rig = Rig::new();
             finished_waiting(&rig, 3, 1, State::Stuck);
             rig.hub.issue(3, &["factory:stuck"]);
@@ -5641,6 +5641,7 @@ mod tests {
             assert_eq!(held_up(&rig).len(), 1);
             rig.hub
                 .edit(3, |issue| issue.labels = vec!["factory:ready".into()]);
+            rig.clock.advance(STUCK_READ_EVERY);
             rig.pass();
             assert!(held_up(&rig).is_empty(), "{:?}", held_up(&rig));
             assert_eq!(rig.status().finished.len(), 1);
@@ -5688,41 +5689,100 @@ mod tests {
             assert_eq!(listed_waiting(&rig), 0, "{:?}", rig.hub.calls());
         }
 
+        /// GitHub's label listing is a search that can lag: a run whose issue a listing left out
+        /// is held up again by the next listing that shows it.
         #[test]
-        fn a_run_whose_issue_was_seen_without_the_label_is_never_listed_for_again() {
+        fn a_listing_that_leaves_the_issue_out_is_not_final() {
+            let mut rig = Rig::new();
+            finished_waiting(&rig, 3, 1, State::Stuck);
+            rig.hub.issue(3, &[]);
+            rig.pass();
+            assert!(held_up(&rig).is_empty());
+            rig.hub
+                .edit(3, |issue| issue.labels = vec!["factory:stuck".into()]);
+            rig.clock.advance(STUCK_READ_EVERY);
+            rig.pass();
+            assert_eq!(held_up(&rig).len(), 1, "{:?}", held_up(&rig));
+        }
+
+        #[test]
+        fn an_issue_closed_and_then_reopened_with_the_label_is_held_up_again() {
+            let mut rig = Rig::new();
+            finished_waiting(&rig, 3, 1, State::Stuck);
+            rig.hub.issue(3, &["factory:stuck"]);
+            rig.pass();
+            rig.hub.edit(3, |issue| issue.closed = true);
+            rig.clock.advance(STUCK_READ_EVERY);
+            rig.pass();
+            assert!(held_up(&rig).is_empty());
+            rig.hub.edit(3, |issue| issue.closed = false);
+            rig.clock.advance(STUCK_READ_EVERY);
+            rig.pass();
+            assert_eq!(held_up(&rig).len(), 1, "{:?}", held_up(&rig));
+        }
+
+        /// A run whose issue left the label for good costs one stuck listing per
+        /// `STUCK_READ_EVERY`, not one per pass.
+        #[test]
+        fn a_run_whose_issue_left_the_label_costs_one_listing_per_stuck_read() {
+            let mut rig = Rig::new();
+            finished_waiting(&rig, 3, 1, State::Stuck);
+            rig.hub.issue(3, &[]);
+            rig.pass();
+            assert_eq!(listed_waiting(&rig), 1);
+            for _ in 0..4 {
+                rig.pass();
+            }
+            assert_eq!(listed_waiting(&rig), 1, "{:?}", rig.hub.calls());
+            rig.clock.advance(STUCK_READ_EVERY);
+            rig.pass();
+            rig.pass();
+            assert_eq!(listed_waiting(&rig), 2, "{:?}", rig.hub.calls());
+        }
+
+        /// What a listing showed holds until the next one, and a run that finishes in between
+        /// is read at once, not after `STUCK_READ_EVERY`.
+        #[test]
+        fn a_run_that_just_finished_stuck_is_held_up_on_the_first_pass_that_shows_it() {
             let mut rig = Rig::new();
             finished_waiting(&rig, 3, 1, State::Stuck);
             rig.hub.issue(3, &["factory:stuck"]);
             rig.pass();
             assert_eq!(held_up(&rig).len(), 1);
-            rig.hub.edit(3, |issue| issue.labels = vec![]);
+            let newer = finished_waiting(&rig, 4, 1, State::Stuck);
+            rig.hub.issue(4, &["factory:stuck"]);
             rig.pass();
-            assert!(held_up(&rig).is_empty());
-            let listed = listed_waiting(&rig);
-            rig.pass();
-            rig.pass();
-            assert_eq!(listed_waiting(&rig), listed, "{:?}", rig.hub.calls());
-            assert!(held_up(&rig).is_empty());
+            let held: Vec<RunId> = held_up(&rig).into_iter().map(|(run, _, _)| run).collect();
+            assert!(held.contains(&newer), "{held:?}");
+            assert_eq!(held.len(), 2);
         }
 
         #[test]
         fn a_cut_listing_that_lacks_the_issue_releases_nothing() {
+            use crate::factory::github::read::LIST_LIMIT;
             let mut rig = Rig::new();
-            finished_waiting(&rig, 500, 1, State::Stuck);
-            rig.hub.issue(500, &["factory:stuck"]);
+            let far = LIST_LIMIT as u64 + 300;
+            finished_waiting(&rig, far, 1, State::Stuck);
+            rig.hub.issue(far, &["factory:stuck"]);
             rig.pass();
             assert_eq!(held_up(&rig).len(), 1);
-            // More than a listing holds, all before issue 500: it is cut off before it.
-            for issue in 1..=201 {
+            // More issues than a listing holds, all before the run's: it is cut off before it.
+            for issue in 1..=(LIST_LIMIT as u64 + 1) {
                 rig.hub.issue(issue, &["factory:stuck"]);
             }
+            rig.clock.advance(STUCK_READ_EVERY);
             rig.pass();
             assert_eq!(held_up(&rig).len(), 1, "a cut listing is no evidence");
-            for issue in 1..=201 {
+            for issue in 1..=(LIST_LIMIT as u64 + 1) {
                 rig.hub.edit(issue, |i| i.labels = vec![]);
             }
+            rig.clock.advance(STUCK_READ_EVERY);
             rig.pass();
-            assert_eq!(held_up(&rig).len(), 1, "the label is still on issue 500");
+            assert_eq!(
+                held_up(&rig).len(),
+                1,
+                "the label is still on the run's issue"
+            );
         }
 
         #[test]
@@ -5732,12 +5792,26 @@ mod tests {
             rig.hub.issue(3, &["factory:stuck"]);
             rig.pass();
             rig.hub.fail("--label factory:stuck", usize::MAX);
+            rig.clock.advance(STUCK_READ_EVERY);
             let report = rig.pass();
             assert_eq!(report.failed, None, "{report:?}");
             assert_eq!(
                 held_up(&rig),
                 vec![(run, HeldUpKind::Stuck, "stuck 3-1".to_owned())]
             );
+        }
+
+        /// A listing that keeps failing is tried once per `STUCK_READ_EVERY`, not every pass.
+        #[test]
+        fn a_listing_that_keeps_failing_is_not_tried_every_pass() {
+            let mut rig = Rig::new();
+            finished_waiting(&rig, 3, 1, State::Stuck);
+            rig.hub.issue(3, &["factory:stuck"]);
+            rig.hub.fail("--label factory:stuck", usize::MAX);
+            for _ in 0..4 {
+                rig.pass();
+            }
+            assert_eq!(listed_waiting(&rig), 1, "{:?}", rig.hub.calls());
         }
     }
 
