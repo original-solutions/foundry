@@ -866,6 +866,38 @@ describe("App", () => {
     vi.restoreAllMocks();
   });
 
+  it("raises no alert for a live factory run's stuck session when the daemon resends the fleet", async () => {
+    const shown: string[] = [];
+    vi.stubGlobal(
+      "Notification",
+      class {
+        static permission = "granted";
+        onclick: (() => void) | null = null;
+        close() {}
+        constructor(readonly title: string) {
+          shown.push(title);
+        }
+      },
+    );
+    localStorage.setItem("foundry.alerts", "on");
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    mockActions();
+    const factoryOn = { ...live, settings: settings({ project_factory: { p1: { on: true, login: "bot", paused: false } } }) };
+    await open("/", factoryOn);
+    const run = { run: "original-solutions__foundry__162__1", title: "t", step: "building", machine: ME, gate_retries_used: 0, minutes_used: 1, workspaces: ["w1"], sessions: ["s1"] };
+    const status = JSON.stringify({ type: "factory_status", protocol: 5, status: { ...heldStatus(2), runs: [run] } });
+    const stuck = session(ME, "s1", "w1", "t1", "stuck", { model: "sonnet", version: 2 });
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(status));
+    act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: stuck })));
+    await waitFor(() => expect(screen.getByText("Quiet 10+ min")).toBeDefined());
+    // The resend, then the status that follows it.
+    act(() => events.deliver(JSON.stringify({ ...factoryOn, records: [...factoryOn.records.filter((r) => !(r.kind === "session" && r.body.id === "s1")), stuck] })));
+    act(() => events.deliver(status));
+    expect(shown).toEqual([]);
+    vi.restoreAllMocks();
+  });
+
   it("says a live factory run's stuck session is quiet in its terminal's tab too", async () => {
     mockActions();
     await open("/terminals/t1", live);

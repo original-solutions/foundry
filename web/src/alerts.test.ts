@@ -61,6 +61,8 @@ describe("alertsFor and the factory", () => {
   const RUN = "original-solutions__foundry__162__1";
   const live = factoryStatus("p1", { [RUN]: ["w1"] });
   const held = factoryStatus("p1", {}, { [RUN]: { kind: "stuck", workspaces: ["w1"] } });
+  /** Project p1's factory is switched on. */
+  const on = { p1: { on: true, login: "bot", paused: false } };
 
   it("raises nothing when a live factory run's session waits, is stuck or fails, since the factory tends it", () => {
     for (const state of ["waiting_for_you", "stuck", "failed"] as const) {
@@ -89,19 +91,28 @@ describe("alertsFor and the factory", () => {
   it("raises nothing while a resend has dropped a tended run's mark, and raises once its run is held up", () => {
     const tended = alertsFor(alertsFor(undefined, withFactory(world("working"), live)).seen, withFactory(world("stuck"), live));
     expect(tended.alerts).toEqual([]);
-    // A state resend: the statuses are gone until they follow it.
-    const bare = alertsFor(tended.seen, withFactory(world("stuck"), {}));
+    // A state resend: the statuses are gone until they follow it, while p1's factory stays on.
+    const bare = alertsFor(tended.seen, withFactory(world("stuck"), {}, on));
     expect(bare.alerts).toEqual([]);
     expect(alertsFor(bare.seen, withFactory(world("stuck"), live)).alerts).toEqual([]);
     expect(alertsFor(bare.seen, withFactory(world("stuck"), held)).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
     // A session that moves on meanwhile is news by the usual rules.
-    expect(alertsFor(bare.seen, withFactory(world("failed"), {})).alerts.map((a) => a.body)).toEqual(["opus failed"]);
+    expect(alertsFor(bare.seen, withFactory(world("failed"), {}, on)).alerts.map((a) => a.body)).toEqual(["opus failed"]);
+  });
+
+  it("raises a tended session's stuck state once its project's factory is off, as no status will follow", () => {
+    const tended = alertsFor(alertsFor(undefined, withFactory(world("working"), live, on)).seen, withFactory(world("stuck"), live, on));
+    const bare = alertsFor(tended.seen, withFactory(world("stuck"), {}, on));
+    expect(bare.alerts).toEqual([]);
+    const off = { p1: { on: false, login: "bot", paused: false } };
+    expect(alertsFor(bare.seen, withFactory(world("stuck"), {}, off)).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
+    expect(alertsFor(tended.seen, withFactory(world("stuck"), {})).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
   });
 
   it("raises a stuck session once its project's status arrives and no longer names its run", () => {
     const tended = alertsFor(alertsFor(undefined, withFactory(world("working"), live)).seen, withFactory(world("stuck"), live));
-    const bare = alertsFor(tended.seen, withFactory(world("stuck"), {}));
-    expect(alertsFor(bare.seen, withFactory(world("stuck"), factoryStatus("p1", {}))).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
+    const bare = alertsFor(tended.seen, withFactory(world("stuck"), {}, on));
+    expect(alertsFor(bare.seen, withFactory(world("stuck"), factoryStatus("p1", {}), on)).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
     // The run ended with no resend between: the same.
     expect(alertsFor(tended.seen, withFactory(world("stuck"), factoryStatus("p1", {}))).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
   });

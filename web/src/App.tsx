@@ -150,7 +150,7 @@ function Layout() {
   const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
   // Each factory run's workspace carries its run, so every view reads its terminals the same way.
   const machines = useMemo(
-    () => withFactory(fleet(state.records, state.settings, briefs, state.online, here), state.factory),
+    () => withFactory(fleet(state.records, state.settings, briefs, state.online, here), state.factory, state.settings.project_factory),
     [state.records, state.settings, briefs, state.online, here, state.factory],
   );
   const projectFaces = useMemo(() => faces(state.settings.projects), [state.settings.projects]);

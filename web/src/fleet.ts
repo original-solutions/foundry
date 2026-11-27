@@ -1,4 +1,4 @@
-import type { AnyRecord, FactoryStatus, HeldUp, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
+import type { AnyRecord, FactoryStatus, HeldUp, ProjectFactory, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
 import { issueUrl, parseRun } from "./factory";
 import { busy, needsYou, plural, sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, urgency, type Glyph } from "./labels";
 
@@ -96,9 +96,9 @@ export interface WorkspaceView {
   /** The factory run it belongs to, once `withFactory` has read the believed statuses. */
   factory?: FactoryRun;
   /**
-   * No believed status of its project is here: none has arrived since the fleet was last sent
-   * whole (a resend drops them all until they follow), or its project has none. Whether a run
-   * tends it is then not known.
+   * Its project's factory is on, but no believed status of it is here: none has arrived since the
+   * fleet was last sent whole (a resend drops them all until they follow). Whether a run tends it
+   * is then not known. Off, no status will follow, so it is known that none does.
    */
   statusUnknown?: true;
 }
@@ -332,10 +332,11 @@ export const needsYouIn = (glyph: Glyph, run: FactoryRun | undefined): boolean =
 
 /**
  * The fleet with each workspace a believed status names marked with its factory run, so every
- * view that lists its terminals (`rows`) reads them the same way, and each whose project has no
- * status here marked `statusUnknown`. Without statuses, the fleet as is.
+ * view that lists its terminals (`rows`) reads them the same way, and each whose project's
+ * factory is on (`factories`) with no status here marked `statusUnknown`. Without statuses, the
+ * fleet as is.
  */
-export function withFactory(machines: MachineView[], statuses: Record<string, FactoryStatus> | undefined): MachineView[] {
+export function withFactory(machines: MachineView[], statuses: Record<string, FactoryStatus> | undefined, factories: Record<string, ProjectFactory> = {}): MachineView[] {
   if (!statuses) return machines;
   const runOf = factoryRuns(statuses);
   return machines.map((machine) => ({
@@ -343,7 +344,7 @@ export function withFactory(machines: MachineView[], statuses: Record<string, Fa
     workspaces: machine.workspaces.map((workspace) => {
       const factory = runOf(workspace);
       if (factory) return { ...workspace, factory };
-      return workspace.projectId in statuses ? workspace : { ...workspace, statusUnknown: true as const };
+      return workspace.projectId in statuses || !factories[workspace.projectId]?.on ? workspace : { ...workspace, statusUnknown: true as const };
     }),
   }));
 }
