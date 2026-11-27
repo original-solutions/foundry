@@ -51,7 +51,7 @@ impl OpState {
             "succeeded" | "success" | "completed" | "complete" | "done" | "finished" => {
                 OpState::Finished
             }
-            "failed" | "error" | "errored" => OpState::Failed,
+            "failed" | "fail" | "error" | "errored" => OpState::Failed,
             "cancelled" | "canceled" => OpState::Cancelled,
             _ => OpState::Other(status),
         }
