@@ -1818,8 +1818,7 @@ impl Gate<'_, '_> {
         if self.archive_gate(&req, Mode::Place)? == Archive::Waiting {
             return Ok(GateStep::NotReady);
         }
-        let commands = self.commands();
-        let result = gate::result(TerminalState::Exited, Some(code), &tail, &commands);
+        let (result, commands) = self.read_tail(code, &tail);
         let failing = match &result {
             GateResult::Failed { command, .. } => {
                 command.clone().unwrap_or_else(|| commands.join(" && "))
@@ -2166,9 +2165,7 @@ impl Gate<'_, '_> {
 
     /// The failing command of `attempt`'s gate as the gate's tail names it. With the tail
     /// naming none, the failure is the gate's commands as a whole and the output the whole tail.
-    /// The tail on record was hidden by the ledger, so each command is hidden by the tracker's
-    /// hider before it is looked for there: a secret written into a command is then `***` in
-    /// the failure's command as it is in its output.
+    /// Both are read as [`Self::read_tail`] hides them.
     fn command_failure(
         &self,
         log: &Log,
@@ -2181,17 +2178,15 @@ impl Gate<'_, '_> {
             .find(|req| req.attempt == attempt && req.ended.is_some())
             .ok_or_else(|| RunError::Invalid("the gate's verdict is not on record".into()))?;
         let (code, tail) = req.ended.clone().unwrap_or_default();
-        let commands: Vec<String> = self
-            .commands()
-            .iter()
-            .map(|command| self.ctx.tracker.hide(command))
-            .collect();
-        match gate::result(TerminalState::Exited, Some(code), &tail, &commands) {
-            GateResult::Failed {
-                command,
-                how,
-                output,
-            } => Ok((
+        match self.read_tail(code, &tail) {
+            (
+                GateResult::Failed {
+                    command,
+                    how,
+                    output,
+                },
+                commands,
+            ) => Ok((
                 CommandFailure {
                     command: command.unwrap_or_else(|| commands.join(" && ")),
                     ended: gate::ended(code),
@@ -2202,6 +2197,23 @@ impl Gate<'_, '_> {
             )),
             _ => Err(RunError::Invalid("the gate did not fail".into())),
         }
+    }
+
+    /// The verdict of a gate that ended with `code` and left `tail`, and the commands it was
+    /// read against. The tail and each command are first hidden by the tracker's hider, with
+    /// the secrets the machine holds now: the ledger hid the tail when it was written, maybe
+    /// before a secret was held, and hiding a hidden text changes nothing. A command that holds
+    /// a secret is then found in the tail as the `***` the tail has in its place, and no secret
+    /// reaches the failure's command or its output.
+    fn read_tail(&self, code: i32, tail: &str) -> (GateResult, Vec<String>) {
+        let commands: Vec<String> = self
+            .commands()
+            .iter()
+            .map(|command| self.ctx.tracker.hide(command))
+            .collect();
+        let tail = self.ctx.tracker.hide(tail);
+        let result = gate::result(TerminalState::Exited, Some(code), &tail, &commands);
+        (result, commands)
     }
 
     /// The failed checks as the message names them: what is on record, with the result and link
