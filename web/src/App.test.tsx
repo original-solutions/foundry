@@ -175,14 +175,14 @@ describe("App", () => {
     settings: settings(),
   };
 
-  const needsYou = {
-    id: "session_waiting:s1",
-    kind: "session_waiting",
+  const diskLow = {
+    id: "disk_low:" + ME,
+    kind: "disk_low",
     machine: ME,
     machine_name: "this-mac",
-    what: "A session in fix login on this-mac is waiting for you",
-    todo: "Open its terminal and answer it",
-    terminal: "t1",
+    what: "this-mac has 2 GB of disk free",
+    todo: "Free some disk, or archive workspaces you are done with",
+    terminal: null,
   };
   const held = {
     id: "r1",
@@ -204,13 +204,13 @@ describe("App", () => {
 
   for (const [screenIs, size] of screens) {
     for (const [name, toggle, shown] of [
-      ["Needs attention", /1 needs attention/, needsYou.what],
+      ["Needs attention", /1 needs attention/, diskLow.what],
       ["Waiting for a machine", /1 waiting for a machine/, held.reasons[0]],
     ] as const) {
       for (const path of ["/terminals/t1", "/", "/machines"]) {
         it(`with ${screenIs} on ${path}, puts "${name}" folded at the head of the page, never over it`, async () => {
           size();
-          attention = [needsYou];
+          attention = [diskLow];
           placements = [held];
           mockActions();
           await open(path, live);
@@ -229,7 +229,7 @@ describe("App", () => {
   }
 
   it("puts the lists above an open terminal's header", async () => {
-    attention = [needsYou];
+    attention = [diskLow];
     mockActions();
     await open("/terminals/t1", live);
     const list = await screen.findByRole("region", { name: "Needs attention" });
@@ -247,7 +247,7 @@ describe("App", () => {
       addEventListener: (_: string, f: () => void) => listeners.add(f),
       removeEventListener: (_: string, f: () => void) => listeners.delete(f),
     }));
-    attention = [needsYou];
+    attention = [diskLow];
     mockActions();
     await open("/terminals/t1", live);
     const list = await screen.findByRole("region", { name: "Needs attention" });
@@ -256,12 +256,12 @@ describe("App", () => {
     wide = true;
     act(() => listeners.forEach((f) => f()));
     expect(screen.getByRole("region", { name: "Needs attention" })).toBe(list);
-    expect(within(list).getByText(needsYou.what)).toBeDefined();
+    expect(within(list).getByText(diskLow.what)).toBeDefined();
 
     wide = false;
     act(() => listeners.forEach((f) => f()));
     expect(screen.getByRole("region", { name: "Needs attention" })).toBe(list);
-    expect(within(list).getByText(needsYou.what)).toBeDefined();
+    expect(within(list).getByText(diskLow.what)).toBeDefined();
   });
 
   for (const [screenIs, size] of screens) {
@@ -534,12 +534,13 @@ describe("App", () => {
     ],
   };
 
-  it("offers the next terminal that needs you in the header, and goes to it with its link or Cmd+J", async () => {
+  it("heads the page over an open terminal with the next one that needs you, not its header, and goes to it with its link or Cmd+J", async () => {
     mockActions();
     const router = await open("/terminals/t1", asking);
 
     const next = screen.getByRole("link", { name: "Next that needs you: tidy cart / opus, 1 more needs you" });
-    expect(within(screen.getByLabelText("Open terminal")).getByRole("link", { name: /^Next that needs you/ })).toBe(next);
+    expect(slot().contains(next)).toBe(true);
+    expect(within(screen.getByLabelText("Open terminal")).queryByRole("link", { name: /^Next that needs you/ })).toBeNull();
 
     fireEvent.keyDown(window, { key: "j", metaKey: true });
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t3"));
@@ -548,6 +549,17 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "j", metaKey: true });
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
   });
+
+  for (const path of ["/", "/machines", "/factory"]) {
+    it(`heads ${path} with the first that needs you, one way into them that every view shares`, async () => {
+      mockActions();
+      await open(path, asking);
+      const first = screen.getByRole("link", { name: "Next that needs you: fix login / sonnet, 2 need you" });
+      expect(slot().contains(first)).toBe(true);
+      expect(first.getAttribute("href")).toBe("/terminals/t1");
+      expect(screen.queryByRole("link", { name: /^Go through/ })).toBeNull();
+    });
+  }
 
   it("takes Cmd+J from the board to the first that needs you, and offers nothing when only the open terminal does", async () => {
     mockActions();

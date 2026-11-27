@@ -2,7 +2,6 @@ import { screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Changes, Shipping } from "./api";
 import { fleet, locate } from "./fleet";
-import type { Needing } from "./needing";
 import { headerFit, TerminalHeader } from "./TerminalHeader";
 import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, renderApp } from "./test-utils";
@@ -13,8 +12,6 @@ const dirty: Changes = {
   files: [{ path: "README.md", from: null, status: "modified", added: 2, removed: 0, uncommitted: true, patch: null }],
 };
 const quiet: Shipping = { branch: "say-hi", pushed: false, unpushed: 0, pr: null, unreachable: false };
-
-const next: Needing = { terminal: "t9", workspace: "tidy cart styles", name: "opus", glyph: "waiting", label: "Needs you", now: { kind: "ask", text: "Run the tests?" } };
 
 /** A ready session of this machine in a workspace with a shell beside it, as the header sees it. */
 function located() {
@@ -52,7 +49,7 @@ function layOut(width: number) {
 async function header(width: number) {
   layOut(width);
   await renderApp(
-    <TerminalHeader id="t1" located={located()} drawerOpen={false} onMenu={() => {}} onJump={() => {}} onChanges={() => {}} onSteps={() => {}} onFind={() => {}} onSplit={() => {}} upNext={{ next, others: 2 }} />,
+    <TerminalHeader id="t1" located={located()} drawerOpen={false} onMenu={() => {}} onJump={() => {}} onChanges={() => {}} onSteps={() => {}} onFind={() => {}} onSplit={() => {}} />,
   );
   const bar = await screen.findByRole("banner", { name: "Open terminal" });
   // The workspace's name and the open terminal's tab come first, at every width.
@@ -74,38 +71,30 @@ describe("headerFit", () => {
 });
 
 describe("TerminalHeader", () => {
-  it("shows everything when wide: the machine, the next one's workspace, the next steps and the buttons' words", async () => {
+  it("shows everything when wide: the machine, the next steps and the buttons' words", async () => {
     const bar = await header(1400);
 
     expect(within(bar).getByText("studio")).toBeTruthy();
-    const nextUp = within(bar).getByRole("link", { name: /^Next that needs you/ });
-    expect(nextUp.textContent).toContain("Next");
-    expect(nextUp.textContent).toContain("tidy cart styles");
     expect(await within(bar).findByRole("group", { name: "Next for opus" })).toBeTruthy();
     expect(within(bar).getByRole("button", { name: "Steps" }).textContent).toBe("Steps");
     expect(within(bar).getByRole("button", { name: /^Changes/ }).querySelector(".sr-only")).toBeNull();
   });
 
-  it("when snug, gives up the next steps, the machine and the next one's workspace, and its buttons keep their names but not their words", async () => {
+  it("when snug, gives up the next steps and the machine, and its buttons keep their names but not their words", async () => {
     const bar = await header(900);
 
     expect(within(bar).queryByRole("group", { name: "Next for opus" })).toBeNull();
     expect(within(bar).queryByText("studio")).toBeNull();
-    const nextUp = within(bar).getByRole("link", { name: "Next that needs you: tidy cart styles / opus, 2 more need you" });
-    expect(nextUp.textContent).toContain("Next");
-    expect(nextUp.textContent).not.toContain("tidy cart styles");
     expect(within(bar).getByRole("button", { name: "Steps" }).querySelector(".sr-only")).toBeTruthy();
     expect(within(bar).getByRole("button", { name: /^Changes/ }).querySelector(".sr-only")?.textContent).toBe("Changes");
     expect(within(bar).getByRole("tablist").className.split(" ")).not.toContain("order-last");
   });
 
-  it("when tight, folds changes and steps into More, keeps Next to its count and puts the tabs on their own row", async () => {
+  it("when tight, folds changes and steps into More and puts the tabs on their own row", async () => {
     const bar = await header(608);
 
     expect(within(bar).queryByRole("button", { name: /^Changes/ })).toBeNull();
     expect(within(bar).queryByRole("button", { name: "Steps" })).toBeNull();
-    const nextUp = within(bar).getByRole("link", { name: "Next that needs you: tidy cart styles / opus, 2 more need you" });
-    expect(nextUp.textContent).toBe("2");
     expect(within(bar).getByRole("button", { name: "Find" })).toBeTruthy();
     expect(within(bar).getByRole("tablist").className.split(" ")).toContain("order-last");
   });

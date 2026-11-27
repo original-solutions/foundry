@@ -37,6 +37,8 @@ import { MD, useMediaQuery } from "./media";
 import { AttentionList } from "./attention/AttentionList";
 import { WaitingList } from "./placement/WaitingList";
 import { upNext } from "./needing";
+import { NextUp } from "./NextUp";
+import { needsYou } from "./labels";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
@@ -50,12 +52,11 @@ import { upNext } from "./needing";
  * in this browser, and with none a window too narrow for the list beside a terminal starts so.
  *
  * One bar heads the terminal: its workspace, then the workspace's terminals as tabs with their
- * states, a + that starts another session or shell in it, and, when another terminal needs you,
- * the way to the next one (Cmd+J from anywhere; the board's needs-you lane starts it too). Short
- * of room, it gives up what matters least first, keeping the workspace and the open tab. The
- * few terminals shown last (and both sides of a split) keep their pane attached behind the
- * others, so going back to one is instant, from its tab or another workspace; an older one
- * attaches again when shown and gets its screen and scrollback back from the holder.
+ * states, and a + that starts another session or shell in it. Short of room, it gives up what
+ * matters least first, keeping the workspace and the open tab. The few terminals shown last (and
+ * both sides of a split) keep their pane attached behind the others, so going back to one is
+ * instant, from its tab or another workspace; an older one attaches again when shown and gets its
+ * screen and scrollback back from the holder.
  *
  * With nothing open, the board shows every workspace as a card with its live states and changes
  * (or as one line of a list, for a large fleet), or, switched to its timeline, every session's
@@ -107,9 +108,11 @@ import { upNext } from "./needing";
  * that finishes its turn or needs you is told once: as a card at the top right while you are at
  * the page, or as a desktop alert while you are not; coming back after a while, a catch-up card
  * heads the same stack. The sidebar's bell sets all three in one place; a screen reader hears the
- * news whatever it is set to. What needs a person and the creates waiting for a machine head the
- * page instead, folded, in its flow above the board, the machines, the factory or an open terminal's
- * header, so they never lie over a control, folded or open; the steps column keeps its own height.
+ * news whatever it is set to. While any terminal needs you, a strip heads the page, in its flow above
+ * the board, the machines, the factory or an open terminal's header: how many need you and the next
+ * one, which it (or Cmd+J from anywhere) opens, in the board's order. Beside it, folded, what else
+ * needs a person (a session's own question, stall or failure is the strip's) and the creates waiting
+ * for a machine, so none of them lies over a control, folded or open; the steps column keeps its own height.
  *
  * ? (outside a field or the terminal) or the sidebar's Keyboard button lists every key the app
  * answers. The sidebar's list is one Tab stop that the arrows walk.
@@ -357,8 +360,9 @@ function Layout() {
                 </div>
               )}
               <main className="flex min-w-0 flex-1 flex-col">
-                {/* In the flow, so what is below gives up the room it takes; none while both are empty, and at most half the screen. */}
-                <div className="flex max-h-[50dvh] shrink-0 flex-col gap-2 overflow-y-auto p-2 empty:hidden">
+                {/* In the flow, so what is below gives up the room it takes; none while all are empty, and at most half the screen. Folded cards sit beside the strip, an open one takes a row. */}
+                <div className="flex max-h-[50dvh] shrink-0 flex-wrap content-start gap-2 overflow-y-auto p-2 empty:hidden">
+                  {next && <NextUp next={next.next} others={next.others} open={terminalId ? (located && !needsYou.includes(located.glyph) ? "answered" : "needing") : undefined} />}
                   <AttentionList folded />
                   <WaitingList folded />
                 </div>
@@ -381,7 +385,6 @@ function Layout() {
                           onClosePane={pair ? () => closePane(id) : undefined}
                           beside={id !== terminalId}
                           changed={changed}
-                          upNext={id === terminalId ? next : undefined}
                         />
                       </div>
                     ))}

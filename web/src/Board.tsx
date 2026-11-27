@@ -24,8 +24,6 @@ import { useCardChanges, useOnScreen } from "./cardChanges";
 import { LayoutSwitch, loadLayout, saveLayout, WorkspaceLine, type Layout } from "./BoardList";
 import { Timeline } from "./Timeline";
 import { Machines } from "./Machines";
-import { needing, type Needing } from "./needing";
-import { nextKey } from "./NextUp";
 import type { History } from "./samples";
 import { setHome, useHome, type Home } from "./home";
 import { readStored, store } from "./storage";
@@ -127,7 +125,6 @@ export function Board({
   const launch = useCreateWorkspace();
   const board = lanes(machines);
   const needs = board.find((l) => l.lane === "needs")?.cards.length ?? 0;
-  const first = needing(machines).at(0);
   const [group, setGroup] = useState(loadGroup);
   const regroup = (next: Group) => {
     setGroup(next);
@@ -195,7 +192,6 @@ export function Board({
                       tone={laneTone[lane]}
                       icon={<StateGlyph glyph={laneGlyph[lane]} still />}
                       count={cards.length}
-                      action={lane === "needs" && first && <GoThrough first={first} />}
                       list={layout === "list"}
                     >
                       {cards.map((card) => (
@@ -293,7 +289,6 @@ function LaneSection({
   tone,
   icon,
   count,
-  action,
   list = false,
   children,
 }: {
@@ -302,8 +297,6 @@ function LaneSection({
   tone: string;
   icon: React.ReactNode;
   count: number;
-  /** Shown after the lane's count. */
-  action?: React.ReactNode;
   /** Whether its workspaces are lines of one list rather than cards in a grid. */
   list?: boolean;
   children: React.ReactNode;
@@ -317,7 +310,6 @@ function LaneSection({
           {title}
         </h2>
         <span className="rounded-full bg-neutral-800 px-1.5 text-[11px] text-neutral-400">{count}</span>
-        {action}
         <span aria-hidden="true" className="h-px flex-1 bg-neutral-800" />
       </div>
       {list ? (
@@ -330,25 +322,6 @@ function LaneSection({
         <div className="grid grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] gap-3">{children}</div>
       )}
     </section>
-  );
-}
-
-/**
- * The start of going through what needs you, at the head of its lane: it opens the first, and
- * from there the bar above each terminal (or the key) leads to the next (`NextUp`).
- */
-function GoThrough({ first }: { first: Needing }) {
-  return (
-    <Link
-      to="/terminals/$terminalId"
-      params={{ terminalId: first.terminal }}
-      aria-label={`Go through what needs you, from ${first.workspace} / ${first.name}`}
-      title={`Open each that needs you in turn (${nextKey})`}
-      className="-my-1 ml-1 flex shrink-0 items-center gap-1.5 rounded-full border border-amber-400/30 px-2.5 py-0.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-400/10"
-    >
-      Go through them
-      <kbd className="hidden font-sans text-[11px] text-amber-300/70 pointer-fine:inline">{nextKey}</kbd>
-    </Link>
   );
 }
 

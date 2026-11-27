@@ -44,7 +44,7 @@ On cards of this machine, a line under the changes says how far the branch has t
 - **Working.** An agent is working or starting.
 - **Quiet.** Nothing is happening.
 
-Inside a group, the most urgent card comes first. **Go through them**, beside the **Needs you** count, opens the first session that needs you; from there **Next** in its header leads to the rest. See [Go through what needs you](sessions.md#go-through-what-needs-you).
+Inside a group, the most urgent card comes first. The amber strip at the top of the page opens the first session that needs you, and from there leads to the rest. See [Go through what needs you](sessions.md#go-through-what-needs-you).
 
 **Shipping** sorts by how far each workspace's work has gone on its way to the main branch.
 
@@ -221,9 +221,11 @@ Come back to the page after two minutes or more, in another tab or app, or after
 
 ## When something needs you
 
-Some things need a person and are not a session's question. They gather in a card at the top of the page, folded to a count such as "1 needs attention". It takes its own room above the board, the machines, the factory or an open terminal, so it never covers a button. Click the header to unfold it, and again to fold it.
+A session that asks you something, is stuck or failed leads from the amber strip at the top of the page. See [Go through what needs you](sessions.md#go-through-what-needs-you).
 
-Each item has a title, the machine it is about, what happened, and what to do. Items with a terminal have **Open terminal**. The titles are Machine offline, Session stuck, Waiting for you, Session failed, Setup failed, Gateway unhealthy, Disk low, Placement waiting, Setting overwritten and Update refused. [The factory](factory.md) adds five more, which show as a raw id instead of a title: `run_stuck` (a run is stuck), `run_needs_info` (a run asked questions on its issue), `gate_infra` (a run's gate could not run at all), `foreign_claim` (an issue is in a factory label under a claim that is not Foundry's) and `factory_idle` (a project's factory is on but idle, or has gone 10 minutes without word from the machine that holds it). They clear themselves when the cause is gone. Only **Setting overwritten** has a **Dismiss** button. **Setup failed** has **Close terminal**: its setup terminal has already exited, so closing it clears the item and stops nothing. Like **Clear**, it does not ask first, and the setup output goes with the terminal, so read it before you close.
+Some things need a person and are not a session's question. They gather in a card at the top of the page, folded to a count such as "1 needs attention", beside the strip. It takes its own room above the board, the machines, the factory or an open terminal, so it never covers a button. Click the header to unfold it, and again to fold it.
+
+Each item has a title, the machine it is about, what happened, and what to do. Items with a terminal have **Open terminal**. The titles are Machine offline, Setup failed, Gateway unhealthy, Disk low, Placement waiting, Setting overwritten and Update refused. [The factory](factory.md) adds five more, which show as a raw id instead of a title: `run_stuck` (a run is stuck), `run_needs_info` (a run asked questions on its issue), `gate_infra` (a run's gate could not run at all), `foreign_claim` (an issue is in a factory label under a claim that is not Foundry's) and `factory_idle` (a project's factory is on but idle, or has gone 10 minutes without word from the machine that holds it). They clear themselves when the cause is gone. Only **Setting overwritten** has a **Dismiss** button. **Setup failed** has **Close terminal**: its setup terminal has already exited, so closing it clears the item and stops nothing. Like **Clear**, it does not ask first, and the setup output goes with the terminal, so read it before you close.
 
 A second card under it, "N waiting for a machine", lists the tasks you asked Foundry to place that no machine can take yet. [Let Foundry choose a machine](machines.md#let-foundry-choose-a-machine) explains it.
 
@@ -250,6 +252,6 @@ On a phone, the board is the home and the sidebar is a drawer.
 
 - A line above the task box sums the fleet, such as "2 need you · 2 working · 1 quiet".
 - A bar at the bottom has **Board**, **Timeline**, **Machines** and **Workspaces**. The first three do what the switch does. **Board** carries a badge with how many workspaces need you. **Workspaces** opens the sidebar as a drawer, and the close button or `Esc` shuts it.
-- What needs you and the tasks waiting for a machine sit at the top of the page, folded, as on a wide screen.
+- The strip to what needs you sits at the top of the page, as on a wide screen, with the folded cards for what needs attention and the tasks waiting for a machine under it.
 - Toasts appear at the top.
 - Open a terminal and its header opens the drawer too. See [On a phone](sessions.md#on-a-phone).

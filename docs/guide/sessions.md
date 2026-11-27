@@ -11,13 +11,12 @@ One bar runs along the top of the terminal. From left to right:
 - The workspace name, then the machine it runs on. Point at the name to see its branch and project.
 - One tab for each terminal in the workspace, sessions first, then shells. Click a tab to switch. The tab you are on shows its state. When a tab in the background changes state, it shows the new state in bold until you open it.
 - A **+** that starts another terminal in this workspace. See [Start a session or a shell](#start-a-session-or-a-shell).
-- **Next**, in amber, when another terminal needs you. It counts how many others need you and, when there is room, names that terminal's workspace. Point at it to read what it asks. Click it, or press `Cmd+J`, to go there. Once the terminal you are on no longer needs you, **Next** fills and glows once. See [Go through what needs you](#go-through-what-needs-you).
 - **Changes**, which opens what the workspace changed. Once you have opened it, the button also shows how many lines were added and removed.
 - **Steps**, **Find** and a split button. **More**, the three dots, holds the rest.
 
 On a phone the bar also has a button that opens the workspaces list, and a **Jump to** button.
 
-When the bar is short of room, for example with the sidebar and Steps both open, what you need least gives way first, so nothing spills out of the bar. The next steps go first, then the machine name and the workspace in **Next**. Next, **Changes** and **Steps** shrink to their icons. At its narrowest, as on a phone, **Changes** and **Steps** move into **More**, **Next** keeps only its count, and two or more tabs get a row of their own. The workspace name and the tab you are on always stay.
+When the bar is short of room, for example with the sidebar and Steps both open, what you need least gives way first, so nothing spills out of the bar. The next steps go first, then the machine name. Next, **Changes** and **Steps** shrink to their icons. At its narrowest, as on a phone, **Changes** and **Steps** move into **More**, and two or more tabs get a row of their own. The workspace name and the tab you are on always stay.
 
 **+** only shows for workspaces on this machine. For a workspace on another machine, the menu also leaves out the entries that start or archive.
 
@@ -40,7 +39,7 @@ Press **+**, then choose:
 
 ## Go through what needs you
 
-When several sessions need you, answer them in turn without going back to the board. Press **Go through them** beside the **Needs you** count on the board, or `Cmd+J` anywhere, to open the first. Answer it, then press **Next** in the header, or `Cmd+J` again, for the one after. The order is the board's. After the last, `Cmd+J` goes round to the first.
+While any session needs you, an amber strip heads every page: the board, the timeline, the machines, the factory and an open terminal. It says how many need you, then the workspace of the next one and what it asks. Click it, or press `Cmd+J` anywhere, to open that one. Answer it, then click the strip or press `Cmd+J` again for the one after. Over a terminal that still needs you, the strip counts the others as "1 more needs you" and stays quiet. Once you have answered, it fills and glows once. The order is the board's. After the last, `Cmd+J` goes round to the first.
 
 ## Session states
 
@@ -49,7 +48,7 @@ The tab, the sidebar and the board all show a session's state the same way. Thre
 | State | What it means | What to do |
 | --- | --- | --- |
 | **Working** | Claude is in the middle of a turn. | Nothing. Watch the terminal or open **Steps**. |
-| **Needs you** | Claude asked a question or wants permission. | Open the terminal and answer. On a phone the key bar offers **1**, **2** and **3**. **Next** in the header goes on to the next one. |
+| **Needs you** | Claude asked a question or wants permission. | Open the terminal and answer. On a phone the key bar offers **1**, **2** and **3**. The strip at the top of the page goes on to the next one. |
 | **Ready** | The turn is done and Claude waits for your next prompt. | Type a prompt, or pick a next step. |
 
 You may also see **Starting**, before the session has reported anything, and **Stuck**, after ten minutes with no output. Open a stuck session and see what it is doing. **Failed** and **Ended** mean it stopped. **Unreachable** means its machine cannot be reached right now.

@@ -10,9 +10,7 @@ import { useWidth } from "./media";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { button, pressed } from "./Modal";
 import { NextSteps, offersNext } from "./NextSteps";
-import { NextUp } from "./NextUp";
-import type { Needing } from "./needing";
-import { needsYou, words } from "./labels";
+import { words } from "./labels";
 import { reply } from "./reply";
 import { StepsIcon } from "./StepsPanel";
 import { TabStrip } from "./TabStrip";
@@ -23,10 +21,9 @@ import { ProjectFace } from "./ProjectFace";
 export const splitKey = jumpKey === "⌘K" ? "⌘\\" : "Ctrl \\";
 
 /**
- * How much the header holds at its width. Wide holds everything. Snug gives up the next steps,
- * the machine's name and the next one's workspace, and its buttons keep their icons. Tight folds
- * changes and steps into More (which holds both), keeps Next to its count and puts two or more
- * tabs on their own row, so the workspace's name and the open tab keep the room. Wide until the
+ * How much the header holds at its width. Wide holds everything. Snug gives up the next steps and
+ * the machine's name, and its buttons keep their icons. Tight folds changes and steps into More
+ * (which holds both) and puts two or more tabs on their own row, so the workspace's name and the open tab keep the room. Wide until the
  * header has been measured.
  */
 export type Fit = "wide" | "snug" | "tight";
@@ -50,8 +47,7 @@ const SNUG = 640;
  * lit edge and the other is dimmed. An idle session of this machine offers its workspace's next
  * steps (commit, open a pull request, fix failing checks) in the bar, each sent to it as a prompt;
  * with a mouse, outside a split and while the bar is wide only (a phone's key bar offers them).
- * When another terminal needs you, the bar of the side with the keyboard leads the way to it
- * (`NextUp`). The bar never spills out of its box: as it narrows, what matters least gives way
+ * The way to the next terminal that needs you heads the page above it (`NextUp`). The bar never spills out of its box: as it narrows, what matters least gives way
  * first (`headerFit`).
  */
 export function TerminalHeader({
@@ -69,7 +65,6 @@ export function TerminalHeader({
   onClosePane,
   beside = false,
   changed = none,
-  upNext,
 }: {
   /** The terminal it heads, for its menu. */
   id?: string;
@@ -93,8 +88,6 @@ export function TerminalHeader({
   beside?: boolean;
   /** Terminals whose state changed in the background since they were last shown. */
   changed?: Set<string>;
-  /** The next terminal that needs you, and how many do besides this one. */
-  upNext?: { next: Needing; others: number };
 }) {
   const { data: here } = useQuery(machineQuery);
   const bar = useRef<HTMLElement>(null);
@@ -136,7 +129,6 @@ export function TerminalHeader({
             )}
           </div>
           {id ? <TabStrip workspace={located.workspace} machine={located.machine} active={id} changed={changed} apart={apart} /> : <span className="flex-1" />}
-          {upNext && !beside && <NextUp next={upNext.next} others={upNext.others} answered={!needsYou.includes(located.glyph)} fit={fit} />}
           {id && !onClosePane && fit === "wide" && offersNext(located, here) && (
             <div className="hidden pointer-fine:contents">
               <NextSteps workspace={located.workspace.id} name={located.name} send={(prompt) => reply(id, prompt)} look="header" />
