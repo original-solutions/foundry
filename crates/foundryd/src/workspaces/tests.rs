@@ -1104,6 +1104,50 @@ async fn archive_with_force_of_a_detached_workspace_removes_its_folder_and_keeps
     assert!(worktrees.contains(&format!("/{name}\n")), "{worktrees}");
 }
 
+/// The factory archives its workspaces anyway: a detached one's folder goes, its marker goes as
+/// the normal path's does, and a warning names the folder deleted unread.
+#[tokio::test]
+async fn archive_anyway_of_a_detached_factory_workspace_drops_its_marker_and_warns_naming_the_folder()
+ {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let sha = setup.remote_at(&remote, "refs/heads/main");
+    let id = setup
+        .make(
+            &remote,
+            "adrift",
+            commit_of(&sha),
+            Provision::None,
+            tag(remote.project, "run"),
+        )
+        .await
+        .unwrap();
+    let marker = setup
+        .data
+        .path()
+        .join("worktrees")
+        .join(remote.project.to_string())
+        .join(format!("{id}.factory"));
+    assert!(marker.exists());
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+    detach_folder(&setup.clone_of(remote.project), &worktree);
+    let logs = Logged::default();
+    let _guard = logs.capture();
+
+    setup.workspaces.archive(id, true).await.unwrap();
+
+    assert!(!worktree.exists());
+    assert!(setup.record(id).unwrap().deleted);
+    assert!(!marker.exists());
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains(&worktree.display().to_string()))
+        .unwrap_or_else(|| panic!("no line names the folder: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains(&id.to_string()), "{line}");
+}
+
 #[tokio::test]
 async fn a_detached_p1_workspace_is_refused_then_archived_anyway_from_its_branch_named_folder() {
     let setup = Setup::new();

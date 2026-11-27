@@ -1445,6 +1445,12 @@ impl Inner {
         let _removing = Removing::mark(self, id);
         if there && detached {
             // Git cannot remove what it does not list; the folder is all there is to take away.
+            // Nothing in it could be read first, so the log says what went.
+            tracing::warn!(
+                workspace = %id,
+                folder = %worktree.display(),
+                "archive anyway deletes a folder git no longer lists as a worktree, unread"
+            );
             remove_any(&worktree).await?;
         } else if there {
             self.remove_worktree(&clone, &worktree, force).await?;
@@ -1630,9 +1636,10 @@ impl Inner {
                 continue;
             }
             // A worktree on a detached `HEAD` has no branch to check, and `folder` is no branch of
-            // its own.
+            // its own. Git listed this folder, so it is not detached.
+            let detached = false;
             let checked = match self
-                .refuse_dirty(&clone, &listed, branch.unwrap_or(folder), false)
+                .refuse_dirty(&clone, &listed, branch.unwrap_or(folder), detached)
                 .await
             {
                 Ok(()) => self.ignored(&listed).await,
