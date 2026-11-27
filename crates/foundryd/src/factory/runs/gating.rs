@@ -4090,6 +4090,64 @@ mod tests {
         }
 
         #[test]
+        fn the_failed_command_on_record_is_the_one_that_holds_the_secret_hidden() {
+            let (mut rig, run, _hub) = built_hiding();
+            let command = format!("cargo test --token {HELD}");
+            rig.config.gate = vec!["cargo fmt".into(), command.clone()];
+            let tail = format!("$ cargo fmt\n$ {command}\nsetup failed: {command} exited 101\n");
+            assert_eq!(
+                gated(&mut rig, &run, 101, &tail),
+                GateStep::SentBack { attempt: 1 }
+            );
+            let lines: Vec<_> = rig
+                .events(&run)
+                .into_iter()
+                .filter(|event| event.event == "gate_command")
+                .collect();
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].data["command"], "cargo test --token ***");
+        }
+
+        #[test]
+        fn a_secret_the_machine_came_to_hold_after_the_tail_was_recorded_is_hidden_in_the_message()
+        {
+            // The ledger recorded the tail while the store did not hold the token yet.
+            let (mut rig, run, hub) = built();
+            rig.tracker = Hiding::new(
+                hub.clone(),
+                Arc::new(|text: &str| text.replace(HELD, "***")),
+            );
+            let command = format!("cargo test --token {HELD}");
+            rig.config.gate = vec![command.clone()];
+            let tail =
+                format!("$ {command}\nfailed with {HELD}\nsetup failed: {command} exited 101\n");
+            assert_eq!(
+                gated(&mut rig, &run, 101, &tail),
+                GateStep::SentBack { attempt: 1 }
+            );
+            let expected = messages::gate_failed(
+                &failure_of("cargo test --token ***", 101, "failed with ***\n"),
+                BODY_PATH,
+            );
+            assert_eq!(sends(&rig), vec![sent(1, expected)]);
+        }
+
+        #[test]
+        fn a_gate_whose_retries_are_used_up_names_its_command_with_the_secret_hidden() {
+            let (mut rig, run, _hub) = built_hiding();
+            rig.config.limits.gate_retries = 0;
+            let command = format!("cargo test --token {HELD}");
+            rig.config.gate = vec![command.clone()];
+            let tail = format!("$ {command}\nsetup failed: {command} exited 101\n");
+            let step = gated(&mut rig, &run, 101, &tail);
+            let GateStep::Stuck { reason } = &step else {
+                panic!("expected stuck, got {step:?}");
+            };
+            assert!(reason.contains("cargo test --token ***"), "{reason}");
+            assert!(!reason.contains(HELD), "{reason}");
+        }
+
+        #[test]
         fn a_failed_provision_goes_back_into_the_session_like_a_failed_gate() {
             let (mut rig, run, _hub) = built();
             rig.config.provision = vec!["npm ci".into()];
