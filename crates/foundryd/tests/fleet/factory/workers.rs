@@ -68,10 +68,13 @@ fn marks(name: &str) -> String {
 /// build, and answers that machine.
 ///
 /// The `claimed` event is in the coordinator's store before the claim's GitHub edits, and the
-/// pass takes that store again, to write its next events and to read the machine list, before
-/// it dials the machine; a cut machine's dial is refused. So the event is read, and the machine
-/// cut off, while the watcher holds the store, on a thread of its own that takes each store again
-/// at once. A test that waits for the claim comment on GitHub instead can lose to the pass.
+/// pass takes that store several times more, to write its next events and to read the machine
+/// list, before it dials the machine; a cut machine's dial is refused. The watcher reads the
+/// event and cuts the machine while it holds the store, on a thread of its own that takes each
+/// store again at once, so the cut lands before the dial unless that thread is kept off the CPU
+/// for all of those steps. Nothing makes the pass wait for it: the window is narrowed, not
+/// closed. A test that waits for the claim comment on GitHub, polled on the runtime, lost to the
+/// pass on a loaded host.
 fn cut_off_at_claim(h: &Harness, issue: u64) -> std::thread::JoinHandle<MachineId> {
     let daemons: Vec<_> = h
         .fleet
@@ -718,10 +721,6 @@ fn a_claim_whose_machine_never_answers_is_launched_on_another() {
                     .any(|c| c.contains("<!-- foundry:claim ") && c.contains(&cut_off.to_string()))
             })
             .await;
-            assert!(
-                h.workspaces_named("fac/12-1").is_empty(),
-                "the machine cut off is not asked for the build"
-            );
 
             hurry(&h, Duration::from_secs(15 * 60 + 30)).await;
             let build = h.made("fac/12-1").await;
@@ -730,6 +729,12 @@ fn a_claim_whose_machine_never_answers_is_launched_on_another() {
                 "the build is launched on the machine that answers"
             );
             h.reaches(12, "factory:pr-open").await;
+            assert!(
+                h.workspaces_named("fac/12-1")
+                    .iter()
+                    .all(|w| w.owner != cut_off),
+                "the machine cut off never made the build"
+            );
             let moved = format!("{CLAIM_MOVED}{}", h.fleet.daemons[elsewhere].id);
             assert!(
                 steps(&h, 12).contains(&moved),
