@@ -3068,6 +3068,25 @@ mod tests {
         assert_eq!(read[&5].labels, Vec::<String>::new());
     }
 
+    /// A URL GitHub resolves to an issue with another number, such as one moved elsewhere, is
+    /// not the issue asked for: it is left out, not read as that number's labels.
+    #[test]
+    fn issue_labels_leaves_out_an_issue_github_answers_with_another_number() {
+        let fake = FakeTracker::new();
+        fake.on(
+            issue_labels_call(&[5, 6]),
+            Answer::ok(
+                json!({"data": {
+                    "i5": labelled(12, "OPEN", &["factory:stuck"]),
+                    "i6": labelled(6, "OPEN", &["factory:stuck"]),
+                }})
+                .to_string(),
+            ),
+        );
+        let read = issue_labels(&fake, REPO, &[5, 6]).unwrap();
+        assert_eq!(read.keys().copied().collect::<Vec<_>>(), vec![6]);
+    }
+
     #[test]
     fn issue_labels_of_no_number_makes_no_call() {
         let fake = FakeTracker::new();

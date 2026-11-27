@@ -5216,6 +5216,30 @@ mod tests {
             assert_eq!(batched_reads(&rig), 2, "each pass reads them again, once");
         }
 
+        /// A cut listing still holds up the runs on the issues it returned, and the batched read
+        /// asks only for the issues it left out.
+        #[test]
+        fn a_cut_listing_holds_up_its_own_issues_runs_and_reads_only_the_rest() {
+            let mut rig = Rig::new();
+            fill_the_listing(&rig, "factory:stuck");
+            let listed = held_up_run(&rig, 5, 1, State::Stuck, "listed");
+            rig.hub.issue(300, &["factory:stuck"]);
+            let past = held_up_run(&rig, 300, 1, State::Stuck, "past the cut");
+            rig.pass();
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![listed, past]);
+            let reads: Vec<String> = rig
+                .hub
+                .calls()
+                .into_iter()
+                .map(|args| args.join(" "))
+                .filter(|call| call.contains("resource(url:"))
+                .collect();
+            assert_eq!(reads.len(), 1, "{reads:?}");
+            assert!(reads[0].contains("/issues/300\""), "{}", reads[0]);
+            assert!(!reads[0].contains("/issues/5\""), "{}", reads[0]);
+        }
+
         #[test]
         fn an_uncut_listing_makes_no_batched_read() {
             let mut rig = Rig::new();
