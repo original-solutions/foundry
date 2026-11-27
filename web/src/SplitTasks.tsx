@@ -6,6 +6,8 @@ import { makeWorkspace, SessionNotStarted, type CreateInput } from "./launch";
 /** One item of a split task: the workspace it makes and the prompt its session starts on. */
 export interface Planned {
   name: string;
+  /** Names to try in turn while the daemon refuses the one before as taken. */
+  then?: string[];
   prompt: string;
 }
 

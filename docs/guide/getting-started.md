@@ -71,7 +71,9 @@ Write the tasks as a list, one item per line, each starting with `-`, `*` or a n
 
 - Press it and the box lists the workspace and branch each item makes. **Start 3** makes them one after another, each with Claude at work on its item, in the project, base, model and machine you picked.
 - You stay where you are. The new workspaces show up on the board and in the sidebar as they start.
+- An item's name is numbered as a single task's is, so a branch the repo already has does not stop it.
 - If one cannot be made, the others start all the same. The box keeps that item and says why.
+- If you close the box or leave the page before the last one starts, the amber card at the top right says how it went, until you press **Dismiss**.
 - Press **Split into 3 tasks** again to make one workspace with the whole list as its task.
 
 ## Projects

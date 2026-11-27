@@ -118,16 +118,17 @@ function freeNames(name: string, project: Project | undefined, workspaces: Works
   return names;
 }
 
-/** The first name `freeNames` gives whose branch none of the names `also` has. Empty when none is free. */
-function freeName(name: string, project: Project | undefined, workspaces: WorkspaceView[], also: string[]): string {
-  return freeNames(name, project, workspaces).find((next) => !also.some((a) => sameBranch(safeBranch(a), safeBranch(next)))) ?? "";
-}
-
-/** The workspace each item of a split task makes, named from its item and numbered past the project's branches and the items before it. */
+/**
+ * The workspace each item of a split task makes, named from its item and numbered past the
+ * project's workspaces and the items before it, with the names to try in turn when the daemon
+ * refuses one as taken, as a single task's suggested name has.
+ */
 function planOf(items: string[], project: Project | undefined, workspaces: WorkspaceView[]): Planned[] {
   const plan: Planned[] = [];
   for (const prompt of items) {
-    plan.push({ name: freeName(taskName(prompt), project, workspaces, plan.map((p) => p.name)), prompt });
+    const before = plan.map((p) => safeBranch(p.name));
+    const [name = "", ...then] = freeNames(taskName(prompt), project, workspaces).filter((next) => !before.some((b) => sameBranch(b, safeBranch(next))));
+    plan.push({ name, then, prompt });
   }
   return plan;
 }
@@ -212,7 +213,7 @@ export function Composer({
   const items = listOf(task);
   // While a split start runs, the plan is the one sent, so workspaces arriving do not renumber it.
   const sent = each.run.isPending ? each.run.variables : undefined;
-  const plan = sent ? sent.map((input) => ({ name: input.name, prompt: input.prompt ?? "" })) : split && items ? planOf(items, project, workspaces) : undefined;
+  const plan = sent ? sent.map((input) => ({ name: input.name, then: input.then, prompt: input.prompt ?? "" })) : split && items ? planOf(items, project, workspaces) : undefined;
   const busy = create.isPending || each.run.isPending;
   const ready = plan
     ? Boolean(project && base.trim() && model.trim()) && plan.every((p) => p.name) && !busy
@@ -229,7 +230,7 @@ export function Composer({
     if (!ready || !project) return;
     each.run.reset();
     if (plan) {
-      const inputs = plan.map((p) => ({ project: project.id, base: base.trim(), name: p.name, machine: machine || undefined, model: model.trim(), prompt: p.prompt }));
+      const inputs = plan.map((p) => ({ project: project.id, base: base.trim(), name: p.name, then: p.then, machine: machine || undefined, model: model.trim(), prompt: p.prompt }));
       each.run.mutate(inputs, {
         // Each one shows up on the board as it starts, so nothing is landed in; what did not start stays in the box.
         onSuccess: ({ missed, warned }) => (missed.length === 0 && warned.length === 0 ? (onDone ?? clear)() : setTask(leftOver(missed))),

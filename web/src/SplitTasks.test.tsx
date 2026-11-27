@@ -101,7 +101,7 @@ describe("a task written as a list", () => {
   });
 
   it("keeps the items that did not start in the box, says why, and stays open", async () => {
-    const calls = mockFetch(json(201, { id: "w7" }), json(201, { id: "s7" }), json(409, { error: "the branch tidy-the-readme exists" }), json(201, { id: "w9" }), json(201, { id: "s9" }));
+    const calls = mockFetch(json(201, { id: "w7" }), json(201, { id: "s7" }), json(400, { error: "no base branch dev" }), json(201, { id: "w9" }), json(201, { id: "s9" }));
     await renderApp(<Harness />);
     const dialog = await show();
 
@@ -112,13 +112,29 @@ describe("a task written as a list", () => {
     await waitFor(() => expect(calls).toHaveLength(5));
     const alert = await within(dialog).findByRole("alert");
     expect(alert.textContent).toContain("Started 2 of 3.");
-    expect(alert.textContent).toContain("tidy the readme: the branch tidy-the-readme exists");
+    expect(alert.textContent).toContain("tidy the readme: no base branch dev");
     expect(taskBox(dialog).value).toBe("Tidy the README");
     expect(screen.getByRole("dialog", { name: "New task" })).toBeDefined();
   });
 
+  it("numbers an item whose name the daemon refuses as taken, as a single task's suggested name is", async () => {
+    const taken = json(409, { error: "a branch or worktree named tidy-the-readme already exists in this project" });
+    const calls = mockFetch(json(201, { id: "w7" }), json(201, { id: "s7" }), taken, json(201, { id: "w8" }), json(201, { id: "s8" }), json(201, { id: "w9" }), json(201, { id: "s9" }));
+    await renderApp(<Harness />);
+    const dialog = await show();
+
+    fireEvent.change(taskBox(dialog), { target: { value: list } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Split into 3 tasks" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start 3" }));
+
+    await waitFor(() => expect(calls).toHaveLength(7));
+    const names = calls.filter((c) => c.url === "/api/workspaces").map((c) => (c.body as { name: string }).name);
+    expect(names).toEqual(["fix the footer", "tidy the readme", "tidy the readme 2", "add csv export"]);
+    expect(within(dialog).queryByRole("alert")).toBeNull();
+  });
+
   it("drops an item whose workspace was made from the box even when its session did not start", async () => {
-    mockFetch(json(201, { id: "w7" }), json(500, { error: "no claude" }), json(201, { id: "w8" }), json(201, { id: "s8" }), json(409, { error: "taken" }));
+    mockFetch(json(201, { id: "w7" }), json(500, { error: "no claude" }), json(201, { id: "w8" }), json(201, { id: "s8" }), json(400, { error: "no base branch dev" }));
     await renderApp(<Harness />);
     const dialog = await show();
 
@@ -133,7 +149,7 @@ describe("a task written as a list", () => {
   });
 
   it("says how it ended through the layout when the box closed before the last item was done", async () => {
-    mockFetch(json(201, { id: "w7" }), json(201, { id: "s7" }), json(409, { error: "the branch tidy-the-readme exists" }), json(201, { id: "w9" }), json(201, { id: "s9" }));
+    mockFetch(json(201, { id: "w7" }), json(201, { id: "s7" }), json(400, { error: "no base branch dev" }), json(201, { id: "w9" }), json(201, { id: "s9" }));
     const answered = fetch;
     let release = () => {};
     const held = new Promise<void>((resolve) => (release = resolve));
@@ -162,11 +178,11 @@ describe("a task written as a list", () => {
     release();
 
     await waitFor(() => expect(report).toHaveBeenCalledTimes(1));
-    expect(report.mock.calls[0][0]).toBe("Started 2 of 3 split tasks.\ntidy the readme: the branch tidy-the-readme exists");
+    expect(report.mock.calls[0][0]).toBe("Started 2 of 3 split tasks.\ntidy the readme: no base branch dev");
   });
 
   it("says nothing through the layout while the box that started it is still open", async () => {
-    mockFetch(json(201, { id: "w7" }), json(201, { id: "s7" }), json(409, { error: "taken" }), json(201, { id: "w9" }), json(201, { id: "s9" }));
+    mockFetch(json(201, { id: "w7" }), json(201, { id: "s7" }), json(400, { error: "no base branch dev" }), json(201, { id: "w9" }), json(201, { id: "s9" }));
     const report = vi.fn();
     await renderApp(
       <SplitEnded.Provider value={report}>
