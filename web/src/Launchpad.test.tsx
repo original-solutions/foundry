@@ -7,7 +7,7 @@ import { taskName, useCreateWorkspace } from "./Composer";
 import type { WorkspaceView } from "./fleet";
 import { Launchpad } from "./Launchpad";
 import { primaryButton } from "./Modal";
-import { settings } from "./test-fixtures";
+import { ME, settings } from "./test-fixtures";
 import { json, mockFetch, renderApp, type Call } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -26,6 +26,21 @@ const start = () => screen.getByRole("button", { name: /^Start/ }) as HTMLButton
 const long = Array.from({ length: 4 }, () => "가나다라마바사아자").join(" ");
 /** The name each request sent, if it sent one. */
 const sentNames = (calls: Call[]) => calls.map((c) => (c.body as { name?: string } | undefined)?.name);
+
+/** A fleet of this machine and `laptop` (m2), and `answers` to the requests the box sends, which it records. */
+function fleetOf(...answers: Response[]): Call[] {
+  const machines = { me: ME, machines: [{ id: ME, name: "studio", online: true }, { id: "m2", name: "laptop", online: true }] };
+  const calls: Call[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init: RequestInit = {}) => {
+      if (url === "/api/machines") return json(200, machines);
+      calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
+      return answers.shift() ?? json(500, { error: "unexpected request" });
+    }),
+  );
+  return calls;
+}
 
 describe("taskName", () => {
   it("names a task by the first words of its first line, lower case, without closing punctuation", () => {
@@ -154,6 +169,40 @@ describe("Launchpad", () => {
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.getByLabelText("Branch").textContent).toBe("review-loop-pr-1181-2");
     expect((screen.getByLabelText("Workspace name") as HTMLInputElement).placeholder).toBe("review-loop pr 1181 2");
+  });
+
+  it("shows the numbered name a workspace was made under when its session then does not start", async () => {
+    const taken = json(409, { error: "a branch or worktree named review-loop-pr-1181 already exists in this project" });
+    const calls = mockFetch(taken, json(201, { id: "w1" }), json(500, { error: "claude not found" }));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: "/review-loop https://github.com/original-solutions/people-hub/pull/1181" } });
+    fireEvent.click(start());
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/its session did not start: claude not found/);
+    expect(sentNames(calls)).toEqual(["review-loop pr 1181", "review-loop pr 1181 2", undefined]);
+    expect(screen.getByLabelText("Branch").textContent).toBe("review-loop-pr-1181-2");
+    expect((screen.getByLabelText("Workspace name") as HTMLInputElement).placeholder).toBe("review-loop pr 1181 2");
+  });
+
+  it.each([
+    ["a picked machine", "m2", {}],
+    ["letting Foundry choose", "choose", { model: "opus", prompt: "Fix it" }],
+  ])("numbers a refused suggested name on %s and keeps the rest of the request as it was", async (_, machine, session) => {
+    const calls = fleetOf(json(409, { error: "a branch or worktree named fix-it already exists in this project" }), json(500, { error: "stop here" }));
+    await renderApp(<Harness />);
+
+    const picker = (await screen.findByLabelText("Machine")) as HTMLSelectElement;
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.change(picker, { target: { value: machine } });
+    fireEvent.click(start());
+
+    await screen.findByRole("alert");
+    const sent = { project: "p1", base: "main", machine, ...session };
+    expect(calls.map((c) => c.body)).toEqual([
+      { ...sent, name: "fix it" },
+      { ...sent, name: "fix it 2" },
+    ]);
   });
 
   it("shows the name a second Start will send, not the one an earlier create was numbered to, while it waits to go out", async () => {
