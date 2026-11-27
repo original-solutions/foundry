@@ -255,6 +255,8 @@ struct Done {
     /// the order the runs' events put it in, never the wall clock. `None` when not read.
     at: Option<(u64, u64, MachineId)>,
     run: FinishedRun,
+    /// Why a run that finished `stuck` or `needs-info` waits for a person.
+    reason: Option<String>,
 }
 
 /// What one pass did.
@@ -1621,6 +1623,51 @@ impl<'a, 'w> Pass<'a, 'w> {
             }
         }
         self.see_finished(&unfinished)?;
+        // A run that finished stuck or needs-info waits for a person while its issue keeps that
+        // label, when it is the issue's newest run. The label is read only when such a run is.
+        let mut newest: BTreeMap<u64, &RunId> = BTreeMap::new();
+        for run in self.memo.finished.keys().chain(&unfinished) {
+            let slot = newest.entry(run.issue()).or_insert(run);
+            if run.attempt() > slot.attempt() {
+                *slot = run;
+            }
+        }
+        let waiting: Vec<(&Done, HeldUpKind)> = newest
+            .values()
+            .filter_map(|run| {
+                let done = self.memo.finished.get(*run)?.as_ref()?;
+                match done.run.outcome {
+                    RunOutcome::Stuck => Some((done, HeldUpKind::Stuck)),
+                    RunOutcome::NeedsInfo => Some((done, HeldUpKind::NeedsInfo)),
+                    RunOutcome::PrOpen => None,
+                }
+            })
+            .collect();
+        for (kind, state) in [
+            (HeldUpKind::Stuck, State::Stuck),
+            (HeldUpKind::NeedsInfo, State::NeedsInfo),
+        ] {
+            let mut of_kind = waiting.iter().filter(|(_, k)| *k == kind).peekable();
+            if of_kind.peek().is_none() {
+                continue;
+            }
+            let labelled: BTreeSet<u64> = world
+                .tracker
+                .list_issues(&world.project.repo, state)?
+                .items
+                .iter()
+                .map(|issue| issue.number)
+                .collect();
+            for (done, _) in of_kind {
+                if labelled.contains(&done.run.run.issue()) {
+                    self.results.held_up.push(HeldUp {
+                        run: done.run.run.clone(),
+                        kind,
+                        reason: done.reason.clone().unwrap_or_default(),
+                    });
+                }
+            }
+        }
         let mut done: Vec<&Done> = self.memo.finished.values().flatten().collect();
         // Newest first by where the `finished` event stands, then by run id for a tie.
         done.sort_by(|a, b| (&b.at, &b.run.run).cmp(&(&a.at, &a.run.run)));
@@ -1659,6 +1706,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                 &summary.id,
             );
             let id = summary.id.clone();
+            let reason = summary.reason.clone();
             let run = summary.state.map(|state| FinishedRun {
                 title: summary.title.clone().unwrap_or_default(),
                 outcome: match state {
@@ -1672,7 +1720,7 @@ impl<'a, 'w> Pass<'a, 'w> {
             });
             self.memo
                 .finished
-                .insert(id, run.map(|run| Done { at, run }));
+                .insert(id, run.map(|run| Done { at, run, reason }));
         }
         Ok(())
     }
@@ -4788,6 +4836,163 @@ mod tests {
             let reconcile = 3 * 15;
             assert!(swept >= plain + reconcile, "{plain} {swept}");
             assert!(swept <= plain + reconcile + 3, "{plain} {swept}");
+        }
+    }
+
+    mod the_held_up_runs_of_the_status {
+        use super::*;
+        use crate::factory::ledger::events::Outcome;
+
+        /// Attempt `attempt` of `issue`, which went `to` (`stuck` or `needs-info`) saying
+        /// `reason` and finished.
+        fn held_up_run(rig: &Rig, issue: u64, attempt: u32, to: State, reason: &str) -> RunId {
+            let run = rig.run_in(issue, attempt, State::Building);
+            let cause = Cause::new(CauseStep::Start, "test");
+            let (said, outcome) = if to == State::Stuck {
+                let said = Event::Stuck {
+                    reason: reason.into(),
+                    branch: None,
+                    commits_ahead: None,
+                };
+                (said, Outcome::Stuck)
+            } else {
+                let said = Event::QuestionsPosted {
+                    questions: reason.into(),
+                };
+                (said, Outcome::NeedsInfo)
+            };
+            for event in [
+                said,
+                Event::StateChanged {
+                    from: State::Building,
+                    to,
+                },
+                Event::Finished {
+                    outcome,
+                    total_ms: 0,
+                    gate_attempts: 0,
+                    review_cycles: None,
+                    pr_url: None,
+                    pr_end: None,
+                },
+            ] {
+                rig.ledger.write(&run, &event, &cause).unwrap();
+            }
+            run
+        }
+
+        #[test]
+        fn a_run_finished_stuck_is_held_up_while_its_issue_is_stuck() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = held_up_run(&rig, 5, 1, State::Stuck, "the gate failed 3 times");
+            rig.pass();
+            assert_eq!(
+                rig.status().held_up,
+                vec![HeldUp {
+                    run,
+                    kind: HeldUpKind::Stuck,
+                    reason: "the gate failed 3 times".into(),
+                }]
+            );
+        }
+
+        #[test]
+        fn a_run_finished_needs_info_is_held_up_while_its_issue_needs_info() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:needs-info"]);
+            let run = held_up_run(&rig, 5, 1, State::NeedsInfo, "Which login?");
+            rig.pass();
+            assert_eq!(
+                rig.status().held_up,
+                vec![HeldUp {
+                    run,
+                    kind: HeldUpKind::NeedsInfo,
+                    reason: "Which login?".into(),
+                }]
+            );
+        }
+
+        #[test]
+        fn a_held_up_run_is_let_go_once_its_issue_leaves_the_label() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            held_up_run(&rig, 5, 1, State::Stuck, "no");
+            rig.pass();
+            assert_eq!(rig.status().held_up.len(), 1);
+            rig.hub.edit(5, |issue| issue.labels.clear());
+            rig.pass();
+            assert!(rig.status().held_up.is_empty());
+        }
+
+        /// The label is the newest run's: an earlier attempt that went stuck is not held up
+        /// again, nor a run whose outcome is not the label the issue carries.
+        #[test]
+        fn only_the_newest_run_of_the_issue_is_held_up_and_only_for_its_own_label() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            held_up_run(&rig, 5, 1, State::Stuck, "the first time");
+            let newest = held_up_run(&rig, 5, 2, State::Stuck, "the second time");
+            rig.hub.issue(6, &["factory:stuck"]);
+            held_up_run(&rig, 6, 1, State::NeedsInfo, "Which login?");
+            rig.pass();
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![newest]);
+        }
+
+        /// A newer attempt that has not finished is the issue's newest run: an older one that
+        /// finished stuck is not held up beside it.
+        #[test]
+        fn a_newer_unfinished_run_of_the_issue_is_held_up_alone() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            held_up_run(&rig, 5, 1, State::Stuck, "the first time");
+            let newer = rig.run_in(5, 2, State::Stuck);
+            rig.pass();
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![newer]);
+        }
+
+        /// With no run finished stuck or needs-info, neither label is read: a read that would
+        /// fail cannot fail the pass.
+        #[test]
+        fn with_no_held_up_run_neither_label_is_read() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            rig.hub.issue(6, &["factory:needs-info"]);
+            rig.hub.fail("factory:stuck", 1);
+            rig.hub.fail("factory:needs-info", 1);
+            let report = rig.pass();
+            assert!(report.failed.is_none(), "{report:?}");
+            assert!(rig.status().held_up.is_empty());
+            let listed: Vec<String> = rig
+                .hub
+                .calls()
+                .into_iter()
+                .filter(|args| args.iter().any(|a| a == "list"))
+                .flat_map(|args| crate::factory::pass::testing::Hub::flag_values(&args, "--label"))
+                .collect();
+            assert!(
+                !listed
+                    .iter()
+                    .any(|l| l == "factory:stuck" || l == "factory:needs-info"),
+                "{listed:?}"
+            );
+        }
+
+        /// The label is read from GitHub as the claims are: a read that fails ends the pass as
+        /// failed, and the status keeps what the last good pass held up.
+        #[test]
+        fn a_failed_read_of_the_label_fails_the_pass_and_keeps_the_last_held_up_runs() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = held_up_run(&rig, 5, 1, State::Stuck, "no");
+            rig.pass();
+            rig.hub.fail("factory:stuck", 1);
+            let report = rig.pass();
+            assert!(report.failed.is_some(), "{report:?}");
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![run]);
         }
     }
 
