@@ -18,6 +18,19 @@ export type DiffLine =
   | { kind: "removed"; text: string; old: number }
   | { kind: "added"; text: string; new: number };
 
+/**
+ * The start of `lines` that holds its first `count` lines other than notes, carried on to the end
+ * of the change it stops inside, so each removed line it holds still meets the added lines it pairs
+ * with. What a peek paints, rather than the whole patch.
+ */
+export function leading(lines: DiffLine[], count: number): DiffLine[] {
+  let end = 0;
+  for (let shown = 0; end < lines.length && shown < count; end++) if (lines[end].kind !== "note") shown++;
+  const changed = (line?: DiffLine) => line?.kind === "removed" || line?.kind === "added";
+  if (changed(lines[end - 1])) while (end < lines.length && (changed(lines[end]) || lines[end].kind === "note")) end++;
+  return lines.slice(0, end);
+}
+
 /** A file's hunks as lines to show, each numbered on the side or sides it is on. */
 export function diffLines(patch: string): DiffLine[] {
   const lines: DiffLine[] = [];

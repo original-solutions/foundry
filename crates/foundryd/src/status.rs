@@ -270,6 +270,7 @@ mod tests {
                 terminal: TerminalId::random(),
                 model: "opus".into(),
                 state,
+                name: None,
             },
         })
     }
