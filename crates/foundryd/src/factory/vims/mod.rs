@@ -830,6 +830,7 @@ mod tests {
             ("succeeded", OpState::Finished),
             ("completed", OpState::Finished),
             ("failed", OpState::Failed),
+            ("fail", OpState::Failed),
             ("cancelled", OpState::Cancelled),
             ("canceled", OpState::Cancelled),
             ("Weird", OpState::Other("weird".into())),
