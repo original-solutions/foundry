@@ -101,8 +101,8 @@ use foundry_proto::ids::SessionId;
 use foundry_proto::state::SessionState;
 
 use super::progress::{
-    LAUNCH_RESENDING, RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, SendTries,
-    TIME_LIMIT as TIME_LIMIT_CODE, TURN_READ, pending_relaunch, read_progress,
+    RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, SendTries, TIME_LIMIT as TIME_LIMIT_CODE,
+    TURN_READ, pending_relaunch, read_progress,
 };
 use super::start::{self, StartStep};
 use super::{
@@ -1040,6 +1040,7 @@ mod tests {
     use foundry_proto::record::{Record, Session};
     use foundry_proto::state::SessionState;
 
+    use super::super::progress::LAUNCH_RESENDING;
     use super::super::testing::*;
     use super::*;
     use crate::factory::github::{Hiding, Tracker, TrackerError};
