@@ -1794,7 +1794,14 @@ mod tests {
     #[test]
     fn set_from_refuses_any_other_name_and_stores_nothing() {
         let (_dir, secrets) = file();
-        for name in ["machine", "machine-keys", "other"] {
+        for name in [
+            "machine",
+            "machine-keys",
+            "other",
+            "Vims",
+            "vims:me",
+            "vims-token",
+        ] {
             let error = set_from(&secrets, name, "x\n".as_bytes()).unwrap_err();
             let text = error.to_string();
             assert!(!text.contains(name), "{text}");
@@ -1814,6 +1821,21 @@ mod tests {
         let secrets = MemorySecrets::default();
         let input = io::BufReader::new(Unreadable);
         assert!(set_from(&secrets, "machine", input).is_err());
+    }
+
+    #[test]
+    fn set_from_stores_the_vims_token() {
+        let (_dir, secrets) = file();
+        set_from(&secrets, VIMS, "vims_tok\n".as_bytes()).unwrap();
+        assert_eq!(VIMS, "vims");
+        assert_eq!(stored(&secrets, "vims").as_deref(), Some("vims_tok"));
+    }
+
+    #[test]
+    fn the_refusal_of_an_unknown_name_names_vims() {
+        let (_dir, secrets) = file();
+        let error = set_from(&secrets, "other", "x\n".as_bytes()).unwrap_err();
+        assert!(error.to_string().contains(", vims and github:"), "{error}");
     }
 
     #[test]
@@ -1951,6 +1973,13 @@ mod tests {
         secrets.set("github:zed", "ghp_abcdef").unwrap();
         let text = "a gw-key-1 b gm-key-2 c ghp_abc d ghp_abcdef e";
         assert_eq!(hide_known(text, &secrets), "a *** b *** c *** d *** e");
+    }
+
+    #[test]
+    fn hide_known_hides_the_vims_token() {
+        let (_dir, secrets) = file();
+        secrets.set(VIMS, "vims-key-3").unwrap();
+        assert_eq!(hide_known("a vims-key-3 b", &secrets), "a *** b");
     }
 
     #[test]
