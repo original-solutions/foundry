@@ -107,7 +107,7 @@ Point at an unfolded workspace and a row of buttons shows at the right of its br
 - **Changes.** Opens the changes sheet.
 - **New session.** Asks for a model and a first prompt, then starts Claude Code in this workspace.
 - **New shell.** Opens a shell in this workspace. It shows in the list, where you can open it.
-- **Clear N ended.** Only on this machine, and only when some terminals have ended.
+- **Clear N ended.** Only when some terminals have ended.
 - **Archive.** Only on this machine.
 
 [End, clear and archive](sessions.md#end-clear-and-archive) says what the last two do.
@@ -197,7 +197,7 @@ Come back to the page after two minutes or more, in another tab or app, or after
 
 Some things need a person and are not a session's question. They gather in a card at the top right, headed with a count, such as "1 needs attention". Click the header to fold it.
 
-Each item has a title, the machine it is about, what happened, and what to do. Items with a terminal have **Open terminal**. The titles are Machine offline, Session stuck, Waiting for you, Session failed, Setup failed, Gateway unhealthy, Disk low, Placement waiting, Setting overwritten and Update refused. [The factory](factory.md) adds five more, which show as a raw id instead of a title: `run_stuck` (a run is stuck), `run_needs_info` (a run asked questions on its issue), `gate_infra` (a run's gate could not run at all), `foreign_claim` (an issue is in a factory label under a claim that is not Foundry's) and `factory_idle` (a project's factory is on but idle, or has gone 10 minutes without word from the machine that holds it). They clear themselves when the cause is gone. Only **Setting overwritten** has a **Dismiss** button.
+Each item has a title, the machine it is about, what happened, and what to do. Items with a terminal have **Open terminal**. The titles are Machine offline, Session stuck, Waiting for you, Session failed, Setup failed, Gateway unhealthy, Disk low, Placement waiting, Setting overwritten and Update refused. [The factory](factory.md) adds five more, which show as a raw id instead of a title: `run_stuck` (a run is stuck), `run_needs_info` (a run asked questions on its issue), `gate_infra` (a run's gate could not run at all), `foreign_claim` (an issue is in a factory label under a claim that is not Foundry's) and `factory_idle` (a project's factory is on but idle, or has gone 10 minutes without word from the machine that holds it). They clear themselves when the cause is gone. Only **Setting overwritten** has a **Dismiss** button. **Setup failed** has **Close terminal**: its setup terminal has already exited, so closing it clears the item and stops nothing. Like **Clear**, it does not ask first, and the setup output goes with the terminal, so read it before you close.
 
 A second card, "N waiting for a machine", lists the tasks you asked Foundry to place that no machine can take yet. [Let Foundry choose a machine](machines.md#let-foundry-choose-a-machine) explains it.
 

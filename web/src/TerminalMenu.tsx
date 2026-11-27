@@ -27,7 +27,7 @@ interface Actions {
 }
 
 export interface Context extends Actions {
-  /** The machine serving the UI, once known: only its terminals can be ended from here. */
+  /** The machine serving the UI, once known: only its workspaces get new terminals or are archived from here. */
   here?: string;
   /** Ends terminal `id`: at once when it already ended, else after asking. */
   end: (id: string) => void;
@@ -48,9 +48,9 @@ const Terminals = createContext<Context | undefined>(undefined);
  * Gives every terminal row inside it (sidebar, tabs, board) a menu of what can be done with that
  * terminal: right-click it, or press and hold on a touch screen. It holds the ending of
  * terminals too: one that still runs is ended after asking, one that already ended is cleared at
- * once, and a request the daemon refuses says why at the foot of the screen. Only the machine
- * serving the UI can end its terminals or start new ones in its workspaces, so another machine's
- * are not offered for that.
+ * once, and a request the daemon refuses says why at the foot of the screen. The daemon carries
+ * an ending to the machine that owns the terminal, so any reachable machine's terminals are ended
+ * from here. Only the machine serving the UI is offered new terminals in its workspaces.
  */
 export function TerminalActions({ children, ...actions }: Actions & { children: ReactNode }) {
   const [asking, setAsking] = useState<string>();
@@ -181,13 +181,13 @@ export interface Act {
 
 /**
  * What can be done with terminal `id` from here, in menu order: going to it or to what belongs to
- * it, starting something new beside it, and ending it. Only this machine's terminals can be
- * ended, and only its workspaces get new terminals.
+ * it, starting something new beside it, and ending it. Any reachable machine's terminals can be
+ * ended; only this machine's workspaces get new terminals or are archived.
  */
 export function actsFor(id: string, at: Context, found: Located, roomy = wide()): Act[] {
   const mine = found.machine.id === at.here;
-  const kind = mine ? endOf(found.glyph) : undefined;
-  const rest = mine ? ended(found.workspace) : [];
+  const kind = endOf(found.glyph);
+  const rest = ended(found.workspace);
   const { id: workspace, name } = found.workspace;
   const acts: (Act | false | undefined)[] = [
     id !== at.current && { key: "open", label: "Open", icon: "M3 3.5h10v9H3zM3 6h10", run: () => at.onOpen(id), group: "go" },
