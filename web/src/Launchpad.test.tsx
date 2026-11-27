@@ -1,7 +1,9 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { safeBranch } from "./branch";
 import { taskName, useCreateWorkspace } from "./Composer";
+import type { WorkspaceView } from "./fleet";
 import { Launchpad } from "./Launchpad";
 import { primaryButton } from "./Modal";
 import { settings } from "./test-fixtures";
@@ -19,6 +21,8 @@ function Harness(props: Partial<ComponentProps<typeof Launchpad>>) {
 
 const promptBox = () => screen.getByLabelText("What should Claude work on?");
 const start = () => screen.getByRole("button", { name: /^Start/ }) as HTMLButtonElement;
+/** A name whose branch is cut at 100 bytes before a number put after it would show. */
+const long = Array.from({ length: 4 }, () => "가나다라마바사아자").join(" ");
 /** The name each request sent, if it sent one. */
 const sentNames = (calls: Call[]) => calls.map((c) => (c.body as { name?: string } | undefined)?.name);
 
@@ -41,6 +45,16 @@ describe("taskName", () => {
     expect(taskName("Review pr #7 then Issue #9")).toBe("review pr 7 then issue");
     expect(taskName("close issue#12")).toBe("close issue 12");
     expect(taskName("See https://example.com/docs for the API")).toBe("see for the api");
+  });
+
+  it("reads a reference or link with punctuation or brackets around it, and keeps a later word's slash", () => {
+    expect(taskName("close Issue #9")).toBe("close issue 9");
+    expect(taskName("review PR #1181, then fix it")).toBe("review pr 1181 then fix");
+    expect(taskName("Review https://github.com/o/r/pull/12.")).toBe("review pr 12");
+    expect(taskName("see https://github.com/o/r/pull/3?x=1")).toBe("see pr 3");
+    expect(taskName("Answer (https://github.com/o/r/pull/5) today")).toBe("answer pr 5 today");
+    expect(taskName("Fix the docs (https://example.com/docs) today")).toBe("fix the docs today");
+    expect(taskName("fix /api route")).toBe("fix /api route");
   });
 });
 
@@ -173,6 +187,27 @@ describe("Launchpad", () => {
 
     expect((await screen.findByRole("alert")).textContent).toMatch(/no base branch dev/);
     expect(sentNames(calls)).toEqual(["fix it"]);
+  });
+
+  it("tries a name made of long words once when numbering it would not change its branch", async () => {
+    const calls = mockFetch(json(409, { error: "a branch or worktree named that already exists in this project" }));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: long } });
+    fireEvent.click(start());
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/already exists/);
+    expect(sentNames(calls)).toEqual([long]);
+  });
+
+  it("suggests no name when numbering a held name would not change its branch", async () => {
+    const held = { project: "demo", branch: safeBranch(long), sessions: [] } as unknown as WorkspaceView;
+    await renderApp(<Harness workspaces={[held]} />);
+
+    fireEvent.change(promptBox(), { target: { value: long } });
+
+    expect(screen.queryByLabelText("Branch")).toBeNull();
+    expect(start().disabled).toBe(true);
   });
 
   it("says there is no project to work in when the fleet has none, and starts nothing", async () => {
