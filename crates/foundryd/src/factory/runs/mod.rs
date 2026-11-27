@@ -1065,6 +1065,24 @@ pub fn end_own_merge(
     )
 }
 
+/// How long a wait has lasted on the sleep-counting clock: from `since`, the lease generation
+/// and clock reading (ms) recorded at its start, to `now` under `generation`. `None` when the
+/// count starts again: no record, one of another generation (a takeover), or one above the
+/// clock now (a reboot that reset the clock). A takeover can lengthen a wait, never end it
+/// early. Every wait the runs count on that clock reads it here.
+pub fn time_waited(
+    since: Option<(u64, u64)>,
+    generation: u64,
+    now: u64,
+) -> Option<std::time::Duration> {
+    match since {
+        Some((from, at)) if from == generation && now >= at => {
+            Some(std::time::Duration::from_millis(now - at))
+        }
+        _ => None,
+    }
+}
+
 /// The id of `text` as a session, or why it is not one.
 pub fn session_id(text: &str) -> Result<SessionId, RunError> {
     uuid::Uuid::parse_str(text)
