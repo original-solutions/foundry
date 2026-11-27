@@ -172,7 +172,7 @@ describe("Board", () => {
     const { router } = await show(fleet(records(), settings()));
     const login = card("fix login");
     expect(within(login).getByText("Working")).toBeDefined();
-    expect(within(login).getByText("Running")).toBeDefined();
+    expect(within(login).getByText("Open")).toBeDefined();
     fireEvent.click(within(login).getByRole("link", { name: /^shell/ }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
   });

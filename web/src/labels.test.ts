@@ -9,7 +9,7 @@ describe("labels", () => {
   });
 
   it("names a shell's end as a session's is named: ended, or failed with its exit code", () => {
-    expect(terminalLabel("running", null)).toBe("Running");
+    expect(terminalLabel("running", null)).toBe("Open");
     expect(terminalLabel("exited", null)).toBe("Ended");
     expect(terminalLabel("exited", 0)).toBe("Ended");
     expect(terminalLabel("exited", 1)).toBe("Failed · exit 1");

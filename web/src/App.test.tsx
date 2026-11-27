@@ -1233,7 +1233,7 @@ describe("App", () => {
         .map((item) => item.textContent);
     };
 
-    const running = within(remote).getByRole("link", { name: /Running$/ });
+    const running = within(remote).getByRole("link", { name: /Open$/ });
     const name = running.getAttribute("data-name");
     expect(await entries(running)).toEqual(["Open", "Open beside", "Changes in remote job", `End ${name}…`, "Clear 1 ended in remote job"]);
     fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });

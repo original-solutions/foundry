@@ -38,7 +38,7 @@ describe("Rail", () => {
     const rail = screen.getByRole("navigation", { name: "Workspaces" });
     const login = within(rail).getByRole("group", { name: "fix login" });
     const links = within(login).getAllByRole("link");
-    expect(links.map((l) => l.getAttribute("aria-label"))).toEqual(["fix login / opus: Working", "fix login / shell: Running"]);
+    expect(links.map((l) => l.getAttribute("aria-label"))).toEqual(["fix login / opus: Working", "fix login / shell: Open"]);
     expect(links[1].getAttribute("aria-current")).toBe("true");
     expect(links[1].getAttribute("href")).toBe("/terminals/t2");
     // The workspace of the open terminal stands out from the others.
