@@ -27,14 +27,13 @@ import { Machines } from "./Machines";
 import { needing, type Needing } from "./needing";
 import { nextKey } from "./NextUp";
 import type { History } from "./samples";
+import { setHome, useHome, type Home } from "./home";
 import { readStored, store } from "./storage";
 
-/** Which of the board and the timeline the home shows, kept for this browser. The machines view has its own URL. */
-type View = "board" | "timeline";
+/** Which of the board and the timeline the home shows, kept for this browser (see `home.ts`). The machines view has its own URL. */
+type View = Home;
+/** Where the home's view is kept: this browser's ship view, from before it became a grouping, is read from it. */
 const VIEW_KEY = "foundry.home";
-function loadView(): View {
-  return readStored(VIEW_KEY) === "timeline" ? "timeline" : "board";
-}
 
 /** How the board groups its cards, kept for this browser: by what they need, or by how far their work has shipped. */
 type Group = "attention" | "shipping";
@@ -48,10 +47,6 @@ function loadGroup(): Group {
 /** Keeps `group` for next time; when not kept, the grouping still changes. */
 function saveGroup(group: Group) {
   store(GROUP_KEY, group);
-}
-/** Keeps `view` as the home's view for next time; when not kept, the view still changes. */
-function saveView(view: View) {
-  store(VIEW_KEY, view);
 }
 
 export { BOARD_BUSY_EVERY };
@@ -114,14 +109,13 @@ export function Board({
   /** Opens the New task dialog set to a machine, from the machines view. */
   onCreate?: (machine: string) => void;
 }) {
-  const [kept, setKept] = useState(loadView);
+  const kept = useHome();
   const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
   const view = onMachines ? "machines" : kept;
   const navigate = useNavigate();
   const pick = (next: View | "machines") => {
     if (next === "machines") return void navigate({ to: "/machines" });
-    setKept(next);
-    saveView(next);
+    setHome(next);
     if (onMachines) void navigate({ to: "/" });
   };
   const workspaces = machines.flatMap((m) => m.workspaces);
@@ -591,7 +585,7 @@ function PhoneNav({ view, onPick, needs, onMenu }: { view: View | "machines"; on
   );
 }
 
-function MachinesIcon() {
+export function MachinesIcon() {
   return (
     <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">
       <rect x="2" y="3" width="12" height="4" rx="1" />
@@ -601,7 +595,7 @@ function MachinesIcon() {
   );
 }
 
-function BoardIcon() {
+export function BoardIcon() {
   return (
     <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <rect x="2" y="2.5" width="5" height="11" rx="1" />
@@ -610,7 +604,7 @@ function BoardIcon() {
   );
 }
 
-function TimelineIcon() {
+export function TimelineIcon() {
   return (
     <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">
       <path d="M2 4h6M5 8h8M3 12h4" />

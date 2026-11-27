@@ -207,7 +207,7 @@ Press `?` outside a text field or the terminal, or the sidebar's **Keyboard** bu
 
 | Where | Keys | What it does |
 | --- | --- | --- |
-| Anywhere | `Cmd+K` | Jump to a terminal or workspace, or give Claude a new task |
+| Anywhere | `Cmd+K` | Jump to a terminal, a view or an action, or give Claude a new task |
 | | `Cmd+J` | Go to the next terminal that needs you |
 | | `Cmd+F` | Find in the open terminal |
 | | `Cmd+\` | Open a terminal beside this one, or close the split |

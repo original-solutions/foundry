@@ -55,9 +55,7 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
         <Mark className="size-4 text-emerald-400" />
       </Link>
       <Link to="/factory" aria-label="The factory" title="The factory" className="grid size-8 place-items-center rounded-md hover:bg-neutral-800 hover:text-neutral-200">
-        <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" className="size-4">
-          <path d="M2 14V7l4 2.5V7l4 2.5V3h4v11z" />
-        </svg>
+        <FactoryIcon className="size-4" />
       </Link>
       <RailButton label="Expand sidebar" title={`Show every workspace and terminal by name (${railKey})`} onClick={onExpand}>
         <PanelIcon className="size-4" />
@@ -136,5 +134,14 @@ function RailButton({ label, title, onClick, children }: { label: string; title:
     <button type="button" aria-label={label} title={title} onClick={onClick} className="grid size-8 place-items-center rounded-md hover:bg-neutral-800 hover:text-neutral-200">
       {children}
     </button>
+  );
+}
+
+/** A factory's roofline: the factory view. */
+export function FactoryIcon({ className }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" className={className}>
+      <path d="M2 14V7l4 2.5V7l4 2.5V3h4v11z" />
+    </svg>
   );
 }

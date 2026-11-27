@@ -161,7 +161,7 @@ The choice of rail or list is kept in this browser. With none kept, a window nar
 
 ## Jump to anything
 
-The jump palette is how you reach any session or shell without going through the lists. Press `Cmd+K` on a Mac, or `Ctrl+K` elsewhere. Inside a terminal the shell keeps `Ctrl+K` for itself, so use a **Jump to** button there: in the sidebar header, on the rail, or in the terminal's header on a phone. The search icon in the board's task line opens it too.
+The jump palette is how you reach any session or shell without going through the lists, and any view or action of the app. Press `Cmd+K` on a Mac, or `Ctrl+K` elsewhere. Inside a terminal the shell keeps `Ctrl+K` for itself, so use a **Jump to** button there: in the sidebar header, on the rail, or in the terminal's header on a phone. The search icon in the board's task line opens it too.
 
 ![The jump palette with the query "retry", one match, and a preview of that session on the right](images/board-jump.png)
 
@@ -171,7 +171,10 @@ Type a few words. A row matches when it holds every word, in any of its workspac
 - `Shift+Enter`, or `Shift` and a click, opens it beside the terminal you already have open, in a split. See [Two terminals side by side](sessions.md#two-terminals-side-by-side).
 - `Tab` lists what you can do with the picked terminal, as its right-click menu does. Type to narrow that list and press `Enter` to do the picked one. `Esc`, `Shift+Tab` or `Backspace` in an empty box goes back.
 - On a wide screen, a preview beside the list shows what the highlighted session was asked, its last turn, what Claude said and what its workspace changed. For a session on another machine it says which machine keeps them.
-- After the sessions and shells come **New shell in** each workspace. Pick one to open a shell there.
+- With nothing typed, the views sit in a row over the list: **Board**, **Timeline**, **Machines** and **Factory**, the one you are on marked. Pick one to go there, from a terminal or a phone too.
+- **Do** lists the app's actions, each with the key that does it from anywhere: **New task**, **Next that needs you** (with how many need you), **Collapse sidebar** or **Expand sidebar** on a wide screen, and **Keyboard shortcuts**. They come after the sessions and shells.
+- After the actions come **New shell in** each workspace. Pick one to open a shell there.
+- Once you type, the views and actions that match come first, so `mach` then `Enter` opens the machines view and `keys` the list of keys.
 - The last row, **New task "your words"**, opens the New task dialog with what you typed. If nothing matches, the palette says "Nothing matches" and that `Enter` makes it a task for Claude.
 
 `Esc` closes the palette.

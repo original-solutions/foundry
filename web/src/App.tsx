@@ -9,6 +9,7 @@ import { ChangesPanel } from "./ChangesPanel";
 import { LinkBanner, Unreachable } from "./Connection";
 import { useCreateWorkspace } from "./Composer";
 import { JumpPalette } from "./JumpPalette";
+import { useCommands } from "./commands";
 import { Launchpad } from "./Launchpad";
 import { NewSession } from "./NewSession";
 import { NewTask } from "./NewTask";
@@ -40,7 +41,8 @@ import { upNext } from "./needing";
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
  * the rest. On a narrow screen the sidebar is a drawer: the board (or the machines view) is the
  * home, with a bar at the bottom that opens it, and an open terminal's header opens it too. Cmd+K (or Ctrl+K outside
- * the terminal, where the shell keeps it) opens the jump palette over everything.
+ * the terminal, where the shell keeps it) opens the jump palette over everything: every terminal,
+ * and every view and action of the app, so the factory and the timeline are reached from a phone too.
  *
  * On a wide screen the sidebar collapses to a rail as narrow as a button (its button, or Cmd+B),
  * which still shows every terminal's state as a column of glyphs per workspace; the choice is kept
@@ -272,6 +274,14 @@ function Layout() {
   useShortcut("\\", terminalId ? () => (split ? setSplit(undefined) : setJump("beside")) : undefined);
   const next = upNext(machines, terminalId);
   useShortcut("j", next ? () => show(next.next.terminal) : undefined);
+  const commands = useCommands({
+    screen: terminalId ? "terminal" : onMachines ? "machines" : onFactory ? "factory" : "home",
+    next,
+    onNext: show,
+    onCreate: () => openCreate(),
+    onKeys: () => setKeysOpen(true),
+    sidebar: narrow ? undefined : { rail, flip: flipRail },
+  });
 
   // Never had the daemon's state: say so, rather than show an empty fleet.
   if (!state.synced && link.lostAt !== undefined) return <Unreachable link={link} />;
@@ -441,6 +451,7 @@ function Layout() {
             current={terminalId && located ? { terminal: terminalId, title: `${located.workspace.name} / ${located.name}` } : undefined}
             besideOnly={jump === "beside"}
             onBeside={openBeside}
+            commands={commands}
           />
           <NewTask
             projects={state.settings.projects}

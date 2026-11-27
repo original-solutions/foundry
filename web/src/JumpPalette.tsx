@@ -1,11 +1,11 @@
 import { useMutation } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { Dialog } from "radix-ui";
-import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { startShell } from "./api";
 import { couldNot } from "./labels";
 import { locate, type MachineView } from "./fleet";
-import { destinations, newWorkspace, search, type Destination } from "./jump";
+import { destinations, newWorkspace, search, type Command, type Destination } from "./jump";
 import { Peek, useWide } from "./Peek";
 import { StateGlyph } from "./StateGlyph";
 import { actsFor, Icon, useTerminalActions, type Act } from "./TerminalMenu";
@@ -25,19 +25,22 @@ interface Props {
   besideOnly?: boolean;
   /** Shows `terminal` beside `current`. */
   onBeside?: (terminal: string) => void;
+  /** The app's views and actions, offered after the terminals; not when every pick opens beside. */
+  commands?: Command[];
 }
 
 /**
  * Jump to any session or shell in the fleet, or start a new shell in any workspace, by typing a
  * few words of its workspace, name, state, project, branch or machine. What was typed can also
- * name a new workspace. With a terminal open, Shift+Enter (or a Shift click) opens the pick beside
+ * name a new workspace. The app's views and actions are here too, after the terminals, and first
+ * once a word names one. With a terminal open, Shift+Enter (or a Shift click) opens the pick beside
  * it instead; opened as "Open beside", every pick does.
  *
  * Tab on a terminal (or its row's actions button) lists what can be done with it, as its
  * right-click menu does; typing narrows that list and Enter does the one picked. Escape, Shift+Tab
  * or Backspace in an empty box goes back to the list as it was.
  */
-export function JumpPalette({ machines, open, onOpenChange, onCreate, current, besideOnly = false, onBeside }: Props) {
+export function JumpPalette({ machines, open, onOpenChange, onCreate, current, besideOnly = false, onBeside, commands = [] }: Props) {
   // After a pick the opened terminal has the keyboard, so focus does not go back where it was.
   const picked = useRef(false);
   // A wide screen previews the highlighted row beside the list.
@@ -67,11 +70,12 @@ export function JumpPalette({ machines, open, onOpenChange, onCreate, current, b
             }}
             onCreate={onCreate}
             current={current?.terminal}
-            placeholder={besideOnly && current ? `Open beside ${current.title}…` : "Workspace, model, state, machine…"}
+            placeholder={besideOnly && current ? `Open beside ${current.title}…` : "A session, a view or an action…"}
             besideOnly={besideOnly && !!current}
             onBeside={current ? onBeside : undefined}
             backRef={back}
             wide={wide}
+            commands={besideOnly && current ? [] : commands}
           />
         </Dialog.Content>
       </Dialog.Portal>
@@ -89,6 +93,7 @@ function Panel({
   onBeside,
   backRef,
   wide,
+  commands,
 }: {
   machines: MachineView[];
   close: () => void;
@@ -101,6 +106,7 @@ function Panel({
   backRef: MutableRefObject<() => boolean>;
   /** Shows the highlighted row's preview beside the list. */
   wide: boolean;
+  commands: Command[];
 }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
@@ -110,9 +116,20 @@ function Panel({
   const terminals = useTerminalActions();
   const actable = !!terminals && !besideOnly;
   const target = acting && terminals ? locate(machines, acting.terminal) : undefined;
-  const all = useMemo(() => destinations(machines).filter((d) => !(besideOnly && d.kind === "terminal" && d.terminal === current)), [machines, besideOnly, current]);
+  const all = useMemo(
+    () => destinations(machines, commands).filter((d) => !(besideOnly && d.kind === "terminal" && d.terminal === current)),
+    [machines, commands, besideOnly, current],
+  );
   const found = useMemo(() => search(all, query), [all, query]);
-  const shown = useMemo(() => (besideOnly ? found : [...found, ...newWorkspace(query)]), [found, query, besideOnly]);
+  // With nothing typed the views sit in a strip over the list, a tap away; typing finds them as rows.
+  const views = commands.filter((c) => c.group === "Go to");
+  const strip = views.length > 0 && query.trim() === "" && !acting;
+  const shown = useMemo(
+    () => (besideOnly ? found : [...(strip ? found.filter((d) => !(d.kind === "command" && d.command.group === "Go to")) : found), ...newWorkspace(query)]),
+    [found, query, besideOnly, strip],
+  );
+  // Once views or actions are listed, each kind of row is headed, so they read apart from the fleet's terminals.
+  const sorted = shown.some((d) => d.kind === "command");
   const acts = target && terminals ? actsMatching(actsFor(acting!.terminal, terminals, target), query) : undefined;
   const count = acts ? acts.length : shown.length;
   const at = Math.min(active, Math.max(count - 1, 0));
@@ -151,6 +168,11 @@ function Panel({
     if (d.kind === "workspace") {
       close();
       onCreate(d.name);
+      return;
+    }
+    if (d.kind === "command") {
+      close();
+      d.command.run();
       return;
     }
     shell.mutate(d.workspace, { onSuccess: show });
@@ -226,6 +248,31 @@ function Panel({
       </div>
       <div className="flex min-h-0 flex-1">
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          {strip && (
+            <nav aria-label="Views" className="flex shrink-0 gap-1.5 border-b border-neutral-800 px-2 py-2 sm:px-3">
+              {views.map((c) => {
+                const here = c.hint === "Here";
+                return (
+                  <button
+                    key={c.key}
+                    type="button"
+                    aria-current={here ? "page" : undefined}
+                    title={c.about}
+                    onClick={() => {
+                      close();
+                      c.run();
+                    }}
+                    className={`flex min-w-0 flex-1 flex-col items-center gap-1 rounded-lg border px-1 py-2 text-[11px] font-medium transition-colors sm:flex-none sm:flex-row sm:gap-1.5 sm:rounded-full sm:px-3 sm:py-1 sm:text-xs [&_svg]:size-4 sm:[&_svg]:size-3.5 ${
+                      here ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300" : "border-neutral-700 text-neutral-300 hover:border-neutral-500 hover:bg-neutral-800 hover:text-neutral-50"
+                    }`}
+                  >
+                    {c.icon}
+                    {c.title}
+                  </button>
+                );
+              })}
+            </nav>
+          )}
           {acts ? (
             <ul id="jump-list" ref={list} role="listbox" aria-label={label} className="min-h-0 flex-1 overflow-y-auto p-1.5">
               {acts.map((a, i) => (
@@ -248,46 +295,61 @@ function Panel({
               ))}
             </ul>
           ) : (
-            <ul id="jump-list" ref={list} role="listbox" aria-label="Sessions and shells" className="min-h-0 flex-1 overflow-y-auto p-1.5">
+            <ul id="jump-list" ref={list} role="listbox" aria-label="Sessions, shells, views and actions" className="min-h-0 flex-1 overflow-y-auto p-1.5">
               {shown.map((d, i) => (
-                <li
-                  key={d.key}
-                  id={optionId(d.key)}
-                  role="option"
-                  aria-selected={i === at}
-                  onMouseMove={() => i !== at && setActive(i)}
-                  onClick={(event) => go(d, event.shiftKey)}
-                  className={`group flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 sm:py-2 ${i === at ? "bg-neutral-800 text-neutral-50" : "text-neutral-200"}`}
-                >
-                  {d.kind === "terminal" ? (
-                    <span className="flex w-4 justify-center">
-                      <StateGlyph glyph={d.glyph} />
+                <Fragment key={d.key}>
+                  {sorted && section(d) !== undefined && section(d) !== section(shown[i - 1]) && (
+                    <li role="presentation" aria-hidden="true" className="px-3 pt-3 pb-1 text-[10px] font-medium tracking-wider text-neutral-500 uppercase first:pt-1.5">
+                      {section(d)}
+                    </li>
+                  )}
+                  <li
+                    id={optionId(d.key)}
+                    role="option"
+                    aria-selected={i === at}
+                    onMouseMove={() => i !== at && setActive(i)}
+                    onClick={(event) => go(d, event.shiftKey)}
+                    className={`group flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 sm:py-2 ${i === at ? "bg-neutral-800 text-neutral-50" : "text-neutral-200"}`}
+                  >
+                    {d.kind === "terminal" ? (
+                      <span className="flex w-4 justify-center">
+                        <StateGlyph glyph={d.glyph} />
+                      </span>
+                    ) : d.kind === "command" ? (
+                      <span className="flex w-4 justify-center text-neutral-400">{d.command.icon}</span>
+                    ) : (
+                      <PlusIcon className="size-4 shrink-0 text-neutral-500" />
+                    )}
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate">{d.title}</span>
+                      {d.kind === "terminal" && d.subtitle && <span className="block truncate text-xs text-neutral-500">{d.subtitle}</span>}
+                      {d.kind === "command" && !wide && <span className="block truncate text-xs text-neutral-500">{d.command.about}</span>}
                     </span>
-                  ) : (
-                    <PlusIcon className="size-4 shrink-0 text-neutral-500" />
-                  )}
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate">{d.title}</span>
-                    {d.kind === "terminal" && d.subtitle && <span className="block truncate text-xs text-neutral-500">{d.subtitle}</span>}
-                  </span>
-                  {d.kind === "terminal" && <span className="shrink-0 text-xs text-neutral-400">{d.label}</span>}
-                  {many && <span className="hidden max-w-32 shrink-0 truncate text-xs text-neutral-500 sm:inline">{d.machine}</span>}
-                  {actable && d.kind === "terminal" && (
-                    <button
-                      type="button"
-                      tabIndex={-1}
-                      aria-label={`Actions for ${d.title}`}
-                      title="What can be done with it (Tab)"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        act(d.terminal, i);
-                      }}
-                      className={`-my-1 -mr-1.5 shrink-0 rounded p-1 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-100 ${i === at ? "" : "pointer-fine:invisible pointer-fine:group-hover:visible"}`}
-                    >
-                      <DotsIcon />
-                    </button>
-                  )}
-                </li>
+                    {d.kind === "terminal" && <span className="shrink-0 text-xs text-neutral-400">{d.label}</span>}
+                    {d.kind === "command" && d.command.hint && (
+                      <span className={`shrink-0 text-xs ${d.command.hint === "Here" ? "text-emerald-400" : "text-neutral-400"}`}>{d.command.hint}</span>
+                    )}
+                    {d.kind === "command" && d.command.keys && (
+                      <kbd className="hidden shrink-0 rounded border border-neutral-700 px-1.5 py-0.5 font-sans text-[10px] text-neutral-400 sm:block">{d.command.keys}</kbd>
+                    )}
+                    {many && <span className="hidden max-w-32 shrink-0 truncate text-xs text-neutral-500 sm:inline">{d.machine}</span>}
+                    {actable && d.kind === "terminal" && (
+                      <button
+                        type="button"
+                        tabIndex={-1}
+                        aria-label={`Actions for ${d.title}`}
+                        title="What can be done with it (Tab)"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          act(d.terminal, i);
+                        }}
+                        className={`-my-1 -mr-1.5 shrink-0 rounded p-1 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-100 ${i === at ? "" : "pointer-fine:invisible pointer-fine:group-hover:visible"}`}
+                      >
+                        <DotsIcon />
+                      </button>
+                    )}
+                  </li>
+                </Fragment>
               ))}
             </ul>
           )}
@@ -321,6 +383,15 @@ function Panel({
       </div>
     </>
   );
+}
+
+/** The heading a row is listed under, when the list holds more than terminals. */
+function section(d: Destination | undefined): string | undefined {
+  if (!d) return undefined;
+  if (d.kind === "command") return d.command.group;
+  if (d.kind === "terminal") return "Sessions and shells";
+  if (d.kind === "shell") return "New shell";
+  return undefined;
 }
 
 /** The acts whose label holds every word of `query`, ignoring case. */

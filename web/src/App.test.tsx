@@ -602,7 +602,9 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "k", metaKey: true });
     const dialog = await screen.findByRole("dialog", { name: "Jump to" });
     const input = within(dialog).getByRole("combobox");
-    expect(within(dialog).getAllByRole("option")).toHaveLength(3);
+    expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual(
+      expect.arrayContaining([expect.stringContaining("fix login / sonnet"), expect.stringContaining("fix login / shell"), expect.stringContaining("New shell in fix login")]),
+    );
 
     fireEvent.change(input, { target: { value: "login shell" } });
     expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual([
@@ -626,7 +628,7 @@ describe("App", () => {
 
     const options = within(dialog).getAllByRole("option");
     fireEvent.keyDown(input, { key: "ArrowUp" });
-    expect(input.getAttribute("aria-activedescendant")).toBe(options[2].id);
+    expect(input.getAttribute("aria-activedescendant")).toBe(options.at(-1)!.id);
     fireEvent.keyDown(input, { key: "ArrowDown" });
     fireEvent.keyDown(input, { key: "ArrowDown" });
     expect(input.getAttribute("aria-activedescendant")).toBe(within(dialog).getAllByRole("option")[1].id);
@@ -1028,6 +1030,64 @@ describe("App", () => {
     expect(screen.queryByText(/0 workspaces/)).toBeNull();
   });
 
+  it("goes to every view from the palette, saying which one you are on", async () => {
+    const router = await open("/", live);
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    let palette = await screen.findByRole("dialog", { name: "Jump to" });
+    const views = within(palette).getByRole("navigation", { name: "Views" });
+    expect(within(views).getAllByRole("button").map((b) => b.textContent)).toEqual(["Board", "Timeline", "Machines", "Factory"]);
+    expect(within(views).getByRole("button", { name: "Board" }).getAttribute("aria-current")).toBe("page");
+    // With nothing typed the views are only in the strip, so the list starts with the fleet.
+    expect(within(palette).queryByRole("option", { name: /^Machines/ })).toBeNull();
+
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "turns" } });
+    expect(within(palette).getAllByRole("option")[0].textContent).toMatch(/^Timeline/);
+    fireEvent.keyDown(within(palette).getByRole("combobox"), { key: "Enter" });
+    await waitFor(() => expect(screen.getByRole("radio", { name: "Timeline" }).getAttribute("aria-checked")).toBe("true"));
+    expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull();
+
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    palette = await screen.findByRole("dialog", { name: "Jump to" });
+    expect(within(within(palette).getByRole("navigation", { name: "Views" })).getByRole("button", { name: "Timeline" }).getAttribute("aria-current")).toBe("page");
+    fireEvent.click(within(palette).getByRole("button", { name: "Factory" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/factory"));
+    expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull();
+
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    palette = await screen.findByRole("dialog", { name: "Jump to" });
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "board" } });
+    fireEvent.keyDown(within(palette).getByRole("combobox"), { key: "Enter" });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    expect(screen.getByRole("radio", { name: "Board" }).getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("does the app's actions from the palette: a new task, the next that needs you and the list of keys", async () => {
+    const waiting: UiMessage & { type: "state" } = {
+      ...live,
+      records: [...live.records, workspace(ME, "w2", "tidy readme"), terminal(ME, "t3", "w2", "running"), session(ME, "s3", "w2", "t3", "waiting_for_you")],
+    };
+    const router = await open("/", waiting);
+    const pick = async (query: string, expected: RegExp) => {
+      fireEvent.keyDown(window, { key: "k", metaKey: true });
+      const palette = await screen.findByRole("dialog", { name: "Jump to" });
+      fireEvent.change(within(palette).getByRole("combobox"), { target: { value: query } });
+      expect(within(palette).getAllByRole("option")[0].textContent).toMatch(expected);
+      fireEvent.keyDown(within(palette).getByRole("combobox"), { key: "Enter" });
+    };
+
+    await pick("needs you next", /^Next that needs you.*1 needs you/);
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t3"));
+
+    await pick("keyboard", /^Keyboard shortcuts.*\?/);
+    expect(await screen.findByRole("dialog", { name: "Keyboard" })).toBeDefined();
+    fireEvent.keyDown(screen.getByRole("dialog", { name: "Keyboard" }), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Keyboard" })).toBeNull());
+
+    await pick("new task", /^New task/);
+    const dialog = await screen.findByRole("dialog", { name: "New task" });
+    expect((within(dialog).getByLabelText("What should Claude work on?") as HTMLTextAreaElement).value).toBe("");
+  });
+
   it("offers a new task of what you typed in the palette", async () => {
     await open("/", live);
     fireEvent.keyDown(window, { key: "k", metaKey: true });
@@ -1417,7 +1477,7 @@ describe("App", () => {
 
     fireEvent.keyDown(input, { key: "Tab" });
     fireEvent.keyDown(input, { key: "Backspace" });
-    expect(within(dialog).getByRole("listbox", { name: "Sessions and shells" })).toBeDefined();
+    expect(within(dialog).getByRole("listbox", { name: "Sessions, shells, views and actions" })).toBeDefined();
 
     fireEvent.keyDown(input, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
