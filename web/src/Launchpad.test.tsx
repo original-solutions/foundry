@@ -30,6 +30,16 @@ describe("taskName", () => {
   it("keeps a name to 40 characters, cut at a word", () => {
     expect(taskName("internationalisation localisation accessibility")).toBe("internationalisation localisation");
   });
+
+  it("names a task after the pull request or issue it points at, without a slash command's slash or other links", () => {
+    expect(taskName("/review-loop https://github.com/original-solutions/people-hub/pull/1181")).toBe("review-loop pr 1181");
+    expect(taskName("/review-loop https://github.com/o/r/pull/1181/files#diff-1")).toBe("review-loop pr 1181");
+    expect(taskName("Fix https://github.com/o/r/issues/42 on mobile")).toBe("fix issue 42 on mobile");
+    expect(taskName("review PR#1181 and fix the failing tests")).toBe("review pr 1181 and fix");
+    expect(taskName("Review pr #7 then Issue #9")).toBe("review pr 7 then issue");
+    expect(taskName("close issue#12")).toBe("close issue 12");
+    expect(taskName("See https://example.com/docs for the API")).toBe("see for the api");
+  });
 });
 
 describe("Launchpad", () => {
@@ -110,6 +120,57 @@ describe("Launchpad", () => {
     expect(start().disabled).toBe(true);
     fireEvent.click(within(alert).getByRole("button", { name: "Go to the board" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+
+  it("numbers a suggested name the daemon refuses as taken, makes the workspace under the first it accepts, and shows that name", async () => {
+    const taken = json(409, { error: "a branch or worktree named review-loop-pr-1181 already exists in this project; give the workspace another name" });
+    const calls = mockFetch(taken, json(201, { id: "w1" }), json(201, { id: "s1" }));
+    const created = vi.fn();
+    await renderApp(<Harness onCreated={created} />);
+
+    fireEvent.change(promptBox(), { target: { value: "/review-loop https://github.com/original-solutions/people-hub/pull/1181" } });
+    expect(screen.getByLabelText("Branch").textContent).toBe("review-loop-pr-1181");
+    fireEvent.click(start());
+
+    await waitFor(() => expect(created).toHaveBeenCalledWith("s1", null));
+    expect(calls.map((c) => c.body?.name)).toEqual(["review-loop pr 1181", "review-loop pr 1181 2", undefined]);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByLabelText("Branch").textContent).toBe("review-loop-pr-1181-2");
+    expect((screen.getByLabelText("Workspace name") as HTMLInputElement).placeholder).toBe("review-loop pr 1181 2");
+  });
+
+  it("gives up on a suggested name after 20 tries and says why", async () => {
+    const calls = mockFetch(...Array.from({ length: 20 }, () => json(409, { error: "a branch or worktree named fix-it already exists in this project" })));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.click(start());
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/already exists in this project/);
+    expect(calls.map((c) => c.body?.name)).toEqual(["fix it", ...Array.from({ length: 19 }, (_, i) => `fix it ${i + 2}`)]);
+  });
+
+  it("does not number a typed name the daemon refuses as taken", async () => {
+    const calls = mockFetch(json(409, { error: "a branch or worktree named login already exists in this project; give the workspace another name" }));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.change(screen.getByLabelText("Workspace name"), { target: { value: "login" } });
+    fireEvent.click(start());
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/a branch or worktree named login already exists/);
+    expect(calls.map((c) => c.body?.name)).toEqual(["login"]);
+  });
+
+  it("does not number a suggested name refused for another reason", async () => {
+    const calls = mockFetch(json(400, { error: "no base branch dev" }));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.click(start());
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/no base branch dev/);
+    expect(calls.map((c) => c.body?.name)).toEqual(["fix it"]);
   });
 
   it("says there is no project to work in when the fleet has none, and starts nothing", async () => {
