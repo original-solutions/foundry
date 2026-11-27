@@ -10,6 +10,7 @@ import { anchor, onLine, type Anchor, type Note } from "./notes";
 import { lineName, NoteBox, NoteRow, SendBar } from "./LineNotes";
 import { button } from "./Modal";
 import { paint } from "./paint";
+import { pollEvery } from "./poll";
 import { ShipLine } from "./Shipping";
 import { freshLines, loadViewed, nextUnviewed, progress, saveViewed, seen, standing, type Seen, type Standing, type Viewed } from "./review";
 
@@ -104,7 +105,7 @@ interface SheetProps {
 }
 
 function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
-  const { data, error, isPending } = useQuery({ ...changesQuery(workspace.id), refetchInterval: CHANGES_EVERY, retry: false });
+  const { data, error, isPending } = useQuery({ ...changesQuery(workspace.id), refetchInterval: pollEvery(CHANGES_EVERY, true), retry: false });
   const body = useRef<HTMLDivElement>(null);
   const [viewed, setViewed] = useState<Viewed>(() => loadViewed(workspace.id));
   const [at, setAt] = useState<number>();

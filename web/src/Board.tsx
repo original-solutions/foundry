@@ -410,15 +410,20 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
         {rows.length > shown.length && <li className="px-2 py-1 text-xs text-neutral-500">+{rows.length - shown.length} more</li>}
         {rows.length === 0 && <li className="px-2 py-1 text-xs text-neutral-500">No terminals</li>}
       </ul>
-      <ChangesFooter card={card} onScreen={onScreen} onOpen={() => onChanges(workspace.id)} />
-      {terminals?.here === machine.id && (
-        <ShipLine
-          workspace={workspace.id}
-          name={workspace.name}
-          enabled={onScreen && !leaving}
-          onArchive={() => terminals.archive(workspace.id)}
-          className="border-t border-neutral-800/70 bg-neutral-950/40 px-4 py-2"
-        />
+      {terminals?.here === machine.id ? (
+        <>
+          <ChangesFooter card={card} onScreen={onScreen} onOpen={() => onChanges(workspace.id)} />
+          <ShipLine
+            workspace={workspace.id}
+            name={workspace.name}
+            enabled={onScreen && !leaving}
+            onArchive={() => terminals.archive(workspace.id)}
+            className="border-t border-neutral-800/70 bg-neutral-950/40 px-4 py-2"
+          />
+        </>
+      ) : (
+        // Another machine's workspace: nothing of it is read from here, but its archive shows.
+        leaving && <p className="mt-auto border-t border-neutral-800 bg-neutral-950/40 px-4 py-2.5 text-xs text-neutral-500">Archiving…</p>
       )}
     </article>
   );
@@ -441,7 +446,10 @@ function CardSteps({ workspace, row }: { workspace: string; row: Card["rows"][nu
   );
 }
 
-/** What the workspace changed since its base, at the foot of its card, read as `useCardChanges` says. */
+/**
+ * What the workspace changed since its base, at the foot of its card, read as `useCardChanges` says.
+ * Only a card of this machine's workspace has one: the daemon serving the UI reads no other machine's.
+ */
 function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boolean; onOpen: () => void }) {
   const { data, error, leaving } = useCardChanges(card, onScreen);
 
