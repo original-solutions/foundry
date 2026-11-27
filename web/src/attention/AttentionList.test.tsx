@@ -142,6 +142,15 @@ describe("AttentionList", () => {
     expect(screen.getByText(setupFailed.what)).toBeTruthy();
   });
 
+  it("offers no close on a setup failed item without a terminal", async () => {
+    lists = [[{ ...setupFailed, terminal: null }]];
+    await renderApp(<AttentionList />);
+    await screen.findByText(setupFailed.what);
+    expect(screen.queryByRole("button", { name: "Close terminal" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
+    expect(requests.filter((request) => request.method === "POST")).toEqual([]);
+  });
+
   it("folds to its count and opens again", async () => {
     lists = [[waiting]];
     await renderApp(<AttentionList />);

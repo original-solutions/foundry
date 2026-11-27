@@ -170,7 +170,7 @@ Only a workspace on this machine gets the new and archive entries. End and clear
 
 ## End, clear and archive
 
-End and clear work for a terminal on any machine Foundry can reach. This machine's daemon passes the request to the machine that runs the terminal. If that machine is offline, a line at the foot of the screen says so. Archive works only for a workspace on this machine. To archive another machine's, open that machine's own UI.
+End and clear work for a terminal on any machine Foundry can reach. This machine's daemon passes the request to the machine that runs the terminal. If that machine is offline, a refused End says so in its dialog, and a refused Clear in a line at the foot of the screen. Archive works only for a workspace on this machine. To archive another machine's, open that machine's own UI.
 
 - **End** stops a terminal that still runs. Foundry asks first and says what is lost: a turn in progress stops where it is, or Claude closes without your answer. The workspace, its worktree and its branch stay. It is in the terminal's menu.
 - **Clear** removes a terminal that has already ended, with its final screen, without asking. **Clear N ended** does it for every ended terminal of a workspace. Both are in the terminal's menu, and **Clear N ended** is also among the sidebar's workspace actions.

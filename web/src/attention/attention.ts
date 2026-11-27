@@ -44,12 +44,16 @@ export const kindLabel: Record<AttentionKind, string> = {
 /** Only these clear when a person says so; every other item clears on its own. */
 export const dismissable = (item: AttentionItem) => item.kind === "setting_overwritten";
 
-/** A failed setup's terminal has already exited, so closing it from the item ends nothing that still runs. */
-export const closable = (item: AttentionItem) => item.kind === "setup_failed" && item.terminal !== null;
+/**
+ * A failed setup's terminal has already exited, so closing it from the item ends nothing that still runs.
+ * It closes without asking, as Clear does for any ended terminal, and its final screen goes with it.
+ */
+export const closable = (item: AttentionItem): item is AttentionItem & { terminal: string } =>
+  item.kind === "setup_failed" && item.terminal !== null;
 
 /** What the item's own button does: dismisses it, or closes its exited setup terminal so it clears. */
 export async function settle(item: AttentionItem): Promise<void> {
-  if (closable(item)) return closeTerminal(item.terminal as string);
+  if (closable(item)) return closeTerminal(item.terminal);
   return dismissItem(item.id);
 }
 
