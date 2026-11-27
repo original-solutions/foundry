@@ -14,7 +14,7 @@ The first-run screen asks one question: **What should Claude work on?**
 
 ![The first-run screen: one question, a task box with project, base branch and model, and the three states below](images/getting-started-first-run.png)
 
-Type the task in the box. Write it the way you would tell a colleague. As you type, Foundry names the workspace and its branch from your words, and shows the branch under the box. "Fix the login redirect" becomes the workspace `fix the login redirect` on the branch `fix-the-login-redirect`.
+Type the task in the box. Write it the way you would tell a colleague. As you type, Foundry names the workspace and its branch from your words, and shows the branch under the box. "Fix the login redirect" becomes the workspace `fix the login redirect` on the branch `fix-the-login-redirect`. A link to a GitHub pull request or issue becomes `pr` or `issue` and its number, other links are left out, and a slash command loses its slash: "/review-loop https://github.com/o/people-hub/pull/1181" becomes `review-loop pr 1181`, numbered `review-loop pr 1181 2` when the repo already has the branch `review-loop-pr-1181`.
 
 Under the box, from left to right:
 

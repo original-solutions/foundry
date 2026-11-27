@@ -1,13 +1,16 @@
+import { onlineManager } from "@tanstack/react-query";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useState, type ComponentProps } from "react";
 import type { Project } from "./api";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { safeBranch } from "./branch";
 import { taskName, useCreateWorkspace } from "./Composer";
 import { repoName } from "./FirstRepo";
+import type { WorkspaceView } from "./fleet";
 import { Launchpad } from "./Launchpad";
 import { primaryButton } from "./Modal";
-import { settings } from "./test-fixtures";
-import { json, mockFetch, renderApp } from "./test-utils";
+import { ME, settings } from "./test-fixtures";
+import { json, mockFetch, renderApp, type Call } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -21,6 +24,25 @@ function Harness(props: Partial<ComponentProps<typeof Launchpad>>) {
 
 const promptBox = () => screen.getByLabelText("What should Claude work on?");
 const start = () => screen.getByRole("button", { name: /^Start/ }) as HTMLButtonElement;
+/** A name whose branch is cut at 100 bytes before a number put after it would show. */
+const long = Array.from({ length: 4 }, () => "가나다라마바사아자").join(" ");
+/** The name each request sent, if it sent one. */
+const sentNames = (calls: Call[]) => calls.map((c) => (c.body as { name?: string } | undefined)?.name);
+
+/** A fleet of this machine and `laptop` (m2), and `answers` to the requests the box sends, which it records. */
+function fleetOf(...answers: Response[]): Call[] {
+  const machines = { me: ME, machines: [{ id: ME, name: "studio", online: true }, { id: "m2", name: "laptop", online: true }] };
+  const calls: Call[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init: RequestInit = {}) => {
+      if (url === "/api/machines") return json(200, machines);
+      calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
+      return answers.shift() ?? json(500, { error: "unexpected request" });
+    }),
+  );
+  return calls;
+}
 
 describe("taskName", () => {
   it("names a task by the first words of its first line, lower case, without closing punctuation", () => {
@@ -31,6 +53,26 @@ describe("taskName", () => {
 
   it("keeps a name to 40 characters, cut at a word", () => {
     expect(taskName("internationalisation localisation accessibility")).toBe("internationalisation localisation");
+  });
+
+  it("names a task after the pull request or issue it points at, without a slash command's slash or other links", () => {
+    expect(taskName("/review-loop https://github.com/original-solutions/people-hub/pull/1181")).toBe("review-loop pr 1181");
+    expect(taskName("/review-loop https://github.com/o/r/pull/1181/files#diff-1")).toBe("review-loop pr 1181");
+    expect(taskName("Fix https://github.com/o/r/issues/42 on mobile")).toBe("fix issue 42 on mobile");
+    expect(taskName("review PR#1181 and fix the failing tests")).toBe("review pr 1181 and fix");
+    expect(taskName("Review pr #7 then Issue #9")).toBe("review pr 7 then issue");
+    expect(taskName("close issue#12")).toBe("close issue 12");
+    expect(taskName("See https://example.com/docs for the API")).toBe("see for the api");
+  });
+
+  it("reads a reference or link with punctuation or brackets around it, and keeps a later word's slash", () => {
+    expect(taskName("close Issue #9")).toBe("close issue 9");
+    expect(taskName("review PR #1181, then fix it")).toBe("review pr 1181 then fix");
+    expect(taskName("Review https://github.com/o/r/pull/12.")).toBe("review pr 12");
+    expect(taskName("see https://github.com/o/r/pull/3?x=1")).toBe("see pr 3");
+    expect(taskName("Answer (https://github.com/o/r/pull/5) today")).toBe("answer pr 5 today");
+    expect(taskName("Fix the docs (https://example.com/docs) today")).toBe("fix the docs today");
+    expect(taskName("fix /api route")).toBe("fix /api route");
   });
 });
 
@@ -128,6 +170,151 @@ describe("Launchpad", () => {
     expect(start().disabled).toBe(true);
     fireEvent.click(within(alert).getByRole("button", { name: "Go to the board" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+
+  it("numbers a suggested name the daemon refuses as taken, makes the workspace under the first it accepts, and shows that name", async () => {
+    const taken = json(409, { error: "a branch or worktree named review-loop-pr-1181 already exists in this project; give the workspace another name" });
+    const calls = mockFetch(taken, json(201, { id: "w1" }), json(201, { id: "s1" }));
+    const created = vi.fn();
+    await renderApp(<Harness onCreated={created} />);
+
+    fireEvent.change(promptBox(), { target: { value: "/review-loop https://github.com/original-solutions/people-hub/pull/1181" } });
+    expect(screen.getByLabelText("Branch").textContent).toBe("review-loop-pr-1181");
+    fireEvent.click(start());
+
+    await waitFor(() => expect(created).toHaveBeenCalledWith("s1", null));
+    expect(sentNames(calls)).toEqual(["review-loop pr 1181", "review-loop pr 1181 2", undefined]);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByLabelText("Branch").textContent).toBe("review-loop-pr-1181-2");
+    expect((screen.getByLabelText("Workspace name") as HTMLInputElement).placeholder).toBe("review-loop pr 1181 2");
+  });
+
+  it("shows the numbered name a workspace was made under when its session then does not start", async () => {
+    const taken = json(409, { error: "a branch or worktree named review-loop-pr-1181 already exists in this project" });
+    const calls = mockFetch(taken, json(201, { id: "w1" }), json(500, { error: "claude not found" }));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: "/review-loop https://github.com/original-solutions/people-hub/pull/1181" } });
+    fireEvent.click(start());
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/its session did not start: claude not found/);
+    expect(sentNames(calls)).toEqual(["review-loop pr 1181", "review-loop pr 1181 2", undefined]);
+    expect(screen.getByLabelText("Branch").textContent).toBe("review-loop-pr-1181-2");
+    expect((screen.getByLabelText("Workspace name") as HTMLInputElement).placeholder).toBe("review-loop pr 1181 2");
+  });
+
+  it.each([
+    ["a picked machine", "m2", {}],
+    ["letting Foundry choose", "choose", { model: "opus", prompt: "Fix it" }],
+  ])("numbers a refused suggested name on %s and keeps the rest of the request as it was", async (_, machine, session) => {
+    const calls = fleetOf(json(409, { error: "a branch or worktree named fix-it already exists in this project" }), json(500, { error: "stop here" }));
+    await renderApp(<Harness />);
+
+    const picker = (await screen.findByLabelText("Machine")) as HTMLSelectElement;
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.change(picker, { target: { value: machine } });
+    fireEvent.click(start());
+
+    await screen.findByRole("alert");
+    const sent = { project: "p1", base: "main", machine, ...session };
+    expect(calls.map((c) => c.body)).toEqual([
+      { ...sent, name: "fix it" },
+      { ...sent, name: "fix it 2" },
+    ]);
+  });
+
+  it("shows the name a second Start will send, not the one an earlier create was numbered to, while it waits to go out", async () => {
+    mockFetch(json(409, { error: "a branch or worktree named fix-it already exists in this project" }), json(400, { error: "no base branch main" }));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.click(start());
+    expect((await screen.findByRole("alert")).textContent).toMatch(/no base branch main/);
+
+    // Offline, the create waits without sending anything: the box shows the name it will send.
+    onlineManager.setOnline(false);
+    try {
+      fireEvent.click(start());
+      expect(await screen.findByText("Making fix-it from main…")).toBeDefined();
+      expect(screen.getByLabelText("Branch").textContent).toBe("fix-it");
+    } finally {
+      onlineManager.setOnline(true);
+    }
+  });
+
+  it("gives up on a suggested name after 20 tries and says why", async () => {
+    const calls = mockFetch(...Array.from({ length: 20 }, () => json(409, { error: "a branch or worktree named fix-it already exists in this project" })));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.click(start());
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/already exists in this project/);
+    expect(sentNames(calls)).toEqual(["fix it", ...Array.from({ length: 19 }, (_, i) => `fix it ${i + 2}`)]);
+  });
+
+  it("does not number a typed name the daemon refuses as taken", async () => {
+    const calls = mockFetch(json(409, { error: "a branch or worktree named login already exists in this project; give the workspace another name" }));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.change(screen.getByLabelText("Workspace name"), { target: { value: "login" } });
+    fireEvent.click(start());
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/a branch or worktree named login already exists/);
+    expect(sentNames(calls)).toEqual(["login"]);
+  });
+
+  it("does not number a suggested name refused for another reason", async () => {
+    const calls = mockFetch(json(400, { error: "no base branch dev" }));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.click(start());
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/no base branch dev/);
+    expect(sentNames(calls)).toEqual(["fix it"]);
+  });
+
+  it("tries a name made of long words once when numbering it would not change its branch", async () => {
+    const calls = mockFetch(json(409, { error: "a branch or worktree named that already exists in this project" }));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: long } });
+    fireEvent.click(start());
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/already exists/);
+    expect(sentNames(calls)).toEqual([long]);
+  });
+
+  it("suggests no name, and says which workspace has it, when numbering a held name would not change its branch", async () => {
+    const held = { project: "demo", branch: safeBranch(long), sessions: [] } as unknown as WorkspaceView;
+    await renderApp(<Harness workspaces={[held]} />);
+
+    fireEvent.change(promptBox(), { target: { value: long } });
+
+    expect(screen.queryByLabelText("Branch")).toBeNull();
+    expect(screen.getByText(`demo already has a workspace on ${safeBranch(long)}. Pick another name.`)).toBeDefined();
+    expect(start().disabled).toBe(true);
+  });
+
+  it("says nothing is taken while the box is empty, even when a workspace is on the branch an empty name gives", async () => {
+    const held = { project: "demo", branch: safeBranch(""), sessions: [] } as unknown as WorkspaceView;
+    await renderApp(<Harness workspaces={[held]} />);
+
+    expect(screen.queryByText(/already has a workspace/)).toBeNull();
+  });
+
+  it("still tries 20 names when an open workspace holds one of the numbered ones", async () => {
+    const held = { project: "demo", branch: "fix-it-2", sessions: [] } as unknown as WorkspaceView;
+    const calls = mockFetch(...Array.from({ length: 20 }, () => json(409, { error: "a branch or worktree named that already exists in this project" })));
+    await renderApp(<Harness workspaces={[held]} />);
+
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.click(start());
+
+    await screen.findByRole("alert");
+    expect(sentNames(calls)).toEqual(["fix it", ...Array.from({ length: 19 }, (_, i) => `fix it ${i + 3}`)]);
   });
 
   it("asks for a repo first when the fleet has no project, with no task box to type into yet", async () => {

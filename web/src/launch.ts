@@ -15,18 +15,38 @@ export interface CreateInput {
   machine?: string;
   model: string;
   prompt?: string;
+  /** Names to try in turn while the daemon refuses the one before as taken (409): none for a typed name. */
+  then?: string[];
 }
 
 /**
- * Makes a workspace, then starts a session in it, calling `onSession` between the two. Letting
- * Foundry choose sends the model and first prompt along: when no machine qualifies the request
- * waits (`session` is null), and the waiting list is read again to show it, Foundry starting the
- * session once it is placed. A session that did not start throws `SessionNotStarted`, since the
- * workspace exists and a second try would only find its name taken.
+ * Makes a workspace, then starts a session in it. The workspace is made under the first of the
+ * input's names (`name`, then `then`) the daemon does not refuse as taken, `onName` hearing each
+ * before it is sent, and `onSession` once the session is being started. Letting Foundry choose
+ * sends the model and first prompt along: when no machine qualifies the request waits (`session`
+ * is null), and the waiting list is read again to show it, Foundry starting the session once it is
+ * placed. A session that did not start throws `SessionNotStarted`, since the workspace exists and
+ * a second try would only find its name taken.
  */
-export async function makeWorkspace(input: CreateInput, client: QueryClient, onSession = () => {}): Promise<{ session: string | null; warning: string | null }> {
+export async function makeWorkspace(
+  input: CreateInput,
+  client: QueryClient,
+  { onName = () => {}, onSession = () => {} }: { onName?: (name: string) => void; onSession?: () => void } = {},
+): Promise<{ session: string | null; warning: string | null }> {
   const session = input.machine === "choose" ? { model: input.model, prompt: input.prompt } : {};
-  const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name, machine: input.machine, ...session });
+  const names = [input.name, ...(input.then ?? [])];
+  let workspace: Awaited<ReturnType<typeof createWorkspace>> | undefined;
+  for (const [i, name] of names.entries()) {
+    onName(name);
+    try {
+      workspace = await createWorkspace({ project: input.project, base: input.base, name, machine: input.machine, ...session });
+      break;
+    } catch (error) {
+      // A refused try made nothing, so the next name is tried in its place.
+      if (!(error instanceof ApiError && error.status === 409) || i === names.length - 1) throw error;
+    }
+  }
+  if (!workspace) throw new Error("no workspace name to try");
   if ("request" in workspace) {
     await client.invalidateQueries({ queryKey: placementsKey });
     return { session: null, warning: null };

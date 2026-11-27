@@ -266,13 +266,7 @@ fn update_ready_with(home: &Path, exe: &Path, running: &str) -> Option<String> {
             return None;
         }
     };
-    let ready = state.ready?;
-    let above = update::tag_version(&ready).is_some_and(|version| update::above(version, running));
-    (above
-        && state.refused.as_deref() != Some(ready.as_str())
-        && update::is_ready(home, &ready)
-        && update::from_current(home, exe, running))
-    .then_some(ready)
+    update::reportable(home, &state, exe, running)
 }
 /// Writes a sample every [`SAMPLE_EVERY`], the first at once, each on the blocking pool so a
 /// slow disk read or a busy store never stalls an async worker. A sample that cannot be read
