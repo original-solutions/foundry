@@ -440,13 +440,16 @@ describe("Sidebar and the factory", () => {
   it("marks a factory run's workspace and links it to its issue, and names a quiet session so", async () => {
     await renderApp(<Sidebar machines={factoryMachines()} statuses={factoryStatuses()} {...props} />);
     const run = screen.getByRole("group", { name: "fac 162" });
+    // Folded, the mark shows on the workspace's line.
     expect(within(run).getByRole("link", { name: "factory #162" }).getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");
+    unfold("fac 162");
     expect(within(run).getByText("Quiet 10+ min")).toBeDefined();
     expect(within(screen.getByRole("group", { name: "on a commit" })).queryByRole("link", { name: /^factory/ })).toBeNull();
   });
 
   it("shows a workspace with no branch by its commit", async () => {
     await renderApp(<Sidebar machines={factoryMachines()} {...props} />);
+    unfold("on a commit");
     expect(within(screen.getByRole("group", { name: "on a commit" })).getByText("fedcba9 · demo")).toBeDefined();
   });
 });

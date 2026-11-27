@@ -775,6 +775,18 @@ describe("App", () => {
     expect(await screen.findByRole("radiogroup", { name: "View" })).toBeDefined();
   });
 
+  it("marks a factory run's workspace on the board and in the sidebar once its status arrives", async () => {
+    mockActions();
+    await open("/", live);
+    expect(await screen.findByRole("article", { name: "fix login" })).toBeDefined();
+    expect(screen.queryByRole("link", { name: "factory #162" })).toBeNull();
+    const run = { run: "original-solutions__foundry__162__1", title: "t", step: "building", machine: ME, gate_retries_used: 0, minutes_used: 1, workspaces: ["w1"], sessions: ["s1"] };
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: { ...heldStatus(2), runs: [run] } })));
+    expect(await within(screen.getByRole("article", { name: "fix login" })).findByRole("link", { name: "factory #162" })).toBeDefined();
+    expect(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: "factory #162" })).toBeDefined();
+  });
+
   it("gives the Projects dialog each project's factory settings from the events socket, and follows a later settings message", async () => {
     mockActions();
     await open("/", {
