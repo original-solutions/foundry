@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { changesQuery } from "./ChangesPanel";
 import type { Located } from "./fleet";
@@ -39,11 +39,19 @@ const looks = {
  * that did not reach it says so.
  */
 export function NextSteps({ workspace, name, send, look }: { workspace: string; name: string; send: (prompt: string) => Promise<void> | void; look: keyof typeof looks }) {
-  // A read the daemon last answered 404 for is not asked again: the workspace is another machine's, or gone.
-  const { data: changes } = useQuery({ ...changesQuery(workspace), enabled: (query) => !gone(query.state.error), staleTime: 0, retry: false });
+  const client = useQueryClient();
+  // A read the daemon last answered 404 for is not asked again: the workspace is another machine's,
+  // or gone. The cache keeps that answer, so a mount after the cache let go of its reads still knows;
+  // an error renders again for that, though only the data is shown.
+  const kept = (queryKey: readonly unknown[]) => ({
+    enabled: (query: { state: { error: Error | null } }) => !gone(query.state.error),
+    ...(gone(client.getQueryState(queryKey)?.error) && { gcTime: Infinity }),
+    notifyOnChangeProps: ["data", "error"] as ("data" | "error")[],
+  });
+  const { data: changes } = useQuery({ ...changesQuery(workspace), ...kept(changesQuery(workspace).queryKey), staleTime: 0, retry: false });
   const { data: shipping } = useQuery({
     ...shippingQuery(workspace),
-    enabled: (query) => !gone(query.state.error),
+    ...kept(shippingQuery(workspace).queryKey),
     staleTime: 0,
     retry: false,
     refetchInterval: (query) => pollEvery(CHECKS_EVERY, query.state.data?.pr?.state === "open" && query.state.data.pr.checks === "pending")(query),

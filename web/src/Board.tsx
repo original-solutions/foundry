@@ -410,7 +410,7 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
         {rows.length > shown.length && <li className="px-2 py-1 text-xs text-neutral-500">+{rows.length - shown.length} more</li>}
         {rows.length === 0 && <li className="px-2 py-1 text-xs text-neutral-500">No terminals</li>}
       </ul>
-      {terminals?.here === machine.id && (
+      {terminals?.here === machine.id ? (
         <>
           <ChangesFooter card={card} onScreen={onScreen} onOpen={() => onChanges(workspace.id)} />
           <ShipLine
@@ -421,6 +421,9 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
             className="border-t border-neutral-800/70 bg-neutral-950/40 px-4 py-2"
           />
         </>
+      ) : (
+        // Another machine's workspace: nothing of it is read from here, but its archive shows.
+        leaving && <p className="mt-auto border-t border-neutral-800 bg-neutral-950/40 px-4 py-2.5 text-xs text-neutral-500">Archiving…</p>
       )}
     </article>
   );

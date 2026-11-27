@@ -26,8 +26,8 @@ export function useOnScreen<T extends Element>() {
  * the end of a turn shows what the turn wrote), and every `BOARD_BUSY_EVERY` while an agent in it
  * works. A state change off screen is read when the card comes back. A failed read is tried again
  * on the timer; a workspace the daemon does not have (a 404) is not asked again, on a timer or when
- * a terminal changes state. Once its workspace is being archived, nothing is read. A card and a
- * line of the list read the same way.
+ * a terminal changes state. Once its workspace is being archived, nothing is read. A card of this
+ * machine's workspace and a line of the list read the same way.
  */
 export function useCardChanges(card: Card, onScreen: boolean) {
   const busy = card.rows.some((r) => r.glyph === "working");
