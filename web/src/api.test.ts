@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, createWorkspace, listMachines, sendFile, sessionBriefs, sessionTrail, thisMachine, workspaceChanges, workspaceShipping } from "./api";
+import { ApiError, createWorkspace, installUpdate, listMachines, sendFile, sessionBriefs, sessionTrail, thisMachine, workspaceChanges, workspaceShipping } from "./api";
 import { json } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -115,5 +115,38 @@ describe("createWorkspace", () => {
       { project: "p1", base: "main", name: "here" },
       { project: "p1", base: "main", name: "there", machine: "m2" },
     ]);
+  });
+});
+
+describe("installUpdate", () => {
+  it("posts the tag to the machine's update route and gives back the status and body as they came", async () => {
+    const fetch = vi.fn(async () => json(409, { error: "v0.9.1 is not ready", ready: "v0.9.2" }));
+    vi.stubGlobal("fetch", fetch);
+    expect(await installUpdate("machine-2", "v0.9.1")).toEqual({ status: 409, json: { error: "v0.9.1 is not ready", ready: "v0.9.2" } });
+    expect(fetch).toHaveBeenCalledWith("/api/machines/machine-2/update", expect.objectContaining({ method: "POST", body: JSON.stringify({ tag: "v0.9.1" }) }));
+  });
+
+  it("stops waiting after a minute with no answer, so the call reads as sent with no answer", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetch = vi.fn(
+        (_path: string, init: RequestInit) =>
+          new Promise<Response>((_answer, fail) => init.signal?.addEventListener("abort", () => fail(new DOMException("timed out", "AbortError")))),
+      );
+      vi.stubGlobal("fetch", fetch);
+      let failed: unknown;
+      void installUpdate("machine-2", "v0.9.1").catch((error: unknown) => (failed = error));
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(failed).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(failed).toBeInstanceOf(DOMException);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives back a 202's empty body as {}", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 202 })));
+    expect(await installUpdate("machine-2", "v0.9.1")).toEqual({ status: 202, json: {} });
   });
 });

@@ -3,7 +3,7 @@ import { createMemoryHistory, createRouter, RouterProvider } from "@tanstack/rea
 import type { ILink, ILinkProvider } from "@xterm/xterm";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { machineQuery, type Briefs, type Changes, type Shipping, type UiMessage } from "./api";
+import { machineQuery, type AnyRecord, type Briefs, type Changes, type Shipping, type UiMessage } from "./api";
 import { router, routeTree } from "./App";
 import { button, dangerButton, pressed, viewLook } from "./Modal";
 import { keep, KEEP_AFTER, recall } from "./memory";
@@ -760,6 +760,14 @@ describe("App", () => {
     expect(within(here).getByText("online")).toBeDefined();
     expect(within(away).getByText("offline")).toBeDefined();
     expect(screen.queryByText("unknown")).toBeNull();
+  });
+
+  it("puts the update badge at the head of the page, inside main, when a machine has a release waiting", async () => {
+    mockActions();
+    const waiting = sample(ME, 2) as AnyRecord & { kind: "machine_sample" };
+    await open("/", { ...live, records: [{ ...waiting, body: { ...waiting.body, version: "0.9.0", update_ready: "v0.9.1" } }, ...live.records.slice(1)] });
+    const badge = await screen.findByRole("button", { name: /v0\.9\.1 on 1 machine/ });
+    expect(document.querySelector("main")!.firstElementChild!.contains(badge)).toBe(true);
   });
 
   it("starts a task from the machines view in the New task dialog, set to let Foundry choose", async () => {
