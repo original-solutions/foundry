@@ -124,35 +124,49 @@ impl Operation {
     }
 }
 
-/// What a call that changes a workspace answered: the operation Vims made for it, or nothing to
-/// wait on.
+/// What a call that changes a workspace answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
-    /// The operation, to be read with `operation show`.
+    /// The operation Vims made for it, to be read with `operation show`.
     Operation(Operation),
-    /// Vims answered with no operation: the change is done.
+    /// The workspace, whose state says whether the change has happened.
+    Workspace(Workspace),
+    /// Nothing: an empty answer, or an empty object.
     Done,
 }
 
 impl Change {
+    /// The change `stdout` answers. An answer that holds an error, or names neither an
+    /// operation nor a workspace, cannot be read, so the caller finds out by the call's key
+    /// rather than take the change as made.
     pub(super) fn read(stdout: &str) -> Option<Self> {
         if stdout.trim().is_empty() {
             return Some(Change::Done);
         }
         let value = json(stdout)?;
-        // Guessed: an operation is under `operation`, or is the answer when it has an
-        // `operationId`, or an `id` that is no workspace's (`wsp_`).
-        let operation = value.get("operation").is_some_and(Value::is_object)
-            || value.get("operationId").is_some()
-            || value
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| !id.starts_with("wsp_"));
-        if operation {
-            Operation::from_value(&value).map(Change::Operation)
-        } else {
-            Some(Change::Done)
+        let fields = value.as_object()?;
+        if fields.is_empty() {
+            return Some(Change::Done);
         }
+        if fields.contains_key("error") {
+            return None;
+        }
+        // Guessed: an operation is under `operation`, or is the answer when it has an
+        // operation id, or an `id` that is no workspace's (`wsp_`, which the checks saw); a
+        // workspace is under `workspace`, or is the answer when its `id` is a workspace's.
+        let id = text(&value, &[&["id"]]);
+        let operation = value.get("operation").is_some_and(Value::is_object)
+            || text(&value, &[&["operationId"], &["operation_id"]]).is_some()
+            || id.as_deref().is_some_and(|id| !id.starts_with("wsp_"));
+        if operation {
+            return Operation::from_value(&value).map(Change::Operation);
+        }
+        let workspace = value.get("workspace").is_some_and(Value::is_object)
+            || id.as_deref().is_some_and(|id| id.starts_with("wsp_"));
+        if workspace {
+            return Workspace::from_value(&value).map(Change::Workspace);
+        }
+        None
     }
 }
 
@@ -211,8 +225,12 @@ impl WorkspaceState {
 
 impl Workspace {
     pub(super) fn read(stdout: &str) -> Option<Self> {
-        let value = json(stdout)?;
-        let value = inner(&value, "workspace");
+        Self::from_value(&json(stdout)?)
+    }
+
+    /// The workspace in `value`, at the top or under `workspace`.
+    fn from_value(value: &Value) -> Option<Self> {
+        let value = inner(value, "workspace");
         let id = text(value, &[&["id"], &["workspaceId"]])?;
         // Seen in check 1: `versions.base.variantDigest` is `sha256:<digest>` for the same digest
         // as the template's `golden:<digest>` source key.
@@ -423,7 +441,9 @@ impl GithubLinks {
                 links.push(GithubLink { owner, login });
             }
         }
-        if let Some(login) = text(&value, &[&["login"], &["user", "login"]]) {
+        if links.is_empty()
+            && let Some(login) = text(&value, &[&["login"], &["user", "login"]])
+        {
             links.push(GithubLink { owner: None, login });
         }
         Some(GithubLinks { links })

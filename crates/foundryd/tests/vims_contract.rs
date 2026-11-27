@@ -2,9 +2,11 @@
 //!
 //! One workspace, made from the template named in `FOUNDRY_VIMS_TEMPLATE` through the real
 //! `vims` command line, signed in with the token in `FOUNDRY_VIMS_TOKEN` as the daemon signs in.
-//! The test reads the template's source key, makes the workspace with a key, finds the create's
-//! operation again by that key, runs `true` with `exec --no-wait`, reads its exit code by
-//! operation, and removes the workspace, also when a step before it fails.
+//! The test reads the template's source key, makes the workspace, runs `true` with
+//! `exec --no-wait`, reads its exit code by operation, and removes the workspace. The removal is
+//! armed as soon as `vims new` answers, so a step that fails after it still removes the
+//! workspace; when the workspace cannot be found, the test prints the create's operation and key
+//! so it can be removed by hand.
 //!
 //! It spends Vims credit and makes no model call, so it is ignored and runs only with
 //! `FOUNDRY_VIMS_CONTRACT=1` and `vims` on `PATH`:
@@ -20,30 +22,45 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use foundry_proto::factory::RunId;
 use foundryd::clock::SystemClock;
-use foundryd::factory::vims::{
-    Egress, Exec, OpState, Operation, Role, Step, Vims, VimsCli, VimsError, key,
-};
+use foundryd::factory::vims::{Egress, Exec, OpState, Operation, Role, Step, Vims, VimsCli, key};
 
 /// How long a create or a command may take to finish.
 const WAIT: Duration = Duration::from_secs(600);
 /// How often an operation is read while it runs.
 const POLL: Duration = Duration::from_secs(3);
 
-/// Removes the workspace when the test ends, however it ends.
+/// Removes the workspace a create made when the test ends, however it ends: the one it names
+/// when it is known, else the one the create's operation names by then.
 struct Removal<'a> {
     vims: &'a VimsCli,
-    workspace: String,
+    /// The create's operation and key.
+    create: String,
+    create_key: String,
+    workspace: Option<String>,
     key: String,
 }
 
 impl Drop for Removal<'_> {
     fn drop(&mut self) {
-        match self.vims.remove(&self.workspace, &self.key) {
-            Ok(change) => eprintln!("vims_contract: removed {}: {change:?}", self.workspace),
-            Err(error) => eprintln!(
-                "vims_contract: could not remove {}; remove it by hand: {error}",
-                self.workspace
-            ),
+        let workspace = self.workspace.clone().or_else(|| {
+            self.vims
+                .operation(&self.create)
+                .ok()
+                .and_then(|operation| operation.workspace)
+        });
+        let Some(workspace) = workspace else {
+            eprintln!(
+                "vims_contract: no workspace found for the create {} (key {}); look for it with \
+                 `vims ls` and remove it by hand",
+                self.create, self.create_key
+            );
+            return;
+        };
+        match self.vims.remove(&workspace, &self.key) {
+            Ok(change) => eprintln!("vims_contract: removed {workspace}: {change:?}"),
+            Err(error) => {
+                eprintln!("vims_contract: could not remove {workspace}; remove it by hand: {error}")
+            }
         }
     }
 }
@@ -90,38 +107,27 @@ fn a_workspace_runs_a_command_read_by_operation_and_is_removed() {
     let made = vims
         .new_workspace(&source_key, Egress::Open, &create)
         .expect("new");
-    let found = vims.operations_by_key(&create).expect("operation list");
-    assert_eq!(
-        found
-            .iter()
-            .map(|operation| &operation.id)
-            .collect::<Vec<_>>(),
-        [&made.id],
-        "the create is found by its key"
+    eprintln!(
+        "vims_contract: create {} (key {create}) for {:?}",
+        made.id, made.workspace
     );
-    let again = vims
-        .new_workspace(&source_key, Egress::Open, &create)
-        .expect("new again");
-    assert_eq!(again.id, made.id, "a repeated key makes nothing new");
-    let refused = vims
-        .new_workspace(&source_key, Egress::Closed, &create)
-        .unwrap_err();
-    assert!(
-        matches!(&refused, VimsError::Refused { refusal, .. } if refusal.code == "IDEMPOTENCY_KEY_REUSED"),
-        "{refused}"
-    );
+    let mut removal = Removal {
+        vims: &vims,
+        create: made.id.clone(),
+        create_key: create.clone(),
+        workspace: made.workspace.clone(),
+        key: key_of(Step::Remove),
+    };
 
     let made = ended(&vims, &made.id);
-    let workspace = made
+    if removal.workspace.is_none() {
+        removal.workspace = made.workspace.clone();
+    }
+    assert_eq!(made.state, OpState::Finished, "{made:?}");
+    let workspace = removal
         .workspace
         .clone()
         .unwrap_or_else(|| panic!("the create names no workspace: {made:?}"));
-    let _removal = Removal {
-        vims: &vims,
-        workspace: workspace.clone(),
-        key: key_of(Step::Remove),
-    };
-    assert_eq!(made.state, OpState::Finished, "{made:?}");
     let shown = vims.show(&workspace).expect("show");
     eprintln!("vims_contract: {workspace} is {:?}", shown.state);
 

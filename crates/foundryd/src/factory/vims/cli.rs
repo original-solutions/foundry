@@ -20,7 +20,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use serde_json::Value;
 
-use super::{Call, Refusal, Vims, VimsError};
+use super::{Call, Refusal, Vims, VimsError, one_line};
 use crate::clock::Clock;
 
 /// How long one `vims` call may run before it is killed.
@@ -35,6 +35,9 @@ pub const TOKEN_VAR: &str = "FOUNDRY_VIMS_TOKEN";
 
 /// What `--token-ref` is given: the variable, never the token.
 pub const TOKEN_REF: &str = "env:FOUNDRY_VIMS_TOKEN";
+
+/// The most of `vims`'s output an error quotes, from its end.
+const QUOTED: usize = 400;
 
 /// How often a running call is looked at.
 const POLL: Duration = Duration::from_millis(10);
@@ -74,18 +77,6 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
             stdout,
             ..
         } => Ok(stdout),
-        // A shell's "command not found" and "not executable".
-        Outcome::Exit {
-            status: Some(status @ (126 | 127)),
-            stderr,
-            ..
-        } => Err(VimsError::NotRun {
-            command,
-            reason: match stderr.trim() {
-                "" => format!("the shell exited with status {status}"),
-                said => said.to_owned(),
-            },
-        }),
         Outcome::Exit {
             status,
             stdout,
@@ -94,10 +85,10 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
             if let Some(refusal) = refusal_in(&stdout).or_else(|| refusal_in(&stderr)) {
                 return Err(VimsError::Refused { command, refusal });
             }
-            let said = match stderr.trim() {
+            let said = quoted(match stderr.trim() {
                 "" => stdout.trim(),
                 said => said,
-            };
+            });
             let reason = match status {
                 Some(status) => format!("it exited with status {status}: {said}"),
                 None => format!("a signal ended it: {said}"),
@@ -110,10 +101,21 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
     }
 }
 
+/// The end of `text`, at most [`QUOTED`] bytes, on one line.
+fn quoted(text: &str) -> String {
+    let mut start = text.len().saturating_sub(QUOTED);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let cut = if start > 0 { "…" } else { "" };
+    format!("{cut}{}", one_line(&text[start..]))
+}
+
 /// Vims's refusal in `text`, when it holds one: JSON with `error.code` (or `code`, or an
 /// `error` that is a code), or a line that starts with a code, such as
 /// `Error: PRECONDITION_FAILED: …`. The checks saw the codes and not the shape they came in,
-/// so both are guesses.
+/// so both are guesses. Only a code shaped as Vims's is read ([`is_code`]): a transport
+/// failure's code says nothing of whether Vims took the call.
 fn refusal_in(text: &str) -> Option<Refusal> {
     let text = text.trim();
     let json = serde_json::from_str::<Value>(text).ok().or_else(|| {
@@ -129,9 +131,10 @@ fn refusal_in(text: &str) -> Option<Refusal> {
                 .filter(|text| !text.is_empty())
                 .map(str::to_owned)
         };
-        let code = field(&["error", "code"])
-            .or_else(|| field(&["code"]))
-            .or_else(|| field(&["error"]).filter(|code| is_code(code)))?;
+        let code = [&["error", "code"][..], &["code"], &["error"]]
+            .into_iter()
+            .filter_map(&field)
+            .find(|code| is_code(code))?;
         let message = field(&["error", "message"])
             .or_else(|| field(&["message"]))
             .unwrap_or_default();
@@ -144,15 +147,24 @@ fn refusal_in(text: &str) -> Option<Refusal> {
             .find_map(|prefix| line.strip_prefix(prefix))
             .unwrap_or(line);
         let (code, message) = line.split_once(':').unwrap_or((line, ""));
-        is_code(code).then(|| Refusal::new(code, message.trim()))
+        // In free text a code is a word with an `_` in it, so a capitalised word is not one.
+        (is_code(code) && code.contains('_')).then(|| Refusal::new(code, message.trim()))
     })
 }
 
-/// Whether `text` reads as one of Vims's codes: capitals, digits and `_`, with an `_` in it.
+/// Whether `text` reads as one of Vims's codes: capitals, digits and `_`, and none of the
+/// codes a client that lost its connection reports, which say nothing of whether Vims took the
+/// call: an errno (`ECONNRESET`, an `E` and no `_`) or Node's own (`ERR_…`, `UND_ERR_…`,
+/// `EAI_…`).
 fn is_code(text: &str) -> bool {
-    text.len() >= 3
+    let errno = text.starts_with('E') && !text.contains('_');
+    let node = ["ERR_", "UND_ERR", "EAI_"]
+        .iter()
+        .any(|prefix| text.starts_with(prefix));
+    !errno
+        && !node
+        && text.len() >= 3
         && text.starts_with(|c: char| c.is_ascii_uppercase())
-        && text.contains('_')
         && text
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')

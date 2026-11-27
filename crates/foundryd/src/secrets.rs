@@ -197,9 +197,9 @@ pub fn github_default(secrets: &dyn Secrets) -> Option<String> {
 }
 
 /// `text` with the gateway keys, the Vims token and every `github:*` token this store holds now
-/// hidden as `***`
-/// (whatever follows `github:`, a login or not), read at this call so a token set after the
-/// daemon started is hidden too, and then the passwords of URLs as [`redact`] hides them. When
+/// hidden as `***` (whatever follows `github:`, a login or not), read at this call so a token
+/// set after the daemon started is hidden too, and then the passwords of URLs as [`redact`]
+/// hides them. When
 /// the store cannot be read, none of `text` is shown: [`HIDDEN_UNREADABLE`] is given instead.
 ///
 /// A held value of at least [`SPLIT_MIN`] characters is hidden also when gaps sit inside it,
@@ -726,9 +726,9 @@ pub fn github_default_command(login: &str) -> ExitCode {
 }
 
 /// Stores the first line of `input` as the secret `name`, without its line ending. Only the
-/// gateway secrets, the Vims token and `github:<login>` tokens can be set: the name is checked before `input` is
-/// read, so any other name leaves the store untouched, and the machine's own identity and key
-/// table stay out of reach.
+/// gateway secrets, the Vims token and `github:<login>` tokens can be set: the name is checked
+/// before `input` is read, so any other name leaves the store untouched, and the machine's own
+/// identity and key table stay out of reach.
 pub fn set_from(
     secrets: &dyn Secrets,
     name: &str,

@@ -27,8 +27,6 @@ pub use cli::{LIMIT, Outcome, TOKEN_REF, TOKEN_VAR, VimsCli};
 pub use fake::{FakeVims, Reply};
 pub use keys::{Role, Step, key};
 
-use crate::factory::github::gh::one_line;
-
 /// One `vims` call: its command, its arguments, its idempotency key, the argv it runs after
 /// `--`, and the bytes for its standard input. Every call answers in JSON.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,7 +130,9 @@ impl Call {
 }
 
 /// Why a `vims` call gave no answer to act on. The text names the command, never the token,
-/// which reaches `vims` only through its environment, and never a call's input.
+/// which reaches `vims` only through its environment, and never a call's input. It can quote
+/// the end of what `vims` printed, with the machine's own token hidden but not the tokens Vims
+/// issues, so it goes through P2's rule for comments before it reaches an event or a comment.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum VimsError {
     /// Vims answered and refused the call, with its code.
@@ -142,12 +142,12 @@ pub enum VimsError {
     /// taken the call; its key finds out.
     #[error("`{command}` gave no answer within {seconds} s")]
     Timeout { command: String, seconds: u64 },
-    /// `vims` could not be run, so Vims never saw the call.
+    /// `vims` could not be started, so Vims never saw the call.
     #[error("cannot run `{command}`: {reason}")]
     NotRun { command: String, reason: String },
-    /// `vims` ran and gave no answer that can be read: it failed with no code of Vims's, a
-    /// signal ended it, or it printed too much or what the call did not expect. Vims may have
-    /// taken the call; its key finds out.
+    /// `vims` ran and gave no answer that can be read: it failed with no code of Vims's (a
+    /// transport failure's code is none), a signal ended it, or it printed too much or what the
+    /// call did not expect. Vims may have taken the call; its key finds out.
     #[error("`{command}` gave no answer Foundry can read: {reason}")]
     Unknown { command: String, reason: String },
 }
@@ -215,14 +215,19 @@ pub enum Limit {
 
 impl Limit {
     /// The limit `code` names. P2c saw none of these codes, so this is a guess: a code that
-    /// speaks of `QUOTA`, `CREDIT` or a `MEMBER`.
+    /// speaks of `QUOTA`, or of `CREDIT` or a `MEMBER` together with a limit (`LIMIT`,
+    /// `EXCEEDED`, `INSUFFICIENT`, `EXHAUSTED`). Any other code is no limit, so a run refused for
+    /// it is not left waiting on a limit that never lifts.
     fn of(code: &str) -> Option<Self> {
         let code = code.to_ascii_uppercase();
+        let limited = ["LIMIT", "EXCEEDED", "INSUFFICIENT", "EXHAUSTED"]
+            .iter()
+            .any(|word| code.contains(word));
         if code.contains("QUOTA") {
             Some(Limit::Quota)
-        } else if code.contains("CREDIT") {
+        } else if limited && code.contains("CREDIT") {
             Some(Limit::Credit)
-        } else if code.contains("MEMBER") {
+        } else if limited && code.contains("MEMBER") {
             Some(Limit::Member)
         } else {
             None
@@ -478,6 +483,11 @@ fn change<V: Vims + ?Sized>(
         Change::read,
         "an operation or nothing",
     )
+}
+
+/// `text` with `\r` and `\n` written as escapes.
+fn one_line(text: &str) -> String {
+    text.replace('\r', "\\r").replace('\n', "\\n")
 }
 
 /// `stdout` read by `parse`, or the call's answer that cannot be read.

@@ -1,8 +1,9 @@
 //! Vims in memory, for tests.
 //!
 //! [`FakeVims`] answers each call from a script kept per command ([`FakeVims::on`]), in the
-//! order scripted. A call nothing answers could not run. It keeps what it answered a call that
-//! carries an idempotency key, as Vims keeps an operation by its key: a repeat of the key with
+//! order scripted. A call nothing answers could not run. It keeps what Vims answered a call
+//! that carries an idempotency key, an answer or a refusal, as Vims keeps an operation by its
+//! key; a failure with no answer from Vims holds no key: a repeat of the key with
 //! the same request is answered as the first call was, without spending the script, and the
 //! key with a different request is refused with `IDEMPOTENCY_KEY_REUSED`. A reply can be
 //! [`Reply::dropped`]: the call was taken and kept by its key, and its answer never came back.
@@ -135,8 +136,12 @@ impl State {
                 );
             }
             let reply = self.next(call.command())?;
-            // Vims keeps what it answered; a call that never reached it holds no key.
-            if reply.dropped || matches!(reply.outcome, Outcome::Exit { .. }) {
+            // Vims keeps what it answered; a call with no answer from it holds no key.
+            let answered = matches!(
+                finish(call, reply.outcome.clone()),
+                Ok(_) | Err(VimsError::Refused { .. })
+            );
+            if reply.dropped || answered {
                 self.taken
                     .insert(key.to_owned(), (call.clone(), reply.outcome.clone()));
             }
