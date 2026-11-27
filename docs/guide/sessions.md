@@ -37,6 +37,10 @@ Press **+**, then choose:
 
 ![The new-session dialog with a model and a first prompt](images/sessions-new-dialog.png)
 
+### Rename a session
+
+A session shows its first prompt beside its model until you name it. Double-click the name in the sidebar or in the tab strip, or pick **Rename** in the terminal's menu anywhere it is listed. Type the name and press `Enter`; `Esc` puts the old one back. The name shows everywhere the session is listed, on every machine. Clear the field and press `Enter` to go back to the first prompt. A shell keeps its name.
+
 ## Go through what needs you
 
 While any session needs you, an amber strip heads every page: the board, the timeline, the machines, the factory and an open terminal. It says how many need you, then the workspace of the next one and what it asks. Click it, or press `Cmd+J` anywhere, to open that one. Answer it, then click the strip or press `Cmd+J` again for the one after. Over a terminal that still needs you, the strip counts the others as "1 more needs you" and stays quiet. Once you have answered, it fills and glows once. The order is the board's. After the last, `Cmd+J` goes round to the first.
@@ -167,7 +171,7 @@ Close a side with its **Close pane** button, or press `Cmd+\` again. The termina
 Press **More** in the header, right-click a terminal anywhere it is listed, long-press it on a touch screen, or press `Tab` on it in the jump palette. The menu lists what you can do:
 
 - **Open** for a terminal you are not on, and **Open beside** on a wide screen.
-- **Steps** for a session.
+- **Steps** and **Rename** for a session.
 - **Find in scrollback** on a narrow screen.
 - **Changes in** the workspace.
 - **New session in** and **New shell in** the workspace.
@@ -220,6 +224,8 @@ Press `?` outside a text field or the terminal, or the sidebar's **Keyboard** bu
 | | `[` / `]` | Earlier / later commit; before the first, all changes |
 | | `Cmd+Enter` | Add the comment on a line |
 | | `Esc` | Drop the comment being written |
+| A name being edited | `Enter` | Save it; an empty session name clears it |
+| | `Esc` | Put the name back |
 | A reply box, on a card or a toast | `Enter` | Send the reply |
 | | `Esc` | Close the box; on a toast, dismiss it |
 

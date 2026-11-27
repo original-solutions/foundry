@@ -5,7 +5,8 @@ import { post, refused, type Limits } from "./api";
 import { byUrgency, rows, type MachineView } from "./fleet";
 import { plural, urgency, type Glyph } from "./labels";
 import { NextTaskHead, RoomLine } from "./MachineRoom";
-import { button, dangerButton, field, fieldLook, Modal, primaryButton } from "./Modal";
+import { button, dangerButton, field, Modal, primaryButton } from "./Modal";
+import { NameField } from "./NameField";
 import { heardAgo, scaled, span, spanWords, type History, type Point } from "./samples";
 import { rooms, type Room } from "./room";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
@@ -602,9 +603,8 @@ async function renameMachine({ id, name }: { id: string; name: string }): Promis
  * list does not hold yet, which the daemon cannot rename. Enter sends the name, trimmed, and
  * closes the field once the daemon takes it; the new name shows once it arrives in the settings,
  * on every machine. The name it already has sends nothing. Escape closes it and sends nothing.
- * While the name is on its way the field is busy and takes no edits. A refusal shows under the
- * field and keeps the text. `className` sizes the field's text to the
- * name it stands in for.
+ * The field is the shared `NameField`: busy while the name is on its way, a refusal under it.
+ * `className` sizes the field's text to the name it stands in for.
  */
 export function MachineName({
   machine,
@@ -628,35 +628,16 @@ export function MachineName({
     if (!rename.isPending) rename.mutate({ id: machine.id, name });
   };
   return (
-    <div className="min-w-0 flex-1">
-      <input
-        aria-label="Machine name"
-        autoFocus
-        autoComplete="off"
-        spellCheck={false}
-        value={text}
-        readOnly={rename.isPending}
-        aria-busy={rename.isPending || undefined}
-        onFocus={(e) => e.currentTarget.select()}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            save();
-          } else if (e.key === "Escape") {
-            e.preventDefault();
-            e.stopPropagation();
-            close();
-          }
-        }}
-        className={`w-full rounded px-1 py-px aria-busy:opacity-60 ${fieldLook} ${className}`}
-      />
-      {rename.isError && (
-        <p role="alert" className="mt-1 text-xs font-normal text-red-400">
-          {rename.error.message}
-        </p>
-      )}
-    </div>
+    <NameField
+      label="Machine name"
+      text={text}
+      onText={setText}
+      busy={rename.isPending}
+      error={rename.isError ? rename.error.message : undefined}
+      onSave={save}
+      onCancel={close}
+      className={className}
+    />
   );
 }
 

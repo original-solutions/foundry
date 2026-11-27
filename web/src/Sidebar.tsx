@@ -12,6 +12,7 @@ import { MachineName } from "./Machines";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
+import { SessionNameField, useRenaming } from "./SessionName";
 import { SparkIcon } from "./FirstPrompt";
 import { Mark } from "./Mark";
 import { ProjectFace } from "./ProjectFace";
@@ -427,9 +428,18 @@ function Action({ label, title, onClick, disabled, className = "", children }: {
 function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspace: string; selected?: string; onNavigate?: () => void; tab: WorkspaceProps["tab"] }) {
   const current = row.terminal === selected;
   const ended = row.glyph === "done" || row.glyph === "away";
+  const naming = useRenaming(row.terminal, "row");
+  if (naming?.editing && row.session) {
+    return (
+      <li className="flex items-center gap-2 rounded bg-neutral-800 px-2 py-1 md:py-0.5">
+        <StateGlyph glyph={row.glyph} />
+        <SessionNameField session={row.session} name={row.title ?? ""} onClose={naming.stop} className="text-sm" />
+      </li>
+    );
+  }
   return (
     <li>
-      <TerminalMenu id={row.terminal}>
+      <TerminalMenu id={row.terminal} place="row">
         <Link
           to="/terminals/$terminalId"
           params={{ terminalId: row.terminal }}
@@ -439,6 +449,7 @@ function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspa
           data-workspace={workspace}
           data-name={row.title ? `${row.name} ${row.title}` : row.name}
           {...tab(row.terminal)}
+          onDoubleClick={row.session ? naming?.start : undefined}
           title={row.title ? `${row.name}: ${row.title}` : undefined}
           className={`flex items-start gap-2 rounded px-2 py-1.5 hover:bg-neutral-800 md:py-1 ${current ? "bg-neutral-800 text-neutral-50" : ended ? "text-neutral-500" : ""}`}
         >

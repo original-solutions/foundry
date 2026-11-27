@@ -369,6 +369,54 @@ impl Sessions {
         let trail = lock(&live.brief).trail.iter().cloned().collect();
         Some(trail)
     }
+
+    /// Names session `id` `name`, shown in place of its first prompt, in a new version of its
+    /// record. The name is cut to one line as a brief's prompt is, with the gateway key, every
+    /// live session's token, token-shaped words and the password of any URL hidden; one that
+    /// leaves nothing clears the name. Gives `false`, and writes nothing, when the session is
+    /// not this machine's or its record is deleted.
+    pub async fn rename(&self, id: SessionId, name: &str) -> Result<bool, SessionError> {
+        let inner = &self.inner;
+        let memory = inner.memory_secrets();
+        let secrets: Vec<&str> = memory.iter().map(String::as_str).collect();
+        let name = Some(brief::shown(name, &secrets)).filter(|name| !name.is_empty());
+        // A live session's record is written only under its lock, so a rename never crosses a
+        // change of state. One that ended or failed to start meanwhile is read from the store.
+        if let Some(live) = inner.live(id) {
+            let mut body = live.body.lock().await;
+            if inner.is_live(&live) {
+                let changed = Session {
+                    name,
+                    ..body.clone()
+                };
+                inner.write(changed.clone()).await?;
+                *body = changed;
+                return Ok(true);
+            }
+        }
+        let me = inner.me;
+        inner
+            .on_store(move |store| {
+                let Some(record) = store.session(id)? else {
+                    return Ok(false);
+                };
+                if record.owner != me || record.deleted {
+                    return Ok(false);
+                }
+                let record = Record {
+                    owner: me,
+                    version: store.own_next_version()?,
+                    deleted: false,
+                    body: Session {
+                        name,
+                        ..record.body
+                    },
+                };
+                store.apply(&AnyRecord::Session(record), me)?;
+                Ok(true)
+            })
+            .await
+    }
 }
 
 impl Drop for Sessions {
@@ -462,6 +510,7 @@ impl Inner {
                 terminal: TerminalId(uuid::Uuid::nil()),
                 model: model.to_string(),
                 state: SessionState::Starting,
+                name: None,
             }),
             activity,
             started: watch::Sender::new(None),
@@ -1322,6 +1371,7 @@ mod adopt_tests {
                 terminal,
                 model: "test-model".into(),
                 state: seed.state,
+                name: None,
             },
         }));
         for record in &records {
@@ -1590,6 +1640,7 @@ mod adopt_tests {
                     terminal,
                     model: "test-model".into(),
                     state: SessionState::Working,
+                    name: None,
                 },
             });
             store.apply(&session, me).unwrap();

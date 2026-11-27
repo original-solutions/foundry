@@ -740,6 +740,7 @@ mod tests {
                 terminal: TerminalId(id(sid + 1000)),
                 model: "m".into(),
                 state,
+                name: None,
             },
         }
     }

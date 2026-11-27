@@ -26,9 +26,21 @@ interface Actions {
   onNewSession: (workspace: string, name: string) => void;
 }
 
+/** Where a session's name is edited in place: its sidebar row or its tab. */
+export type Place = "row" | "tab";
+
 export interface Context extends Actions {
   /** The machine serving the UI, once known: only its workspaces get new terminals or are archived from here. */
   here?: string;
+  /** The session name being edited, by its terminal, and where. */
+  renaming?: { terminal: string; place: Place };
+  /**
+   * Edits the name of the session in terminal `id` at `place`; with no place, in its tab, opening
+   * the terminal first when it is not the one with the keyboard.
+   */
+  rename: (id: string, place?: Place) => void;
+  /** Closes the name being edited. */
+  stopRenaming: () => void;
   /** Ends terminal `id`: at once when it already ended, else after asking. */
   end: (id: string) => void;
   /** Removes ended terminals `ids`. */
@@ -57,6 +69,7 @@ export function TerminalActions({ children, ...actions }: Actions & { children: 
   const [failed, setFailed] = useState<string>();
   const [archiving, setArchiving] = useState<string>();
   const [archived, setArchived] = useState<{ name: string; branch: string }>();
+  const [renaming, setRenaming] = useState<{ terminal: string; place: Place }>();
   useEffect(() => {
     if (!archived) return;
     const timer = setTimeout(() => setArchived(undefined), ARCHIVED_FOR);
@@ -83,6 +96,12 @@ export function TerminalActions({ children, ...actions }: Actions & { children: 
     clear: (ids) => clearing.mutate(ids),
     shell: (workspace) => shell.mutate(workspace),
     archive: setArchiving,
+    renaming,
+    rename: (id, place) => {
+      if (!place && id !== actions.current) actions.onOpen(id);
+      setRenaming({ terminal: id, place: place ?? "tab" });
+    },
+    stopRenaming: () => setRenaming(undefined),
   };
   const target = asking ? locate(actions.machines, asking) : undefined;
   const leaving = archiving ? actions.machines.flatMap((m) => m.workspaces).find((w) => w.id === archiving) : undefined;
@@ -181,8 +200,9 @@ export interface Act {
 
 /**
  * What can be done with terminal `id` from here, in menu order: going to it or to what belongs to
- * it, starting something new beside it, and ending it. Any reachable machine's terminals can be
- * ended; only this machine's workspaces get new terminals or are archived.
+ * it, and renaming a session, starting something new beside it, and ending it. Any reachable
+ * machine's terminals can be ended and its sessions renamed; only this machine's workspaces get
+ * new terminals or are archived.
  */
 export function actsFor(id: string, at: Context, found: Located, roomy = wide()): Act[] {
   const mine = found.machine.id === at.here;
@@ -193,6 +213,7 @@ export function actsFor(id: string, at: Context, found: Located, roomy = wide())
     id !== at.current && { key: "open", label: "Open", icon: "M3 3.5h10v9H3zM3 6h10", run: () => at.onOpen(id), group: "go" },
     !!at.current && id !== at.current && roomy && { key: "beside", label: "Open beside", icon: "M2.5 3h11v10h-11zM8 3v10", run: () => at.onBeside(id), group: "go" },
     !!found.session && { key: "steps", label: "Steps", icon: "M3 4h2M3 8h2M3 12h2M7 4h6M7 8h6M7 12h4", run: () => at.onSteps(id), group: "go" },
+    !!found.session && { key: "rename", label: "Rename", icon: "M10.5 2.5l3 3L6 13H3v-3z", run: () => at.rename(id), group: "go" },
     id === at.current &&
       !roomy && {
         key: "find",
@@ -254,12 +275,19 @@ export function Icon({ d }: { d: string }) {
   );
 }
 
+/** `at` with its rename editing at `place`, the row the menu was opened from, when there is one. */
+function renamingAt(at: Context, place: Place | undefined): Context {
+  return place ? { ...at, rename: (id) => at.rename(id, place) } : at;
+}
+
 /**
  * Terminal `id`'s row, which opens its menu on a right-click or a long press. Outside
- * `TerminalActions`, or for a terminal no longer listed, the row is shown as it is.
+ * `TerminalActions`, or for a terminal no longer listed, the row is shown as it is. A row that
+ * shows a session's name says which `place` it is, so the menu's Rename edits it there.
  */
-export function TerminalMenu({ id, children }: { id: string; children: ReactElement }) {
-  const at = useContext(Terminals);
+export function TerminalMenu({ id, place, children }: { id: string; place?: Place; children: ReactElement }) {
+  const terminals = useContext(Terminals);
+  const at = terminals && renamingAt(terminals, place);
   const focus = useReturnFocus();
   const found = at && locate(at.machines, id);
   if (!at || !found) return children;
@@ -277,9 +305,13 @@ export function TerminalMenu({ id, children }: { id: string; children: ReactElem
   );
 }
 
-/** The same menu from a button, for the terminal's header: the way in on a touch screen. */
+/**
+ * The same menu from a button, for the terminal's header: the way in on a touch screen. Its Rename
+ * edits the name in the open tab.
+ */
 export function TerminalMenuButton({ id }: { id: string }) {
-  const at = useContext(Terminals);
+  const terminals = useContext(Terminals);
+  const at = terminals && renamingAt(terminals, "tab");
   const focus = useReturnFocus();
   const found = at && locate(at.machines, id);
   if (!at || !found) return null;
@@ -287,7 +319,7 @@ export function TerminalMenuButton({ id }: { id: string }) {
     <DropdownMenu.Root modal={false}>
       <DropdownMenu.Trigger
         aria-label="More"
-        title="More: open beside, steps, changes, end"
+        title="More: open beside, steps, rename, changes, end"
         className="shrink-0 rounded p-1.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 data-[state=open]:bg-neutral-800 data-[state=open]:text-neutral-100"
       >
         <svg viewBox="0 0 16 16" className="size-4" fill="currentColor" aria-hidden="true">

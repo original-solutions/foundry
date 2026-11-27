@@ -561,6 +561,7 @@ mod tests {
                 terminal: TerminalId::random(),
                 model: "claude-opus-5-5".into(),
                 state,
+                name: None,
             },
         });
         store.apply(&record, owner).unwrap();

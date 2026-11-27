@@ -67,6 +67,13 @@ const groups: { where: string; keys: [string[], string][] }[] = [
     ],
   },
   {
+    where: "A name being edited, a machine's or a session's",
+    keys: [
+      [["Enter"], "Save the name; an empty one clears a session's"],
+      [["Esc"], "Put the name back"],
+    ],
+  },
+  {
     where: "A reply box, on a card or a toast",
     keys: [
       [["Enter"], "Send the reply"],

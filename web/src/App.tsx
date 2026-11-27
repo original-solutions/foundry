@@ -102,7 +102,8 @@ import { needsYou } from "./labels";
  * scrollback of the terminal with the keyboard; the bar follows it as the steps column does.
  *
  * Each session is named by its first prompt, and a busy one says what it is doing, from the
- * daemon's briefs of its hooks.
+ * daemon's briefs of its hooks. A name you give it shows in place of the first prompt on every
+ * machine: double-click its name in the sidebar or its tab, or pick Rename in its menu.
  *
  * The browser tab shows the fleet's state in its title and icon. A session you are not looking at
  * that finishes its turn or needs you is told once: as a card at the top right while you are at

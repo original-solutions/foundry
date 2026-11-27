@@ -1494,6 +1494,7 @@ describe("App", () => {
     expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual([
       "Open",
       "Steps",
+      "Rename",
       "Changes in fix login",
       "New session in fix login",
       "New shell in fix login",
@@ -1584,6 +1585,55 @@ describe("App", () => {
 
     fireEvent.click(within(shell()).getByRole("button", { name: "Close steps" }));
     expect(screen.queryByRole("complementary", { name: "Steps" })).toBeNull();
+  });
+
+  it("renames a session from its tab: a double-click swaps the name for a field, Enter saves, and the name the owner writes shows everywhere", async () => {
+    briefs = { s1: { title: "fix the login redirect", now: null } };
+    const calls = mockActions(new Response(null, { status: 204 }));
+    await open("/terminals/t1", live);
+    const tabs = screen.getByRole("tablist", { name: "Terminals in fix login" });
+    const tab = await within(tabs).findByRole("tab", { name: /^sonnet fix the login redirect/ });
+    expect(tab.getAttribute("href")).toBe("/terminals/t1");
+
+    fireEvent.doubleClick(tab);
+    const field = within(tabs).getByRole<HTMLInputElement>("textbox", { name: "Session name" });
+    expect(field.value).toBe("fix the login redirect");
+    fireEvent.change(field, { target: { value: "login redirect" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(within(tabs).queryByRole("textbox")).toBeNull());
+    expect(calls).toEqual([{ url: "/api/sessions/s1/rename", method: "POST", body: { name: "login redirect" } }]);
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "working", { model: "sonnet", version: 2, name: "login redirect" }) })));
+    expect(within(tabs).getByRole("tab", { name: /^sonnet login redirect/ })).toBeDefined();
+    expect(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /^sonnet login redirect/ })).toBeDefined();
+  });
+
+  it("offers Rename in a session's menu, which opens the field where the menu was opened, and none for a shell", async () => {
+    const calls = mockActions();
+    await open("/terminals/t1", live);
+    const sidebar = screen.getByRole("group", { name: "fix login" });
+    const tabs = screen.getByRole("tablist", { name: "Terminals in fix login" });
+
+    fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^sonnet/ }));
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Rename" }));
+    const field = await within(sidebar).findByRole<HTMLInputElement>("textbox", { name: "Session name" });
+    expect(field.value).toBe("");
+    expect(within(tabs).queryByRole("textbox")).toBeNull();
+    fireEvent.keyDown(field, { key: "Escape" });
+    expect(within(sidebar).queryByRole("textbox")).toBeNull();
+
+    fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell/ }));
+    const menu = await screen.findByRole("menu");
+    expect(within(menu).queryByRole("menuitem", { name: "Rename" })).toBeNull();
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+
+    fireEvent.keyDown(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "More" }), { key: "Enter" });
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Rename" }));
+    expect(await within(tabs).findByRole("textbox", { name: "Session name" })).toBeDefined();
+    expect(within(sidebar).queryByRole("textbox")).toBeNull();
+    expect(calls).toEqual([]);
   });
 
   it("opens a workspace's changes at a file its terminal names, on ⌘-click", async () => {

@@ -1,10 +1,11 @@
 import { Link } from "@tanstack/react-router";
 import { DropdownMenu } from "radix-ui";
-import { useEffect, useRef } from "react";
-import { rows, type MachineView, type WorkspaceView } from "./fleet";
+import { useEffect, useRef, type ReactNode } from "react";
+import { rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { useWidth } from "./media";
 import { Named } from "./Now";
 import { glyphText, StateGlyph } from "./StateGlyph";
+import { SessionNameField, useRenaming } from "./SessionName";
 import { TerminalMenu, useTerminalActions } from "./TerminalMenu";
 
 interface Props {
@@ -23,11 +24,11 @@ interface Props {
  * The tabs in a terminal's bar: its workspace's terminals, its sessions then its shells as the
  * sidebar lists them, one tab each with its live state, so its agent and its shells are one click
  * apart. The open tab says its state; a tab whose state changed while it was in the background
- * says its new state until it is shown. The + at the end, which stays in sight while the tabs
- * scroll, starts a session or a shell in the workspace, on the machine serving the UI only. In a
- * split each side's bar has its own tabs, as an editor's two groups do. On a narrow screen, in a
- * half of a split or in a tight bar, two or more tabs take a row of their own under the bar; one
- * sits in it.
+ * says its new state until it is shown. A double-click on a session's tab renames it in place.
+ * The + at the end, which stays in sight while the tabs scroll, starts a session or a shell in
+ * the workspace, on the machine serving the UI only. In a split each side's bar has its own tabs,
+ * as an editor's two groups do. On a narrow screen, in a half of a split or in a tight bar, two or
+ * more tabs take a row of their own under the bar; one sits in it.
  */
 export function TabStrip({ workspace, machine, active, changed, apart = false }: Props) {
   const strip = useRef<HTMLDivElement>(null);
@@ -53,25 +54,30 @@ export function TabStrip({ workspace, machine, active, changed, apart = false }:
         const current = row.terminal === active;
         const fresh = !current && changed.has(row.terminal);
         return (
-          <TerminalMenu key={row.terminal} id={row.terminal}>
-            <Link
-              to="/terminals/$terminalId"
-              params={{ terminalId: row.terminal }}
-              role="tab"
-              aria-selected={current}
-              data-changed={fresh ? "true" : undefined}
-              title={`${workspace.name} / ${row.title ?? row.name}: ${row.label}`}
-              className={`flex h-7 min-w-0 max-w-[60vw] shrink-0 items-center gap-2 rounded-md px-2 text-xs md:max-w-72 ${
-                current ? "bg-neutral-800 text-neutral-100 ring-1 ring-neutral-700" : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
-              }`}
-            >
-              <StateGlyph glyph={row.glyph} />
-              <span className={`flex min-w-0 ${fresh ? "font-semibold text-neutral-100" : ""}`}>
-                <Named name={row.name} title={row.title} />
-              </span>
-              {(current || fresh) && <span className={`shrink-0 font-medium ${glyphText[row.glyph]}`}>{row.label}</span>}
-            </Link>
-          </TerminalMenu>
+          <Tab key={row.terminal} row={row} current={current}>
+            {(rename) => (
+              <TerminalMenu id={row.terminal} place="tab">
+                <Link
+                  to="/terminals/$terminalId"
+                  params={{ terminalId: row.terminal }}
+                  role="tab"
+                  aria-selected={current}
+                  data-changed={fresh ? "true" : undefined}
+                  onDoubleClick={rename}
+                  title={`${workspace.name} / ${row.title ?? row.name}: ${row.label}`}
+                  className={`flex h-7 min-w-0 max-w-[60vw] shrink-0 items-center gap-2 rounded-md px-2 text-xs md:max-w-72 ${
+                    current ? "bg-neutral-800 text-neutral-100 ring-1 ring-neutral-700" : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
+                  }`}
+                >
+                  <StateGlyph glyph={row.glyph} />
+                  <span className={`flex min-w-0 ${fresh ? "font-semibold text-neutral-100" : ""}`}>
+                    <Named name={row.name} title={row.title} />
+                  </span>
+                  {(current || fresh) && <span className={`shrink-0 font-medium ${glyphText[row.glyph]}`}>{row.label}</span>}
+                </Link>
+              </TerminalMenu>
+            )}
+          </Tab>
         );
       })}
       {canAdd && (
@@ -103,6 +109,22 @@ export function TabStrip({ workspace, machine, active, changed, apart = false }:
           </DropdownMenu.Portal>
         </DropdownMenu.Root>
       )}
+    </div>
+  );
+}
+
+/**
+ * One tab, or, while its session's name is edited here, the field in its place, as wide as a
+ * name needs. `children` draws the tab and is given what starts the edit: a double-click on a
+ * session's tab, and nothing on a shell's.
+ */
+function Tab({ row, current, children }: { row: Row; current: boolean; children: (rename: (() => void) | undefined) => ReactNode }) {
+  const naming = useRenaming(row.terminal, "tab");
+  if (!naming?.editing || !row.session) return <>{children(row.session ? naming?.start : undefined)}</>;
+  return (
+    <div role="tab" aria-selected={current} className="flex h-7 w-80 max-w-[85vw] shrink-0 items-center gap-2 rounded-md bg-neutral-800 px-2 text-xs ring-1 ring-neutral-700">
+      <StateGlyph glyph={row.glyph} />
+      <SessionNameField session={row.session} name={row.title ?? ""} onClose={naming.stop} inline className="text-xs" />
     </div>
   );
 }
