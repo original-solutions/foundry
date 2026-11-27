@@ -1556,6 +1556,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         ("GET", &changes, None, false),
         ("GET", &commit, None, false),
         ("GET", &shipping, None, false),
+        ("POST", &shipping, None, false),
     ];
     for (method, path, body, upgrade) in routes {
         for (name, value) in [
@@ -2676,6 +2677,48 @@ async fn a_pull_request_read_hides_credentials_in_its_title_and_link() {
     assert!(!reply.body.contains("hunter2"), "{}", reply.body);
 }
 
+#[tokio::test]
+async fn a_post_to_pr_answers_what_the_get_answers_with_credentials_hidden() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let gh = tempfile::tempdir().unwrap();
+    let answer = gh.path().join("answer.json");
+    let stub = gh.path().join("gh");
+    std::fs::write(&stub, format!("#!/bin/sh\ncat '{}'\n", answer.display())).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon = Daemon::start_with(TURN, built("foundry-holder"), &[], None, Some(&stub)).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "twin").await;
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "twin"]);
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    let head = String::from_utf8(out.stdout).unwrap();
+    std::fs::write(
+        &answer,
+        format!(
+            r#"[{{"number":9,"title":"mirror to https://bot:hunter2@example.com/r.git","url":"https://bot:hunter2@github.com/o/r/pull/9","state":"OPEN","isDraft":false,"reviewDecision":"","statusCheckRollup":[],"headRefOid":"{}"}}]"#,
+            head.trim()
+        ),
+    )
+    .unwrap();
+
+    let path = format!("/api/workspaces/{workspace}/pr");
+    let read = daemon.call("GET", &path, None).await;
+    let post = daemon.call("POST", &path, None).await;
+    assert_eq!(read.status, 200, "{}", read.body);
+    assert_eq!(post.status, read.status, "{}", post.body);
+    assert_eq!(post.json(), read.json());
+    assert_eq!(post.json()["pr"]["number"], 9, "{}", post.body);
+    assert!(!post.body.contains("hunter2"), "{}", post.body);
+
+    let missing = format!("/api/workspaces/{}/pr", WorkspaceId::random());
+    assert_eq!(daemon.call("POST", &missing, None).await.status, 404);
+}
+
 // --- calls carried to another machine ---
 
 /// A workspace of `owner`, held here as a peer's record is.
@@ -3027,6 +3070,28 @@ async fn a_carried_action_on_another_machines_workspace_runs_only_here_and_is_40
     let path = format!("/api/workspaces/{workspace}/shells");
     let reply = carried(&daemon, &path, None).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_carried_pr_read_on_another_machines_workspace_runs_only_here_and_is_404() {
+    let daemon = Daemon::new(TURN).await;
+    let peer = daemon.add_machine();
+    let workspace = peer_workspace(&daemon, peer);
+    let path = format!("/api/workspaces/{workspace}/pr");
+    let reply = carried(&daemon, &path, None).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_pr_read_posted_for_an_offline_machines_workspace_is_carried_and_503() {
+    let daemon = Daemon::new(TURN).await;
+    let peer = daemon.add_machine();
+    let workspace = peer_workspace(&daemon, peer);
+    let path = format!("/api/workspaces/{workspace}/pr");
+    let reply = daemon.call("POST", &path, None).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "peer is offline");
+    assert_eq!(daemon.call("GET", &path, None).await.status, 404);
 }
 
 #[tokio::test]

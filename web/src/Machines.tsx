@@ -211,6 +211,16 @@ function MachineCard({
         </span>
       </header>
       <p className="truncate px-4 font-mono text-[11px] text-neutral-600">{machine.id}</p>
+      <p className="px-4 pt-1 text-xs text-neutral-400">
+        {sample?.version ? (
+          <>
+            Version <span className="font-mono text-neutral-200">{sample.version}</span>
+          </>
+        ) : (
+          "Version unknown"
+        )}
+        {sample?.update_ready && <span className="text-sky-300"> · {sample.update_ready} waiting</span>}
+      </p>
       <div className="flex items-center justify-between gap-2 px-4 pt-1.5">
         <p className="min-w-0 text-xs text-neutral-400">{machine.limits ? limitsText(machine.limits) : "No limits"}</p>
         {machine.listed && <LimitsDialog machine={machine} />}

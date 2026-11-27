@@ -28,6 +28,8 @@
 //! - `POST /api/machines/{id}/limits` and `POST /api/machines/{id}/limits/clear`: set and clear a
 //!   machine's placement limits, see [`machine_limits`].
 //! - `POST /api/machines/{id}/remove`: removes a machine from the fleet, see [`machine_remove`].
+//! - `POST /api/machines/{id}/update` `{tag}`: installs the machine's ready release, from any
+//!   machine, see [`machine_update`].
 //! - `POST /api/workspaces` `{project, base, name, machine}`: makes a workspace, `201 {id}`, on
 //!   the machine `machine` names, or on this machine when it is absent. When the workspace is
 //!   made but its setup could not be started, it is still `201`, with an `error` beside the
@@ -50,11 +52,13 @@
 //! - `POST /api/workspaces/{id}/shells`: starts the daemon's `$SHELL` in the workspace, `201
 //!   {id}`.
 //! - `POST /api/terminals/{id}/close`: `204`.
+//! - `POST /api/workspaces/{id}/pr`: what `GET` of it answers, through the same handler; the
+//!   body is not read.
 //! - `POST /api/sessions/{id}/rename` `{name}`: names the session, shown in place of its first
 //!   prompt, `204`; see [`Sessions::rename`] for how the name is cut and hidden. A name that is
 //!   blank clears it. A session that is not this machine's, or is gone, is `404`.
 //!
-//!   These six actions, on a workspace, terminal or session another machine owns or a create
+//!   These seven actions, on a workspace, terminal or session another machine owns or a create
 //!   that names another machine, are carried to that machine and answered as it answers: see
 //!   [`carry`].
 //! - `POST /api/terminals/{id}/files?name=<name>`: keeps a file for the terminal and answers
@@ -64,7 +68,8 @@
 //! - `GET /api/workspaces/{id}/commits/{hash}`: what one commit on the workspace's branch
 //!   changed, see [`changes`]. Only a workspace of this machine.
 //! - `GET /api/workspaces/{id}/pr`: whether the workspace's branch is on `origin`, what is only
-//!   on this machine, and its pull request, see [`pr`]. Only a workspace of this machine.
+//!   on this machine, and its pull request, see [`pr`]. Only a workspace of this machine; a
+//!   `POST` of it is answered the same, and carried for another machine's.
 //!
 //!   These three reads of a workspace whose folder is no longer a git worktree of its project
 //!   are `404` too, saying so: archive it to remove the folder.
@@ -139,6 +144,7 @@ pub mod machine_limits;
 pub mod machine_names;
 pub mod machine_priority;
 pub mod machine_remove;
+pub mod machine_update;
 mod pr;
 pub mod projects;
 pub mod terminals;
@@ -214,7 +220,10 @@ pub fn router(api: Api) -> Router {
         .route("/api/workspaces/{id}/shells", post(start_shell))
         .route("/api/workspaces/{id}/changes", get(changes::changes))
         .route("/api/workspaces/{id}/commits/{hash}", get(changes::commit))
-        .route("/api/workspaces/{id}/pr", get(pr::shipping))
+        .route(
+            "/api/workspaces/{id}/pr",
+            get(pr::shipping).post(pr::shipping),
+        )
         .route("/api/briefs", get(briefs::briefs))
         .route("/api/machine", get(machine::machine))
         .route("/api/sessions/{id}/trail", get(trail::trail))
