@@ -3161,6 +3161,33 @@ mod tests {
                 assert!(calls(rig).is_empty());
             }
 
+            /// The `gh api graphql` approval reads among the calls the rig's GitHub was asked.
+            fn approval_reads(rig: &Rig) -> usize {
+                let query = format!("query={}", crate::factory::github::read::APPROVAL_QUERY);
+                rig.sim
+                    .calls()
+                    .iter()
+                    .filter(|call| call[..2] == ["api", "graphql"] && call.contains(&query))
+                    .count()
+            }
+
+            /// A takeover reads the issue's approval history once, whether it approves or not.
+            #[test]
+            fn a_takeover_reads_the_approval_history_once() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                rig.sim.set_approval(removed_by_the_claim("tom", &[]));
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(approval_reads(&rig), 1);
+
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(approval_reads(&rig), 1);
+            }
+
             /// The claim removed `factory:ready`: the run is approved on the newest label an
             /// instructor applied before it, and carried on.
             #[test]
