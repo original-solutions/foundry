@@ -129,7 +129,9 @@ impl Stop {
 }
 
 /// The stop each machine's carried calls fire after an answer that asks for one, by machine.
-/// Kept beside the peers rather than in them, so a daemon that gives none stops for no call.
+/// A daemon that gives none stops for no call. A second stop given for the same machine
+/// replaces the first, and none is ever removed. It lives here rather than in the peers' state
+/// only because #274 does not own `sync/mod.rs`; #334 moves it there and deletes this map.
 static STOPS: Mutex<BTreeMap<MachineId, Stop>> = Mutex::new(BTreeMap::new());
 
 /// The stop the peers of machine `me` were given, if any.
