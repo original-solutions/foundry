@@ -3,12 +3,12 @@
 //! The data directory holds `versions/<version>/{foundryd,foundry-holder}`, `current` (a
 //! relative link to one of them, which the service runs) and `update.json`. The check every
 //! ten minutes downloads, verifies and unpacks a newer tag into `versions/` and saves it as the
-//! ready tag; it never installs it. A version installed with a trial record in `update.json` is
-//! a trial: the daemon that starts from it counts its starts, and `update::run` calls it
+//! ready tag; it never installs it. [`install_ready`] installs the ready tag when asked, with a
+//! trial record in `update.json`. A version installed with a trial record is a trial: the daemon that starts from it counts its starts, and `update::run` calls it
 //! healthy once it has run for a minute. A trial that starts three times without becoming
 //! healthy is put back to the previous version and its tag is refused until a higher one
-//! appears. Nothing in this module writes a trial any more: a hand install (`foundryd install`)
-//! starts none. Only a daemon that runs from `<home>/current` takes part in any of this.
+//! appears. A hand install (`foundryd install`) starts no trial and clears the ready tag. Only a
+//! daemon that runs from `<home>/current` takes part in any of this.
 //!
 //! `foundryd install` and the daemon are separate processes that both change `update.json`
 //! and `current`, so every change to either is made while holding `<home>/update.lock`.
@@ -90,6 +90,22 @@ const VERSION_LIMIT: Duration = Duration::from_secs(10);
 
 /// Set once this daemon has run long enough to be healthy; the watchdog reads it.
 static HEALTHY: AtomicBool = AtomicBool::new(false);
+
+/// Why the ready tag was not installed. Neither holds a secret.
+#[derive(Debug, thiserror::Error)]
+pub enum InstallError {
+    /// The tag cannot be installed now, and nothing was changed apart from a stranded trial.
+    /// `ready` is the tag the sample's `update_ready` would report, and `reason` says which
+    /// case it was.
+    #[error("{reason}")]
+    NotReady {
+        ready: Option<String>,
+        reason: String,
+    },
+    /// The state could not be read or written, or `current` could not be pointed.
+    #[error("{0}")]
+    Failed(UpdateError),
+}
 
 /// Why a tag could not be made ready, or a version installed. None of these ever holds a secret.
 #[derive(Debug, thiserror::Error)]
@@ -229,7 +245,7 @@ fn unrunnable(error: &io::Error) -> bool {
 }
 
 /// A version a trial record in `update.json` names, which has not yet shown it stays up.
-/// Nothing in this module writes one now; a record an older release left is still honoured.
+/// [`install_ready`] writes one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trial {
     /// The version on trial, like `0.2.0`.
@@ -308,9 +324,8 @@ pub fn state(home: &Path) -> io::Result<State> {
 /// reads and writes `update.json`, removes or renames directories under `versions/` and moves
 /// `current` (no network, no copy and no child process), so the wait is short. The lock is let
 /// go when the value is dropped. Never take it twice in one thread: a second open of the file
-/// waits for the first. The check swaps a version into `versions/` under it ([`make_ready`]);
-/// a hand install's [`place_version`] still swaps before it takes it, until #273 adds the hand
-/// install's lock.
+/// waits for the first. The check and a hand install swap a version into `versions/` under it
+/// ([`make_ready`], [`place_version`]).
 fn lock(home: &Path) -> io::Result<Flock<File>> {
     let file = OpenOptions::new()
         .write(true)
@@ -586,7 +601,8 @@ pub(crate) fn above(version: &str, running: &str) -> bool {
 /// a trial of any other version. When `version` is lower it refuses `v<before>`, as an
 /// automatic rollback does, so the updater does not undo the install until a higher tag
 /// ships; a higher refusal already held stays. Returns the tag that is refused after a
-/// go-back, and `None` when the version did not go down. It takes no lock: `install` calls it
+/// go-back, and `None` when the version did not go down. It clears the ready tag, whatever
+/// version it installs. It takes no lock: `install` calls it
 /// as the `record` of [`commit_version`], which holds one.
 pub fn placed_by_hand(
     home: &Path,
@@ -598,6 +614,7 @@ pub fn placed_by_hand(
     if state.trial.as_ref().is_some_and(|t| t.version != version) {
         state.trial = None;
     }
+    state.ready = None;
     let went_back = lowered(before, version);
     if let Some(before) = before.filter(|_| went_back) {
         let held = state
@@ -624,9 +641,9 @@ fn pick(tags: &[String], running: &str, refused: Option<&str>) -> Option<String>
 }
 
 /// Makes `versions/<version>` from a fresh stage directory: `fill` puts the files in it,
-/// both binaries must be there and are made executable, then the stage is swapped in and
-/// [`commit_version`] records it and points `current` at it. The swap is made before the lock
-/// is taken; #273 moves it under the lock.
+/// both binaries must be there and are made executable. Then, under one hold of [`lock`], the
+/// stage is swapped in, `record` runs and `current` is pointed at it, so nothing runs between
+/// them. The stage is filled before the lock is taken. `record` must not take the lock itself.
 pub(crate) fn place_version(
     home: &Path,
     version: &str,
@@ -634,8 +651,12 @@ pub(crate) fn place_version(
     record: impl FnOnce() -> io::Result<()>,
 ) -> Result<(), UpdateError> {
     let stage = stage_version(home, version, fill)?;
-    let result =
-        swap_in(home, &stage, version).and_then(|()| commit_version(home, version, record));
+    let result = lock(home)
+        .map_err(io_error("cannot lock the update state"))
+        .and_then(|_lock| {
+            swap_in(home, &stage, version)?;
+            record_and_point(home, version, record)
+        });
     if result.is_err() {
         let _ = fs::remove_dir_all(&stage);
     }
@@ -727,8 +748,106 @@ pub(crate) fn commit_version(
     record: impl FnOnce() -> io::Result<()>,
 ) -> Result<(), UpdateError> {
     let _lock = lock(home).map_err(io_error("cannot lock the update state"))?;
+    record_and_point(home, version, record)
+}
+
+/// The body of [`commit_version`], for a caller that already holds [`lock`].
+fn record_and_point(
+    home: &Path,
+    version: &str,
+    record: impl FnOnce() -> io::Result<()>,
+) -> Result<(), UpdateError> {
     record().map_err(io_error("cannot save the update state"))?;
     point_current(home, version).map_err(io_error("cannot point current at the new version"))
+}
+
+/// The tag the sample's `update_ready` would report for `state`: the ready tag while it is above
+/// `running`, is not refused, has both binaries on disk and the daemon at `exe` runs from
+/// `current`.
+fn reportable(home: &Path, state: &State, exe: &Path, running: &str) -> Option<String> {
+    let ready = state.ready.as_deref()?;
+    (tag_version(ready).is_some_and(|version| above(version, running))
+        && state.refused.as_deref() != Some(ready)
+        && is_ready(home, ready)
+        && from_current(home, exe, running))
+    .then(|| ready.to_string())
+}
+
+/// Installs `tag`, the ready tag, when asked: it saves a trial of its version with `running` as
+/// `previous`, clears the ready tag in the same write, then points `current` at it. It never
+/// stops the daemon; its caller does. The whole call holds [`lock`]. A trial `current` does not
+/// name is cleared first, and stays cleared whatever the call answers. It refuses, with
+/// [`InstallError::NotReady`] and nothing else changed, when `tag` is not the ready tag (or
+/// its binaries are gone), is not above `running` or is refused, when `exe` is not run from
+/// `<home>/current`, when `current` does not name `running`, or when a trial is on. A refusal
+/// of a tag below `tag` is cleared; a higher one stays. If `current` cannot be pointed the state
+/// is saved back as it was.
+pub fn install_ready(
+    home: &Path,
+    tag: &str,
+    running: &str,
+    exe: &Path,
+) -> Result<(), InstallError> {
+    let failed = |what: &'static str| move |error| InstallError::Failed(io_error(what)(error));
+    let _lock = lock(home).map_err(failed("cannot lock the update state"))?;
+    let mut held = state(home).map_err(failed("cannot read the update state"))?;
+    let cleared = clear_stranded_trial(home, &mut held);
+    let ready = reportable(home, &held, exe, running);
+    let version = tag_version(tag).filter(|_| held.ready.as_deref() == Some(tag));
+    let refusal = match version {
+        Some(version) if is_ready(home, tag) => {
+            if !above(version, running) {
+                Some(format!("{tag} is not above the running version {running}"))
+            } else if held.refused.as_deref() == Some(tag) {
+                Some(format!("{tag} is refused"))
+            } else if current_version(home).as_deref() != Some(running) {
+                Some(format!(
+                    "current does not name the running version {running}"
+                ))
+            } else if !from_current(home, exe, running) {
+                Some(format!(
+                    "this daemon is not run from {}",
+                    home.join("current").display()
+                ))
+            } else {
+                held.trial
+                    .as_ref()
+                    .map(|trial| format!("a trial of {} is on", trial.version))
+            }
+        }
+        _ => Some(format!("{tag} is not the ready tag")),
+    };
+    if let Some(reason) = refusal {
+        if cleared {
+            save(home, &held).map_err(failed("cannot save the update state"))?;
+        }
+        return Err(InstallError::NotReady { ready, reason });
+    }
+    // `refusal` is `None` only when `version` is `Some`.
+    let version = version.unwrap_or_default();
+    let mut next = held.clone();
+    next.trial = Some(Trial {
+        version: version.to_string(),
+        previous: running.to_string(),
+        starts: 0,
+    });
+    next.ready = None;
+    if held
+        .refused
+        .as_deref()
+        .and_then(tag_version)
+        .is_none_or(|refused| above(version, refused))
+    {
+        next.refused = None;
+    }
+    save(home, &next).map_err(failed("cannot save the update state"))?;
+    if let Err(error) = point_current(home, version) {
+        if let Err(restore) = save(home, &held) {
+            tracing::warn!("the update state could not be put back: {restore}");
+        }
+        return Err(failed("cannot point current at the new version")(error));
+    }
+    Ok(())
 }
 
 /// Makes `tag` ready: `fetch` puts the release's files in a fresh stage directory, the

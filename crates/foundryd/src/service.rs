@@ -166,7 +166,8 @@ WantedBy=multi-user.target\n"
 /// Puts `exe` and the holder beside it in `versions/<version>` and points `current` there,
 /// and records the install: a version lower than the one `current` named is kept by refusing
 /// the higher one. Returns the tag a go-back left refused. A copy is made in a stage
-/// directory and renamed in; when `exe` already runs from that directory nothing is copied.
+/// directory outside the update lock and renamed in under it; when `exe` already runs from that
+/// directory nothing is copied.
 fn place(home: &Path, exe: &Path, version: &str) -> Result<Option<String>, UpdateError> {
     let from = exe.parent().unwrap_or(Path::new("."));
     let holder = from.join(HOLDER);
