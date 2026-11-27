@@ -607,15 +607,15 @@ describe("where a workspace's work stands", () => {
   });
 
   /** Renders the sidebar with `first`, and a button that swaps in `then`, as the socket's next state does. */
-  async function changing(first: ReturnType<typeof fleet>, then: ReturnType<typeof fleet>, beside?: (view: ReturnType<typeof fleet>) => ReactNode) {
+  async function changing(first: ReturnType<typeof fleet>, then: ReturnType<typeof fleet>, beside?: (view: ReturnType<typeof fleet>) => ReactNode, after = false) {
     function Changing() {
       const [view, setView] = useState(first);
       return (
         <>
           <button onClick={() => setView(then)}>next state</button>
-          {beside?.(view)}
+          {!after && beside?.(view)}
           <Sidebar machines={view} {...props} />
-          {beside?.(view)}
+          {after && beside?.(view)}
         </>
       );
     }
@@ -635,10 +635,13 @@ describe("where a workspace's work stands", () => {
     return null;
   }
 
-  it("sends one read for a glyph change that another reader of the entry also marks out of date", async () => {
+  it.each([
+    ["before", false],
+    ["after", true],
+  ])("sends one read for a glyph change that another reader of the entry, %s the sidebar, also marks out of date", async (_, after) => {
     const answers = [json(200, { ...ready, pr: null, pushed: false })];
     const calls = reads({ w1: () => answers.shift() ?? json(200, ready) });
-    await changing(fleet(mine("working"), both, {}, [ME, OTHER]), fleet(mine("idle"), both, {}, [ME, OTHER]), (view) => <AlsoInvalidates view={view} />);
+    await changing(fleet(mine("working"), both, {}, [ME, OTHER]), fleet(mine("idle"), both, {}, [ME, OTHER]), (view) => <AlsoInvalidates view={view} />, after);
     await lineOf("fix login", "demo · Building");
 
     fireEvent.click(screen.getByRole("button", { name: "next state" }));
