@@ -98,9 +98,10 @@ use foundry_proto::ids::SessionId;
 use foundry_proto::state::SessionState;
 
 use super::progress::{
-    RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, SendTries, TIME_LIMIT as TIME_LIMIT_CODE,
-    TURN_READ, pending_relaunch, read_progress,
+    LAUNCH_RESENDING, RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, SendTries,
+    TIME_LIMIT as TIME_LIMIT_CODE, TURN_READ, pending_relaunch, read_progress,
 };
+use super::start::StartStep;
 use super::{
     ActionPayload, Closing, Progress, RunContext, RunError, Stop, StuckStop, abandon,
     apply_actions, closed_issue, end_own_merge, end_run, finish_building, go_stuck, pending_send,
@@ -161,6 +162,9 @@ pub enum BuildStep {
     /// The run's pull request was merged or closed (or its own merge closed the issue): the run
     /// is ended.
     Ended,
+    /// No turn ended and the session's launch is `start`'s: what `start`'s pass did, which asks
+    /// for the launch again by count when the session has not taken it (the spec's step 3).
+    Launch(StartStep),
 }
 
 /// What [`time_limit`] decided.
@@ -1040,7 +1044,7 @@ mod tests {
         self, SESSION_GONE, TIME_LIMIT, WRONG_ACCOUNT, WorkLeft, reminder,
     };
     use crate::factory::worker::{Call, FleetView, WorkerError};
-    use crate::sessions::factory::{FactoryStart, SendRefused};
+    use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
     use crate::sessions::turns::TurnText;
 
     const SESSION: &str = "00000000-0000-0000-0000-0000000005e5";
@@ -5101,9 +5105,66 @@ mod tests {
             assert!(matches!(error, RunError::Invalid(_)), "{error}");
         }
 
+        /// The launch the session was started with, which `start` asks for again.
+        fn launch_sent_again() -> Call {
+            Call::Send {
+                session: session(),
+                message: messages::launch(REPO, ISSUE, LOGIN, None, BODY_PATH),
+                only_if_prompts: Some(0),
+            }
+        }
+
+        /// The spec's step 3: a building session idle with no turn ended has not taken its
+        /// launch (a daemon restart lost it before it was typed), and `start` asks for it
+        /// again by count, though the label moved to `building` with the start.
         #[test]
-        fn a_session_with_no_turn_ended_yet_is_left_to_start() {
+        fn a_session_that_has_not_taken_its_launch_is_asked_for_it_again_by_count() {
             let (mut rig, run) = built();
+            show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Ok(0));
+            let before = rig.events(&run).len();
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Resent { session: session() })
+            );
+            assert_eq!(sends(&rig), vec![launch_sent_again()]);
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [format!("{LAUNCH_RESENDING}0")]
+            );
+            assert_eq!(rig.sim.labels(), ["factory:building"]);
+        }
+
+        /// The worker decides: a launch whose count rose was typed, and nothing more is sent.
+        #[test]
+        fn a_launch_the_worker_refuses_with_its_count_risen_is_typed_once() {
+            let (mut rig, run) = built();
+            show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Err(SendRefused::CountRose { now: 1 }));
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Started { session: session() })
+            );
+            assert_eq!(sends(&rig), vec![launch_sent_again()]);
+        }
+
+        /// A session whose newest launch is a resume is `resume`'s to ask again, with the
+        /// resume's words: the build's launch is not sent to it.
+        #[test]
+        fn a_resumed_session_that_has_not_taken_its_message_is_left_to_resume() {
+            let (mut rig, run) = built();
+            rig.write(
+                &run,
+                Event::SessionInterrupted {
+                    resumes: 1,
+                    relaunch: false,
+                    run_ordinal: Some(1),
+                    branch: Some(BRANCH.into()),
+                    t3_error: None,
+                    ended_in_pass: 1,
+                },
+            );
+            rig.write(&run, launch(Some(BRANCH), Some(BRANCH), Some("main")));
             show(&mut rig, SessionState::Idle, 0, 0);
             let events = rig.events(&run).len();
             assert_eq!(pass(&rig, &run), BuildStep::Running);
