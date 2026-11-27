@@ -5525,6 +5525,39 @@ mod tests {
             }
         }
 
+        /// The fleet shows a session on a machine it cannot reach as it last saw it. One that may
+        /// be at work there after it reported its pull request keeps the run running.
+        #[test]
+        fn a_session_that_cannot_be_reached_and_may_be_at_work_keeps_the_run_running() {
+            let cases: [(&str, u64, u64, Option<&str>); 3] = [
+                ("a prompt after its newest turn", 1, 2, None),
+                ("a newer turn not read", 2, 2, None),
+                (
+                    "a message sent and not shown yet",
+                    1,
+                    1,
+                    Some("send-intent forward-comment c1 1"),
+                ),
+            ];
+            for (case, turn, prompts, step) in cases {
+                let (mut rig, run) = built();
+                end_turn(&mut rig, 1, DONE_MESSAGE);
+                assert!(matches!(
+                    pass(&rig, &run),
+                    BuildStep::ReadyForGate { pr: 12, .. }
+                ));
+                if let Some(step) = step {
+                    rig.step(&run, step);
+                }
+                show(&mut rig, SessionState::Unreachable, turn, prompts);
+                let events = rig.events(&run).len();
+                assert_eq!(pass(&rig, &run), BuildStep::Running, "{case}");
+                assert_eq!(rig.events(&run).len(), events, "{case}");
+                assert_eq!(turn_reads(&rig), 1, "{case}");
+                assert!(sends(&rig).is_empty(), "{case}");
+            }
+        }
+
         #[test]
         fn a_relaunch_decided_for_a_gate_failure_is_resumes() {
             let (rig, run) = built();

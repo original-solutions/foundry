@@ -3014,6 +3014,18 @@ mod tests {
     /// The fleet shows the session in `state` with the newest turn `turn` (and as many prompts),
     /// and the gate workspaces `gates`. `turn` 0 shows no turn record.
     fn show(rig: &mut Rig, run: &RunId, state: SessionState, turn: u64, gates: &[G]) {
+        show_prompts(rig, run, state, turn, turn, gates);
+    }
+
+    /// As [`show`], the session having had `prompts` prompts by its turn `turn`.
+    fn show_prompts(
+        rig: &mut Rig,
+        run: &RunId,
+        state: SessionState,
+        turn: u64,
+        prompts: u64,
+        gates: &[G],
+    ) {
         let mut view = gate_machine(FleetView::builder()).session(session_record(state));
         if turn > 0 {
             view = view.turn(SessionTurn {
@@ -3021,7 +3033,7 @@ mod tests {
                 workspace: workspace(),
                 project: project_id(),
                 turn,
-                prompts: turn,
+                prompts,
                 question: false,
             });
         }
@@ -3623,6 +3635,64 @@ mod tests {
             rig.worker.on_create(Ok(gate_ws(1)));
             assert_eq!(go(&rig, &run), GateStep::Running);
             assert!(has_step(&rig, &run, &format!("{GATE_REQUESTED}1 1 {HEAD}")));
+        }
+
+        /// The fleet shows a session on a machine it cannot reach as it last saw it. One that may
+        /// be at work there is waited for, as one shown working is, so its work is not passed by.
+        #[test]
+        fn the_pull_request_of_a_session_that_cannot_be_reached_and_may_be_at_work_is_not_gated() {
+            let cases: [(&str, u64, u64, Option<&str>); 3] = [
+                ("a prompt after its newest turn", 1, 2, None),
+                ("a newer turn not read", 2, 2, None),
+                (
+                    "a message sent and not shown yet",
+                    1,
+                    1,
+                    Some("send-intent forward-comment c1 1"),
+                ),
+            ];
+            for (case, turn, prompts, step) in cases {
+                let (mut rig, run, hub) = built();
+                if let Some(step) = step {
+                    rig.step(&run, step);
+                }
+                show_prompts(
+                    &mut rig,
+                    &run,
+                    SessionState::Unreachable,
+                    turn,
+                    prompts,
+                    &[],
+                );
+                let before = rig.events(&run).len();
+                assert_eq!(go(&rig, &run), GateStep::NotReady, "{case}");
+                no_writes(&rig);
+                assert_eq!(calls(&rig), vec![], "{case}");
+                assert_eq!(rig.events(&run).len(), before, "{case}");
+                assert_eq!(hub.reads(), Vec::<String>::new(), "{case}");
+            }
+        }
+
+        #[test]
+        fn a_failure_found_while_the_session_cannot_be_reached_waits_for_it_and_is_sent_once() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show(
+                &mut rig,
+                &run,
+                SessionState::Unreachable,
+                1,
+                &[exited(1, 101)],
+            );
+            rig.worker.on_tail(Ok(FAIL_TAIL.into()));
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert_eq!(sends(&rig), vec![]);
+            assert_eq!(step_count(&rig, &run, "send-intent"), 0);
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 101)]);
+            assert_eq!(go(&rig, &run), GateStep::SentBack { attempt: 1 });
+            assert_eq!(sends(&rig).len(), 1);
+            assert_eq!(rig.ctx().seen(&run).unwrap().sent_back_attempts.len(), 1);
         }
 
         #[test]
@@ -5464,7 +5534,8 @@ mod tests {
         #[test]
         fn a_gate_on_the_build_machine_cut_off_could_not_run_and_is_tried_again_while_the_session_is_away()
          {
-            // The gate and the build session are on one machine, which is cut off mid-gate.
+            // The fleet's one-machine case in the rig: the session is shown unreachable while
+            // its gate's machine is cut off mid-gate.
             let (mut rig, run, _hub) = built();
             place(&mut rig, &run, 1, 1);
             let cut_off = |rig: &mut Rig, minutes: u64| {
