@@ -4,11 +4,12 @@
 //! relative link to one of them, which the service runs) and `update.json`. The check every
 //! ten minutes downloads, verifies and unpacks a newer tag into `versions/` and saves it as the
 //! ready tag; it never installs it. [`install_ready`] installs the ready tag when asked, with a
-//! trial record in `update.json`. A version installed with a trial record is a trial: the daemon that starts from it counts its starts, and `update::run` calls it
-//! healthy once it has run for a minute. A trial that starts three times without becoming
-//! healthy is put back to the previous version and its tag is refused until a higher one
-//! appears. A hand install (`foundryd install`) starts no trial and clears the ready tag. Only a
-//! daemon that runs from `<home>/current` takes part in any of this.
+//! trial record in `update.json`. A version installed with a trial record is a trial: the
+//! daemon that starts from it counts its starts, and `update::run` calls it healthy once it
+//! has run for a minute. A trial that starts three times without becoming healthy is put back
+//! to the previous version and its tag is refused until a higher one appears. A hand install
+//! (`foundryd install`) starts no trial and clears the ready tag. Only a daemon that runs from
+//! `<home>/current` takes part in any of this.
 //!
 //! `foundryd install` and the daemon are separate processes that both change `update.json`
 //! and `current`, so every change to either is made while holding `<home>/update.lock`.
@@ -103,8 +104,8 @@ pub enum InstallError {
         reason: String,
     },
     /// The state could not be read or written, or `current` could not be pointed.
-    #[error("{0}")]
-    Failed(UpdateError),
+    #[error(transparent)]
+    Failed(#[from] UpdateError),
 }
 
 /// Why a tag could not be made ready, or a version installed. None of these ever holds a secret.
@@ -597,19 +598,22 @@ pub(crate) fn above(version: &str, running: &str) -> bool {
     matches!((parse(version), parse(running)), (Some(version), Some(running)) if version > running)
 }
 
-/// Records a hand install of `version` over `before` (the version `current` named). It ends
-/// a trial of any other version. When `version` is lower it refuses `v<before>`, as an
-/// automatic rollback does, so the updater does not undo the install until a higher tag
-/// ships; a higher refusal already held stays. Returns the tag that is refused after a
-/// go-back, and `None` when the version did not go down. It clears the ready tag, whatever
-/// version it installs. It takes no lock: `install` calls it
-/// as the `record` of [`commit_version`], which holds one.
+/// Records a hand install of `version` over `before` (the version `current` named). It runs as
+/// the `record` of [`place_version`] or [`commit_version`], both of which hold the lock, so it
+/// takes none. A trial `current` does not name is stranded and is cleared, as is a trial of
+/// any other version; a trial of `version` that `current` names stays, so installing it again
+/// does not stop its rollback. When `version` is lower it refuses `v<before>`, as an automatic
+/// rollback does, so the updater does not undo the install until a higher tag ships; a higher
+/// refusal already held stays. Returns the tag that is refused after a go-back, and `None`
+/// when the version did not go down. It clears the ready tag, whatever version it installs.
 pub fn placed_by_hand(
     home: &Path,
     version: &str,
     before: Option<&str>,
 ) -> io::Result<Option<String>> {
     let mut state = state(home)?;
+    // `current` still names `before` here, so a trial it does not name is one a crash stranded.
+    clear_stranded_trial(home, &mut state);
     // Installing the version that is on trial again must not stop its rollback.
     if state.trial.as_ref().is_some_and(|t| t.version != version) {
         state.trial = None;
@@ -788,43 +792,41 @@ pub fn install_ready(
     running: &str,
     exe: &Path,
 ) -> Result<(), InstallError> {
-    let failed = |what: &'static str| move |error| InstallError::Failed(io_error(what)(error));
-    let _lock = lock(home).map_err(failed("cannot lock the update state"))?;
-    let mut held = state(home).map_err(failed("cannot read the update state"))?;
+    let _lock = lock(home).map_err(io_error("cannot lock the update state"))?;
+    let mut held = state(home).map_err(io_error("cannot read the update state"))?;
     let cleared = clear_stranded_trial(home, &mut held);
     let ready = reportable(home, &held, exe, running);
-    let version = tag_version(tag).filter(|_| held.ready.as_deref() == Some(tag));
-    let refusal = match version {
-        Some(version) if is_ready(home, tag) => {
-            if !above(version, running) {
-                Some(format!("{tag} is not above the running version {running}"))
-            } else if held.refused.as_deref() == Some(tag) {
-                Some(format!("{tag} is refused"))
-            } else if current_version(home).as_deref() != Some(running) {
-                Some(format!(
-                    "current does not name the running version {running}"
-                ))
-            } else if !from_current(home, exe, running) {
-                Some(format!(
-                    "this daemon is not run from {}",
-                    home.join("current").display()
-                ))
-            } else {
-                held.trial
-                    .as_ref()
-                    .map(|trial| format!("a trial of {} is on", trial.version))
+    let verdict: Result<&str, String> =
+        match tag_version(tag).filter(|_| held.ready.as_deref() == Some(tag)) {
+            None => Err(format!("{tag} is not the ready tag")),
+            Some(_) if !is_ready(home, tag) => {
+                Err(format!("{tag} is not ready: its binaries are gone"))
             }
+            Some(version) if !above(version, running) => {
+                Err(format!("{tag} is not above the running version {running}"))
+            }
+            Some(_) if held.refused.as_deref() == Some(tag) => Err(format!("{tag} is refused")),
+            Some(_) if current_version(home).as_deref() != Some(running) => Err(format!(
+                "current does not name the running version {running}"
+            )),
+            Some(_) if !from_current(home, exe, running) => Err(format!(
+                "this daemon is not run from {}",
+                home.join("current").display()
+            )),
+            Some(version) => match &held.trial {
+                Some(trial) => Err(format!("a trial of {} is on", trial.version)),
+                None => Ok(version),
+            },
+        };
+    let version = match verdict {
+        Err(reason) => {
+            if cleared {
+                save(home, &held).map_err(io_error("cannot save the update state"))?;
+            }
+            return Err(InstallError::NotReady { ready, reason });
         }
-        _ => Some(format!("{tag} is not the ready tag")),
+        Ok(version) => version,
     };
-    if let Some(reason) = refusal {
-        if cleared {
-            save(home, &held).map_err(failed("cannot save the update state"))?;
-        }
-        return Err(InstallError::NotReady { ready, reason });
-    }
-    // `refusal` is `None` only when `version` is `Some`.
-    let version = version.unwrap_or_default();
     let mut next = held.clone();
     next.trial = Some(Trial {
         version: version.to_string(),
@@ -840,12 +842,12 @@ pub fn install_ready(
     {
         next.refused = None;
     }
-    save(home, &next).map_err(failed("cannot save the update state"))?;
+    save(home, &next).map_err(io_error("cannot save the update state"))?;
     if let Err(error) = point_current(home, version) {
         if let Err(restore) = save(home, &held) {
             tracing::warn!("the update state could not be put back: {restore}");
         }
-        return Err(failed("cannot point current at the new version")(error));
+        return Err(io_error("cannot point current at the new version")(error).into());
     }
     Ok(())
 }
@@ -3968,7 +3970,10 @@ mod tests {
         // The hand install cleared the ready tag, so the answer is that it is not the ready
         // tag (the first rung of the ladder), with no ready tag left to report.
         match &error {
-            InstallError::NotReady { ready: None, reason } => {
+            InstallError::NotReady {
+                ready: None,
+                reason,
+            } => {
                 assert_eq!(reason, "v0.2.0 is not the ready tag");
             }
             other => panic!("{other:?}"),
