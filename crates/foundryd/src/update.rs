@@ -3819,6 +3819,23 @@ mod tests {
     }
 
     #[test]
+    fn install_ready_moves_nothing_when_it_cannot_save_the_trial() {
+        let (home, exe) = ready_home(Some("v0.1.5"));
+        let before = snapshot(home.path());
+        // A directory with something in it cannot be opened as the file the state is written
+        // to, so the save fails. `current` must not have moved ahead of it.
+        let temp = home.path().join("update.json.tmp");
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("in-the-way"), "x").unwrap();
+
+        let error = install_ready(home.path(), "v0.2.0", "0.1.0", &exe).unwrap_err();
+
+        assert!(matches!(error, InstallError::Failed(_)), "{error:?}");
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert_eq!(snapshot(home.path()), before);
+    }
+
+    #[test]
     fn install_ready_keeps_a_higher_refusal_and_clears_a_lower_one() {
         let (home, exe) = ready_home(Some("v0.9.2"));
         install_ready(home.path(), "v0.2.0", "0.1.0", &exe).unwrap();
