@@ -38,6 +38,7 @@ use crate::secrets::{self, GATEWAY, SecretsError};
 use crate::sessions::{self, Gateway, Sessions};
 use crate::store::{Store, StoreError};
 use crate::sync::Peers;
+use crate::sync::call::Stop;
 use crate::sync::ws::{self, WsDialer};
 use crate::tailscale::{AskError, Entry, host_names, own_entry, tailscale_ips};
 use crate::terminals::{TerminalError, Terminals};
@@ -340,6 +341,11 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_remove_routes = api::machine_remove::router(me, coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
+    // Fired once after an install's `202` has left, by the route or by a carried call's link.
+    let stop = Stop::sigterm();
+    peers.stop_after_calls(stop.clone());
+    let machine_update_routes = api::machine_update::router(api.clone(), home.clone(), stop)
+        .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_priority_routes = api::machine_priority::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let factory_routes = api::factory::view_router(api::factory::View {
@@ -359,6 +365,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .merge(machine_add_routes)
         .merge(machine_limit_routes)
         .merge(machine_remove_routes)
+        .merge(machine_update_routes)
         .merge(machine_priority_routes)
         .merge(factory_routes)
         .merge(ws::keyed_router(peers.clone(), keys.clone()));
