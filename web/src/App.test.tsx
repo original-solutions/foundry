@@ -770,6 +770,21 @@ describe("App", () => {
     expect(screen.queryByText("unknown")).toBeNull();
   });
 
+  it("starts a task from the machines view in the New task dialog, set to let Foundry choose", async () => {
+    const calls = mockActions(json(202, { request: "r1", reasons: [] }));
+    const fleet = settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "laptop", address: "100.64.0.2" }] });
+    await open("/machines", { type: "state", protocol: 1, records: [sample(ME, 1), sample(OTHER, 1, { load: 0.1 })], settings: fleet, online: [ME, OTHER] });
+
+    const head = await screen.findByRole("region", { name: "Next task" });
+    expect(head.textContent).toMatch(/laptop takes the next task/);
+    fireEvent.click(within(head).getByRole("button", { name: "New task, Foundry chooses the machine" }));
+    const dialog = await screen.findByRole("dialog", { name: "New task" });
+    fireEvent.change(within(dialog).getByLabelText("What should Claude work on?"), { target: { value: "Add search." } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0].body).toMatchObject({ name: "add search", machine: "choose" });
+  });
+
   const factoryOverview = (status: unknown = null) =>
     json(200, {
       settings: { paused: false, poll_seconds: 30, feedback_seconds: 300, max_runs: 2, max_gates: 3, model: "opus", effort: "high" },

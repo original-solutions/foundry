@@ -65,7 +65,8 @@ import { upNext } from "./needing";
  * The machines view (`/machines`, from the board's switch or a machine's name in the sidebar)
  * shows every machine as a card: its status, when it was last heard, its load drawn over the last
  * ten minutes from the samples this page has seen, its free memory and disk, its terminals by
- * state and its workspaces.
+ * state and its workspaces. It is headed by the machine a task Foundry places would go to now,
+ * each card says whether it has room, and either opens the New task dialog set to a machine.
  *
  * The Factory view (`/factory`, from the rail's factory link) shows the fleet's factory settings,
  * and for each project its lease holder and generation or why it is idle, the ready queue, live
@@ -140,8 +141,8 @@ function Layout() {
   /** The palette, and whether its picks open beside the open terminal. */
   const [jump, setJump] = useState<"jump" | "beside">();
   const [split, setSplit] = useState<Split>();
-  /** The New task dialog: open, and the task it starts with. */
-  const [create, setCreate] = useState({ open: false, task: "" });
+  /** The New task dialog: open, and the task and machine it starts with. */
+  const [create, setCreate] = useState({ open: false, task: "", machine: "" });
   /** Whether the steps column is shown. */
   const [stepsOpen, setStepsOpen] = useState(false);
   /** The find bar over the terminal with the keyboard: 0 closed, and one more each time it is asked for. */
@@ -247,9 +248,9 @@ function Layout() {
     setDrawer(false);
     setChangesOf({ workspace, file });
   };
-  const openCreate = (task = "") => {
+  const openCreate = (task = "", machine = "") => {
     setDrawer(false);
-    setCreate({ open: true, task });
+    setCreate({ open: true, task, machine });
   };
 
   useLayoutEffect(() => {
@@ -404,6 +405,7 @@ function Layout() {
                       onMenu={() => setDrawer(true)}
                       history={samples}
                       connected={connected}
+                      onCreate={(machine) => openCreate("", machine)}
                       onSteps={(id) => {
                         setStepsOpen(true);
                         show(id);
@@ -443,6 +445,7 @@ function Layout() {
             open={create.open}
             onOpenChange={(open) => setCreate((c) => ({ ...c, open }))}
             task={create.task}
+            machine={create.machine}
             onCreated={setLanding}
           />
           <KeySheet open={keysOpen} onOpenChange={setKeysOpen} />

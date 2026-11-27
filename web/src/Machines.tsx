@@ -4,8 +4,10 @@ import { useRef, useState, type ReactNode } from "react";
 import { post, refused, type Limits } from "./api";
 import { byUrgency, rows, type MachineView } from "./fleet";
 import { plural, urgency, type Glyph } from "./labels";
+import { NextTaskHead, RoomLine } from "./MachineRoom";
 import { button, dangerButton, field, fieldLook, Modal, primaryButton } from "./Modal";
 import { heardAgo, scaled, span, spanWords, type History, type Point } from "./samples";
+import { rooms, type Room } from "./room";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { useNow } from "./StepsPanel";
 
@@ -35,6 +37,11 @@ interface Props {
   /** The machine whose daemon serves this page. */
   here?: string;
   connected: boolean;
+  /**
+   * Opens the task box set to a machine: `""` for this one, `"choose"` to let Foundry choose, or
+   * another machine's id.
+   */
+  onCreate?: (machine: string) => void;
 }
 
 /**
@@ -45,8 +52,12 @@ interface Props {
  * order machines take the coordinator role, the one holding it marked, and each listed machine
  * moves up or down that order (the whole new order is posted, and the board follows the settings
  * that come back). The home's third view, under the head it shares with the board and the timeline.
+ *
+ * With another machine listed, the view is headed by where a task Foundry chooses the machine for
+ * would go now (`rooms`), and each card says whether it is that pick, has room or is full and by
+ * which limits. An online card starts a task on its machine; the head starts one Foundry places.
  */
-export function Machines({ machines, history, here, connected }: Props) {
+export function Machines({ machines, history, here, connected, onCreate }: Props) {
   // Moved on every second, for "heard 4 s ago" and the lines' sliding window.
   const now = useNow(1000);
   // Listed machines in the order they take the coordinator role, then the rest as given.
@@ -69,6 +80,13 @@ export function Machines({ machines, history, here, connected }: Props) {
     },
   });
   const waiting = move.isPending || posted?.from === shown;
+  const next = rooms(machines);
+  // Foundry chooses only among several: the task box offers it once another machine is listed.
+  const several = machines.some((m) => m.listed && m.id !== here);
+  const roomy = [...next.room.values()].filter((r) => r.kind === "pick" || r.kind === "room").length;
+  // A task goes to this machine, or to another listed one by id, and never to one offline.
+  const createOn = (machine: MachineView) =>
+    onCreate && machine.status === "online" && (machine.id === here || (machine.listed && here !== undefined)) ? () => onCreate(machine.id === here ? "" : machine.id) : undefined;
   return (
     <section aria-label="Machines" className="flex flex-col gap-6">
       {!connected && (
@@ -76,7 +94,16 @@ export function Machines({ machines, history, here, connected }: Props) {
           Disconnected from the daemon: these are the last numbers this page saw, until it reconnects.
         </p>
       )}
-      <div className="flex justify-end">
+      <div className="flex flex-wrap items-start justify-end gap-3">
+        {several && (
+          <NextTaskHead
+            pick={next.pick && machines.find((m) => m.id === next.pick)?.name}
+            count={machines.length}
+            roomy={roomy}
+            reasons={next.reasons}
+            onCreate={onCreate && (() => onCreate("choose"))}
+          />
+        )}
         <AddMachine machines={machines} />
       </div>
       {move.error && (
@@ -97,6 +124,9 @@ export function Machines({ machines, history, here, connected }: Props) {
             here={machine.id === here}
             known={here !== undefined}
             now={now}
+            room={next.room.get(machine.id) ?? { kind: "unknown" }}
+            several={several}
+            onCreate={createOn(machine)}
           />
         ))}
       </div>
@@ -121,6 +151,9 @@ function MachineCard({
   here,
   known,
   now,
+  room,
+  several,
+  onCreate,
 }: {
   machine: MachineView;
   order: string[];
@@ -131,6 +164,9 @@ function MachineCard({
   here: boolean;
   known: boolean;
   now: number;
+  room: Room;
+  several: boolean;
+  onCreate?: () => void;
 }) {
   const { sample, status } = machine;
   const away = status === "offline";
@@ -210,6 +246,7 @@ function MachineCard({
           <RemoveDialog machine={machine} />
         </div>
       )}
+      <RoomLine name={machine.name} room={room} several={several} onCreate={onCreate} />
 
       {sample ? (
         <div className={away ? "opacity-60 grayscale" : undefined}>

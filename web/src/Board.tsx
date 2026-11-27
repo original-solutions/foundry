@@ -92,6 +92,7 @@ export function Board({
   onMenu,
   history,
   connected,
+  onCreate,
 }: {
   machines: MachineView[];
   /** The fleet's projects, which a new task is started in. */
@@ -110,6 +111,8 @@ export function Board({
   history: History;
   /** Whether the page hears the daemon now, so the machines view can say its numbers stopped. */
   connected: boolean;
+  /** Opens the New task dialog set to a machine, from the machines view. */
+  onCreate?: (machine: string) => void;
 }) {
   const [kept, setKept] = useState(loadView);
   const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
@@ -172,7 +175,7 @@ export function Board({
             </div>
           </div>
           {view === "machines" ? (
-            <Machines machines={machines} history={history} here={here} connected={connected} />
+            <Machines machines={machines} history={history} here={here} connected={connected} onCreate={onCreate} />
           ) : view === "timeline" ? (
             <Timeline machines={machines} traced={traced} onSteps={onSteps} />
           ) : (

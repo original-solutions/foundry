@@ -103,6 +103,7 @@ export function Composer({
   doneLabel,
   onDone,
   initialTask = "",
+  initialMachine = "",
 }: {
   mode: "page" | "bar";
   /** The task box's id, so a heading elsewhere can label it. */
@@ -121,6 +122,8 @@ export function Composer({
   onDone?: () => void;
   /** The task the box opens with. */
   initialTask?: string;
+  /** The machine the box opens set to: empty for this machine, `"choose"`, or another machine's id. */
+  initialMachine?: string;
 }) {
   const [task, setTask] = useState(initialTask);
   const [name, setName] = useState("");
@@ -128,7 +131,7 @@ export function Composer({
   const [model, setModel] = useState("opus");
   const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
   /** The machine picked: empty for this machine. */
-  const [machine, setMachine] = useState("");
+  const [machine, setMachine] = useState(initialMachine);
   const [focused, setFocused] = useState(false);
   /** Whether the Projects dialog is open. */
   const [managing, setManaging] = useState(false);
