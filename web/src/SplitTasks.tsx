@@ -2,6 +2,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { safeBranch } from "./branch";
 import { makeWorkspace, SessionNotStarted, type CreateInput } from "./launch";
+import { buttonShape, pressed } from "./Modal";
 
 /** One item of a split task: the workspace it makes and the prompt its session starts on. */
 export interface Planned {
@@ -90,9 +91,7 @@ export function SplitButton({ count, split, disabled, onToggle }: { count: numbe
       disabled={disabled}
       onClick={onToggle}
       title={split ? "Make one workspace with the whole list as its task" : "Make a workspace per item, each with Claude at work on it"}
-      className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 font-medium disabled:opacity-50 motion-safe:animate-state-in ${
-        split ? "border-emerald-400/50 bg-emerald-400/10 text-emerald-300" : "border-dashed border-emerald-400/40 text-emerald-300/90 hover:border-emerald-400/70 hover:bg-emerald-400/5"
-      }`}
+      className={`flex shrink-0 items-center gap-1.5 ${buttonShape} ${pressed} border-neutral-700 text-neutral-300 hover:bg-neutral-800 motion-safe:animate-state-in`}
     >
       <ForkIcon className="size-3.5" />
       Split into {count} tasks

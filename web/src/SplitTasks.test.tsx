@@ -3,6 +3,7 @@ import { useState, type ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fleet } from "./fleet";
 import { Composer, useCreateWorkspace } from "./Composer";
+import { buttonShape, pressed } from "./Modal";
 import { NewTask } from "./NewTask";
 import { SplitEnded } from "./SplitTasks";
 import { ME, session, settings, terminal, workspace } from "./test-fixtures";
@@ -47,6 +48,8 @@ describe("a task written as a list", () => {
     fireEvent.change(taskBox(dialog), { target: { value: list } });
     const split = within(dialog).getByRole("button", { name: "Split into 3 tasks" });
     expect(split.getAttribute("aria-pressed")).toBe("false");
+    // Drawn as the app's other switches are: the shared button with its pressed look.
+    expect(`${buttonShape} ${pressed}`.split(" ").filter((c) => !split.classList.contains(c))).toEqual([]);
     expect(within(dialog).getByRole("button", { name: "Start" })).toBeDefined();
   });
 

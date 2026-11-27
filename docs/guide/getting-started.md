@@ -73,7 +73,7 @@ Write the tasks as a list, one item per line, each starting with `-`, `*` or a n
 - You stay where you are. The new workspaces show up on the board and in the sidebar as they start.
 - An item's name is numbered as a single task's is, so a branch the repo already has does not stop it.
 - If one cannot be made, the others start all the same. The box keeps that item and says why.
-- If you close the box or leave the page before the last one starts, the amber card at the top right says how it went, until you press **Dismiss**.
+- If you close the box or leave the page before the last one starts and one of them did not start cleanly, the amber card at the top right says which and why, until you press **Dismiss**. When all of them started, no card shows.
 - Press **Split into 3 tasks** again to make one workspace with the whole list as its task.
 
 ## Projects
