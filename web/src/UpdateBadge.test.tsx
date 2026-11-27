@@ -39,7 +39,9 @@ function at(owner: string, version: number, update: Partial<Pick<MachineSample, 
 
 const machinesOf = (records: AnyRecord[]) => fleet(records, three);
 
-function show(records: AnyRecord[], here: string | undefined = ME) {
+/** Shows the badge over `records`, served by `here`; `null` for a page that does not know its machine yet. */
+function show(records: AnyRecord[], served: string | null = ME) {
+  const here = served ?? undefined;
   const view = render(<UpdateBadge machines={machinesOf(records)} here={here} />);
   return { ...view, update: (next: AnyRecord[]) => view.rerender(<UpdateBadge machines={machinesOf(next)} here={here} />) };
 }
@@ -116,7 +118,7 @@ describe("UpdateBadge", () => {
   });
 
   it("waits to install until it knows which machine serves the page", () => {
-    show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" })], undefined);
+    show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" })], null);
     fireEvent.click(badge());
     expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(true);
   });
@@ -186,13 +188,13 @@ describe("UpdateBadge", () => {
     it("6. Already changed, with the error text and the tag now ready, when the call answered 409", async () => {
       await installed((c) => c.answer({ status: 409, json: { error: "v0.9.1 is not ready", ready: "v0.9.2" } }));
       says(/^Already changed: v0\.9\.1 is not ready/);
-      says(/v0\.9\.2 is ready/);
+      says(/v0\.9\.2 is ready now/);
     });
 
     it("6. Already changed, with no tag when none is ready", async () => {
       await installed((c) => c.answer({ status: 409, json: { error: "nothing is ready", ready: null } }));
       says(/^Already changed: nothing is ready/);
-      expect(within(row("laptop")).queryByText(/is ready/)).toBeNull();
+      expect(within(row("laptop")).queryByText(/is ready now/)).toBeNull();
     });
 
     it("7. Failed, with the error text, on any other answer", async () => {
