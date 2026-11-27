@@ -910,13 +910,25 @@ fn the_coordinator_killed_during_a_build_and_the_next_carries_the_run_on_with_it
                 .count();
             assert_eq!(launches, 1, "the launch message was typed once");
             assert_eq!(rig.claims(12).len(), 1, "the issue was claimed once");
-            // Every machine still running holds the same events in the same order.
+            // Every machine still running holds the next coordinator's events in the same order.
+            // It writes on at every pass, so machine 2 is waited for until it holds what machine
+            // 1 held at pr-open. Of the old coordinator's events, each machine holds those its
+            // links sent before it died, and no machine passes on another's records, so one
+            // machine's are the first of the other's.
             until(
                 WAIT,
-                "machine 2 holds the run's events as machine 1 does",
-                || rig.events(2, &run) == rig.events(1, &run),
+                "machine 2 holds the next coordinator's events as machine 1 does",
+                || rig.events_by(2, &run, 1).starts_with(&events[old..]),
             )
             .await;
+            let (on_1, on_2) = (rig.events_by(1, &run, 0), rig.events_by(2, &run, 0));
+            assert!(
+                on_1.starts_with(&on_2) || on_2.starts_with(&on_1),
+                "machine 2 holds the old coordinator's events as machine 1 does, up to the last \
+                 one sent: {:?} and {:?}",
+                names(&on_1),
+                names(&on_2)
+            );
             rig.no_foreign_claim(&[1, 2]).await;
             rig.h.no_unknown_calls();
         },
