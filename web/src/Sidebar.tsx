@@ -1,6 +1,6 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named, Now } from "./Now";
@@ -20,7 +20,7 @@ import { ProjectFace } from "./ProjectFace";
 import { ThemeButton } from "./ThemeButton";
 import { railKey } from "./collapsed";
 import { pollEvery } from "./poll";
-import { CHECKS_EVERY, shippingQuery, standing, toneText } from "./Shipping";
+import { CHECKS_EVERY, checksPending, SHIPPING_STALE, shippingQuery, standing, toneText, useReadOnChange } from "./Shipping";
 import { useOnScreen } from "./cardChanges";
 import type { MachineSample } from "./api";
 
@@ -390,52 +390,19 @@ function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, 
  * leaves the project alone, and says nothing of why.
  */
 function StandingLine({ workspace, list, readable }: { workspace: WorkspaceView; list: Row[]; readable: boolean }) {
-  const client = useQueryClient();
   const [ref, onScreen] = useOnScreen<HTMLParagraphElement>();
   const enabled = readable && onScreen;
   const { data, isError } = useQuery({
     ...shippingQuery(workspace.id),
     enabled,
-    staleTime: 30_000,
+    staleTime: SHIPPING_STALE,
     retry: false,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
-    refetchInterval: (query) => {
-      const pending = query.state.data?.pr?.state === "open" && query.state.data.pr.checks === "pending";
-      return pollEvery(CHECKS_EVERY, enabled && pending)(query);
-    },
+    refetchInterval: (query) => pollEvery(CHECKS_EVERY, enabled && checksPending(query.state.data))(query),
   });
-  const glyphs = list.map((r) => `${r.terminal}:${r.glyph}`).join(" ");
-  const last = useRef(glyphs);
-  // Before any passive effect of this commit: what read, if any, was out when the glyph changed.
-  useLayoutEffect(() => {
-    if (last.current === glyphs) return;
-    last.current = glyphs;
-    const { queryKey } = shippingQuery(workspace.id);
-    const query = () => client.getQueryCache().find({ queryKey, exact: true });
-    const updates = () => (query()?.state.dataUpdateCount ?? 0) + (query()?.state.errorUpdateCount ?? 0);
-    const before = { read: query()?.promise, updates: updates() };
-    // A board card marks the same entry out of date on the same change, before or after this row.
-    // Waiting a tick lets its read start (or land) first, so the change is read once. A read that
-    // was out before the change may have asked before a push, so it does not count: once it lands,
-    // the row reads again unless another read has started since.
-    let live = true;
-    const settle = () => {
-      if (!live) return;
-      const read = query()?.promise;
-      if (read !== undefined && read === before.read) {
-        void read.then(settle, settle);
-        return;
-      }
-      const readSince = read !== undefined || (before.read === undefined && updates() !== before.updates);
-      if (!readSince) void client.invalidateQueries({ queryKey, exact: true });
-    };
-    const wait = setTimeout(settle, 0);
-    return () => {
-      live = false;
-      clearTimeout(wait);
-    };
-  }, [glyphs, client, workspace.id]);
+  // The row reads on a glyph change as a board card does (#311); the hook reads once when both do.
+  useReadOnChange(workspace.id, list.map((r) => `${r.terminal}:${r.glyph}`).join(" "));
 
   const working = list.some((r) => r.glyph === "starting" || r.glyph === "working");
   const stands = readable && data && !isError ? standing(data, working) : undefined;

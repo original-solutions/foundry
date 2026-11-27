@@ -573,9 +573,9 @@ describe("where a workspace's work stands", () => {
     await lineOf("fix login", "demo");
   });
 
-  it("says Building while a terminal works on a branch with no pull request", async () => {
+  it.each(["working", "starting"] as const)("says Building while a terminal is %s on a branch with no pull request", async (state) => {
     reads({ w1: () => json(200, { ...ready, pr: null, pushed: false }) });
-    await renderApp(<Sidebar machines={fleet(mine("working"), both, {}, [ME, OTHER])} {...props} />);
+    await renderApp(<Sidebar machines={fleet(mine(state), both, {}, [ME, OTHER])} {...props} />);
     const line = await lineOf("fix login", "demo · Building");
     expect(within(line).queryByRole("link")).toBeNull();
   });
@@ -604,6 +604,20 @@ describe("where a workspace's work stands", () => {
       ["/api/workspaces/w1/pr", "POST"],
       ["/api/workspaces/w1/pr", "POST"],
     ]);
+  });
+
+  it("reads only the workspace whose terminal changed glyph, not the others beside it", async () => {
+    const calls = reads({ w1: () => json(200, ready), w9: () => json(200, ready) });
+    const before = [sample(OTHER, 1), workspace(OTHER, "w9", "remote job"), terminal(OTHER, "t9", "w9"), session(OTHER, "s9", "w9", "t9", "working")];
+    await changing(fleet([...mine(), ...before], both, {}, [ME, OTHER]), fleet([...mine(), ...theirs], both, {}, [ME, OTHER]));
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    await lineOf("remote job", "demo · PR #88 · Ready to merge");
+    expect(calls).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "next state" }));
+    await waitFor(() => expect(calls).toHaveLength(3));
+    await act(() => new Promise((done) => setTimeout(done, 50)));
+    expect(calls.map((c) => c.url)).toEqual(["/api/workspaces/w1/pr", "/api/workspaces/w9/pr", "/api/workspaces/w9/pr"]);
   });
 
   /** Renders the sidebar with `first`, and a button that swaps in `then`, as the socket's next state does. */

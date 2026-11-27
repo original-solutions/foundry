@@ -1,4 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useLayoutEffect, useRef } from "react";
 import { workspaceShipping, type PullRequest, type Shipping } from "./api";
 import { plural, words } from "./labels";
 import { buttonShape } from "./Modal";
@@ -9,6 +10,51 @@ export const shippingQuery = (workspace: string) => ({ queryKey: ["pr", workspac
 
 /** How often a pull request whose checks still run is read again while it is shown. */
 export const CHECKS_EVERY = 60_000;
+
+/** How long a read of where a branch stands is fresh: each read runs git and asks GitHub on the owner. */
+export const SHIPPING_STALE = 30_000;
+
+/** Whether `s` has an open pull request whose checks still run, so it is worth reading again on `CHECKS_EVERY`. */
+export const checksPending = (s: Shipping | undefined) => s?.pr?.state === "open" && s.pr.checks === "pending";
+
+/**
+ * Reads `workspace`'s shared entry once after each change of `change` (its terminals' glyphs: a turn
+ * that ends may have pushed or opened a pull request). A board card marks the same entry out of date
+ * on the same change, before or after this caller (`useCardChanges` in cardChanges.ts, outside the
+ * files #311 owns, so the two are not merged into one owner). Waiting a tick lets its read start (or
+ * land) first, so the change is read once. A read that was out before the change may have asked
+ * before a push, so it does not count: once it lands, the entry is read again unless another read
+ * has started since.
+ */
+export function useReadOnChange(workspace: string, change: string) {
+  const client = useQueryClient();
+  const last = useRef(change);
+  // Before any passive effect of this commit: what read, if any, was out when the change came.
+  useLayoutEffect(() => {
+    if (last.current === change) return;
+    last.current = change;
+    const { queryKey } = shippingQuery(workspace);
+    const query = () => client.getQueryCache().find({ queryKey, exact: true });
+    const updates = () => (query()?.state.dataUpdateCount ?? 0) + (query()?.state.errorUpdateCount ?? 0);
+    const before = { read: query()?.promise, updates: updates() };
+    let live = true;
+    const settle = () => {
+      if (!live) return;
+      const read = query()?.promise;
+      if (read !== undefined && read === before.read) {
+        void read.then(settle, settle);
+        return;
+      }
+      const readSince = read !== undefined || (before.read === undefined && updates() !== before.updates);
+      if (!readSince) void client.invalidateQueries({ queryKey, exact: true });
+    };
+    const wait = setTimeout(settle, 0);
+    return () => {
+      live = false;
+      clearTimeout(wait);
+    };
+  }, [change, client, workspace]);
+}
 
 export type Tone = "quiet" | "warn" | "bad" | "good" | "merged";
 
@@ -137,12 +183,9 @@ export function ShipLine({
   const { data } = useQuery({
     ...shippingQuery(workspace),
     enabled,
-    staleTime: 30_000,
+    staleTime: SHIPPING_STALE,
     retry: false,
-    refetchInterval: (query) => {
-      const pending = query.state.data?.pr?.state === "open" && query.state.data.pr.checks === "pending";
-      return pollEvery(every ?? CHECKS_EVERY, enabled && (every !== undefined || pending))(query);
-    },
+    refetchInterval: (query) => pollEvery(every ?? CHECKS_EVERY, enabled && (every !== undefined || checksPending(query.state.data)))(query),
   });
   const line = data && shipLine(data);
   if (!line) return null;
