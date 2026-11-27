@@ -139,7 +139,7 @@ describe("lanes of factory runs", () => {
     expect(of(board[0].workspaces[0])).toBeUndefined();
   });
 
-  it("keeps a factory session P1 marks stuck under working, shown as quiet with how long, while a session by hand that is stuck needs you", () => {
+  it("keeps a factory session P1 marks stuck under working, shown as Quiet 10+ min, while a session by hand that is stuck needs you", () => {
     const result = lanes(board, factory("p1", { "o__r__162__1": ["w1"] }));
     expect(named(result)).toEqual([
       ["needs", ["by hand"]],
@@ -161,6 +161,13 @@ describe("lanes of factory runs", () => {
     const info = factory("p1", {}, { "o__r__170__1": { kind: "needs_info", workspaces: ["w2"] } });
     // With no live run, w1's stuck session is P1's to show, so it needs you as any other would.
     expect(named(lanes(board, info))).toEqual([["needs", ["fac/162-1", "by hand", "fac/170-1"]]]);
+  });
+
+  it("leaves a held-up run's stuck session saying Stuck, on its card under needs you", () => {
+    const result = lanes(board, factory("p1", {}, { "o__r__162__1": { kind: "stuck", workspaces: ["w1"] } }));
+    const card = result[0].cards.find((c) => c.workspace.id === "w1");
+    expect(result[0].lane).toBe("needs");
+    expect(card?.rows.map((r) => r.label)).toEqual(["Stuck"]);
   });
 
   it("keeps a live run's session that waits for an answer out of needs you", () => {
