@@ -107,7 +107,7 @@ Point at an unfolded workspace and a row of buttons shows at the right of its br
 - **Changes.** Opens the changes sheet.
 - **New session.** Asks for a model and a first prompt, then starts Claude Code in this workspace.
 - **New shell.** Opens a shell in this workspace. It shows in the list, where you can open it.
-- **Clear N ended.** Only on this machine, and only when some terminals have ended.
+- **Clear N ended.** Only when some terminals have ended.
 - **Archive.** Only on this machine.
 
 [End, clear and archive](sessions.md#end-clear-and-archive) says what the last two do.
