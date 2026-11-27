@@ -3015,6 +3015,70 @@ mod tests {
                 assert!(calls(&rig).is_empty());
                 assert!(rig.finished(&run));
             }
+
+            /// What GitHub answers once the claim swapped `factory:ready` for `factory:triage`:
+            /// the label `by` applied at [`LABELED_AT`], then the claim's removal of it, so no
+            /// label is in force.
+            fn removed_by_the_claim(by: &str, edits_by: &[(&str, &str)]) -> String {
+                let mut answer: serde_json::Value =
+                    serde_json::from_str(&approval_answer(LABELED_AT, by, edits_by)).unwrap();
+                let timeline = &mut answer["data"]["repository"]["issue"]["timelineItems"];
+                timeline["totalCount"] = 2.into();
+                timeline["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "__typename": "UnlabeledEvent",
+                        "createdAt": "2026-10-04T10:05:00Z",
+                        "actor": {"__typename": "User", "login": LOGIN},
+                        "label": {"name": "factory:ready"},
+                    }));
+                answer.to_string()
+            }
+
+            /// The claim removed `factory:ready`: the run is approved on the newest label an
+            /// instructor applied before it, and carried on.
+            #[test]
+            fn records_the_approval_of_the_label_the_claim_removed() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                rig.sim.set_approval(removed_by_the_claim("tom", &[]));
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.steps(&run)[0], format!("approved {LABELED_AT}"));
+                assert!(!rig.finished(&run));
+            }
+
+            #[test]
+            fn a_label_the_claim_removed_that_a_stranger_applied_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                rig.sim.set_approval(removed_by_the_claim("mallory", &[]));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: CANNOT_CONFIRM.into()
+                    }
+                );
+                assert!(calls(&rig).is_empty());
+            }
+
+            #[test]
+            fn a_text_a_stranger_edited_after_the_label_the_claim_removed_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                rig.sim.set_approval(removed_by_the_claim(
+                    "tom",
+                    &[("2026-10-04T10:01:00Z", "mallory")],
+                ));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: CANNOT_CONFIRM.into()
+                    }
+                );
+                assert!(calls(&rig).is_empty());
+            }
         }
 
         mod the_setup {
