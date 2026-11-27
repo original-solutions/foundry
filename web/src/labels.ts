@@ -16,9 +16,9 @@ export const sessionLabel: Record<SessionState, string> = {
   unreachable: "Unreachable",
 };
 
-/** A shell's state in the same words as a session's: a clean exit has Ended, any other Failed with its code. */
+/** A shell's state in the same words as a session's: a clean exit has Ended, any other Failed with its code. A live shell is only known to be Open, not whether a command runs in it. */
 export function terminalLabel(state: TerminalState, exitCode: number | null): string {
-  if (state === "running") return "Running";
+  if (state === "running") return "Open";
   if (state === "unreachable") return sessionLabel.unreachable;
   return exitCode ? `${sessionLabel.failed} · exit ${exitCode}` : sessionLabel.finished;
 }

@@ -22,7 +22,7 @@ On a phone the bar also has a button that opens the workspaces list, and a **Jum
 
 A session is Claude Code. A shell is a plain command line in the same worktree, for running tests, checking git or making an edit yourself. Both show in the tab strip and the sidebar, and both take typing: click in the terminal and type.
 
-Only a session reports what it is doing. A shell shows **Running** while it is open, **Ended** after a clean exit and **Failed · exit N** after any other.
+Only a session reports what it is doing. A shell shows **Open** while it is open, **Ended** after a clean exit and **Failed · exit N** after any other.
 
 ### Start a session or a shell
 
