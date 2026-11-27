@@ -3608,6 +3608,23 @@ mod tests {
     }
 
     #[test]
+    fn install_ready_refuses_a_tag_with_binaries_on_disk_that_is_not_the_ready_tag() {
+        let (home, exe) = ready_home(None);
+        let other = home.path().join("versions/0.3.0");
+        fs::create_dir_all(&other).unwrap();
+        release(&other, "0.3.0");
+        refuses(
+            home.path(),
+            &exe,
+            "v0.3.0",
+            "0.1.0",
+            Some("v0.2.0"),
+            "v0.3.0 is not the ready tag",
+            None,
+        );
+    }
+
+    #[test]
     fn install_ready_refuses_a_ready_tag_whose_binaries_are_gone() {
         let (home, exe) = ready_home(None);
         fs::remove_file(home.path().join("versions/0.2.0/foundry-holder")).unwrap();
