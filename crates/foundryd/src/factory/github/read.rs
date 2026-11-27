@@ -2875,6 +2875,140 @@ mod tests {
         assert_eq!(fake.calls()[0][..3], args(&["issue", "view", "7"])[..]);
     }
 
+    // Several issues' labels in one read.
+
+    /// The one call that reads the labels of `numbers`, as `issue_labels` makes it.
+    fn issue_labels_call(numbers: &[u64]) -> Vec<String> {
+        let asked: Vec<String> = numbers
+            .iter()
+            .map(|n| {
+                format!("i{n}: resource(url: \"https://github.com/{REPO}/issues/{n}\") {{ ...Labelled }}")
+            })
+            .collect();
+        args(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!(
+                "query=query {{ {} }} fragment Labelled on Issue {{ number state labels(first: 100) {{ nodes {{ name }} }} }}",
+                asked.join(" ")
+            ),
+        ])
+    }
+
+    /// GitHub's answer for an issue the read found.
+    fn labelled(number: u64, state: &str, labels: &[&str]) -> Value {
+        json!({
+            "number": number,
+            "state": state,
+            "labels": {"nodes": labels.iter().map(|name| json!({"name": name})).collect::<Vec<_>>()},
+        })
+    }
+
+    #[test]
+    fn issue_labels_reads_the_labels_and_state_of_each_number_in_one_call() {
+        let fake = FakeTracker::new();
+        fake.on(
+            issue_labels_call(&[5, 7]),
+            Answer::ok(
+                json!({"data": {
+                    "i5": labelled(5, "OPEN", &["factory:stuck", "type:fix"]),
+                    "i7": labelled(7, "CLOSED", &["factory:stuck"]),
+                }})
+                .to_string(),
+            ),
+        );
+        // Asked out of order and twice: each number is read once, in one call.
+        let read = issue_labels(&fake, REPO, &[7, 5, 7]).unwrap();
+        assert_eq!(fake.calls().len(), 1, "{:?}", fake.calls());
+        assert_eq!(
+            read.into_iter().collect::<Vec<_>>(),
+            vec![
+                (
+                    5,
+                    IssueLabels {
+                        number: 5,
+                        labels: vec!["factory:stuck".into(), "type:fix".into()],
+                        closed: false,
+                    }
+                ),
+                (
+                    7,
+                    IssueLabels {
+                        number: 7,
+                        labels: vec!["factory:stuck".into()],
+                        closed: true,
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// A number GitHub has no issue for answers null, and one it has as something other than an
+    /// issue answers an empty object: neither is in the answer, and neither fails the read.
+    #[test]
+    fn issue_labels_leaves_out_a_number_github_does_not_return() {
+        let fake = FakeTracker::new();
+        fake.on(
+            issue_labels_call(&[5, 8, 9]),
+            Answer::ok(
+                json!({"data": {
+                    "i5": labelled(5, "OPEN", &[]),
+                    "i8": {},
+                    "i9": null,
+                }})
+                .to_string(),
+            ),
+        );
+        let read = issue_labels(&fake, REPO, &[5, 8, 9]).unwrap();
+        assert_eq!(read.keys().copied().collect::<Vec<_>>(), vec![5]);
+        assert_eq!(read[&5].labels, Vec::<String>::new());
+    }
+
+    #[test]
+    fn issue_labels_of_no_number_makes_no_call() {
+        let fake = FakeTracker::new();
+        assert!(issue_labels(&fake, REPO, &[]).unwrap().is_empty());
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn issue_labels_errors_are_typed() {
+        let failing = FakeTracker::answering([Answer::fail(1, "boom")]);
+        let failed = issue_labels(&failing, REPO, &[5]).unwrap_err();
+        assert!(is_failed(&failed), "{failed}");
+        assert!(failed.to_string().contains("status 1"), "{failed}");
+
+        for wrong in [
+            // Not an answer at all.
+            "[]".to_string(),
+            // No data.
+            json!({"data": null}).to_string(),
+            // A number asked for that the answer does not name.
+            json!({"data": {}}).to_string(),
+            // An issue without its labels.
+            json!({"data": {"i5": {"number": 5, "state": "OPEN"}}}).to_string(),
+            // An issue in a state GitHub does not have.
+            json!({"data": {"i5": labelled(5, "GONE", &[])}}).to_string(),
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(wrong.clone())]);
+            let error = issue_labels(&fake, REPO, &[5]).unwrap_err();
+            assert!(is_parse(&error), "{wrong}: {error}");
+        }
+    }
+
+    /// The repo is written into the query, so one that is not a plain `owner/name` is refused
+    /// before any call.
+    #[test]
+    fn issue_labels_refuses_a_repo_not_written_as_owner_name_before_any_call() {
+        for repo in ["rawphp", "rawphp/soft\"fac", "rawphp/softfac/x", "../softfac", "/softfac"] {
+            let fake = FakeTracker::new();
+            let error = issue_labels(&fake, repo, &[5]).unwrap_err();
+            assert!(is_refused(&error), "{repo}: {error}");
+            assert!(fake.calls().is_empty(), "{repo}");
+        }
+    }
+
     // Pull requests.
 
     const PR_VIEW: &str = "{\"createdAt\":\"2026-10-29T05:50:00Z\",\"baseRefName\":\"main\",\"headRefName\":\"t3code/2bb65018\",\"headRefOid\":\"4f1c2d3e4a5b60718293a4b5c6d7e8f901234567\",\"isCrossRepository\":false,\"isDraft\":true,\"mergeable\":\"MERGEABLE\",\"number\":2,\"state\":\"OPEN\"}";
