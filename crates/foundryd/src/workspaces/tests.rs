@@ -958,13 +958,14 @@ async fn a_worktree_removed_by_hand_still_archives() {
 /// clone: its admin folder in the clone goes, so git lists no worktree there.
 fn detach(setup: &Setup, project: ProjectId, branch: &str) -> PathBuf {
     let worktree = setup.worktree(project, branch);
-    let admin = setup
-        .clone_of(project)
-        .join("worktrees")
-        .join(worktree.file_name().unwrap());
-    std::fs::remove_dir_all(&admin).unwrap();
-    assert!(worktree.exists());
+    detach_folder(&setup.clone_of(project), &worktree);
     worktree
+}
+
+/// Removes `<clone>/worktrees/<folder name>`, the admin folder git keeps for `worktree`.
+fn detach_folder(clone: &Path, worktree: &Path) {
+    std::fs::remove_dir_all(clone.join("worktrees").join(worktree.file_name().unwrap())).unwrap();
+    assert!(worktree.exists());
 }
 
 #[tokio::test]
@@ -1066,6 +1067,10 @@ async fn archive_with_force_of_a_detached_workspace_removes_its_folder_and_keeps
     );
     let clone = setup.clone_of(remote.project);
     let tip = git(&clone, &["rev-parse", "refs/heads/adrift"]);
+    // A healthy workspace beside it, with work of its own, is left alone.
+    setup.create(&remote, "main", "neighbour").await;
+    let neighbour = setup.worktree(remote.project, "neighbour");
+    std::fs::write(neighbour.join("draft.txt"), "d").unwrap();
     detach(&setup, remote.project, "adrift");
 
     setup.workspaces.archive(id, true).await.unwrap();
@@ -1077,6 +1082,32 @@ async fn archive_with_force_of_a_detached_workspace_removes_its_folder_and_keeps
     assert_eq!(terminals.len(), 1);
     assert_eq!(terminals[0].body.id, terminal);
     assert!(terminals[0].deleted, "{terminals:?}");
+    assert!(neighbour.join("draft.txt").exists());
+    let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
+    let name = neighbour.file_name().unwrap().to_str().unwrap();
+    assert!(worktrees.contains(&format!("/{name}\n")), "{worktrees}");
+}
+
+#[tokio::test]
+async fn a_detached_p1_workspace_is_refused_then_archived_anyway_from_its_branch_named_folder() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let (id, worktree) = setup.p1_workspace(&remote, "old").await;
+    let clone = setup.clone_of(remote.project);
+    let tip = git(&clone, &["rev-parse", "refs/heads/old"]);
+    detach_folder(&clone, &worktree);
+
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    assert!(
+        matches!(&err, WorkspaceError::Dirty(dirty) if dirty.detached),
+        "{err}"
+    );
+    assert!(worktree.exists());
+
+    setup.workspaces.archive(id, true).await.unwrap();
+    assert!(!worktree.exists());
+    assert!(setup.record(id).unwrap().deleted);
+    assert_eq!(git(&clone, &["rev-parse", "refs/heads/old"]), tip);
 }
 
 #[tokio::test]
