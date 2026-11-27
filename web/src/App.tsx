@@ -57,8 +57,9 @@ import { upNext } from "./needing";
  * attaches again when shown and gets its screen and scrollback back from the holder.
  *
  * With nothing open, the board shows every workspace as a card with its live states and changes
- * (or as one line of a list, for a large fleet), or, switched to its timeline, every session's turns on one clock; a turn opens its terminal
- * with the steps column.
+ * (or as one line of a list, for a large fleet), or, switched to its timeline, every session's
+ * turns on one clock, with the stretches each waited on you striped and added up in a row over the
+ * lanes; a turn opens its terminal with the steps column.
  *
  * A fleet with no workspaces opens on one question, what Claude should work on, and a box to
  * answer it in: the task names the workspace and its branch, Start makes it and lands in its

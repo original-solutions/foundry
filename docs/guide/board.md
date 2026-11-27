@@ -88,8 +88,10 @@ The timeline answers "what has each agent been doing". Each session on this mach
 
 - A bar that is still going runs up to the **now** edge, in its session's colour. A finished turn is paler.
 - A tick on a bar is a tool Claude ran. An amber dot is a question it asked.
-- Point at a bar to see what the turn was and did. Click it to open the terminal with its steps column.
-- The line above the rows sums the window: turns, agent time, tool calls and questions.
+- From a question to the step after it, the bar has amber stripes: the turn was waiting on you, not working. While a session still waits, its stripes run to the **now** edge and its row says for how long, for example "Needs you for 12m".
+- Point at a bar to see what the turn was and did, and how long it waited on you. Click it to open the terminal with its steps column.
+- The line above the rows sums the window: turns, agent time, time waiting on you, tool calls and questions. Time waiting on you is not counted as agent time.
+- **Waiting on you**, the first row, lays every session's waits on top of each other. It is taller where more sessions waited at once, so you can see when you held the fleet up. While any session waits, click its name to open the one that has waited longest. The row only shows when something waited on you in the window.
 - **15m**, **1h**, **4h** and **12h** pick the window. The choice is kept in this browser.
 - Sessions with no turn in the window are counted below, for example "1 more session took no turns in the last hour".
 
