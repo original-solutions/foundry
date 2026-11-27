@@ -177,7 +177,7 @@ Branch names are `<name>` as typed, made safe for git. Worktrees live under the 
 ### Archiving
 
 - Archiving stops the workspace's terminals, removes the worktree and keeps the branch.
-- It refuses when the worktree has uncommitted or unpushed work, and says which. Tom can confirm to archive anyway. A folder git no longer lists as a worktree of the project also holds archive up, and archive anyway deletes it.
+- It refuses when the worktree has uncommitted or unpushed work, and says which. Tom can confirm to archive anyway. A folder git no longer lists as a worktree of the project also holds archive up, and archive anyway deletes it with whatever is in it.
 - A workspace on an offline machine shows as unreachable. If its branch was pushed, Tom can open a new workspace from that branch on another machine.
 - Archive is offered for any machine's workspaces from the sidebar row, the board card and any of its terminals' actions (menu and jump palette). Before anything is sent it shows what archiving means, and each terminal that stops, marking a turn it cuts short. For a workspace on the machine serving the UI it also shows, from one read of the workspace's changes, the commits kept on its branch and the uncommitted files lost with the worktree. For another machine's workspace that read answers only on its owner, so the dialog shows the terminals that stop and relies on the owner's refusal. The daemon carries the archive to the owning machine, which still decides; its refusal lists what it holds and offers to archive anyway.
 

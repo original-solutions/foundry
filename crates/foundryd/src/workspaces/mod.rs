@@ -675,7 +675,9 @@ impl Workspaces {
 
     /// Closes the workspace's terminals, removes its worktree and keeps its branch. Unless
     /// `force`, refuses with [`WorkspaceError::Dirty`] while there is uncommitted or unpushed
-    /// work or a checked-out submodule, and changes nothing. Work that appears while the
+    /// work or a checked-out submodule, or while its folder is detached (there, but no worktree
+    /// git lists), and changes nothing; `force` deletes a detached folder outright, as git
+    /// cannot remove it. Work that appears while the
     /// terminals close is refused with [`WorkspaceError::Dirty`] too, and then the terminals are
     /// already closed. The archive finishes even when the caller stops waiting, and holds the
     /// workspace's lifecycle lock throughout, so no [`Workspaces::start_in`] runs beside it.
@@ -1443,7 +1445,7 @@ impl Inner {
         let _removing = Removing::mark(self, id);
         if there && detached {
             // Git cannot remove what it does not list; the folder is all there is to take away.
-            tokio::fs::remove_dir_all(&worktree).await?;
+            remove_any(&worktree).await?;
         } else if there {
             self.remove_worktree(&clone, &worktree, force).await?;
         } else if let Some((listed, _)) = self.registered_either(&clone, &body).await? {
@@ -1627,7 +1629,8 @@ impl Inner {
                 );
                 continue;
             }
-            // A detached worktree has no branch to check, and `folder` is no branch of its own.
+            // A worktree on a detached `HEAD` has no branch to check, and `folder` is no branch of
+            // its own.
             let checked = match self
                 .refuse_dirty(&clone, &listed, branch.unwrap_or(folder), false)
                 .await
@@ -1850,15 +1853,14 @@ impl Inner {
         if !branch.is_empty() && self.has_ref(clone, &reference).await? {
             heads.push(reference);
         }
+        // Git cannot read a `HEAD` in a folder it does not list, so a detached one is never read.
         let present = !detached && tokio::fs::try_exists(worktree).await?;
-        if detached {
-            // Git cannot read a `HEAD` in a folder it does not list.
-        } else if present {
+        if present {
             let head = self
                 .git(worktree, "rev-parse", ["--verify", "HEAD"])
                 .await?;
             heads.push(head.trim().to_owned());
-        } else if let Some((_, head)) = self.registered(clone, worktree).await? {
+        } else if !detached && let Some((_, head)) = self.registered(clone, worktree).await? {
             heads.push(head);
         }
         let (uncommitted, submodules) = if present {

@@ -82,7 +82,9 @@ impl Workspaces {
     /// What live workspace `id` has changed since it left its base. Each git call is bounded
     /// as every git call here is. A read an archive's removal of the worktree overlaps, and one
     /// that fails with the worktree gone, is [`WorkspaceError::Unknown`]: there is nothing here
-    /// to read.
+    /// to read. One that fails in a folder git no longer lists as a worktree is
+    /// [`WorkspaceError::Detached`], as is the same failure of [`Workspaces::commit`] and
+    /// [`Workspaces::shipping`].
     pub async fn changes(&self, id: WorkspaceId) -> Result<Changes, WorkspaceError> {
         let (worktree, base) = self.reading(id).await?;
         let read = self.inner.changes(&worktree, &base).await;
