@@ -45,7 +45,7 @@ In:
 - A coordinator role that moves by a priority order.
 - An attention list.
 - A minimal web UI: a sidebar of machines and workspaces, and the terminal.
-- Self-update from a tag, with rollback.
+- Updates from a tag, installed from the UI, with rollback.
 
 Out, and where it goes:
 
@@ -284,8 +284,9 @@ P2 adds a lease per project on GitHub, so that claiming issues can never happen 
 
 ## Updates
 
-- A release is a `v*` tag. A machine installs a newer tag on its own and restarts. Holders are separate processes, so terminals survive.
-- The rollback from factory-on-paradev carries over: a version that starts three times without becoming healthy puts the previous version back and refuses that tag until a higher one exists.
+- A release is a `v*` tag. Each machine downloads and verifies a newer tag on its own, and installs it when someone picks it in the UI. Holders are separate processes, so terminals survive.
+- [manual-updates.md](manual-updates.md) has the details: when a release is made ready, the machine record's version and waiting tag, the install endpoint and the UI's update badge.
+- The rollback from factory-on-paradev carries over: a version that starts three times without becoming healthy puts the previous version back and refuses that tag until a higher one is installed.
 - Sync messages carry a protocol version. A newer machine speaks the older form to an older peer, so a fleet can update one machine at a time.
 - The holder's protocol is versioned separately and changes rarely, since a running holder cannot be updated without ending its terminal.
 
@@ -340,7 +341,7 @@ One thing the check found that the design did not expect: in a folder Claude Cod
 9. A machine taken off the network shows as offline on the others within 15 seconds, with its sessions shown as unreachable.
 10. A machine back from two hours offline shows the full current state within 30 seconds of rejoining.
 11. Archiving a workspace with uncommitted work is refused with the list of what is uncommitted.
-12. A release tag is installed by all three machines without ending any terminal.
+12. A release tag installed from one machine's UI onto all three machines ends no terminal on any of them.
 
 ## Decisions already made for later pieces
 
