@@ -51,8 +51,8 @@ use super::{
     stop_session, workspace_id,
 };
 use crate::factory::github::read::{
-    gh_json, is_branch_path, is_plain_ref_name, is_safe_branch_name, is_utc_second,
-    issue_query_args,
+    APPROVAL_QUERY, ApprovalIssue, LabelChange, TimelineNode, gh_json, is_branch_path,
+    is_human_instructor, is_plain_ref_name, is_safe_branch_name, is_utc_second, issue_query_args,
 };
 use crate::factory::github::{
     Claim, IssueDetail, OpenPullRequest, OtherKind, Tracker, TrackerError, newest_claim,
@@ -840,13 +840,8 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
         }
         None => return skipped(format!("no claim comment names run {run}")),
     };
-    if let Approval::Approved {
-        labeled_at,
-        labeled_by,
-    } = ctx.tracker.approval(repo, issue, &ctx.config.instructors)?
-    {
-        let by = (!labeled_by.is_empty()).then_some(labeled_by.as_str());
-        record_approval(ctx, run, &labeled_at, by, CauseStep::Start)?;
+    if let Some((labeled_at, labeled_by)) = claimed_on(ctx, issue)? {
+        record_approval(ctx, run, &labeled_at, Some(&labeled_by), CauseStep::Start)?;
     }
     ctx.record(
         run,
@@ -857,6 +852,87 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
         &Cause::new(CauseStep::Start, "claim-found"),
     )?;
     Ok(None)
+}
+
+/// GitHub's answer to [`APPROVAL_QUERY`].
+#[derive(Deserialize)]
+struct LabelHistory {
+    data: LabelHistoryData,
+}
+
+#[derive(Deserialize)]
+struct LabelHistoryData {
+    repository: LabelHistoryRepository,
+}
+
+#[derive(Deserialize)]
+struct LabelHistoryRepository {
+    issue: ApprovalIssue,
+}
+
+/// The approval a claim was made on, read after the claim removed `factory:ready`: when and by
+/// whom the label the claim took off was applied, if an instructor applied it and the text is
+/// as an instructor left it since. Only the label's newest event is judged. A removal by the
+/// project's login is the claim's, and the label it took off is the event before it. A label
+/// still on is the approval, as when the claim's removal is not on the timeline. Any other
+/// newest event (a removal by anyone else, or none) approves nothing. These are
+/// `judge_approval`'s checks, made as of the claim rather than now. The text is judged by
+/// `text_check`, which reads the history again and checks its timestamps. `None` when the
+/// approval cannot be confirmed.
+fn claimed_on(ctx: &RunContext<'_>, issue: u64) -> Result<Option<(String, String)>, RunError> {
+    let repo = ctx.repo();
+    let instructors = &ctx.config.instructors;
+    let args = issue_query_args(repo, APPROVAL_QUERY, issue)?;
+    let history: LabelHistory = gh_json(ctx.tracker, &args, "a GraphQL response with the issue")?;
+    let ready = State::Ready.label();
+    // The label's events, newest first: `true` for applied, `false` for removed.
+    let mut events = history
+        .data
+        .repository
+        .issue
+        .timeline_items
+        .nodes
+        .into_iter()
+        .rev()
+        .filter_map(|node| match node {
+            TimelineNode::LabeledEvent(change) if change.label.name == ready => {
+                Some((true, change))
+            }
+            TimelineNode::UnlabeledEvent(change) if change.label.name == ready => {
+                Some((false, change))
+            }
+            _ => None,
+        });
+    let label = match events.next() {
+        Some((true, label)) => label,
+        Some((false, removal))
+            if removal
+                .actor
+                .as_ref()
+                .is_some_and(|actor| actor.login.eq_ignore_ascii_case(&ctx.project.login)) =>
+        {
+            match events.next() {
+                Some((true, label)) => label,
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+    let LabelChange {
+        created_at,
+        actor: Some(actor),
+        ..
+    } = label
+    else {
+        return Ok(None);
+    };
+    if !is_human_instructor(Some(&actor), instructors) {
+        return Ok(None);
+    }
+    let text = ctx
+        .tracker
+        .text_check(repo, issue, &created_at, instructors)?;
+    Ok((text == TextCheck::Unchanged).then_some((created_at, actor.login)))
 }
 
 /// What a launch continues from.
@@ -3014,6 +3090,414 @@ mod tests {
                 assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
                 assert!(calls(&rig).is_empty());
                 assert!(rig.finished(&run));
+            }
+
+            /// One label event of the timeline: `kind` of `label` at `at` by `login`, who is a
+            /// `User` unless `typename` says otherwise.
+            fn label_event(
+                kind: &str,
+                label: &str,
+                at: &str,
+                typename: &str,
+                login: &str,
+            ) -> serde_json::Value {
+                serde_json::json!({
+                    "__typename": kind,
+                    "createdAt": at,
+                    "actor": {"__typename": typename, "login": login},
+                    "label": {"name": label},
+                })
+            }
+
+            /// The claim's swap of `factory:ready` for `factory:triage` at `at`, as GitHub
+            /// records it: the removal and the label, both by the factory's login.
+            fn claim_swap(at: &str) -> [serde_json::Value; 2] {
+                [
+                    label_event("UnlabeledEvent", "factory:ready", at, "User", LOGIN),
+                    label_event("LabeledEvent", "factory:triage", at, "User", LOGIN),
+                ]
+            }
+
+            /// GitHub's answer whose timeline is `nodes`, oldest first, with the body edits of
+            /// `edits_by`.
+            fn timeline_of(nodes: Vec<serde_json::Value>, edits_by: &[(&str, &str)]) -> String {
+                let mut answer: serde_json::Value =
+                    serde_json::from_str(&approval_answer(LABELED_AT, "tom", edits_by)).unwrap();
+                let timeline = &mut answer["data"]["repository"]["issue"]["timelineItems"];
+                timeline["totalCount"] = nodes.len().into();
+                timeline["nodes"] = nodes.into();
+                answer.to_string()
+            }
+
+            /// What GitHub answers once the claim swapped `factory:ready` for `factory:triage`:
+            /// the label `by` applied at [`LABELED_AT`], then the claim's swap, so no label is in
+            /// force.
+            fn removed_by_the_claim(by: &str, edits_by: &[(&str, &str)]) -> String {
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    LABELED_AT,
+                    "User",
+                    by,
+                )];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                timeline_of(nodes, edits_by)
+            }
+
+            /// `pass` on `run` goes stuck because the approval cannot be confirmed, and records
+            /// no approval.
+            fn goes_stuck_unapproved(rig: &Rig, run: &RunId) {
+                assert_eq!(
+                    pass(rig, run),
+                    StartStep::Stuck {
+                        reason: CANNOT_CONFIRM.into()
+                    }
+                );
+                assert!(
+                    !rig.steps(run).iter().any(|s| s.starts_with("approved ")),
+                    "{:?}",
+                    rig.steps(run)
+                );
+                assert!(calls(rig).is_empty());
+            }
+
+            /// The claim removed `factory:ready`: the run is approved on the newest label an
+            /// instructor applied before it, and carried on.
+            #[test]
+            fn records_the_approval_of_the_label_the_claim_removed() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                rig.sim.set_approval(removed_by_the_claim("tom", &[]));
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.steps(&run)[0], format!("approved {LABELED_AT}"));
+                assert!(!rig.finished(&run));
+            }
+
+            #[test]
+            fn a_label_the_claim_removed_that_a_stranger_applied_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                rig.sim.set_approval(removed_by_the_claim("mallory", &[]));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: CANNOT_CONFIRM.into()
+                    }
+                );
+                assert!(calls(&rig).is_empty());
+            }
+
+            #[test]
+            fn a_text_a_stranger_edited_after_the_label_the_claim_removed_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                rig.sim.set_approval(removed_by_the_claim(
+                    "tom",
+                    &[("2026-10-04T10:01:00Z", "mallory")],
+                ));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: CANNOT_CONFIRM.into()
+                    }
+                );
+                assert!(calls(&rig).is_empty());
+            }
+
+            /// The claim's removal must be the label's newest event: a label applied and removed
+            /// again after the claim hides it, and without the claim comment's time the factory
+            /// cannot tell that from an approval withdrawn, so the run goes stuck.
+            #[test]
+            fn a_label_applied_and_removed_after_the_claim_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    LABELED_AT,
+                    "User",
+                    "tom",
+                )];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                nodes.push(label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    "2026-10-04T10:06:00Z",
+                    "User",
+                    "mallory",
+                ));
+                nodes.push(label_event(
+                    "UnlabeledEvent",
+                    "factory:ready",
+                    "2026-10-04T10:07:00Z",
+                    "User",
+                    "mallory",
+                ));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// The claim's removal with no label before it on the timeline: nothing says what it
+            /// was approved on, so the run goes stuck.
+            #[test]
+            fn a_claims_removal_with_no_label_before_it_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                rig.sim
+                    .set_approval(timeline_of(claim_swap("2026-10-04T10:05:00Z").into(), &[]));
+                goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// A label whose actor GitHub gives as none (a deleted account) is no instructor's.
+            #[test]
+            fn a_label_the_claim_removed_with_no_actor_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                let mut label =
+                    label_event("LabeledEvent", "factory:ready", LABELED_AT, "User", "tom");
+                label["actor"] = serde_json::Value::Null;
+                let mut nodes = vec![label];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// GitHub logins match whatever their case: a removal by the factory's login written
+            /// in another case is still the claim's.
+            #[test]
+            fn the_claims_removal_is_known_by_its_login_in_any_case() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    LABELED_AT,
+                    "User",
+                    "tom",
+                )];
+                nodes.push(label_event(
+                    "UnlabeledEvent",
+                    "factory:ready",
+                    "2026-10-04T10:05:00Z",
+                    "User",
+                    &LOGIN.to_uppercase(),
+                ));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.steps(&run)[0], format!("approved {LABELED_AT}"));
+            }
+
+            /// A stranger's label in force at the claim is no approval, though an instructor's
+            /// came before it.
+            #[test]
+            fn a_strangers_label_in_force_at_the_claim_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                let mut nodes = vec![
+                    label_event("LabeledEvent", "factory:ready", LABELED_AT, "User", "tom"),
+                    label_event(
+                        "UnlabeledEvent",
+                        "factory:ready",
+                        "2026-10-04T10:01:00Z",
+                        "User",
+                        "tom",
+                    ),
+                    label_event(
+                        "LabeledEvent",
+                        "factory:ready",
+                        "2026-10-04T10:02:00Z",
+                        "User",
+                        "mallory",
+                    ),
+                ];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// A label taken off by anyone but the claim was withdrawn, so it approves nothing.
+            #[test]
+            fn a_label_taken_off_by_someone_other_than_the_claim_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                let nodes = vec![
+                    label_event("LabeledEvent", "factory:ready", LABELED_AT, "User", "tom"),
+                    label_event(
+                        "UnlabeledEvent",
+                        "factory:ready",
+                        "2026-10-04T10:01:00Z",
+                        "User",
+                        "tom",
+                    ),
+                    label_event(
+                        "LabeledEvent",
+                        "factory:triage",
+                        "2026-10-04T10:02:00Z",
+                        "User",
+                        "mallory",
+                    ),
+                ];
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// An instructor is a person: a GitHub App under an instructor's login approves
+            /// nothing.
+            #[test]
+            fn a_label_an_app_applied_under_an_instructors_login_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    LABELED_AT,
+                    "Bot",
+                    "tom",
+                )];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// An edit history cut off after the label cannot be judged whole, so it confirms
+            /// nothing.
+            #[test]
+            fn a_label_the_claim_removed_with_an_edit_history_cut_off_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                let mut answer: serde_json::Value = serde_json::from_str(&removed_by_the_claim(
+                    "tom",
+                    &[("2026-10-04T10:01:00Z", "tom")],
+                ))
+                .unwrap();
+                answer["data"]["repository"]["issue"]["userContentEdits"]["totalCount"] =
+                    150.into();
+                rig.sim.set_approval(answer.to_string());
+                goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// `pass` on `run` is carried on, approved on the label applied at `labeled_at`.
+            fn carried_on_approved_at(rig: &Rig, run: &RunId, labeled_at: &str) {
+                assert_eq!(pass(rig, run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.steps(run)[0], format!("approved {labeled_at}"));
+            }
+
+            /// An earlier attempt's claim took the label off once; the label an instructor put
+            /// back and took off again before this claim could is no approval.
+            #[test]
+            fn a_label_withdrawn_after_an_earlier_attempts_claim_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    LABELED_AT,
+                    "User",
+                    "tom",
+                )];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                nodes.push(label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    "2026-10-04T11:00:00Z",
+                    "User",
+                    "tom",
+                ));
+                nodes.push(label_event(
+                    "UnlabeledEvent",
+                    "factory:ready",
+                    "2026-10-04T11:05:00Z",
+                    "User",
+                    "tom",
+                ));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// A second attempt is approved on the label put back after the first went stuck,
+            /// not on the first attempt's.
+            #[test]
+            fn a_second_attempt_is_approved_on_the_label_its_own_claim_took_off() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                let again = "2026-10-04T11:00:00Z";
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    LABELED_AT,
+                    "User",
+                    "tom",
+                )];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                nodes.push(label_event(
+                    "UnlabeledEvent",
+                    "factory:triage",
+                    "2026-10-04T10:30:00Z",
+                    "User",
+                    LOGIN,
+                ));
+                nodes.push(label_event(
+                    "LabeledEvent",
+                    "factory:stuck",
+                    "2026-10-04T10:30:00Z",
+                    "User",
+                    LOGIN,
+                ));
+                nodes.push(label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    again,
+                    "User",
+                    "tom",
+                ));
+                nodes.extend(claim_swap("2026-10-04T11:05:00Z"));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                carried_on_approved_at(&rig, &run, again);
+            }
+
+            /// Other labels applied or removed around the claim, by anyone, change nothing.
+            #[test]
+            fn other_labels_around_the_claim_leave_its_approval_as_it_was() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                let mut nodes = vec![
+                    label_event("LabeledEvent", "factory:ready", LABELED_AT, "User", "tom"),
+                    label_event(
+                        "UnlabeledEvent",
+                        "factory:proposed",
+                        LABELED_AT,
+                        "User",
+                        "tom",
+                    ),
+                    label_event(
+                        "LabeledEvent",
+                        "bug",
+                        "2026-10-04T10:01:00Z",
+                        "Bot",
+                        "triage-bot",
+                    ),
+                ];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                nodes.push(label_event(
+                    "UnlabeledEvent",
+                    "factory:triage",
+                    "2026-10-04T10:06:00Z",
+                    "User",
+                    LOGIN,
+                ));
+                nodes.push(label_event(
+                    "LabeledEvent",
+                    "factory:building",
+                    "2026-10-04T10:06:00Z",
+                    "User",
+                    LOGIN,
+                ));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                carried_on_approved_at(&rig, &run, LABELED_AT);
             }
         }
 
