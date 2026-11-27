@@ -865,8 +865,12 @@ fn the_coordinator_killed_during_a_build_and_the_next_carries_the_run_on_with_it
                 events[..old].to_vec(),
                 "the old generation is the old coordinator's"
             );
+            // The next coordinator goes on writing after `pr-open` (it archives the build), so
+            // its own list may have grown since `events` was read: compare what both hold.
+            let by_next = rig.events_by(1, &run, 1);
+            assert!(by_next.len() >= events.len() - old, "{by_next:?}");
             assert_eq!(
-                rig.events_by(1, &run, 1),
+                by_next[..events.len() - old].to_vec(),
                 events[old..].to_vec(),
                 "the next generation is the next coordinator's"
             );

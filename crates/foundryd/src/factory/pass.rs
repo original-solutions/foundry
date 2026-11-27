@@ -4939,6 +4939,34 @@ mod tests {
             let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
             assert_eq!(held, vec![newest]);
         }
+
+        /// A newer attempt that has not finished is the issue's newest run: an older one that
+        /// finished stuck is not held up beside it.
+        #[test]
+        fn a_newer_unfinished_run_of_the_issue_is_held_up_alone() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            held_up_run(&rig, 5, 1, State::Stuck, "the first time");
+            let newer = rig.run_in(5, 2, State::Stuck);
+            rig.pass();
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![newer]);
+        }
+
+        /// The label is read from GitHub as the claims are: a read that fails ends the pass as
+        /// failed, and the status keeps what the last good pass held up.
+        #[test]
+        fn a_failed_read_of_the_label_fails_the_pass_and_keeps_the_last_held_up_runs() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = held_up_run(&rig, 5, 1, State::Stuck, "no");
+            rig.pass();
+            rig.hub.fail("factory:stuck", 1);
+            let report = rig.pass();
+            assert!(report.failed.is_some(), "{report:?}");
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![run]);
+        }
     }
 
     mod feedback_and_the_fleets_slots {
