@@ -68,9 +68,12 @@ import { upNext } from "./needing";
  * state and its workspaces. It is headed by the machine a task Foundry places would go to now,
  * each card says whether it has room, and either opens the New task dialog set to a machine.
  *
- * The Factory view (`/factory`, from the rail's factory link) shows the fleet's factory settings,
- * and for each project its lease holder and generation or why it is idle, the ready queue, live
- * runs with a Stop that asks first, and the last finished runs. It takes the place of the board.
+ * The Factory view (`/factory`, from the rail's factory link) is headed by the line: how many
+ * issues stand ready, building, held up and finished across the projects that are on, with the
+ * fleet's factory settings folded to one line under it. Each project has its switch, login and
+ * pause, its lease holder and generation or why it is idle, and its issues in the line's four
+ * stations side by side: the ready queue, live runs with a Stop that asks first, runs held up, and
+ * the last finished. It takes the place of the board.
  *
  * A workspace is made one way, from a task box: the first run's, the board's top line, or the
  * New task dialog (the sidebar's button, or the palette with what was typed as the task). It is landed in: once its session shows up, its terminal opens, its setup shell a tab beside it.
