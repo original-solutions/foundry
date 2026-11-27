@@ -1,3 +1,158 @@
+//! Installing a machine's ready release, from the UI of any machine.
+//!
+//! - `POST /api/machines/{id}/update` `{"tag": "v0.9.1"}`: installs the ready release on
+//!   machine `{id}` ([`update::install_ready`]) and answers `202` with no body. The daemon then
+//!   stops, and the service starts the installed version on trial.
+//!
+//! A call naming another machine is carried there ([`carry`](super::carry)): a machine not in
+//! the machine list is `404`, one offline, whose link is down or that speaks a protocol below
+//! [`UPDATES_SINCE`](foundry_proto::messages::UPDATES_SINCE) is `503` and names it, and one whose
+//! link went down after it was sent is `504`. On the machine itself:
+//!
+//! - an id that is not this machine's, which only a carried call reaches, is `421`, as a
+//!   carried create naming another machine is;
+//! - a body with no `tag` string is `400`;
+//! - a tag the install refuses is `409` `{"error": "<why>", "ready": "<tag>" | null}`, `ready`
+//!   being the tag the machine's sample reports ready;
+//! - an install that could not be made is `500` `{"error": "..."}`, and the daemon goes on.
+//!
+//! After a `202` the daemon stops only once the answer has left: for a request made here, once
+//! its response is written; for a carried call, once the link has sent it ([`STOP_AFTER`]). It
+//! stops anyway [`STOP_WITHIN`] after the install, when the answer could not be sent.
+
+use std::convert::Infallible;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
+
+use axum::Json;
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use foundry_proto::ids::MachineId;
+use serde::Deserialize;
+
+use super::{Api, ApiError, carry, error, parse_id};
+use crate::sync::call::{CARRIED, STOP_AFTER, STOP_WITHIN, Stop};
+use crate::update::{self, InstallError};
+
+/// What the install route acts on: this machine's id, its data directory, the version it runs
+/// and the program it runs from, and the stop it fires after a `202`.
+struct Held {
+    me: MachineId,
+    home: PathBuf,
+    running: String,
+    exe: PathBuf,
+    stop: Stop,
+    /// How long after an install the daemon stops anyway: [`STOP_WITHIN`].
+    within: Duration,
+}
+
+/// The install route of the machine `api` serves, whose data directory is `home`, behind the
+/// layer that carries a call naming another machine there. It fires `stop` once after a `202`.
+/// The caller guards it as it guards the rest of the API.
+pub fn router(api: Api, home: PathBuf, stop: Stop) -> Router {
+    // A program that cannot be found is not run from `current`, which the install refuses.
+    let exe = std::env::current_exe().unwrap_or_default();
+    routes(Held {
+        me: api.peers.me(),
+        home,
+        running: env!("CARGO_PKG_VERSION").to_owned(),
+        exe,
+        stop,
+        within: STOP_WITHIN,
+    })
+    .layer(middleware::from_fn_with_state(api, carry::carry))
+}
+
+/// The install route on `held`, with no carry layer.
+fn routes(held: Held) -> Router {
+    Router::new()
+        .route("/api/machines/{id}/update", post(install))
+        .with_state(Arc::new(held))
+}
+
+/// The body the route takes.
+#[derive(Deserialize)]
+struct Install {
+    tag: String,
+}
+
+async fn install(
+    State(held): State<Arc<Held>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id, "machine", MachineId)?;
+    if id != held.me {
+        // A call naming another machine is carried there before this runs, so one that
+        // reaches here was carried in, and is never carried on.
+        return Ok(error(
+            StatusCode::MISDIRECTED_REQUEST,
+            format!("this call names machine {id}, not this one, and is not carried on"),
+        ));
+    }
+    let Ok(Install { tag }) = serde_json::from_slice(&body) else {
+        return Ok(error(
+            StatusCode::BAD_REQUEST,
+            "the body must be {\"tag\": \"<the ready tag>\"}".to_owned(),
+        ));
+    };
+    let installed = tokio::task::spawn_blocking({
+        let held = held.clone();
+        move || update::install_ready(&held.home, &tag, &held.running, &held.exe)
+    })
+    .await;
+    match installed {
+        Ok(Ok(())) => {
+            held.stop.fire_within(held.within);
+            if headers.contains_key(CARRIED) {
+                // The link that carried the call stops this daemon once it has sent the answer.
+                Ok((StatusCode::ACCEPTED, [(STOP_AFTER, "1")]).into_response())
+            } else {
+                Ok((StatusCode::ACCEPTED, stops_once_written(held.stop.clone())).into_response())
+            }
+        }
+        Ok(Err(InstallError::NotReady { ready, reason })) => {
+            let body = serde_json::json!({ "error": reason, "ready": ready });
+            Ok((StatusCode::CONFLICT, Json(body)).into_response())
+        }
+        Ok(Err(InstallError::Failed(failed))) => {
+            tracing::warn!("api: the ready release was not installed: {failed}");
+            Ok(error(StatusCode::INTERNAL_SERVER_ERROR, failed.to_string()))
+        }
+        Err(_) => Ok(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the install stopped before it answered".to_owned(),
+        )),
+    }
+}
+
+/// Fires its stop when dropped.
+struct StopOnDrop(Stop);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.fire();
+    }
+}
+
+/// An empty body that fires `stop` once the server is done with it: when the response is
+/// written, or the connection is gone.
+fn stops_once_written(stop: Stop) -> Body {
+    let guard = StopOnDrop(stop);
+    Body::from_stream(futures::stream::poll_fn(move |_| {
+        let _held = &guard;
+        Poll::Ready(None::<Result<Bytes, Infallible>>)
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -29,10 +184,10 @@ mod tests {
     const READY: &str = r#"{"ready":"v0.2.0"}"#;
 
     /// What the route must leave alone when it refuses: where `current` points and the state.
-    fn snapshot(home: &Path) -> (PathBuf, String) {
+    fn snapshot(home: &Path) -> (PathBuf, update::State) {
         (
             fs::read_link(home.join("current")).unwrap(),
-            fs::read_to_string(home.join("update.json")).unwrap(),
+            update::state(home).unwrap(),
         )
     }
 
@@ -129,7 +284,14 @@ mod tests {
         let served = Served::new(home.path(), exe, BRIEF).await;
         let before = snapshot(home.path());
 
-        for body in ["", "{}", r#"{"tag":3}"#, r#"{"tag":null}"#, "not json", "[]"] {
+        for body in [
+            "",
+            "{}",
+            r#"{"tag":3}"#,
+            r#"{"tag":null}"#,
+            "not json",
+            "[]",
+        ] {
             let (status, asked, text) = served.post(served.me, body, false).await;
             assert_eq!(status, 400, "{body:?}: {text}");
             assert!(!asked, "{body:?}");
@@ -145,7 +307,8 @@ mod tests {
     #[tokio::test]
     async fn each_case_the_install_refuses_is_409_with_the_ready_tag_and_stops_nothing() {
         let other = |home: &Path| home.join("elsewhere");
-        let trial = r#"{"ready":"v0.2.0","trial":{"version":"0.1.0","previous":"0.0.9","starts":0}}"#;
+        let trial =
+            r#"{"ready":"v0.2.0","trial":{"version":"0.1.0","previous":"0.0.9","starts":0}}"#;
         let cases: [(&str, &str, bool, Option<&str>, &str); 4] = [
             (READY, "v0.3.0", false, Some("v0.2.0"), "not the ready tag"),
             (READY, "v0.2.0", true, None, "not run from"),
@@ -156,7 +319,13 @@ mod tests {
                 None,
                 "refused",
             ),
-            (trial, "v0.2.0", false, Some("v0.2.0"), "a trial of 0.1.0 is on"),
+            (
+                trial,
+                "v0.2.0",
+                false,
+                Some("v0.2.0"),
+                "a trial of 0.1.0 is on",
+            ),
         ];
         for (state, tag, elsewhere, ready, reason) in cases {
             let (home, exe) = ready_home(state);
@@ -202,7 +371,10 @@ mod tests {
         assert_eq!(status, 500, "{text}");
         assert!(!asked);
         let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert!(answer["error"].as_str().unwrap().contains("current"), "{text}");
+        assert!(
+            answer["error"].as_str().unwrap().contains("current"),
+            "{text}"
+        );
         assert_eq!(snapshot(home.path()), before);
         tokio::time::sleep(BRIEF * 2).await;
         assert_eq!(served.stops(), 0);
@@ -241,7 +413,11 @@ mod tests {
         let (status, asked, text) = served.post(served.me, r#"{"tag":"v0.2.0"}"#, true).await;
 
         assert_eq!((status, asked, text.as_str()), (202, true, ""));
-        assert_eq!(served.stops(), 0, "it stopped before the link sent the answer");
+        assert_eq!(
+            served.stops(),
+            0,
+            "it stopped before the link sent the answer"
+        );
         assert!(
             served.stopped(1, Duration::from_secs(5)).await,
             "it did not stop by itself"

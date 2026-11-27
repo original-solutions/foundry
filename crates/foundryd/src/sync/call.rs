@@ -14,17 +14,29 @@
 //! workspace it made, finds what it made already here.
 //!
 //! A call goes only to a machine in the machine list, heard from within [`OFFLINE_AFTER`], with
-//! an open record link that speaks [`CALLS_SINCE`] or later; any other is refused before a link
+//! an open record link that speaks the protocol its route needs ([`needs`]): [`UPDATES_SINCE`]
+//! for a machine's install, [`CALLS_SINCE`] for every other. Any other is refused before a link
 //! opens, so the refusal changes nothing anywhere and an older machine is never sent one. No end
 //! ever logs a body.
+//!
+//! A route whose answer must leave before this daemon stops, a machine's install, asks for the
+//! stop with [`STOP_AFTER`] on its answer to a carried call. B then fires the [`Stop`] its
+//! peers were given ([`Peers::stop_after_calls`]) once that answer is on the link and A has
+//! closed it, or the link is gone ([`answer`]). The route fires the same stop by itself
+//! [`STOP_WITHIN`] after it asked, so an answer the link cannot take still stops B, and a
+//! [`Stop`] acts only once.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use foundry_proto::ids::MachineId;
-use foundry_proto::messages::{CALLS_SINCE, Call, PROTOCOL, PeerMessage};
+use foundry_proto::messages::{CALLS_SINCE, Call, PROTOCOL, PeerMessage, UPDATES_SINCE};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout};
 
 use super::link::listed;
@@ -44,6 +56,85 @@ const CALL_LIMIT: Duration = Duration::from_secs(15 * 60);
 
 /// How often a caller checks whether the records a call wrote have arrived.
 const SYNCED_EVERY: Duration = Duration::from_millis(50);
+
+/// The header on a route's answer that asks for this daemon to stop once that answer has left:
+/// [`serve`] fires the machine's [`Stop`] after it sent it on the link.
+pub const STOP_AFTER: &str = "x-foundry-stop-after";
+
+/// How long after a route asked for a stop the daemon stops anyway, when its answer could not
+/// be sent.
+pub const STOP_WITHIN: Duration = Duration::from_secs(5);
+
+/// The protocol a link must speak for a call to `path`: [`UPDATES_SINCE`] for a machine's
+/// install, which an older machine does not serve, and [`CALLS_SINCE`] for every other route.
+fn needs(path: &str) -> u16 {
+    let parts: Vec<&str> = path.split('/').collect();
+    match parts.as_slice() {
+        ["", "api", "machines", _, "update"] => UPDATES_SINCE,
+        _ => CALLS_SINCE,
+    }
+}
+
+/// Stops this daemon once, however many ask: the route that asked, after its answer left or
+/// [`STOP_WITHIN`] later, and a carried call's link after the answer it sent.
+#[derive(Clone)]
+pub struct Stop(Arc<Stopping>);
+
+struct Stopping {
+    fired: AtomicBool,
+    action: Box<dyn Fn() + Send + Sync>,
+}
+
+impl Stop {
+    /// A stop that runs `action` the first time it fires, and never again.
+    pub fn new(action: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(Stopping {
+            fired: AtomicBool::new(false),
+            action: Box::new(action),
+        }))
+    }
+
+    /// Raises SIGTERM on this process, as the updater stopped the daemon before #272: the
+    /// daemon stops as it does for the service's own SIGTERM, and the service starts it again.
+    pub fn sigterm() -> Self {
+        Self::new(|| {
+            tracing::info!("update: stopping, so the service starts the installed version");
+            if let Err(error) = nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM) {
+                tracing::error!("update: cannot raise SIGTERM: {error}");
+            }
+        })
+    }
+
+    /// Stops, unless it already did.
+    pub fn fire(&self) {
+        if !self.0.fired.swap(true, Ordering::SeqCst) {
+            (self.0.action)();
+        }
+    }
+
+    /// Whether it has stopped.
+    pub fn fired(&self) -> bool {
+        self.0.fired.load(Ordering::SeqCst)
+    }
+
+    /// Stops `limit` from now, unless it stopped before. Call it inside the runtime.
+    pub fn fire_within(&self, limit: Duration) {
+        let stop = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(limit).await;
+            stop.fire();
+        });
+    }
+}
+
+/// The stop each machine's carried calls fire after an answer that asks for one, by machine.
+/// Kept beside the peers rather than in them, so a daemon that gives none stops for no call.
+static STOPS: Mutex<BTreeMap<MachineId, Stop>> = Mutex::new(BTreeMap::new());
+
+/// The stop the peers of machine `me` were given, if any.
+fn stop_of(me: MachineId) -> Option<Stop> {
+    lock(&STOPS).get(&me).cloned()
+}
 
 /// One message on a call link past the call that opened it, owner to caller.
 #[derive(Debug, Serialize, Deserialize)]
@@ -104,6 +195,13 @@ impl Peers {
         *lock(&self.inner.calls) = Some(api);
     }
 
+    /// Fires `stop` after a carried call's answer that asks for one ([`STOP_AFTER`]) has left
+    /// on its link. Until this is called, such an answer stops nothing here: the route that
+    /// asked stops by itself [`STOP_WITHIN`] later.
+    pub fn stop_after_calls(&self, stop: Stop) {
+        lock(&STOPS).insert(self.inner.me, stop);
+    }
+
     /// Carries a `POST` of `body` to `path`, with `content_type`, to machine `owner`'s API, and
     /// gives back its answer once this machine holds what the call wrote, as the module says.
     pub async fn call(
@@ -123,7 +221,7 @@ impl Peers {
             return Err(CallError::Offline(peer.name));
         }
         match self.speaks(owner) {
-            Some(speak) if speak >= CALLS_SINCE => {}
+            Some(speak) if speak >= needs(path) => {}
             Some(_) => return Err(CallError::Older(peer.name)),
             // Nothing says the machine can take a call until a record link agrees a protocol.
             None => return Err(CallError::Down(peer.name)),
@@ -196,29 +294,30 @@ impl Peers {
 /// caller to close the link, so the answer is never lost to a link torn down under it. A
 /// machine that is not a peer is answered `403`, a path that is not one of the routes the API
 /// carries `400`, and a call to a `Peers` serving no calls `503`. The call runs to its end even
-/// when the caller goes.
+/// when the caller goes. An answer that asks for a stop ([`STOP_AFTER`]) fires this machine's
+/// [`Stop`] once it has left ([`answer`]).
 pub(super) async fn serve(inner: &Inner, machine: MachineId, call: Call, conn: Conn) {
     let Conn { send, mut recv } = conn;
     let api = *lock(&inner.calls);
-    let (status, body) = if machine == inner.me || !listed(inner, machine).await {
+    let (status, body, stop) = if machine == inner.me || !listed(inner, machine).await {
         tracing::warn!("sync: refused a call from {machine}: not a peer of this machine");
-        refusal(
+        going_on(refusal(
             403,
             format!("machine {machine} is not a peer of this machine"),
-        )
+        ))
     } else if !crate::api::carries(&call.path) {
-        refusal(
+        going_on(refusal(
             400,
             "a carried call names a route that is not carried".to_owned(),
-        )
+        ))
     } else if let Some(api) = api {
         let _beat = beat(send.clone());
         match unhex(&call.body) {
             Some(body) => run(api, call.path, call.content_type, body).await,
-            None => refusal(400, "the carried body cannot be read".to_owned()),
+            None => going_on(refusal(400, "the carried body cannot be read".to_owned())),
         }
     } else {
-        refusal(503, "this machine serves no calls".to_owned())
+        going_on(refusal(503, "this machine serves no calls".to_owned()))
     };
     let me = inner.me;
     let version = on_store(&inner.store, move |store| store.versions())
@@ -226,12 +325,41 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, call: Call, conn: C
         .ok()
         .and_then(|versions| versions.get(&me).copied())
         .unwrap_or(0);
-    let answer = Frame::Answer {
+    let frame = Frame::Answer {
         status,
         body: hex(&body),
         version,
     };
-    last_word(&send, &mut recv, &answer).await;
+    let stop = if stop {
+        let stop = stop_of(me);
+        if stop.is_none() {
+            tracing::warn!("sync: a carried call asked for a stop, and this machine has none");
+        }
+        stop
+    } else {
+        None
+    };
+    answer(&send, &mut recv, &frame, stop).await;
+}
+
+/// Sends `frame`, the call's answer, as its last word ([`last_word`]), then fires `stop`, when
+/// the route asked for one: once the caller has closed the link, the answer in hand, or the
+/// link could not take it.
+async fn answer(
+    send: &Sender<String>,
+    recv: &mut Receiver<String>,
+    frame: &Frame,
+    stop: Option<Stop>,
+) {
+    last_word(send, recv, frame).await;
+    if let Some(stop) = stop {
+        stop.fire();
+    }
+}
+
+/// `(status, body)` as the answer of a route that asked for no stop.
+fn going_on((status, body): (u16, Bytes)) -> (u16, Bytes, bool) {
+    (status, body, false)
 }
 
 /// `builder` as the client a carried call is made to this machine's API with: no proxy,
@@ -247,14 +375,15 @@ fn loopback(
         .timeout_global(Some(CALL_LIMIT))
 }
 
-/// Makes the call to this machine's API at `api` and gives back its status and body. The
-/// request runs on the blocking pool and to its end, whatever happens to the link.
+/// Makes the call to this machine's API at `api` and gives back its status, its body and whether
+/// it asked for a stop after its answer ([`STOP_AFTER`]). The request runs on the blocking pool
+/// and to its end, whatever happens to the link.
 async fn run(
     api: SocketAddr,
     path: String,
     content_type: Option<String>,
     body: Bytes,
-) -> (u16, Bytes) {
+) -> (u16, Bytes, bool) {
     let made = tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = loopback(ureq::Agent::config_builder()).build().into();
         let mut request = agent
@@ -265,27 +394,28 @@ async fn run(
         }
         let mut response = request.send(&body[..])?;
         let status = response.status().as_u16();
+        let stop = response.headers().contains_key(STOP_AFTER);
         let body = response.body_mut().read_to_vec()?;
-        Ok::<_, ureq::Error>((status, Bytes::from(body)))
+        Ok::<_, ureq::Error>((status, Bytes::from(body), stop))
     })
     .await;
     match made {
         Ok(Ok(answered)) => answered,
-        Ok(Err(ureq::Error::Timeout(_))) => refusal(
+        Ok(Err(ureq::Error::Timeout(_))) => going_on(refusal(
             504,
             format!("this machine's API did not answer within {CALL_LIMIT:?}"),
-        ),
+        )),
         Ok(Err(error)) => {
             tracing::warn!("sync: a carried call could not reach this machine's API: {error}");
-            refusal(
+            going_on(refusal(
                 502,
                 format!("this machine's API could not be reached: {error}"),
-            )
+            ))
         }
-        Err(_) => refusal(
+        Err(_) => going_on(refusal(
             500,
             "the carried call stopped before it answered".to_owned(),
-        ),
+        )),
     }
 }
 
@@ -364,7 +494,10 @@ mod tests {
 
         let install = format!("/api/machines/{old}/update");
         let body = br#"{"tag":"v0.9.1"}"#;
-        match peers.call(old, &install, Some("application/json"), body).await {
+        match peers
+            .call(old, &install, Some("application/json"), body)
+            .await
+        {
             Err(CallError::Older(name)) => assert_eq!(name, "peer"),
             other => panic!("not refused as older: {other:?}"),
         }
@@ -479,10 +612,8 @@ mod tests {
             answer(&send, &mut recv, &accepted(), Some(stop)).await;
         });
 
-        while stops.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(started.elapsed() <= STOP_WITHIN, "{:?}", started.elapsed());
+        tokio::time::sleep_until(started + STOP_WITHIN + Duration::from_millis(1)).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "not stopped within the limit");
         answering.await.unwrap();
         assert_eq!(stops.load(Ordering::SeqCst), 1, "stopped twice");
     }
@@ -522,7 +653,9 @@ mod tests {
         let app = axum::Router::new()
             .route(
                 "/stops",
-                axum::routing::post(|| async { (axum::http::StatusCode::ACCEPTED, [(STOP_AFTER, "1")]) }),
+                axum::routing::post(|| async {
+                    (axum::http::StatusCode::ACCEPTED, [(STOP_AFTER, "1")])
+                }),
             )
             .route(
                 "/goes-on",

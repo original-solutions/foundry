@@ -5,6 +5,9 @@
 //! - `POST /api/workspaces/{id}/sessions`, `/shells` and `/archive` for a workspace another
 //!   machine owns.
 //! - `POST /api/terminals/{id}/close` for a terminal another machine owns.
+//! - `POST /api/machines/{id}/update` for another machine: it installs that machine's ready
+//!   release ([`super::machine_update`]), and goes only on a link that speaks
+//!   [`UPDATES_SINCE`](foundry_proto::messages::UPDATES_SINCE) or later.
 //!
 //! Each goes to its owner over [`Peers::call`](crate::sync::Peers::call), its body passed as
 //! bytes, and the owner's status and body come back unchanged. A call for a machine not in the
@@ -49,6 +52,8 @@ enum Target {
     Create,
     Workspace(WorkspaceId),
     Terminal(TerminalId),
+    /// A machine's install, which runs on the machine it names.
+    Machine(MachineId),
     /// A factory worker route, which only a run carries.
     Worker(Worker),
     /// A Factory view route whose handler carries it: a stop, to the lease holder, and a
@@ -108,6 +113,7 @@ fn target(path: &str) -> Option<Target> {
             Some(Target::Workspace(WorkspaceId(id.parse().ok()?)))
         }
         ["terminals", id, "close"] => Some(Target::Terminal(TerminalId(id.parse().ok()?))),
+        ["machines", id, "update"] => Some(Target::Machine(MachineId(id.parse().ok()?))),
         ["factory", "workspaces"] => Some(Target::Worker(Worker::Create)),
         ["workspaces", id, "factory", "session"] => {
             Some(Target::Worker(Worker::Start(WorkspaceId(id.parse().ok()?))))
@@ -275,6 +281,7 @@ async fn owner(api: &Api, target: Target, body: &Bytes) -> Result<Option<Machine
             .filter(|record| !record.deleted && record.owner != me)
             .map(|record| record.owner)),
         Target::Terminal(id) => Ok(api.peers.owner_of(id).await?),
+        Target::Machine(id) => Ok(Some(id).filter(|id| *id != me)),
         // Never carried by this layer: a run's call finds its owner with `worker_owner`, and
         // a Factory view route's handler carries it itself.
         Target::Worker(_) | Target::View => Ok(None),
