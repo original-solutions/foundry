@@ -106,7 +106,7 @@ describe("Sidebar", () => {
       const link = within(group).getByRole("link", { name: new RegExp(`model-${i}.*${label}$`) });
       expect(link.getAttribute("href")).toBe(`/terminals/st${i}`);
     });
-    expect(within(group).getByRole("link", { name: /Running/ }).getAttribute("href")).toBe("/terminals/sh1");
+    expect(within(group).getByRole("link", { name: /Open/ }).getAttribute("href")).toBe("/terminals/sh1");
     expect(within(group).getByRole("link", { name: /Failed · exit 1/ }).getAttribute("href")).toBe("/terminals/sh2");
     expect(within(group).getAllByRole("link", { name: /Unreachable/ })).toHaveLength(2);
     for (const name of ["New session", "New shell"]) {
@@ -140,7 +140,7 @@ describe("Sidebar", () => {
     await renderApp(<Sidebar machines={machines()} selected="sh2" {...props} />);
 
     expect(screen.getByRole("link", { name: /Failed · exit 1/ }).getAttribute("aria-current")).toBe("true");
-    expect(screen.getByRole("link", { name: /Running/ }).getAttribute("aria-current")).toBeNull();
+    expect(screen.getByRole("link", { name: /Open/ }).getAttribute("aria-current")).toBeNull();
   });
 
   it("offers a new task", async () => {
@@ -254,7 +254,7 @@ describe("Sidebar", () => {
 
     const strip = within(screen.getByRole("group", { name: "fix login" })).getAllByRole("link");
     expect(strip).toHaveLength(6);
-    expect(strip[5].getAttribute("aria-label")).toBe("shell 1 Running");
+    expect(strip[5].getAttribute("aria-label")).toBe("shell 1 Open");
     expect(strip[5].getAttribute("aria-current")).toBe("true");
   });
 
