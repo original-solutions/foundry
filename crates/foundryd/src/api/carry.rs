@@ -2,8 +2,9 @@
 //! runs, so no handler knows about other machines.
 //!
 //! - `POST /api/workspaces` whose `machine` names another machine.
-//! - `POST /api/workspaces/{id}/sessions`, `/shells` and `/archive` for a workspace another
-//!   machine owns.
+//! - `POST /api/workspaces/{id}/sessions`, `/shells`, `/archive` and `/pr` for a workspace
+//!   another machine owns. An owner on a build from before `/pr` was carried answers it `400`,
+//!   as it answers any route it does not carry.
 //! - `POST /api/terminals/{id}/close` for a terminal another machine owns.
 //! - `POST /api/sessions/{id}/rename` for a session another machine owns.
 //! - `POST /api/machines/{id}/update` for another machine: it installs that machine's ready
@@ -111,7 +112,7 @@ fn target(path: &str) -> Option<Target> {
     let parts: Vec<&str> = path.strip_prefix("/api/")?.split('/').collect();
     match parts.as_slice() {
         ["workspaces"] => Some(Target::Create),
-        ["workspaces", id, "sessions" | "shells" | "archive"] => {
+        ["workspaces", id, "sessions" | "shells" | "archive" | "pr"] => {
             Some(Target::Workspace(WorkspaceId(id.parse().ok()?)))
         }
         ["terminals", id, "close"] => Some(Target::Terminal(TerminalId(id.parse().ok()?))),
@@ -357,7 +358,7 @@ mod tests {
     fn only_the_carried_routes_have_a_target() {
         let id = uuid::Uuid::new_v4();
         assert!(matches!(target("/api/workspaces"), Some(Target::Create)));
-        for action in ["sessions", "shells", "archive"] {
+        for action in ["sessions", "shells", "archive", "pr"] {
             let path = format!("/api/workspaces/{id}/{action}");
             assert!(matches!(target(&path), Some(Target::Workspace(w)) if w.0 == id));
         }
@@ -436,6 +437,7 @@ mod tests {
             format!("/api/workspaces/{id}/sessions"),
             format!("/api/workspaces/{id}/shells"),
             format!("/api/workspaces/{id}/archive"),
+            format!("/api/workspaces/{id}/pr"),
             format!("/api/terminals/{id}/close"),
             format!("/api/sessions/{id}/rename"),
         ] {
