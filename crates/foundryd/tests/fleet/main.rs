@@ -521,6 +521,7 @@ pub fn session(
                 terminal,
                 model: "claude-opus-5-5".into(),
                 state,
+                name: None,
             },
         })
     }

@@ -10,8 +10,9 @@ export const ATTENTION_EVERY = 2000;
 const key = ["attention"];
 
 /**
- * What needs a person, across the fleet: a card at the top of the layout's news while anything
- * does, nothing otherwise. Each item says what happened, what to do and on which machine, with its terminal one
+ * What needs a person across the fleet that is not a session's question, stall or failure (those
+ * lead from the strip beside it, `NextUp`): a card at the head of the page while anything does,
+ * nothing otherwise. Each item says what happened, what to do and on which machine, with its terminal one
  * click away. A "setting overwritten" item is dismissed here, and a "setup failed" item clears by closing its
  * exited terminal here; every other clears on its own.
  * `folded` starts it folded to its count, each time the card shows.
@@ -38,7 +39,8 @@ function Items({ items, folded }: { items: AttentionItem[]; folded: boolean }) {
   return (
     <section
       aria-label="Needs attention"
-      className="pointer-events-auto rounded-lg border border-amber-700/60 bg-neutral-900 text-sm shadow-lg shadow-black/50"
+      // Folded, it sits beside the strip to the next that needs you; open, it takes a row of its own.
+      className={`${open ? "basis-full" : "flex-[1_1_auto]"} pointer-events-auto rounded-lg border border-amber-700/60 bg-neutral-900 text-sm shadow-lg shadow-black/50`}
     >
       <button
         type="button"
