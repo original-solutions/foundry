@@ -3114,6 +3114,31 @@ mod tests {
                 assert_eq!(approval_reads(&rig), 1);
             }
 
+            /// An approval history with a malformed timestamp fails the takeover before it
+            /// records or does anything, even where the label is a stranger's: the read checks
+            /// every timestamp, and a later pass reads it again.
+            #[test]
+            fn a_malformed_timestamp_in_the_history_fails_the_takeover_before_it_records_anything()
+            {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    "2026-10-04 10:00:00Z",
+                    "User",
+                    "mallory",
+                )];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert!(rig.ledger.read(&run).unwrap().is_empty());
+                assert_eq!(rig.sim.labels(), ["factory:triage"]);
+                assert!(calls(&rig).is_empty());
+                assert_eq!(approval_reads(&rig), 1);
+            }
+
             /// The claim removed `factory:ready`: the run is approved on the newest label an
             /// instructor applied before it, and carried on.
             #[test]
