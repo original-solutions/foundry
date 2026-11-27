@@ -775,4 +775,18 @@ mod tests {
             Err(ServiceError::NoHome)
         ));
     }
+
+    #[test]
+    fn a_hand_install_clears_the_ready_tag_for_a_version_below_equal_to_and_above_it() {
+        for version in ["0.1.0", "0.2.0", "0.3.0"] {
+            let home = tempfile::tempdir().unwrap();
+            let src = tempfile::tempdir().unwrap();
+            binaries(src.path(), version);
+            fs::write(home.path().join("update.json"), r#"{"ready":"v0.2.0"}"#).unwrap();
+
+            place(home.path(), &src.path().join("foundryd"), version).unwrap();
+
+            assert_eq!(update::state(home.path()).unwrap().ready, None, "{version}");
+        }
+    }
 }
