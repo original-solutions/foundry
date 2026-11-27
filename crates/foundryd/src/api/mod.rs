@@ -49,9 +49,12 @@
 //! - `POST /api/workspaces/{id}/shells`: starts the daemon's `$SHELL` in the workspace, `201
 //!   {id}`.
 //! - `POST /api/terminals/{id}/close`: `204`.
+//! - `POST /api/sessions/{id}/rename` `{name}`: names the session, shown in place of its first
+//!   prompt, `204`; see [`Sessions::rename`] for how the name is cut and hidden. A name that is
+//!   blank clears it. A session that is not this machine's, or is gone, is `404`.
 //!
-//!   These five actions, on a workspace or terminal another machine owns or a create that
-//!   names another machine, are carried to that machine and answered as it answers: see
+//!   These six actions, on a workspace, terminal or session another machine owns or a create
+//!   that names another machine, are carried to that machine and answered as it answers: see
 //!   [`carry`].
 //! - `POST /api/terminals/{id}/files?name=<name>`: keeps a file for the terminal and answers
 //!   its path, see [`files`].
@@ -211,6 +214,7 @@ pub fn router(api: Api) -> Router {
         .route("/api/briefs", get(briefs::briefs))
         .route("/api/machine", get(machine::machine))
         .route("/api/sessions/{id}/trail", get(trail::trail))
+        .route("/api/sessions/{id}/rename", post(rename_session))
         .route("/api/placements", get(placement::list))
         .route("/api/placements/{id}/cancel", post(placement::cancel))
         .merge(factory::router())
@@ -1218,6 +1222,26 @@ async fn start_shell(State(api): State<Api>, Path(id): Path<String>) -> Result<R
         })
         .await?;
     Ok(created(terminal))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Rename {
+    name: String,
+}
+
+async fn rename_session(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    Body(rename): Body<Rename>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id, "session", SessionId)?;
+    if !api.sessions.rename(id, &rename.name).await? {
+        return Err(ApiError::NotFound(format!(
+            "no session {id} on this machine"
+        )));
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn close_terminal(

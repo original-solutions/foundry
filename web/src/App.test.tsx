@@ -5,7 +5,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { machineQuery, type Briefs, type Changes, type Shipping, type UiMessage } from "./api";
 import { router, routeTree } from "./App";
-import { button, dangerButton, pressed } from "./Modal";
+import { button, dangerButton, pressed, viewLook } from "./Modal";
 import { keep, KEEP_AFTER, recall } from "./memory";
 import { nextSteps } from "./next";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
@@ -175,32 +175,14 @@ describe("App", () => {
     settings: settings(),
   };
 
-  it("shows the attention list over the layout", async () => {
-    attention = [
-      {
-        id: "session_waiting:s1",
-        kind: "session_waiting",
-        machine: ME,
-        machine_name: "this-mac",
-        what: "A session in fix login on this-mac is waiting for you",
-        todo: "Open its terminal and answer it",
-        terminal: "t1",
-      },
-    ];
-    mockActions();
-    await open("/", live);
-    const list = await screen.findByRole("region", { name: "Needs attention" });
-    expect(within(list).getByText("A session in fix login on this-mac is waiting for you")).toBeDefined();
-  });
-
-  const needsYou = {
-    id: "session_waiting:s1",
-    kind: "session_waiting",
+  const diskLow = {
+    id: "disk_low:" + ME,
+    kind: "disk_low",
     machine: ME,
     machine_name: "this-mac",
-    what: "A session in fix login on this-mac is waiting for you",
-    todo: "Open its terminal and answer it",
-    terminal: "t1",
+    what: "this-mac has 2 GB of disk free",
+    todo: "Free some disk, or archive workspaces you are done with",
+    terminal: null,
   };
   const held = {
     id: "r1",
@@ -211,54 +193,51 @@ describe("App", () => {
     reasons: ["laptop: offline"],
     error: null,
   };
-  /** The fixed stack of news at the top of the screen. */
-  const newsStack = (el: Element) => el.closest(".fixed");
+  /** The slot at the head of the page, in the flow, so what it holds pushes the page down rather than lying over it. */
+  const slot = () => document.querySelector("main")!.firstElementChild!;
 
-  for (const [name, toggle, shown] of [
-    ["Needs attention", /1 needs attention/, needsYou.what],
-    ["Waiting for a machine", /1 waiting for a machine/, held.reasons[0]],
-  ] as const) {
-    it(`on a narrow screen puts "${name}" folded in the page above the terminal header, not over it`, async () => {
-      vi.stubGlobal("matchMedia", () => ({ matches: false }));
-      attention = [needsYou];
-      placements = [held];
-      mockActions();
-      await open("/terminals/t1", live);
-      const list = await screen.findByRole("region", { name });
-      expect(screen.getAllByRole("region", { name })).toHaveLength(1);
-      expect(document.querySelector("main")!.contains(list)).toBe(true);
-      const header = document.querySelector('header[aria-label="Open terminal"]')!;
-      expect(list.compareDocumentPosition(header) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-      expect(newsStack(list)).toBeNull();
-      const button = within(list).getByRole("button", { name: toggle });
-      expect(button.getAttribute("aria-expanded")).toBe("false");
-      expect(within(list).queryByText(shown)).toBeNull();
-      fireEvent.click(button);
-      expect(within(list).getByText(shown)).toBeDefined();
-    });
-  }
-
-  for (const [screenIs, wide] of [
+  const screens = [
     ["a wide screen", () => vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(min-width: 768px)" }))],
+    ["a narrow screen", () => vi.stubGlobal("matchMedia", () => ({ matches: false }))],
     ["no matchMedia", () => {}],
-  ] as const) {
-    it(`with ${screenIs}, keeps both lists open in the news stack`, async () => {
-      wide();
-      attention = [needsYou];
-      placements = [held];
-      mockActions();
-      await open("/terminals/t1", live);
-      for (const name of ["Needs attention", "Waiting for a machine"]) {
-        const list = await screen.findByRole("region", { name });
-        expect(screen.getAllByRole("region", { name })).toHaveLength(1);
-        expect(newsStack(list)).not.toBeNull();
-        expect(document.querySelector("main")!.contains(list)).toBe(false);
-        expect(within(list).getByRole("button", { expanded: true })).toBeDefined();
+  ] as const;
+
+  for (const [screenIs, size] of screens) {
+    for (const [name, toggle, shown] of [
+      ["Needs attention", /1 needs attention/, diskLow.what],
+      ["Waiting for a machine", /1 waiting for a machine/, held.reasons[0]],
+    ] as const) {
+      for (const path of ["/terminals/t1", "/", "/machines"]) {
+        it(`with ${screenIs} on ${path}, puts "${name}" folded at the head of the page, never over it`, async () => {
+          size();
+          attention = [diskLow];
+          placements = [held];
+          mockActions();
+          await open(path, live);
+          const list = await screen.findByRole("region", { name });
+          expect(screen.getAllByRole("region", { name })).toHaveLength(1);
+          expect(slot().contains(list)).toBe(true);
+          expect(list.closest(".fixed")).toBeNull();
+          const button = within(list).getByRole("button", { name: toggle });
+          expect(button.getAttribute("aria-expanded")).toBe("false");
+          expect(within(list).queryByText(shown)).toBeNull();
+          fireEvent.click(button);
+          expect(within(list).getByText(shown)).toBeDefined();
+        });
       }
-    });
+    }
   }
 
-  it("moves the lists between the page and the news stack as the screen crosses the breakpoint", async () => {
+  it("puts the lists above an open terminal's header", async () => {
+    attention = [diskLow];
+    mockActions();
+    await open("/terminals/t1", live);
+    const list = await screen.findByRole("region", { name: "Needs attention" });
+    const header = document.querySelector('header[aria-label="Open terminal"]')!;
+    expect(list.compareDocumentPosition(header) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("keeps the lists, and their fold, in place as the screen crosses the breakpoint", async () => {
     let wide = false;
     const listeners = new Set<() => void>();
     vi.stubGlobal("matchMedia", (query: string) => ({
@@ -268,37 +247,36 @@ describe("App", () => {
       addEventListener: (_: string, f: () => void) => listeners.add(f),
       removeEventListener: (_: string, f: () => void) => listeners.delete(f),
     }));
-    attention = [needsYou];
+    attention = [diskLow];
     mockActions();
     await open("/terminals/t1", live);
-    const narrow = await screen.findByRole("region", { name: "Needs attention" });
-    expect(newsStack(narrow)).toBeNull();
+    const list = await screen.findByRole("region", { name: "Needs attention" });
+    fireEvent.click(within(list).getByRole("button", { name: /1 needs attention/ }));
 
     wide = true;
     act(() => listeners.forEach((f) => f()));
-    const moved = screen.getByRole("region", { name: "Needs attention" });
-    expect(newsStack(moved)).not.toBeNull();
-    expect(within(moved).getByText(needsYou.what)).toBeDefined();
+    expect(screen.getByRole("region", { name: "Needs attention" })).toBe(list);
+    expect(within(list).getByText(diskLow.what)).toBeDefined();
 
     wide = false;
     act(() => listeners.forEach((f) => f()));
-    const back = screen.getByRole("region", { name: "Needs attention" });
-    expect(newsStack(back)).toBeNull();
-    expect(within(back).queryByText(needsYou.what)).toBeNull();
+    expect(screen.getByRole("region", { name: "Needs attention" })).toBe(list);
+    expect(within(list).getByText(diskLow.what)).toBeDefined();
   });
 
-  it("takes no room in the page on a narrow screen while nothing needs attention or waits, and at most half of it otherwise", async () => {
-    vi.stubGlobal("matchMedia", () => ({ matches: false }));
-    mockActions();
-    await open("/terminals/t1", live);
-    await waitFor(() => expect(document.querySelector("main")!.firstElementChild!.className).toMatch(/\bempty:hidden\b/));
-    const slot = document.querySelector("main")!.firstElementChild!;
-    expect(slot.className).toMatch(/\bshrink-0\b/);
-    // Both lists unfolded never push the header off the screen: the slot scrolls past half of it.
-    expect(slot.className).toMatch(/\bmax-h-\[50dvh\]/);
-    expect(slot.className).toMatch(/\boverflow-y-auto\b/);
-    expect(slot.childElementCount).toBe(0);
-  });
+  for (const [screenIs, size] of screens) {
+    it(`with ${screenIs}, takes no room in the page while nothing needs attention or waits, and at most half of it otherwise`, async () => {
+      size();
+      mockActions();
+      await open("/terminals/t1", live);
+      await waitFor(() => expect(slot().className).toMatch(/\bempty:hidden\b/));
+      expect(slot().className).toMatch(/\bshrink-0\b/);
+      // Both lists unfolded never push the header off the screen: the slot scrolls past half of it.
+      expect(slot().className).toMatch(/\bmax-h-\[50dvh\]/);
+      expect(slot().className).toMatch(/\boverflow-y-auto\b/);
+      expect(slot().childElementCount).toBe(0);
+    });
+  }
 
   it("says the daemon cannot be reached, instead of showing an empty fleet, when no state ever arrives", async () => {
     mockActions();
@@ -540,6 +518,63 @@ describe("App", () => {
     expect(screen.getByRole("navigation", { name: "Workspaces" }).id).toBe("sidebar");
   });
 
+  const asking: UiMessage & { type: "state" } = {
+    ...live,
+    records: [
+      sample(ME, 1),
+      workspace(ME, "w1", "fix login"),
+      terminal(ME, "t1", "w1", "running"),
+      session(ME, "s1", "w1", "t1", "waiting_for_you", { model: "sonnet" }),
+      workspace(ME, "w2", "tidy cart"),
+      terminal(ME, "t3", "w2", "running"),
+      session(ME, "s3", "w2", "t3", "waiting_for_you"),
+      workspace(ME, "w3", "busy"),
+      terminal(ME, "t4", "w3", "running"),
+      session(ME, "s4", "w3", "t4", "working"),
+    ],
+  };
+
+  it("heads the page over an open terminal with the next one that needs you, not its header, and goes to it with its link or Cmd+J", async () => {
+    mockActions();
+    const router = await open("/terminals/t1", asking);
+
+    const next = screen.getByRole("link", { name: "Next that needs you: tidy cart / opus, 1 more needs you" });
+    expect(slot().contains(next)).toBe(true);
+    expect(within(screen.getByLabelText("Open terminal")).queryByRole("link", { name: /^Next that needs you/ })).toBeNull();
+
+    fireEvent.keyDown(window, { key: "j", metaKey: true });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t3"));
+    // Round again to the first.
+    expect(screen.getByRole("link", { name: "Next that needs you: fix login / sonnet, 1 more needs you" })).toBeDefined();
+    fireEvent.keyDown(window, { key: "j", metaKey: true });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+  });
+
+  for (const path of ["/", "/machines", "/factory"]) {
+    it(`heads ${path} with the first that needs you, one way into them that every view shares`, async () => {
+      mockActions();
+      await open(path, asking);
+      const first = screen.getByRole("link", { name: "Next that needs you: fix login / sonnet, 2 need you" });
+      expect(slot().contains(first)).toBe(true);
+      expect(first.getAttribute("href")).toBe("/terminals/t1");
+      expect(screen.queryByRole("link", { name: /^Go through/ })).toBeNull();
+    });
+  }
+
+  it("takes Cmd+J from the board to the first that needs you, and offers nothing when only the open terminal does", async () => {
+    mockActions();
+    const router = await open("/", asking);
+    fireEvent.keyDown(window, { key: "j", metaKey: true });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+
+    act(() => {
+      sockets("/api/events")
+        .at(-1)!
+        .deliver(JSON.stringify({ ...asking, records: asking.records.map((r) => (r.kind === "session" && r.body.id === "s3" ? { ...r, version: 2, body: { ...r.body, state: "idle" } } : r)) }));
+    });
+    expect(screen.queryByRole("link", { name: /^Next that needs you/ })).toBeNull();
+  });
+
   it("opens collapsed in a window too narrow for the list and a terminal, while a phone's drawer still holds the whole list", async () => {
     vi.stubGlobal("innerWidth", 900);
     await open("/terminals/t1", live);
@@ -557,7 +592,9 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "k", metaKey: true });
     const dialog = await screen.findByRole("dialog", { name: "Jump to" });
     const input = within(dialog).getByRole("combobox");
-    expect(within(dialog).getAllByRole("option")).toHaveLength(3);
+    expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual(
+      expect.arrayContaining([expect.stringContaining("fix login / sonnet"), expect.stringContaining("fix login / shell"), expect.stringContaining("New shell in fix login")]),
+    );
 
     fireEvent.change(input, { target: { value: "login shell" } });
     expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual([
@@ -581,7 +618,7 @@ describe("App", () => {
 
     const options = within(dialog).getAllByRole("option");
     fireEvent.keyDown(input, { key: "ArrowUp" });
-    expect(input.getAttribute("aria-activedescendant")).toBe(options[2].id);
+    expect(input.getAttribute("aria-activedescendant")).toBe(options.at(-1)!.id);
     fireEvent.keyDown(input, { key: "ArrowDown" });
     fireEvent.keyDown(input, { key: "ArrowDown" });
     expect(input.getAttribute("aria-activedescendant")).toBe(within(dialog).getAllByRole("option")[1].id);
@@ -723,6 +760,21 @@ describe("App", () => {
     expect(within(here).getByText("online")).toBeDefined();
     expect(within(away).getByText("offline")).toBeDefined();
     expect(screen.queryByText("unknown")).toBeNull();
+  });
+
+  it("starts a task from the machines view in the New task dialog, set to let Foundry choose", async () => {
+    const calls = mockActions(json(202, { request: "r1", reasons: [] }));
+    const fleet = settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "laptop", address: "100.64.0.2" }] });
+    await open("/machines", { type: "state", protocol: 1, records: [sample(ME, 1), sample(OTHER, 1, { load: 0.1 })], settings: fleet, online: [ME, OTHER] });
+
+    const head = await screen.findByRole("region", { name: "Next task" });
+    expect(head.textContent).toMatch(/laptop takes the next task/);
+    fireEvent.click(within(head).getByRole("button", { name: "New task, Foundry chooses the machine" }));
+    const dialog = await screen.findByRole("dialog", { name: "New task" });
+    fireEvent.change(within(dialog).getByLabelText("What should Claude work on?"), { target: { value: "Add search." } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0].body).toMatchObject({ name: "add search", machine: "choose" });
   });
 
   const factoryOverview = (status: unknown = null) =>
@@ -966,6 +1018,69 @@ describe("App", () => {
     );
     expect(screen.queryByLabelText("What should Claude work on?")).toBeNull();
     expect(screen.queryByText(/0 workspaces/)).toBeNull();
+  });
+
+  it("goes to every view from the palette, saying which one you are on", async () => {
+    const router = await open("/", live);
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    let palette = await screen.findByRole("dialog", { name: "Jump to" });
+    const views = within(palette).getByRole("navigation", { name: "Views" });
+    expect(within(views).getAllByRole("button").map((b) => b.textContent)).toEqual(["Board", "Timeline", "Machines", "Factory"]);
+    expect(within(views).getByRole("button", { name: "Board" }).getAttribute("aria-current")).toBe("page");
+    // The view you are on looks as it does in the board's own View switch.
+    const lacks = (el: Element, look: string) => look.split(" ").filter((c) => !el.classList.contains(c));
+    expect(lacks(within(views).getByRole("button", { name: "Board" }), viewLook.on)).toEqual([]);
+    expect(lacks(within(views).getByRole("button", { name: "Timeline" }), viewLook.off)).toEqual([]);
+    expect(lacks(screen.getByRole("radio", { name: "Board", hidden: true }), viewLook.on)).toEqual([]);
+    // With nothing typed the views are only in the strip, so the list starts with the fleet.
+    expect(within(palette).queryByRole("option", { name: /^Machines/ })).toBeNull();
+
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "turns" } });
+    expect(within(palette).getAllByRole("option")[0].textContent).toMatch(/^Timeline/);
+    fireEvent.keyDown(within(palette).getByRole("combobox"), { key: "Enter" });
+    await waitFor(() => expect(screen.getByRole("radio", { name: "Timeline" }).getAttribute("aria-checked")).toBe("true"));
+    expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull();
+
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    palette = await screen.findByRole("dialog", { name: "Jump to" });
+    expect(within(within(palette).getByRole("navigation", { name: "Views" })).getByRole("button", { name: "Timeline" }).getAttribute("aria-current")).toBe("page");
+    fireEvent.click(within(palette).getByRole("button", { name: "Factory" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/factory"));
+    expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull();
+
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    palette = await screen.findByRole("dialog", { name: "Jump to" });
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "board" } });
+    fireEvent.keyDown(within(palette).getByRole("combobox"), { key: "Enter" });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    expect(screen.getByRole("radio", { name: "Board" }).getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("does the app's actions from the palette: a new task, the next that needs you and the list of keys", async () => {
+    const waiting: UiMessage & { type: "state" } = {
+      ...live,
+      records: [...live.records, workspace(ME, "w2", "tidy readme"), terminal(ME, "t3", "w2", "running"), session(ME, "s3", "w2", "t3", "waiting_for_you")],
+    };
+    const router = await open("/", waiting);
+    const pick = async (query: string, expected: RegExp) => {
+      fireEvent.keyDown(window, { key: "k", metaKey: true });
+      const palette = await screen.findByRole("dialog", { name: "Jump to" });
+      fireEvent.change(within(palette).getByRole("combobox"), { target: { value: query } });
+      expect(within(palette).getAllByRole("option")[0].textContent).toMatch(expected);
+      fireEvent.keyDown(within(palette).getByRole("combobox"), { key: "Enter" });
+    };
+
+    await pick("needs you next", /^Next that needs you.*1 needs you/);
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t3"));
+
+    await pick("keyboard", /^Keyboard shortcuts.*\?/);
+    expect(await screen.findByRole("dialog", { name: "Keyboard" })).toBeDefined();
+    fireEvent.keyDown(screen.getByRole("dialog", { name: "Keyboard" }), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Keyboard" })).toBeNull());
+
+    await pick("new task", /^New task/);
+    const dialog = await screen.findByRole("dialog", { name: "New task" });
+    expect((within(dialog).getByLabelText("What should Claude work on?") as HTMLTextAreaElement).value).toBe("");
   });
 
   it("offers a new task of what you typed in the palette", async () => {
@@ -1366,7 +1481,7 @@ describe("App", () => {
 
     fireEvent.keyDown(input, { key: "Tab" });
     fireEvent.keyDown(input, { key: "Backspace" });
-    expect(within(dialog).getByRole("listbox", { name: "Sessions and shells" })).toBeDefined();
+    expect(within(dialog).getByRole("listbox", { name: "Sessions, shells, views and actions" })).toBeDefined();
 
     fireEvent.keyDown(input, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
@@ -1383,6 +1498,7 @@ describe("App", () => {
     expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual([
       "Open",
       "Steps",
+      "Rename",
       "Changes in fix login",
       "New session in fix login",
       "New shell in fix login",
@@ -1473,6 +1589,55 @@ describe("App", () => {
 
     fireEvent.click(within(shell()).getByRole("button", { name: "Close steps" }));
     expect(screen.queryByRole("complementary", { name: "Steps" })).toBeNull();
+  });
+
+  it("renames a session from its tab: a double-click swaps the name for a field, Enter saves, and the name the owner writes shows everywhere", async () => {
+    briefs = { s1: { title: "fix the login redirect", now: null } };
+    const calls = mockActions(new Response(null, { status: 204 }));
+    await open("/terminals/t1", live);
+    const tabs = screen.getByRole("tablist", { name: "Terminals in fix login" });
+    const tab = await within(tabs).findByRole("tab", { name: /^sonnet fix the login redirect/ });
+    expect(tab.getAttribute("href")).toBe("/terminals/t1");
+
+    fireEvent.doubleClick(tab);
+    const field = within(tabs).getByRole<HTMLInputElement>("textbox", { name: "Session name" });
+    expect(field.value).toBe("fix the login redirect");
+    fireEvent.change(field, { target: { value: "login redirect" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(within(tabs).queryByRole("textbox")).toBeNull());
+    expect(calls).toEqual([{ url: "/api/sessions/s1/rename", method: "POST", body: { name: "login redirect" } }]);
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "working", { model: "sonnet", version: 2, name: "login redirect" }) })));
+    expect(within(tabs).getByRole("tab", { name: /^sonnet login redirect/ })).toBeDefined();
+    expect(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /^sonnet login redirect/ })).toBeDefined();
+  });
+
+  it("offers Rename in a session's menu, which opens the field where the menu was opened, and none for a shell", async () => {
+    const calls = mockActions();
+    await open("/terminals/t1", live);
+    const sidebar = screen.getByRole("group", { name: "fix login" });
+    const tabs = screen.getByRole("tablist", { name: "Terminals in fix login" });
+
+    fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^sonnet/ }));
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Rename" }));
+    const field = await within(sidebar).findByRole<HTMLInputElement>("textbox", { name: "Session name" });
+    expect(field.value).toBe("");
+    expect(within(tabs).queryByRole("textbox")).toBeNull();
+    fireEvent.keyDown(field, { key: "Escape" });
+    expect(within(sidebar).queryByRole("textbox")).toBeNull();
+
+    fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell/ }));
+    const menu = await screen.findByRole("menu");
+    expect(within(menu).queryByRole("menuitem", { name: "Rename" })).toBeNull();
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+
+    fireEvent.keyDown(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "More" }), { key: "Enter" });
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Rename" }));
+    expect(await within(tabs).findByRole("textbox", { name: "Session name" })).toBeDefined();
+    expect(within(sidebar).queryByRole("textbox")).toBeNull();
+    expect(calls).toEqual([]);
   });
 
   it("opens a workspace's changes at a file its terminal names, on ⌘-click", async () => {

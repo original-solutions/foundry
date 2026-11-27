@@ -4983,6 +4983,7 @@ impl Setup {
                 terminal,
                 model: "claude-opus-5-5".into(),
                 state: SessionState::Working,
+                name: None,
             },
         });
         store.apply(&record, self.me).unwrap();

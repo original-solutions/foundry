@@ -174,6 +174,20 @@ describe("NewTask", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
+  it("opens set to the machine it was given, as the machines view asks for one", async () => {
+    const calls = fleetOf(json(201, { id: "w9", machine: "m2" }), json(201, { id: "s9" }));
+    await renderApp(<Harness machine="m2" />);
+
+    const dialog = await show();
+    const machine = (await within(dialog).findByLabelText("Machine")) as HTMLSelectElement;
+    expect(machine.value).toBe("m2");
+    fireEvent.change(taskBox(dialog), { target: { value: "Far work" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start" }));
+
+    await waitFor(() => expect(calls.length).toBeGreaterThan(0));
+    expect(calls[0].body).toMatchObject({ name: "far work", machine: "m2" });
+  });
+
   it("closes on a request that waits for a machine, starts no session, and asks for the waiting list again", async () => {
     const calls = fleetOf(json(202, { request: "r1", reasons: ["laptop: load 1.8 over limit 1.0"] }));
     const created = vi.fn();

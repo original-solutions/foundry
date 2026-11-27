@@ -369,6 +369,54 @@ impl Sessions {
         let trail = lock(&live.brief).trail.iter().cloned().collect();
         Some(trail)
     }
+
+    /// Names session `id` `name`, shown in place of its first prompt, in a new version of its
+    /// record. The name is cut to one line as a brief's prompt is, with the gateway key, every
+    /// live session's token, token-shaped words and the password of any URL hidden; one that
+    /// leaves nothing clears the name. Gives `false`, and writes nothing, when the session is
+    /// not this machine's or its record is deleted.
+    pub async fn rename(&self, id: SessionId, name: &str) -> Result<bool, SessionError> {
+        let inner = &self.inner;
+        let memory = inner.memory_secrets();
+        let secrets: Vec<&str> = memory.iter().map(String::as_str).collect();
+        let name = Some(brief::shown(name, &secrets)).filter(|name| !name.is_empty());
+        // A live session's record is written only under its lock, so a rename never crosses a
+        // change of state. One that ended or failed to start meanwhile is read from the store.
+        if let Some(live) = inner.live(id) {
+            let mut body = live.body.lock().await;
+            if inner.is_live(&live) {
+                let changed = Session {
+                    name,
+                    ..body.clone()
+                };
+                inner.write(changed.clone()).await?;
+                *body = changed;
+                return Ok(true);
+            }
+        }
+        let me = inner.me;
+        inner
+            .on_store(move |store| {
+                let Some(record) = store.session(id)? else {
+                    return Ok(false);
+                };
+                if record.owner != me || record.deleted {
+                    return Ok(false);
+                }
+                let record = Record {
+                    owner: me,
+                    version: store.own_next_version()?,
+                    deleted: false,
+                    body: Session {
+                        name,
+                        ..record.body
+                    },
+                };
+                store.apply(&AnyRecord::Session(record), me)?;
+                Ok(true)
+            })
+            .await
+    }
 }
 
 impl Drop for Sessions {
@@ -462,6 +510,7 @@ impl Inner {
                 terminal: TerminalId(uuid::Uuid::nil()),
                 model: model.to_string(),
                 state: SessionState::Starting,
+                name: None,
             }),
             activity,
             started: watch::Sender::new(None),
@@ -1269,19 +1318,21 @@ mod adopt_tests {
         with_a_session_record(terminal_record, WORKING)
     }
 
-    /// The session's own record: its state, whether it is deleted, and whether a peer owns it
-    /// rather than this machine.
+    /// The session's own record: its state, whether it is deleted, whether a peer owns it
+    /// rather than this machine, and the name it was given.
     #[derive(Clone, Copy)]
     struct Seed {
         state: SessionState,
         deleted: bool,
         peer: bool,
+        name: Option<&'static str>,
     }
 
     const WORKING: Seed = Seed {
         state: SessionState::Working,
         deleted: false,
         peer: false,
+        name: None,
     };
 
     /// [`with_a_session`], with the session's record seeded as `seed` says.
@@ -1322,6 +1373,7 @@ mod adopt_tests {
                 terminal,
                 model: "test-model".into(),
                 state: seed.state,
+                name: seed.name.map(str::to_owned),
             },
         }));
         for record in &records {
@@ -1491,6 +1543,37 @@ mod adopt_tests {
     }
 
     #[tokio::test]
+    async fn a_renamed_session_keeps_its_name_through_adoption_and_its_next_state_change() {
+        let named = Seed {
+            name: Some("login redirect"),
+            ..WORKING
+        };
+        let name = |sessions: &Sessions, id| record(sessions, id).unwrap().body.name;
+
+        // Exited while the daemon was down: adoption writes the end.
+        let exited = Some((false, TerminalState::Exited, Some(0)));
+        let (_data, sessions, id) = with_a_session_record(exited, named);
+        sessions.adopt().await;
+        assert_eq!(state(&sessions, id), Some(SessionState::Finished));
+        assert_eq!(name(&sessions, id).as_deref(), Some("login redirect"));
+
+        // Still running: taken up, and the record its next state change writes keeps the name.
+        let running = Some((false, TerminalState::Running, None));
+        let (_data, sessions, id) = with_a_session_record(running, named);
+        sessions.adopt().await;
+        let live = lock(&sessions.inner.live)[&id].clone();
+        let before = record(&sessions, id).unwrap().version;
+        sessions
+            .inner
+            .event(&live, Event::Exited(Some(0)))
+            .await
+            .unwrap();
+        let after = record(&sessions, id).unwrap();
+        assert!(after.version > before, "no new record was written");
+        assert_eq!(after.body.name.as_deref(), Some("login redirect"));
+    }
+
+    #[tokio::test]
     async fn a_running_sessions_curl_config_is_written_again_with_this_daemons_hook_url() {
         let running = Some((false, TerminalState::Running, None));
         let (_data, sessions, id) = with_a_session(running);
@@ -1590,6 +1673,7 @@ mod adopt_tests {
                     terminal,
                     model: "test-model".into(),
                     state: SessionState::Working,
+                    name: None,
                 },
             });
             store.apply(&session, me).unwrap();

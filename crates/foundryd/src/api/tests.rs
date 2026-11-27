@@ -1787,6 +1787,7 @@ fn peer_session(owner: MachineId, version: u64, state: SessionState) -> AnyRecor
             terminal: TerminalId::random(),
             model: MODEL.into(),
             state,
+            name: None,
         },
     })
 }
@@ -2801,6 +2802,179 @@ async fn a_close_of_an_offline_machines_terminal_is_503_naming_it() {
         .await;
     assert_eq!(reply.status, 503, "{}", reply.body);
     assert_eq!(reply.json()["error"], "peer is offline");
+}
+
+// --- rename ---
+
+/// Session `id`'s record on `daemon`.
+fn session_record(daemon: &Daemon, id: SessionId) -> Record<Session> {
+    let record = daemon.store.lock().unwrap().session(id).unwrap();
+    record.expect("the session's record")
+}
+
+/// The name session `id`'s record holds on `daemon`.
+fn name_of(daemon: &Daemon, id: SessionId) -> Option<String> {
+    session_record(daemon, id).body.name
+}
+
+#[tokio::test]
+async fn a_running_session_is_renamed_on_one_trimmed_line_cut_with_secrets_hidden_and_an_empty_name_clears_it()
+ {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "named").await;
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/workspaces/{workspace}/sessions"),
+            Some(serde_json::json!({"model": MODEL})),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let session: SessionId = reply.id();
+    let path = format!("/api/sessions/{session}/rename");
+    let rename =
+        |name: String| daemon.call("POST", &path, Some(serde_json::json!({ "name": name })));
+
+    let reply = rename("  tidy   the\ncart  ".into()).await;
+    assert_eq!(reply.status, 204, "{}", reply.body);
+    assert_eq!(name_of(&daemon, session).as_deref(), Some("tidy the cart"));
+
+    let token = "ghp_0123456789abcdefABCDEF0123456789";
+    let reply = rename(format!("use {} and {token}", daemon.key)).await;
+    assert_eq!(reply.status, 204, "{}", reply.body);
+    let hidden = name_of(&daemon, session).unwrap();
+    assert!(
+        !hidden.contains(&daemon.key) && !hidden.contains(token),
+        "{hidden}"
+    );
+    assert_eq!(hidden, "use ••• and •••");
+
+    let reply = rename("a".repeat(300)).await;
+    assert_eq!(reply.status, 204, "{}", reply.body);
+    let cut = name_of(&daemon, session).unwrap();
+    assert_eq!(cut.chars().count(), 120, "{cut}");
+    assert!(cut.ends_with('…'), "{cut}");
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let record = loop {
+        let record = session_record(&daemon, session);
+        if record.body.state == SessionState::Idle {
+            break record;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{record:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        record.body.name.as_deref(),
+        Some(cut.as_str()),
+        "a change of state keeps the name"
+    );
+    let reply = rename("   ".into()).await;
+    assert_eq!(reply.status, 204, "{}", reply.body);
+    let cleared = session_record(&daemon, session);
+    assert_eq!(cleared.body.name, None);
+    assert!(
+        cleared.version > record.version,
+        "a rename is a new version"
+    );
+    assert_eq!(cleared.body.state, record.body.state);
+}
+
+#[tokio::test]
+async fn an_ended_session_of_this_machine_is_renamed_and_an_unknown_gone_or_misshapen_one_is_refused()
+ {
+    let daemon = Daemon::new(TURN).await;
+    let version = daemon.store.lock().unwrap().own_next_version().unwrap();
+    let mut ended = peer_session(daemon.me, version, SessionState::Finished);
+    daemon
+        .store
+        .lock()
+        .unwrap()
+        .apply(&ended, daemon.me)
+        .unwrap();
+    let AnyRecord::Session(record) = &ended else {
+        unreachable!()
+    };
+    let id = record.body.id;
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/sessions/{id}/rename"),
+            Some(serde_json::json!({"name": "the date library"})),
+        )
+        .await;
+    assert_eq!(reply.status, 204, "{}", reply.body);
+    let renamed = daemon.store.lock().unwrap().session(id).unwrap().unwrap();
+    assert_eq!(renamed.body.name.as_deref(), Some("the date library"));
+    assert_eq!(renamed.body.state, SessionState::Finished);
+    assert_eq!(renamed.owner, daemon.me);
+
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/sessions/{id}/rename"),
+            Some(serde_json::json!({"title": "not the field"})),
+        )
+        .await;
+    assert_eq!(reply.status, 422, "{}", reply.body);
+
+    let unknown = SessionId::random();
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/sessions/{unknown}/rename"),
+            Some(serde_json::json!({"name": "anything"})),
+        )
+        .await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+
+    if let AnyRecord::Session(record) = &mut ended {
+        record.version = daemon.store.lock().unwrap().own_next_version().unwrap();
+        record.deleted = true;
+    }
+    daemon
+        .store
+        .lock()
+        .unwrap()
+        .apply(&ended, daemon.me)
+        .unwrap();
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/sessions/{id}/rename"),
+            Some(serde_json::json!({"name": "gone"})),
+        )
+        .await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_rename_of_an_offline_machines_session_is_503_naming_it_and_a_carried_one_runs_only_here()
+{
+    let daemon = Daemon::new(TURN).await;
+    let peer = daemon.add_machine();
+    let theirs = peer_session(peer, 1, SessionState::Working);
+    daemon.store.lock().unwrap().apply(&theirs, peer).unwrap();
+    let AnyRecord::Session(record) = &theirs else {
+        unreachable!()
+    };
+    let path = format!("/api/sessions/{}/rename", record.body.id);
+    let body = serde_json::json!({"name": "far"});
+    let reply = daemon.call("POST", &path, Some(body.clone())).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "peer is offline");
+
+    let reply = carried(&daemon, &path, Some(body)).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+    let held = daemon
+        .store
+        .lock()
+        .unwrap()
+        .session(record.body.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.body.name, None, "nothing was renamed");
 }
 
 /// `method path` with `body`, marked as a call carried here from another machine.

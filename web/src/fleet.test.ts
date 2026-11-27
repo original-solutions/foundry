@@ -530,6 +530,22 @@ describe("briefs", () => {
     expect(rows(machine.workspaces[0]).map((r) => r.said)).toEqual([undefined, said, undefined, said, undefined]);
   });
 
+  it("shows the name a session was given in place of its first prompt, a peer's session too, and the first prompt once it has none", () => {
+    const named = [
+      ...records.map((r) => (r.kind === "session" && r.body.id === "s1" ? session(ME, "s1", "w1", "t1", "working", { name: "login redirect" }) : r)),
+      terminal(OTHER, "t9", "w9"),
+      workspace(OTHER, "w9", "far"),
+      session(OTHER, "s9", "w9", "t9", "idle", { name: "far work" }),
+    ];
+    const listed = settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "attic", address: "" }] });
+    const view = fleet(named, listed, briefs);
+    const mine = view.find((m) => m.id === ME)!;
+    expect(rows(mine.workspaces[0]).map((r) => r.title)).toEqual(["login redirect", "add a test", undefined]);
+    expect(locate(view, "t1")?.title).toBe("login redirect");
+    const theirs = view.find((m) => m.id === OTHER)!;
+    expect(rows(theirs.workspaces[0])[0].title).toBe("far work");
+  });
+
   it("leaves a session with no brief, as a peer's is, as it was", () => {
     const [machine] = fleet(records, settings());
     expect(rows(machine.workspaces[0]).every((r) => r.title === undefined && r.now === undefined)).toBe(true);
