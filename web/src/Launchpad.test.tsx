@@ -30,6 +30,14 @@ describe("taskName", () => {
   it("keeps a name to 40 characters, cut at a word", () => {
     expect(taskName("internationalisation localisation accessibility")).toBe("internationalisation localisation");
   });
+
+  it("names a task after the pull request or issue it points at, and drops other links", () => {
+    expect(taskName("/review-loop https://github.com/original-solutions/people-hub/pull/1181")).toBe("review-loop pr 1181");
+    expect(taskName("/review-loop https://github.com/o/r/pull/1181/files#diff-1")).toBe("review-loop pr 1181");
+    expect(taskName("Fix https://github.com/o/r/issues/42 on mobile")).toBe("fix issue 42 on mobile");
+    expect(taskName("review PR#1181 and fix the failing tests")).toBe("review pr 1181 and fix");
+    expect(taskName("See https://example.com/docs for the API")).toBe("see for the api");
+  });
 });
 
 describe("Launchpad", () => {
@@ -128,5 +136,64 @@ describe("Launchpad", () => {
 
     const states = screen.getByRole("list", { name: "What you will see" });
     expect(within(states).getAllByRole("listitem").map((i) => i.querySelector("[data-glyph]")?.getAttribute("data-glyph"))).toEqual(["working", "waiting", "ready"]);
+  });
+
+  describe("when the suggested name is taken", () => {
+    const review = "/review-loop https://github.com/original-solutions/people-hub/pull/1181";
+    const taken = (error = "branch exists") => json(409, { error });
+    const creates = (calls: { url: string }[]) => calls.filter((c) => c.url === "/api/workspaces");
+
+    it("shows the branch the task points at", async () => {
+      await renderApp(<Harness />);
+      fireEvent.change(promptBox(), { target: { value: review } });
+      expect(screen.getByLabelText("Branch").textContent).toBe("review-loop-pr-1181");
+    });
+
+    it("retries with the next number and shows the name the workspace was made with", async () => {
+      const calls = mockFetch(taken(), json(201, { id: "w1" }), json(201, { id: "s1" }));
+      const created = vi.fn();
+      await renderApp(<Harness onCreated={created} />);
+      fireEvent.change(promptBox(), { target: { value: review } });
+      fireEvent.click(start());
+
+      await waitFor(() => expect(created).toHaveBeenCalledWith("s1", null));
+      expect(calls.map((c) => [c.url, (c.body as { name?: string }).name])).toEqual([
+        ["/api/workspaces", "review-loop pr 1181"],
+        ["/api/workspaces", "review-loop pr 1181 2"],
+        ["/api/workspaces/w1/sessions", undefined],
+      ]);
+      expect(screen.getByLabelText("Branch").textContent).toBe("review-loop-pr-1181-2");
+    });
+
+    it("does not retry a typed name", async () => {
+      const calls = mockFetch(taken("that branch is taken"));
+      await renderApp(<Harness />);
+      fireEvent.change(promptBox(), { target: { value: review } });
+      fireEvent.change(screen.getByLabelText("Workspace name"), { target: { value: "login" } });
+      fireEvent.click(start());
+
+      expect((await screen.findByRole("alert")).textContent).toMatch(/that branch is taken/);
+      expect(creates(calls)).toHaveLength(1);
+    });
+
+    it("does not retry a refusal other than 409", async () => {
+      const calls = mockFetch(json(422, { error: "bad base" }));
+      await renderApp(<Harness />);
+      fireEvent.change(promptBox(), { target: { value: review } });
+      fireEvent.click(start());
+
+      expect((await screen.findByRole("alert")).textContent).toMatch(/bad base/);
+      expect(creates(calls)).toHaveLength(1);
+    });
+
+    it("gives up after 20 tries", async () => {
+      const calls = mockFetch(...Array.from({ length: 25 }, () => taken("still taken")));
+      await renderApp(<Harness />);
+      fireEvent.change(promptBox(), { target: { value: review } });
+      fireEvent.click(start());
+
+      expect((await screen.findByRole("alert")).textContent).toMatch(/still taken/);
+      expect(creates(calls)).toHaveLength(20);
+    });
   });
 });
