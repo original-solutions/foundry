@@ -49,8 +49,10 @@
 //! - `POST /api/workspaces/{id}/shells`: starts the daemon's `$SHELL` in the workspace, `201
 //!   {id}`.
 //! - `POST /api/terminals/{id}/close`: `204`.
+//! - `POST /api/workspaces/{id}/pr`: what `GET` of it answers, through the same handler; the
+//!   body is not read.
 //!
-//!   These five actions, on a workspace or terminal another machine owns or a create that
+//!   These six actions, on a workspace or terminal another machine owns or a create that
 //!   names another machine, are carried to that machine and answered as it answers: see
 //!   [`carry`].
 //! - `POST /api/terminals/{id}/files?name=<name>`: keeps a file for the terminal and answers
@@ -60,7 +62,8 @@
 //! - `GET /api/workspaces/{id}/commits/{hash}`: what one commit on the workspace's branch
 //!   changed, see [`changes`]. Only a workspace of this machine.
 //! - `GET /api/workspaces/{id}/pr`: whether the workspace's branch is on `origin`, what is only
-//!   on this machine, and its pull request, see [`pr`]. Only a workspace of this machine.
+//!   on this machine, and its pull request, see [`pr`]. Only a workspace of this machine; a
+//!   `POST` of it is answered the same, and carried for another machine's.
 //! - `GET /api/briefs`: what each session of this machine is for and doing, see [`briefs`].
 //! - `GET /api/sessions/{id}/trail`: every step a session of this machine took, see [`trail`].
 //!
@@ -207,7 +210,10 @@ pub fn router(api: Api) -> Router {
         .route("/api/workspaces/{id}/shells", post(start_shell))
         .route("/api/workspaces/{id}/changes", get(changes::changes))
         .route("/api/workspaces/{id}/commits/{hash}", get(changes::commit))
-        .route("/api/workspaces/{id}/pr", get(pr::shipping))
+        .route(
+            "/api/workspaces/{id}/pr",
+            get(pr::shipping).post(pr::shipping),
+        )
         .route("/api/briefs", get(briefs::briefs))
         .route("/api/machine", get(machine::machine))
         .route("/api/sessions/{id}/trail", get(trail::trail))

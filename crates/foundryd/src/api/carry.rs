@@ -2,8 +2,8 @@
 //! runs, so no handler knows about other machines.
 //!
 //! - `POST /api/workspaces` whose `machine` names another machine.
-//! - `POST /api/workspaces/{id}/sessions`, `/shells` and `/archive` for a workspace another
-//!   machine owns.
+//! - `POST /api/workspaces/{id}/sessions`, `/shells`, `/archive` and `/pr` for a workspace
+//!   another machine owns.
 //! - `POST /api/terminals/{id}/close` for a terminal another machine owns.
 //!
 //! Each goes to its owner over [`Peers::call`](crate::sync::Peers::call), its body passed as
@@ -104,7 +104,7 @@ fn target(path: &str) -> Option<Target> {
     let parts: Vec<&str> = path.strip_prefix("/api/")?.split('/').collect();
     match parts.as_slice() {
         ["workspaces"] => Some(Target::Create),
-        ["workspaces", id, "sessions" | "shells" | "archive"] => {
+        ["workspaces", id, "sessions" | "shells" | "archive" | "pr"] => {
             Some(Target::Workspace(WorkspaceId(id.parse().ok()?)))
         }
         ["terminals", id, "close"] => Some(Target::Terminal(TerminalId(id.parse().ok()?))),
