@@ -163,21 +163,25 @@ impl Change {
         }
         // An error with no state of its own is the answer's error, not an operation's.
         let failed = fields.get("error").is_some_and(|error| !error.is_null());
-        let state = text(&value, &[&["status"], &["state"]]).is_some();
-        if failed && !state {
+        let state = text(&value, &[&["status"], &["state"]]).map(|status| OpState::read(&status));
+        if failed && state.is_none() {
             return None;
         }
         // Guessed: an operation is under `operation`, or is the answer when it has an
         // operation id, or an `id` that is no workspace's (`wsp_`, which the checks saw); a
         // workspace is under `workspace`, or is the answer when its `id` is a workspace's. Where
-        // the answer may be the thing made, a bare `id` is an operation's only with a state.
+        // the answer may be the thing made, a bare `id` is an operation's only with a state an
+        // operation has.
         let made = otherwise.is_some();
         let id = text(&value, &[&["id"]]);
+        let operation_state = state
+            .as_ref()
+            .is_some_and(|state| !matches!(state, OpState::Other(_)));
         let operation = value.get("operation").is_some_and(Value::is_object)
             || text(&value, &[&["operationId"], &["operation_id"]]).is_some()
             || id
                 .as_deref()
-                .is_some_and(|id| !id.starts_with("wsp_") && (state || !made));
+                .is_some_and(|id| !id.starts_with("wsp_") && (operation_state || !made));
         if operation {
             return Operation::from_value(&value).map(Change::Operation);
         }
@@ -186,7 +190,13 @@ impl Change {
         if workspace {
             return Workspace::from_value(&value).map(Change::Workspace);
         }
-        if failed { None } else { otherwise }
+        // An answer whose own state says it failed is never the change made.
+        let said_failed = matches!(state, Some(OpState::Failed | OpState::Cancelled));
+        if failed || said_failed {
+            None
+        } else {
+            otherwise
+        }
     }
 }
 
