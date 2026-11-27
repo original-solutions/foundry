@@ -3,7 +3,7 @@ import { Dialog } from "radix-ui";
 import { Fragment, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { workspaceChanges, workspaceCommit, type Changes, type Commit, type FileChange } from "./api";
 import { diffLines, splitPath, totals } from "./changes";
-import type { SessionView } from "./fleet";
+import type { FactoryRun, SessionView } from "./fleet";
 import { couldNot, plural } from "./labels";
 import { anchor, onLine, type Anchor, type Note } from "./notes";
 import { lineName, NoteBox, NoteRow, SendBar } from "./LineNotes";
@@ -37,6 +37,8 @@ interface Target {
   branch: string;
   /** Its sessions, which can take the comments written on its diff. */
   sessions?: SessionView[];
+  /** The factory run it belongs to, which decides how its sessions read. */
+  factory?: FactoryRun;
 }
 
 /** The comment being written or changed: on a line of a file, and which comment when it is a change. */
@@ -278,7 +280,7 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
             </div>
           </div>
         )}
-        <SendBar notes={notes} sessions={workspace.sessions ?? []} onSent={() => onNotes([])} />
+        <SendBar notes={notes} sessions={workspace.sessions ?? []} factory={workspace.factory} onSent={() => onNotes([])} />
       </Dialog.Content>
     </>
   );

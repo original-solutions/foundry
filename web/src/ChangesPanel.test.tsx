@@ -309,6 +309,19 @@ describe("ChangesPanel", () => {
       expect(within(file).getByRole("row", { name: "Comment on line 6" }).textContent).toContain("call it total");
     });
 
+    it("says a live factory run's stuck session is quiet, as the board does", async () => {
+      FakeSocket.install();
+      mockFetch(json(200, changes), json(200, changes));
+      const quiet = [{ ...sessions[1], name: "opus", state: "stuck" as const }];
+      await renderApp(<ChangesPanel workspace={{ ...target, sessions: quiet, factory: { run: "o__r__162__1" } }} onClose={() => {}} />);
+      const panel = await screen.findByRole("dialog", { name: /changes in fix login/i });
+      const file = await within(panel).findByRole("region", { name: "src/login.ts" });
+      fireEvent.click(within(file).getByRole("button", { name: "Comment on line 6" }));
+      fireEvent.change(within(file).getByRole("textbox", { name: "Comment on line 6" }), { target: { value: "x" } });
+      fireEvent.keyDown(within(file).getByRole("textbox", { name: "Comment on line 6" }), { key: "Enter", metaKey: true });
+      expect(panel.textContent).toContain("opus is quiet 10+ min");
+    });
+
     it("sends nothing while no session is idle, and says why", async () => {
       const { panel } = await commented({ sessions: [{ ...sessions[1], name: "opus" }] });
       const send = within(panel).getByRole("button", { name: "Send 1 comment to opus" });

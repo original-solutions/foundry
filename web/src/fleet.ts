@@ -392,19 +392,24 @@ const rests: Glyph[] = ["ready", "done"];
 
 /** A workspace's terminals in sidebar order: its sessions, then its shells. */
 export function rows(workspace: WorkspaceView): Row[] {
-  // A live factory run's stuck session is quiet, since the factory watches it; in a held-up run,
-  // which waits on a person, it stays stuck. It keeps P1's stuck glyph on purpose: that is P1's
-  // true state, and the label says why it is not urgent. A tended run's waiting session keeps
-  // its label too: the factory answers it.
-  const tended = tendedByFactory(workspace.factory);
   return [
     ...workspace.sessions.map((s) => {
       const glyph = sessionGlyph[s.state];
-      const label = tended && glyph === "stuck" ? QUIET : sessionLabel[s.state];
-      return { terminal: s.terminal, session: s.id, name: s.name, title: s.title, now: busy.includes(glyph) ? s.now : undefined, said: rests.includes(glyph) ? s.said : undefined, label, glyph };
+      return { terminal: s.terminal, session: s.id, name: s.name, title: s.title, now: busy.includes(glyph) ? s.now : undefined, said: rests.includes(glyph) ? s.said : undefined, label: sessionLabelIn(s.state, workspace.factory), glyph };
     }),
     ...workspace.shells.map((t) => ({ terminal: t.id, name: t.name, label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
   ];
+}
+
+/**
+ * A session's label in a workspace of factory run `run`. A live run's stuck session is quiet, since
+ * the factory watches it; in a held-up run, which waits on a person, it stays stuck. Every view
+ * that names a session's state reads it here. It keeps P1's stuck glyph on purpose: that is P1's
+ * true state, and the label says why it is not urgent. A tended run's waiting session keeps its
+ * label too: the factory answers it.
+ */
+export function sessionLabelIn(state: SessionState, run: FactoryRun | undefined): string {
+  return tendedByFactory(run) && sessionGlyph[state] === "stuck" ? QUIET : sessionLabel[state];
 }
 
 /** `rows` with what needs a person first, then what is busy, then the rest; ties keep their order. */
