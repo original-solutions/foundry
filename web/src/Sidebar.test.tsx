@@ -1,5 +1,6 @@
+import { focusManager, useQueryClient } from "@tanstack/react-query";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fleet, withFactory } from "./fleet";
 import { Sidebar } from "./Sidebar";
@@ -603,6 +604,111 @@ describe("where a workspace's work stands", () => {
       ["/api/workspaces/w1/pr", "POST"],
       ["/api/workspaces/w1/pr", "POST"],
     ]);
+  });
+
+  /** Renders the sidebar with `first`, and a button that swaps in `then`, as the socket's next state does. */
+  async function changing(first: ReturnType<typeof fleet>, then: ReturnType<typeof fleet>, beside?: (view: ReturnType<typeof fleet>) => ReactNode) {
+    function Changing() {
+      const [view, setView] = useState(first);
+      return (
+        <>
+          <button onClick={() => setView(then)}>next state</button>
+          {beside?.(view)}
+          <Sidebar machines={view} {...props} />
+          {beside?.(view)}
+        </>
+      );
+    }
+    await renderApp(<Changing />);
+  }
+
+  /** Another reader of the shared entry, as a board card is: it marks it out of date when w1's glyphs change. */
+  function AlsoInvalidates({ view }: { view: ReturnType<typeof fleet> }) {
+    const client = useQueryClient();
+    const glyphs = JSON.stringify(view);
+    const last = useRef(glyphs);
+    useEffect(() => {
+      if (last.current === glyphs) return;
+      last.current = glyphs;
+      void client.invalidateQueries({ queryKey: ["pr", "w1"], exact: true });
+    }, [glyphs, client]);
+    return null;
+  }
+
+  it("sends one read for a glyph change that another reader of the entry also marks out of date", async () => {
+    const answers = [json(200, { ...ready, pr: null, pushed: false })];
+    const calls = reads({ w1: () => answers.shift() ?? json(200, ready) });
+    await changing(fleet(mine("working"), both, {}, [ME, OTHER]), fleet(mine("idle"), both, {}, [ME, OTHER]), (view) => <AlsoInvalidates view={view} />);
+    await lineOf("fix login", "demo · Building");
+
+    fireEvent.click(screen.getByRole("button", { name: "next state" }));
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    await act(() => new Promise((done) => setTimeout(done, 50)));
+    expect(calls).toHaveLength(2);
+  });
+
+  it("shows the project alone again when a later read fails", async () => {
+    const answers = [json(200, ready), json(503, { error: "laptop did not answer" })];
+    const calls = reads({ w1: () => answers.shift() ?? json(503, {}) });
+    await changing(fleet(mine("working"), both, {}, [ME, OTHER]), fleet(mine("idle"), both, {}, [ME, OTHER]));
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+
+    fireEvent.click(screen.getByRole("button", { name: "next state" }));
+    await waitFor(() => expect(calls).toHaveLength(2));
+    await lineOf("fix login", "demo");
+    expect(screen.queryByText(/did not answer/)).toBeNull();
+  });
+
+  it("shows the project alone once the workspace's machine goes offline", async () => {
+    const calls = reads({ w9: () => json(200, ready) });
+    await changing(fleet(theirs, both, {}, [ME, OTHER]), fleet(theirs, both, {}, [ME]));
+    await lineOf("remote job", "demo · PR #88 · Ready to merge");
+
+    fireEvent.click(screen.getByRole("button", { name: "next state" }));
+    await lineOf("remote job", "demo");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("does not read again when the window takes focus", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const calls = reads({ w1: () => json(200, ready) });
+      await renderApp(<Sidebar machines={fleet(mine(), both, {}, [ME, OTHER])} {...props} />);
+      await lineOf("fix login", "demo · PR #88 · Ready to merge");
+      await act(() => vi.advanceTimersByTimeAsync(5 * 60_000));
+      act(() => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(calls).toHaveLength(1);
+    } finally {
+      focusManager.setFocused(undefined);
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads a row only once it is on screen", async () => {
+    const watched: { fire: (on: boolean) => void }[] = [];
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        constructor(private callback: (entries: { isIntersecting: boolean }[]) => void) {}
+        observe() {
+          watched.push({ fire: (on) => this.callback([{ isIntersecting: on }]) });
+        }
+        disconnect() {}
+      },
+    );
+    const calls = reads({ w1: () => json(200, ready) });
+    await renderApp(<Sidebar machines={fleet(mine(), both, {}, [ME, OTHER])} {...props} />);
+    await act(() => new Promise((done) => setTimeout(done, 20)));
+    expect(calls).toEqual([]);
+    await lineOf("fix login", "demo");
+
+    act(() => watched.forEach((w) => w.fire(true)));
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    expect(calls).toHaveLength(1);
   });
 
   it("reads an open pull request again on the timer only while its checks run", async () => {
