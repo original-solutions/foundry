@@ -75,7 +75,7 @@ pub fn unapproved_comment(refusal: &Refusal) -> String {
             "The issue's edit history is too long for the factory to check. File a new issue with the final text and apply `factory:ready` to it."
         }
         Refusal::TimelineShortOfLabel { .. } => {
-            "The issue's recent history is too long for the factory to check from the label. Apply `factory:ready` again."
+            "The issue's recent history is too long for the factory to check from the label. Review the issue text, then apply `factory:ready` again."
         }
         _ => {
             "Review the issue text, then apply `factory:ready` again. An instructor must apply the label, and the text must not be edited afterwards by anyone who is not an instructor."
