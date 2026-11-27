@@ -12,5 +12,7 @@ export default defineConfig({
   expect: { timeout: 30_000 },
   reporter: "list",
   globalSetup: "./e2e/global-setup.ts",
-  use: { channel: "chrome", trace: "retain-on-failure" },
+  // A terminal pane draws with WebGL where it can, onto a canvas; with WebGL off it draws with the
+  // DOM, whose rows the specs read the screen's text from.
+  use: { channel: "chrome", trace: "retain-on-failure", launchOptions: { args: ["--disable-webgl"] } },
 });
