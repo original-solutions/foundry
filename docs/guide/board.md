@@ -10,7 +10,8 @@ To get back to the board from anywhere, click **Foundry** at the top of the side
 
 Each workspace is one card. The coloured bar on its left edge takes the colour of its most urgent terminal.
 
-- **Title.** The workspace name. Click it to open its most urgent terminal. Below it, the project and the branch.
+- **Title.** The workspace name. Click it to open its most urgent terminal. Below it, the project and the branch. A workspace that sits on a commit, with no branch, shows the first 7 characters of that commit instead, such as `demo · fedcba9`.
+- **Factory mark.** A workspace the factory builds in has a violet **factory #N** after its name, where N is the issue it builds. Click it to open the issue on GitHub. Its line in the sidebar has the same mark.
 - **Machine name.** Shown at the right of the title when the fleet has more than one machine.
 - **Terminals.** One row per session or shell, most urgent first. A row has its state glyph, its name, and its state label. For a session on this machine, the row also has the title it took from its first prompt, and underneath what it is doing right now, such as "Edit src/auth/redirect.ts" or the question it asked you. Click a row to open that terminal. A card shows four rows, then "+N more". A workspace with none says "No terminals".
 - **What Claude said.** When a session on this machine is **Ready** or **Ended**, what Claude said at the end of its last turn shows under its row, three lines at a time. Click it to read it all.
@@ -37,6 +38,8 @@ On cards of this machine, a line under the changes says how far the branch has t
 - **Needs you.** A session asked something, is stuck or failed.
 - **Working.** An agent is working or starting.
 - **Quiet.** Nothing is happening.
+
+A factory run's card follows its run, not its sessions. While the run is live, the factory tends its sessions, so the card stays under **Working** even when one of them waits or fails, and a session with ten minutes of no output reads **Quiet 10+ min** instead of **Stuck**. The card moves to **Needs you** only when the run itself is stuck or needs answers on its issue. Then a stuck session in it reads **Stuck** again.
 
 Inside a group, the most urgent card comes first.
 
@@ -163,7 +166,7 @@ Type a few words. A row matches when it holds every word, in any of its workspac
 
 ## Notifications
 
-You do not have to watch the board. Foundry tells you once when a session finishes its turn, and once when one needs you. A session needs you when it is waiting for you, stuck after ten minutes with no output, or failed. You get no toast for a terminal that is on screen.
+You do not have to watch the board. Foundry tells you once when a session finishes its turn, and once when one needs you. A session needs you when it is waiting for you, stuck after ten minutes with no output, or failed. A session in a live factory run never needs you, since the factory tends it. It raises no toast or alert, the tab does not count it, and the **While you were away** card shows it as the board does. You get no toast for a terminal that is on screen.
 
 **Notifications**, the bell in the sidebar header and at the foot of the rail, chooses how the news reaches you.
 

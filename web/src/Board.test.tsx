@@ -3,11 +3,11 @@ import { createMemoryHistory, createRootRoute, createRoute, createRouter, Router
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createContext, useContext, type ComponentProps } from "react";
-import type { AnyRecord, Changes, FactoryStatus, SessionState, Shipping } from "./api";
+import type { AnyRecord, Changes, SessionState, Shipping } from "./api";
 import { archiveOf } from "./Archive";
 import { Board, BOARD_BUSY_EVERY } from "./Board";
 import { fleet, type MachineView } from "./fleet";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { RETRY_EVERY } from "./poll";
 import { TerminalActions } from "./TerminalMenu";
 import { expectButtonShape, FakeSocket, json } from "./test-utils";
@@ -562,34 +562,6 @@ describe("The task bar", () => {
 });
 
 /** Project p1's believed status: run 162 builds in w1, run 170 is held up in w2. */
-function factoryStatuses(held: "stuck" | "needs_info" = "stuck"): Record<string, FactoryStatus> {
-  return {
-    p1: {
-      project: "p1",
-      pass: 1,
-      holds: true,
-      generation: 1,
-      not_holding: null,
-      idle: null,
-      owner_ignored: false,
-      ready: [],
-      feedback_waiting: [],
-      runs: [{ run: "original-solutions__foundry__162__1", title: "t", step: "building", machine: ME, gate_retries_used: 0, minutes_used: 3, workspaces: ["w1"], sessions: ["s1"] }],
-      held_up: [{ run: "original-solutions__foundry__170__1", kind: held, reason: "why", workspaces: ["w2"] }],
-      gate_infra: [],
-      finished: [],
-      foreign: [],
-    },
-  };
-}
-
-/** A workspace record that sits on a commit, with no branch. */
-function onCommit(owner: string, id: string, name: string): AnyRecord {
-  const record = workspace(owner, id, name);
-  if (record.kind === "workspace") record.body = { ...record.body, branch: "", base: "fedcba9876543210fedcba9876543210fedcba98" };
-  return record;
-}
-
 describe("Board and the factory", () => {
   const factoryRecords = (): AnyRecord[] => [
     sample(ME, 1),
@@ -610,6 +582,13 @@ describe("Board and the factory", () => {
     const mark = within(card("fac 162")).getByRole("link", { name: "factory #162" });
     expect(mark.getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");
     expect(within(card("far away")).queryByRole("link", { name: /^factory/ })).toBeNull();
+  });
+
+  it("marks a run whose id names no issue as plain text, with no link", async () => {
+    await show(fleet(factoryRecords(), settings()), vi.fn(), { statuses: factoryStatus("p1", { "not-a-run": ["w1"] }) });
+    const run = card("fac 162");
+    expect(within(run).getByText("factory").tagName).toBe("SPAN");
+    expect(within(run).queryByRole("link", { name: /^factory/ })).toBeNull();
   });
 
   it("keeps a factory session P1 marks stuck under working, quiet 10+ min, and a held-up run's card under needs you", async () => {

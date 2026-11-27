@@ -1,9 +1,9 @@
 import { useQueries } from "@tanstack/react-query";
 import { useLayoutEffect, useRef, useState } from "react";
-import { sessionTrail, type AnyRecord, type Mark } from "./api";
+import { sessionTrail, type AnyRecord, type FactoryStatus, type Mark } from "./api";
 import { AWAY_MS, keepLeft, leaving, moved, since, takeLeft, type Left, type Moved } from "./absence";
 import type { MachineView } from "./fleet";
-import { addsSteps, needsYou, plural } from "./labels";
+import { addsSteps, plural } from "./labels";
 import { Named, Now } from "./Now";
 import { pollEvery } from "./poll";
 import { glyphText, StateGlyph } from "./StateGlyph";
@@ -30,6 +30,7 @@ export function Away({
   traced,
   onOpen,
   onShown,
+  statuses,
 }: {
   records: AnyRecord[];
   synced: boolean;
@@ -38,11 +39,13 @@ export function Away({
   onOpen: (terminal: string) => void;
   /** The sessions the card lists now, so news of them raises no card of its own. */
   onShown?: (sessions: string[]) => void;
+  /** The believed factory statuses by project id: a live run's sessions need no one, as on the board. */
+  statuses?: Record<string, FactoryStatus>;
 }) {
   const left = useLeft(records, synced);
   const [gone, setGone] = useState<{ of?: number; ids: string[] }>({ ids: [] });
   const dismissed = gone.of === left.since?.at ? gone.ids : [];
-  const list = left.since && synced ? moved(left.since, records, machines).filter((m) => !dismissed.includes(m.row.session)) : [];
+  const list = left.since && synced ? moved(left.since, records, machines, statuses).filter((m) => !dismissed.includes(m.row.session)) : [];
   const trails = useQueries({
     queries: list.map((m) => ({
       enabled: traced.has(m.row.session),
@@ -68,7 +71,7 @@ export function Away({
   const did = trails.map((t) => since(t.data ?? [], from));
   const turns = did.reduce((n, d) => n + d.turns, 0);
   const tools = did.reduce((n, d) => n + d.steps.filter((s) => s.kind === "tool").length, 0);
-  const need = list.filter((m) => needsYou.includes(m.row.glyph)).length;
+  const need = list.filter((m) => m.needs).length;
   const sum = [plural(list.length, "session"), turns > 0 && plural(turns, "turn"), tools > 0 && plural(tools, "tool call"), need > 0 && `${need} need${need === 1 ? "s" : ""} you`].filter(Boolean).join(" · ");
 
   const open = (m: Moved) => {
@@ -116,7 +119,7 @@ function Line({ m, turns, steps, onOpen }: { m: Moved; turns: number; steps: Mar
       type="button"
       aria-label={`Open ${row.name} in ${m.workspace}: ${row.label}`}
       onClick={onOpen}
-      className={`flex w-full flex-col gap-0.5 rounded-lg px-2.5 py-2 text-left hover:bg-neutral-800/70 focus-visible:outline-2 focus-visible:outline-sky-400 ${needsYou.includes(row.glyph) ? "bg-amber-400/5" : ""}`}
+      className={`flex w-full flex-col gap-0.5 rounded-lg px-2.5 py-2 text-left hover:bg-neutral-800/70 focus-visible:outline-2 focus-visible:outline-sky-400 ${m.needs ? "bg-amber-400/5" : ""}`}
     >
       <span className="flex items-center gap-2">
         <StateGlyph glyph={row.glyph} />

@@ -212,7 +212,7 @@ function Layout() {
   );
   const show = (id: string) => void navigate({ to: "/terminals/$terminalId", params: { terminalId: id } });
   // News is told from the daemon's own states only, never from the change between the remembered fleet and them.
-  const { spoken, news, ...notify } = useAlerts(machines, sent.synced, show);
+  const { spoken, news, ...notify } = useAlerts(machines, sent.synced, show, state.factory);
   /** The sessions the catch-up card lists, whose news it already shows. */
   const [caughtUp, setCaughtUp] = useState<string[]>([]);
   /** Whether the list of keys is open. */
@@ -438,7 +438,7 @@ function Layout() {
             <LinkBanner link={link} remembered={remembering ? memory.at : undefined} />
             {!narrow && <AttentionList />}
             {!narrow && <WaitingList />}
-            {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
+            {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} statuses={state.factory} />}
             {taskWarning && (
               <div
                 role="alert"

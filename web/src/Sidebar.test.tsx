@@ -4,9 +4,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { fleet } from "./fleet";
 import { Sidebar } from "./Sidebar";
 import { TerminalActions } from "./TerminalMenu";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, mockFetch, renderApp } from "./test-utils";
-import type { AnyRecord, FactoryStatus, SessionState } from "./api";
+import type { SessionState } from "./api";
 
 const states: [SessionState, string][] = [
   ["starting", "Starting"],
@@ -402,34 +402,6 @@ describe("Sidebar", () => {
 });
 
 /** Project p1's believed status: run 162 builds in w1, run 170 is held up in w2. */
-function factoryStatuses(held: "stuck" | "needs_info" = "stuck"): Record<string, FactoryStatus> {
-  return {
-    p1: {
-      project: "p1",
-      pass: 1,
-      holds: true,
-      generation: 1,
-      not_holding: null,
-      idle: null,
-      owner_ignored: false,
-      ready: [],
-      feedback_waiting: [],
-      runs: [{ run: "original-solutions__foundry__162__1", title: "t", step: "building", machine: ME, gate_retries_used: 0, minutes_used: 3, workspaces: ["w1"], sessions: ["s1"] }],
-      held_up: [{ run: "original-solutions__foundry__170__1", kind: held, reason: "why", workspaces: ["w2"] }],
-      gate_infra: [],
-      finished: [],
-      foreign: [],
-    },
-  };
-}
-
-/** A workspace record that sits on a commit, with no branch. */
-function onCommit(owner: string, id: string, name: string): AnyRecord {
-  const record = workspace(owner, id, name);
-  if (record.kind === "workspace") record.body = { ...record.body, branch: "", base: "fedcba9876543210fedcba9876543210fedcba98" };
-  return record;
-}
-
 describe("Sidebar and the factory", () => {
   const factoryMachines = () =>
     fleet(

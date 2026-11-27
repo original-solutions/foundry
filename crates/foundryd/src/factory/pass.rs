@@ -1664,10 +1664,18 @@ impl<'a, 'w> Pass<'a, 'w> {
             for (done, _) in of_kind {
                 if labelled.contains(&done.run.run.issue()) {
                     // A finished run's events are read only while a person holds it up. One
-                    // that cannot be read names no workspace; it is still held up.
+                    // that cannot be read names no workspace; it is still held up, and the
+                    // failed read is logged so a store that keeps failing shows.
                     let workspaces = self
                         .ledger
                         .read(&done.run.run)
+                        .inspect_err(|error| {
+                            tracing::warn!(
+                                project = %world.project.id,
+                                run = %done.run.run,
+                                "factory: a held-up run's events could not be read, so it names no workspace: {error}"
+                            );
+                        })
                         .map(|events| workspace_of(&read_progress(&events)))
                         .unwrap_or_default();
                     self.results.held_up.push(HeldUp {
@@ -4938,6 +4946,28 @@ mod tests {
                     kind: HeldUpKind::NeedsInfo,
                     reason: "Which login?".into(),
                     workspaces: vec![workspace_of(5, 1)],
+                }]
+            );
+        }
+
+        /// A held-up finished run whose events can no longer be read stays held up, naming no
+        /// workspace, and the pass goes on.
+        #[test]
+        fn a_held_up_run_whose_events_cannot_be_read_names_no_workspace() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = held_up_run(&rig, 5, 1, State::Stuck, "the gate failed 3 times");
+            rig.pass();
+            super::a_run_this_build_cannot_read::unreadable_row(&rig, &run);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(
+                rig.status().held_up,
+                vec![HeldUp {
+                    run,
+                    kind: HeldUpKind::Stuck,
+                    reason: "the gate failed 3 times".into(),
+                    workspaces: vec![],
                 }]
             );
         }

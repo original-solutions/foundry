@@ -51,13 +51,18 @@ export function factoryRuns(statuses: Record<string, FactoryStatus> | undefined)
   return (workspace) => named.get(`${workspace.projectId}/${workspace.id}`);
 }
 
+/** Whether the factory tends a workspace: its run is live, not held up for a person, so nothing in it needs you (G14). */
+export const tendedByFactory = (run: FactoryRun | undefined): boolean => run !== undefined && !run.held;
+
 /**
  * A workspace's terminals as they show. In a live factory run, a session P1 marks stuck is quiet,
  * since the factory watches it; in a held-up run, which waits on a person, it stays stuck.
  */
 export function runRows(workspace: WorkspaceView, run: FactoryRun | undefined): Row[] {
   const list = rows(workspace);
-  if (!run || run.held) return list;
+  if (!tendedByFactory(run)) return list;
+  // The row keeps P1's stuck glyph on purpose: it is P1's true state, and the label says why it
+  // is not urgent. A tended run's waiting session keeps "Waiting" too: the factory answers it.
   return list.map((row) => (row.session && row.glyph === "stuck" ? { ...row, label: QUIET } : row));
 }
 

@@ -3,7 +3,7 @@ import type { AnyRecord, SessionState } from "./api";
 import { alertsFor, favicon, pulse, rippleFrames, tabTitle } from "./alerts";
 import { fleet } from "./fleet";
 import { shapes } from "./StateGlyph";
-import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 /** One workspace "tidy" with one opus session in `state`, plus whatever `more` adds. */
 function world(state: SessionState, more: AnyRecord[] = []) {
@@ -57,6 +57,34 @@ describe("alertsFor", () => {
   });
 });
 
+describe("alertsFor and the factory", () => {
+  const RUN = "original-solutions__foundry__162__1";
+  const live = factoryStatus("p1", { [RUN]: ["w1"] });
+  const held = factoryStatus("p1", {}, { [RUN]: { kind: "stuck", workspaces: ["w1"] } });
+
+  it("raises nothing when a live factory run's session waits, is stuck or fails, since the factory tends it", () => {
+    for (const state of ["waiting_for_you", "stuck", "failed"] as const) {
+      const { seen } = alertsFor(undefined, world("working"), live);
+      const next = alertsFor(seen, world(state), live);
+      expect(next.alerts).toEqual([]);
+      expect(next.seen.get("s1")).toBe(state);
+    }
+  });
+
+  it("still says a live factory run's session finished its turn", () => {
+    const { seen } = alertsFor(undefined, world("working"), live);
+    expect(alertsFor(seen, world("idle"), live).alerts.map((a) => a.body)).toEqual(["opus finished its turn"]);
+  });
+
+  it("raises a held-up run's session that is stuck, and any session outside a run", () => {
+    const { seen } = alertsFor(undefined, world("working"), held);
+    expect(alertsFor(seen, world("stuck"), held).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
+    const other = factoryStatus("p1", { [RUN]: ["w9"] });
+    const before = alertsFor(undefined, world("working"), other).seen;
+    expect(alertsFor(before, world("stuck"), other).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
+  });
+});
+
 describe("pulse", () => {
   it("counts what needs you and what works, shells included, and leads with the most urgent glyph", () => {
     const machines = world("working", [
@@ -66,6 +94,17 @@ describe("pulse", () => {
       terminal(ME, "t3", "w2", "exited", { exit_code: 1 }),
     ]);
     expect(pulse(machines)).toEqual({ glyph: "failed", needYou: 1, working: 2 });
+  });
+
+  it("leaves a live factory run's sessions out of what needs you, and counts a held-up run's", () => {
+    const RUN = "original-solutions__foundry__162__1";
+    const machines = world("stuck", [workspace(ME, "w2", "other"), terminal(ME, "t2", "w2"), session(ME, "s2", "w2", "t2", "working")]);
+    expect(pulse(machines, factoryStatus("p1", { [RUN]: ["w1"] }))).toEqual({ glyph: "working", needYou: 0, working: 1 });
+    for (const state of ["waiting_for_you", "failed"] as const) {
+      expect(pulse(world(state), factoryStatus("p1", { [RUN]: ["w1"] }))).toEqual({ glyph: undefined, needYou: 0, working: 0 });
+    }
+    expect(pulse(machines, factoryStatus("p1", {}, { [RUN]: { kind: "stuck", workspaces: ["w1"] } }))).toEqual({ glyph: "stuck", needYou: 1, working: 1 });
+    expect(pulse(machines)).toEqual({ glyph: "stuck", needYou: 1, working: 1 });
   });
 
   it("has no glyph for an empty fleet", () => {

@@ -1,11 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AnyRecord, Briefs, Mark, SessionState } from "./api";
+import type { AnyRecord, Briefs, FactoryStatus, Mark, SessionState } from "./api";
 import { AWAY_KEY, AWAY_MS } from "./absence";
 import { Away } from "./Away";
 import { fleet } from "./fleet";
-import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { json } from "./test-utils";
 
 const MIN = 60_000;
@@ -82,11 +82,11 @@ afterEach(() => {
   localStorage.clear();
 });
 
-function view(records: AnyRecord[], onOpen = vi.fn()) {
+function view(records: AnyRecord[], onOpen = vi.fn(), statuses?: Record<string, FactoryStatus>) {
   const client = new QueryClient();
   const ui = (r: AnyRecord[]) => (
     <QueryClientProvider client={client}>
-      <Away records={r} synced machines={fleet(r, settings(), briefs)} traced={new Set(["s1", "s2", "s3"])} onOpen={onOpen} />
+      <Away records={r} synced machines={fleet(r, settings(), briefs)} traced={new Set(["s1", "s2", "s3"])} onOpen={onOpen} statuses={statuses} />
     </QueryClientProvider>
   );
   const rendered = render(ui(records));
@@ -116,6 +116,34 @@ describe("Away", () => {
     expect(within(panel()).getByText("2 sessions · 1 turn · 3 tool calls · 1 needs you")).toBeDefined();
     // Only the sessions that moved are read; s3 did not.
     expect(reads.some((url) => url.includes("/s3/"))).toBe(false);
+  });
+
+  it("says a live factory run's session that went stuck is quiet, and counts it as needing no one", async () => {
+    const { move } = view(fleetAt(), vi.fn(), factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1"] }));
+    vi.spyOn(Date, "now").mockReturnValue(at(0));
+    setVisibility("hidden");
+    move(fleetAt({ s1: "idle", s2: "stuck" }, { s1: 3, s2: 2 }));
+    vi.spyOn(Date, "now").mockReturnValue(at(12));
+    setVisibility("visible");
+
+    const line = await within(panel()).findByRole("button", { name: "Open sonnet in fix login: Quiet 10+ min" });
+    expect(line.className).not.toContain("bg-amber");
+    await waitFor(() => expect(within(panel()).getByText("2 sessions · 1 turn · 3 tool calls")).toBeDefined());
+  });
+
+  it("leaves out a live factory run's session that was stuck already, but tells of a held-up run's", async () => {
+    const before = fleetAt({ s2: "stuck", s3: "stuck" });
+    const statuses = factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1"] }, { "original-solutions__foundry__170__1": { kind: "stuck", workspaces: ["w2"] } });
+    const { move } = view(before, vi.fn(), statuses);
+    vi.spyOn(Date, "now").mockReturnValue(at(0));
+    setVisibility("hidden");
+    move(fleetAt({ s1: "idle", s2: "stuck", s3: "stuck" }, { s1: 3 }));
+    vi.spyOn(Date, "now").mockReturnValue(at(12));
+    setVisibility("visible");
+
+    await within(panel()).findByRole("button", { name: /^Open opus in fix login/ });
+    const items = within(panel()).getAllByRole("button", { name: /^Open / });
+    expect(items.map((b) => b.getAttribute("aria-label"))).toEqual(["Open opus in tidy readme: Stuck", "Open opus in fix login: Ready"]);
   });
 
   it("stays out of the way after a short absence, or a long one in which nothing happened", () => {

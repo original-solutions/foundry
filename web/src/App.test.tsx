@@ -787,6 +787,45 @@ describe("App", () => {
     expect(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: "factory #162" })).toBeDefined();
   });
 
+  it("leaves a live factory run's stuck session out of the tab's title and raises no alert for it, as the board does", async () => {
+    const shown: string[] = [];
+    vi.stubGlobal(
+      "Notification",
+      class {
+        static permission = "granted";
+        onclick: (() => void) | null = null;
+        close() {}
+        constructor(readonly title: string) {
+          shown.push(title);
+        }
+      },
+    );
+    localStorage.setItem("foundry.alerts", "on");
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    mockActions();
+    await open("/", live);
+    const run = { run: "original-solutions__foundry__162__1", title: "t", step: "building", machine: ME, gate_retries_used: 0, minutes_used: 1, workspaces: ["w1"], sessions: ["s1"] };
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: { ...heldStatus(2), runs: [run] } })));
+    act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "stuck", { model: "sonnet", version: 2 }) })));
+    await waitFor(() => expect(screen.getByText("Quiet 10+ min")).toBeDefined());
+    expect(document.title).toBe("Foundry");
+    expect(shown).toEqual([]);
+    vi.restoreAllMocks();
+  });
+
+  it("says in the while-you-were-away card that a live factory run's stuck session is quiet", async () => {
+    localStorage.setItem("foundry.away", JSON.stringify({ at: Date.now() - 5 * 60_000, versions: { s1: 1 } }));
+    mockActions();
+    await open("/", live);
+    const run = { run: "original-solutions__foundry__162__1", title: "t", step: "building", machine: ME, gate_retries_used: 0, minutes_used: 1, workspaces: ["w1"], sessions: ["s1"] };
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: { ...heldStatus(2), runs: [run] } })));
+    act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "stuck", { model: "sonnet", version: 2 }) })));
+    const card = await screen.findByRole("complementary", { name: "While you were away" });
+    expect(within(card).getByRole("button", { name: "Open sonnet in fix login: Quiet 10+ min" })).toBeDefined();
+  });
+
   it("gives the Projects dialog each project's factory settings from the events socket, and follows a later settings message", async () => {
     mockActions();
     await open("/", {

@@ -1,5 +1,6 @@
-import type { SessionState } from "./api";
+import type { FactoryStatus, SessionState } from "./api";
 import { byUrgency, rows, type MachineView } from "./fleet";
+import { factoryRuns, tendedByFactory } from "./lanes";
 import { needsYou, sessionGlyph, type Glyph } from "./labels";
 import { shapes } from "./StateGlyph";
 
@@ -28,18 +29,21 @@ const says: Partial<Record<SessionState, string>> = {
 /**
  * The alerts for what changed since `before`: a session that went from working to idle finished
  * its turn, and one that entered waiting, stuck or failed needs you (also when it shows up that
- * way). The first look, with nothing before it, raises nothing.
+ * way). A live factory run's session never needs you, as on the board: the factory tends it. The
+ * first look, with nothing before it, raises nothing.
  */
-export function alertsFor(before: Seen | undefined, machines: MachineView[]): { alerts: Alert[]; seen: Seen } {
+export function alertsFor(before: Seen | undefined, machines: MachineView[], statuses?: Record<string, FactoryStatus>): { alerts: Alert[]; seen: Seen } {
+  const factoryOf = factoryRuns(statuses);
   const seen: Seen = new Map();
   const alerts: Alert[] = [];
   for (const workspace of machines.flatMap((m) => m.workspaces)) {
+    const tended = tendedByFactory(factoryOf(workspace));
     for (const s of workspace.sessions) {
       seen.set(s.id, s.state);
       if (!before) continue;
       const was = before.get(s.id);
       if (was === s.state) continue;
-      const phrase = was === "working" && s.state === "idle" ? "finished its turn" : says[s.state];
+      const phrase = was === "working" && s.state === "idle" ? "finished its turn" : tended ? undefined : says[s.state];
       if (phrase) alerts.push({ terminal: s.terminal, tag: s.id, glyph: sessionGlyph[s.state], title: workspace.name, body: `${s.name} ${phrase}` });
     }
   }
@@ -53,8 +57,12 @@ export interface Pulse {
   working: number;
 }
 
-export function pulse(machines: MachineView[]): Pulse {
-  const all = machines.flatMap((m) => m.workspaces.flatMap(rows));
+/** The fleet's pulse. A live factory run's terminals that would need you are left out, as the board leaves its card under working. */
+export function pulse(machines: MachineView[], statuses?: Record<string, FactoryStatus>): Pulse {
+  const factoryOf = factoryRuns(statuses);
+  const all = machines.flatMap((m) =>
+    m.workspaces.flatMap((w) => (tendedByFactory(factoryOf(w)) ? rows(w).filter((r) => !needsYou.includes(r.glyph)) : rows(w))),
+  );
   const count = (...glyphs: Glyph[]) => all.filter((r) => glyphs.includes(r.glyph)).length;
   return { glyph: byUrgency(all)[0]?.glyph, needYou: count(...needsYou), working: count("working") };
 }

@@ -1,5 +1,6 @@
-import type { AnyRecord, Mark } from "./api";
-import { rows, type MachineView, type Row } from "./fleet";
+import type { AnyRecord, FactoryStatus, Mark } from "./api";
+import type { MachineView, Row } from "./fleet";
+import { factoryRuns, runRows, tendedByFactory } from "./lanes";
 import { needsYou, urgency } from "./labels";
 import { turns } from "./trail";
 import { readStoredJson, storeJson, unstore } from "./storage";
@@ -30,26 +31,33 @@ export interface Moved {
   changed: boolean;
   /** It started while the page was hidden. */
   fresh: boolean;
+  /** It needs you now: its glyph says so and no live factory run tends it. */
+  needs: boolean;
 }
 
 /**
  * Every session to tell about on coming back, what needs you first, then what is busy, then the
  * rest, ties in fleet order. Empty when no session's record moved: a session that was already
- * waiting before the page was hidden is not news on its own. Records are compared by version,
+ * waiting before the page was hidden is not news on its own. A live factory run's session never
+ * needs you, as on the board: its rows read as the board's do. Records are compared by version,
  * never by time.
  */
-export function moved(left: Left, records: AnyRecord[], machines: MachineView[]): Moved[] {
+export function moved(left: Left, records: AnyRecord[], machines: MachineView[], statuses?: Record<string, FactoryStatus>): Moved[] {
+  const factoryOf = factoryRuns(statuses);
   const version = new Map(records.flatMap((r) => (r.kind === "session" && !r.deleted ? [[r.body.id, r.version] as const] : [])));
   const all = machines.flatMap((m) =>
-    m.workspaces.flatMap((w) =>
-      rows(w).flatMap((row) => {
+    m.workspaces.flatMap((w) => {
+      const run = factoryOf(w);
+      const tended = tendedByFactory(run);
+      return runRows(w, run).flatMap((row) => {
         if (!row.session) return [];
         const before = left.versions[row.session];
         const changed = before === undefined || (version.get(row.session) ?? 0) > before;
-        if (!changed && !needsYou.includes(row.glyph)) return [];
-        return [{ row: { ...row, session: row.session }, workspace: w.name, changed, fresh: before === undefined }];
-      }),
-    ),
+        const needs = !tended && needsYou.includes(row.glyph);
+        if (!changed && !needs) return [];
+        return [{ row: { ...row, session: row.session }, workspace: w.name, changed, fresh: before === undefined, needs }];
+      });
+    }),
   );
   if (!all.some((m) => m.changed)) return [];
   return all.sort((a, b) => urgency.indexOf(a.row.glyph) - urgency.indexOf(b.row.glyph));
