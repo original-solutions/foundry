@@ -1349,8 +1349,9 @@ pub fn text_changes_since(
 /// Whether the factory may build the issue: an instructor (only ever a `User`) applied the
 /// `ready` label in force now, and every body edit and title rename from that second on was an
 /// instructor's. Only the newest timeline page is read: it holds the label in force and all
-/// after it, and a full page without it is `label-history-incomplete`. Label names match
-/// exactly; times compare as text.
+/// after it, a full page without it is `label-history-incomplete`, and a page that may hide a
+/// rename in the label's second leaves the text unjudged. Label names match exactly; times
+/// compare as text.
 pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]) -> Approval {
     let mut in_force: Option<&LabelChange> = None;
     for event in &issue.timeline_items.nodes {
@@ -1364,8 +1365,7 @@ pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]
             _ => {}
         }
     }
-    // The label is on the page, so the renames at or after it are too.
-    judge_chosen_label(issue, in_force, instructors, true)
+    judge_chosen_label(issue, in_force, instructors)
 }
 
 /// The approval a claim was made on, judged after the claim removed `ready`: [`judge_approval`]'s
@@ -1412,21 +1412,18 @@ pub fn judge_claimed_approval(
         }
         _ => None,
     };
-    // The page may be cut off just after the label, hiding a rename in its second.
-    let reaches = label.is_some_and(|label| timeline_reaches(issue, &label.created_at));
-    judge_chosen_label(issue, label, instructors, reaches)
+    judge_chosen_label(issue, label, instructors)
 }
 
 /// What both judges decide once they have chosen the label (or found none): a missing label is
 /// `label-history-incomplete` on a full page of a longer history and `label-not-found`
 /// otherwise; a label applied by anyone but a human instructor is refused; and every body edit
-/// and title rename from the label's second on must be an instructor's. `reaches` says the
-/// timeline page holds every rename at or after the label.
+/// and title rename from the label's second on must be an instructor's, with a timeline page
+/// that may hide a rename in that second leaving the text unjudged.
 fn judge_chosen_label(
     issue: &ApprovalIssue,
     label: Option<&LabelChange>,
     instructors: &[String],
-    reaches: bool,
 ) -> Approval {
     let Some(label) = label else {
         let timeline = &issue.timeline_items;
@@ -1447,6 +1444,8 @@ fn judge_chosen_label(
             labeled_at,
         });
     };
+    // The page may be cut off just after the label, hiding a rename in its second.
+    let reaches = timeline_reaches(issue, &labeled_at);
     match text_changes_since(issue, &labeled_at, instructors, reaches) {
         TextCheck::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
         TextCheck::Unjudged => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
@@ -4618,6 +4617,21 @@ mod tests {
     }
 
     #[test]
+    fn judge_approval_refuses_a_cut_off_timeline_whose_oldest_event_is_the_label() {
+        // A rename in the label's second could sit on the page before this one.
+        let mut page = vec![labeled(LABELED, "tom", READY)];
+        page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        assert_eq!(
+            judge_approval(
+                &issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None),
+                READY,
+                &names(&["tom"])
+            ),
+            refused(history_cut(LABELED))
+        );
+    }
+
+    #[test]
     fn edited_since_counts_anyones_edit_or_rename_at_or_after_the_moment() {
         assert!(!edited_since(
             &issue_of(vec![renamed(BEFORE, "tom")], &[(BEFORE, "tom")], None, None),
@@ -4903,9 +4917,8 @@ mod tests {
     }
 
     /// The two judges agree wherever the label in force decides: the same label, actor, edit
-    /// and rename rules, and the same refusals. The one known difference is left out of the
-    /// agreement: on a cut-off page whose oldest event is the label, `judge_approval` assumes the
-    /// page holds every rename and `judge_claimed_approval` does not.
+    /// and rename rules, and the same refusals, a cut-off page whose oldest event is the label
+    /// included.
     #[test]
     fn judge_claimed_approval_agrees_with_judge_approval_on_a_label_in_force() {
         /// A timeline, the body edits, and the edit history's total when it is not their count.
@@ -4969,6 +4982,19 @@ mod tests {
             page.extend((page.len()..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
             cases.push(issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None));
         }
+        // A cut-off page whose oldest event is another one in the label's second: a rename in
+        // that second could still be on the page before it.
+        let mut same_second = vec![
+            labeled(LABELED, "eve", "bug"),
+            labeled(LABELED, "tom", READY),
+        ];
+        same_second.extend((2..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        let same_second = issue_of(same_second, &[], Some(HISTORY_PAGE as u64 + 5), None);
+        assert_eq!(
+            judge_approval(&same_second, READY, &names(&["tom"])),
+            refused(history_cut(LABELED))
+        );
+        cases.push(same_second);
 
         let instructors = names(&["tom"]);
         let mut seen = Vec::new();
@@ -4996,16 +5022,16 @@ mod tests {
             assert!(seen.contains(&outcome), "{outcome:?} in {seen:?}");
         }
 
-        // Both judges hand the label they chose to one tail, each with its own `reaches`: this
-        // pins the `reaches` each passes, and a refusal added to a single judge beside the tail
-        // shows wherever a case triggers it. The known difference is in it too: on a cut-off
-        // page whose oldest event is the label, each judge still answers as before.
+        // Both judges hand the label they chose to one tail, which judges the cut-off page
+        // itself: a refusal added to a single judge beside the tail shows wherever a case
+        // triggers it. On a cut-off page whose oldest event is the label, a rename in its second
+        // could be hidden, so both refuse it.
         let mut oldest = vec![labeled(LABELED, "tom", READY)];
         oldest.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
         let oldest = issue_of(oldest, &[], Some(HISTORY_PAGE as u64 + 5), None);
         assert_eq!(
             judge_approval(&oldest, READY, &instructors),
-            approved(LABELED, "tom")
+            refused(history_cut(LABELED))
         );
         assert_eq!(
             judge_claimed_approval(&oldest, READY, PROJECT, &instructors),
@@ -5025,15 +5051,14 @@ mod tests {
                     }
                     _ => None,
                 });
-            let reaches = label.is_some_and(|label| timeline_reaches(issue, &label.created_at));
             assert_eq!(
                 judge_approval(issue, READY, &instructors),
-                judge_chosen_label(issue, label, &instructors, true),
+                judge_chosen_label(issue, label, &instructors),
                 "{issue:?}"
             );
             assert_eq!(
                 judge_claimed_approval(issue, READY, PROJECT, &instructors),
-                judge_chosen_label(issue, label, &instructors, reaches),
+                judge_chosen_label(issue, label, &instructors),
                 "{issue:?}"
             );
         }
@@ -5759,13 +5784,23 @@ mod tests {
 
     #[test]
     fn labels_and_renames_share_the_page_and_the_label_in_force_is_enough() {
-        // The label is the oldest event shown, so every later event, the renames included, is
-        // on the page: events come oldest first and the page is the newest 100. Nothing before
-        // the label matters, whatever the total.
-        let mut events = vec![ready_on(LABELED, "tom")];
-        events.extend(renames_after_label(99));
+        // The oldest event shown is before the label, so every event in or after the label's
+        // second, the renames included, is on the page: events come oldest first and the page
+        // is the newest 100. Nothing before the label matters, whatever the total.
+        let mut events = vec![
+            rename_event("2026-10-04T09:59:59Z", "eve"),
+            ready_on(LABELED, "tom"),
+        ];
+        events.extend(renames_after_label(98));
         let answer = approval_reply(&events, 400, None, &creation_only("eve"));
         assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+
+        // With the label the oldest event shown, a rename in its second could be on the page
+        // before this one.
+        let mut oldest = vec![ready_on(LABELED, "tom")];
+        oldest.extend(renames_after_label(99));
+        let cut = approval_reply(&oldest, 400, None, &creation_only("eve"));
+        assert_eq!(approval_of(&cut, &["tom"]), refused(history_cut(LABELED)));
 
         // A stranger's rename on that page is seen.
         let mut with_stranger = events.clone();
