@@ -417,6 +417,14 @@ describe("Grouped by shipping", () => {
     expect(within(card("far off")).queryByRole("group", { name: /Next for/ })).toBeNull();
   });
 
+  it("offers Archive on the card of a workspace on another machine, and opens its dialog without reading its changes", async () => {
+    await show(fleet(fleetOf(), listed()), vi.fn(), {}, true);
+    const far = card("far off");
+    fireEvent.click(await within(far).findByRole("button", { name: "Archive far off" }));
+    expect(await screen.findByRole("dialog", { name: "Archive far off?" })).toBeDefined();
+    expect(reads).not.toContain("/api/workspaces/w6/changes");
+  });
+
   it("moves a card to its new lane when one of its terminals changes state, and lights it up once there", async () => {
     localStorage.setItem("foundry.group", "shipping");
     const { update } = await show(fleet(fleetOf("working"), listed()), vi.fn(), {}, true);

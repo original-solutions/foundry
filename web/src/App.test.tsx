@@ -1212,7 +1212,7 @@ describe("App", () => {
     expect((await screen.findByRole("alert")).textContent).toMatch(/^Could not clear the terminal: no such terminal\./);
   });
 
-  it("ends and clears another machine's terminals, which the daemon carries to it, from a menu that offers no start or archive there", async () => {
+  it("ends and clears another machine's terminals, which the daemon carries to it, from a menu that offers no start there", async () => {
     const calls = mockActions(new Response(null, { status: 204 }), new Response(null, { status: 204 }));
     await open("/terminals/t1", {
       ...ended,
@@ -1235,12 +1235,12 @@ describe("App", () => {
 
     const running = within(remote).getByRole("link", { name: /Running$/ });
     const name = running.getAttribute("data-name");
-    expect(await entries(running)).toEqual(["Open", "Open beside", "Changes in remote job", `End ${name}…`, "Clear 1 ended in remote job"]);
+    expect(await entries(running)).toEqual(["Open", "Open beside", "Changes in remote job", `End ${name}…`, "Clear 1 ended in remote job", "Archive remote job…"]);
     fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
 
     const failed = within(remote).getByRole("link", { name: /Failed · exit 101$/ });
-    expect(await entries(failed)).toEqual(["Open", "Open beside", "Changes in remote job", "Clear"]);
+    expect(await entries(failed)).toEqual(["Open", "Open beside", "Changes in remote job", "Clear", "Archive remote job…"]);
     fireEvent.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: "Clear" }));
     await waitFor(() => expect(calls).toEqual([{ url: "/api/terminals/t9/close", method: "POST", body: undefined }]));
 
