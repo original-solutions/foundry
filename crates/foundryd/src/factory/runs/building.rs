@@ -13,9 +13,9 @@
 //! pass cut short repeats nothing. A session that idles through a gate has its newest turn
 //! read already and is sent nothing. A session idle with no turn ended may not have taken its
 //! launch: when that launch is `start`'s (no interruption, and no feedback round owns the run),
-//! the run is `start`'s pass then ([`BuildStep::Launch`]), which asks for the launch again by
-//! count, since the label moved to `building` with the start and the pass no longer routes the
-//! run to `start`.
+//! `start`'s check of a launched session runs then ([`BuildStep::Launch`]), which asks for the
+//! launch again by count, since the label moved to `building` with the start and the pass no
+//! longer routes the run to `start`.
 //!
 //! Where it differs from the runner:
 //!
@@ -167,8 +167,9 @@ pub enum BuildStep {
     /// The run's pull request was merged or closed (or its own merge closed the issue): the run
     /// is ended.
     Ended,
-    /// No turn ended and the session's launch is `start`'s: what `start`'s pass did, which asks
-    /// for the launch again by count when the session has not taken it (the spec's step 3).
+    /// No turn ended and the session's launch is `start`'s: what `start`'s check of a launched
+    /// session did, which asks for the launch again by count when the session has not taken it
+    /// (the spec's step 3).
     Launch(StartStep),
 }
 
@@ -285,13 +286,14 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
                 // The newest turn was read already.
                 None if turn.as_ref().is_some_and(|turn| turn.turn > 0) => Ok(step.read_already()),
                 // No turn ended yet. The label moved to `building` with the start, so the
-                // launch the session may not have taken is asked for again by `start` from here
-                // (the spec's step 3), which decides by the session's count. Only `start`'s own
-                // launch: a run that has had an interruption is `resume`'s, and a session a
-                // feedback round launched is the round's, each with its own words.
-                None if seen.interruption.is_none() && !feedback::round_owns(&events) => {
-                    Ok(BuildStep::Launch(start::advance(ctx, run)?))
-                }
+                // launch the session may not have taken is asked for again here with `start`'s
+                // check (the spec's step 3), which decides by the session's count. Only
+                // `start`'s own launch: a run that has had an interruption is `resume`'s, and a
+                // session a feedback round launched is the round's, each with its own words.
+                // This pass's guards and reads stand: none of `start`'s own pass is run again.
+                None if seen.interruption.is_none() && !feedback::round_owns(&events) => Ok(
+                    BuildStep::Launch(start::launched(ctx, run, &seen, &mut at)?),
+                ),
                 None => Ok(BuildStep::Running),
             }
         }
@@ -5160,6 +5162,73 @@ mod tests {
                 BuildStep::Launch(StartStep::Started { session: session() })
             );
             assert_eq!(sends(&rig), vec![launch_sent_again()]);
+        }
+
+        /// The worker finds the session busy after all: nothing was typed, the run goes on, and
+        /// the next pass looks again.
+        #[test]
+        fn a_launch_the_worker_refuses_as_not_idle_leaves_the_run_going() {
+            let (mut rig, run) = built();
+            show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Err(SendRefused::NotIdle));
+            let before = rig.events(&run).len();
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Started { session: session() })
+            );
+            assert_eq!(sends(&rig), vec![launch_sent_again()]);
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [format!("{LAUNCH_RESENDING}0")]
+            );
+            assert_eq!(rig.sim.labels(), ["factory:building"]);
+        }
+
+        /// A send that fails otherwise is the pass's error, as a reminder's is: the step is
+        /// written before the send, and the next pass asks again under the same count.
+        #[test]
+        fn a_launch_whose_send_fails_is_the_passs_error_and_asked_again_next_pass() {
+            let (mut rig, run) = built();
+            show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Err(SendRefused::Failed {
+                reason: "the terminal gave an error".into(),
+                prompts: Some(0),
+            }));
+            let before = rig.events(&run).len();
+            let error = advance(&rig.ctx(), &run).unwrap_err();
+            assert!(
+                matches!(error, RunError::Send(SendRefused::Failed { .. })),
+                "{error}"
+            );
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [format!("{LAUNCH_RESENDING}0")]
+            );
+            rig.worker.on_send(Ok(0));
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Resent { session: session() })
+            );
+            assert_eq!(sends(&rig), vec![launch_sent_again(), launch_sent_again()]);
+        }
+
+        /// The launch is asked for with this pass's own reads: `start`'s pass, with its second
+        /// read of the issue and its own checks, is not run again from here.
+        #[test]
+        fn a_launch_asked_for_again_reads_github_no_more_than_a_pass_that_sends_nothing() {
+            let (mut rig, run) = built();
+            show(&mut rig, SessionState::Working, 0, 0);
+            let from = rig.sim.calls().len();
+            assert_eq!(pass(&rig, &run), BuildStep::Running);
+            let quiet = rig.sim.calls()[from..].to_vec();
+            show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Ok(0));
+            let from = rig.sim.calls().len();
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Resent { session: session() })
+            );
+            assert_eq!(rig.sim.calls()[from..].to_vec(), quiet);
         }
 
         /// A session whose newest launch is a resume is `resume`'s to ask again, with the

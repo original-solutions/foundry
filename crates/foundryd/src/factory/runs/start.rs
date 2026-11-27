@@ -1715,8 +1715,9 @@ fn record_launched(
 }
 
 /// A run whose session is launched: the label, and the launch asked for again by count when the
-/// session is idle a pass after it started.
-fn launched(
+/// session is idle a pass after it started. `building` asks through this too, once the label has
+/// moved, with the ledger and issue it has read already.
+pub(super) fn launched(
     ctx: &RunContext<'_>,
     run: &RunId,
     seen: &Seen,
