@@ -51,11 +51,13 @@ use super::{
     stop_session, workspace_id,
 };
 use crate::factory::github::read::{
-    gh_json, is_branch_path, is_plain_ref_name, is_safe_branch_name, is_utc_second,
-    issue_query_args,
+    APPROVAL_QUERY, ApprovalIssue, TimelineNode, gh_json, gh_pages, is_branch_path,
+    is_human_instructor, is_plain_ref_name, is_safe_branch_name, is_utc_second, issue_query_args,
+    text_changes_since,
 };
 use crate::factory::github::{
-    Claim, IssueDetail, OpenPullRequest, OtherKind, Tracker, TrackerError, newest_claim,
+    Claim, IssueComment, IssueDetail, OpenPullRequest, OtherKind, Tracker, TrackerError,
+    newest_claim,
 };
 use crate::factory::ledger::events::{
     Cause, CauseStep, Event, ModelOption, OptionValue, Outcome, ResumedFrom, names,
@@ -840,11 +842,16 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
         }
         None => return skipped(format!("no claim comment names run {run}")),
     };
-    if let Approval::Approved {
-        labeled_at,
-        labeled_by,
-    } = ctx.tracker.approval(repo, issue, &ctx.config.instructors)?
-    {
+    // The claim took `factory:ready` off, so the label is no longer in force: the approval is
+    // the newest label an instructor applied before the claim comment.
+    let approved = match ctx.tracker.approval(repo, issue, &ctx.config.instructors)? {
+        Approval::Approved {
+            labeled_at,
+            labeled_by,
+        } => Some((labeled_at, labeled_by)),
+        Approval::Refused(_) => approved_before_claim(ctx, issue, &comments)?,
+    };
+    if let Some((labeled_at, labeled_by)) = approved {
         let by = (!labeled_by.is_empty()).then_some(labeled_by.as_str());
         record_approval(ctx, run, &labeled_at, by, CauseStep::Start)?;
     }
@@ -857,6 +864,121 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
         &Cause::new(CauseStep::Start, "claim-found"),
     )?;
     Ok(None)
+}
+
+/// A claim comment's id and time, as GitHub lists it.
+#[derive(Deserialize)]
+struct ClaimRow {
+    id: u64,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HistoryAnswer {
+    data: HistoryData,
+}
+
+#[derive(Deserialize)]
+struct HistoryData {
+    repository: HistoryRepository,
+}
+
+#[derive(Deserialize)]
+struct HistoryRepository {
+    issue: ApprovalIssue,
+}
+
+/// The approval of a label the claim has since removed: the newest `factory:ready` label put
+/// on at or before the time of the issue's newest claim comment, judged as `judge_approval`
+/// judges the label in force. It must be an instructor's (a person), and no one but an
+/// instructor may have edited or renamed the issue from that second on. `None` when there is no
+/// such label on the newest page of the timeline, or it does not pass.
+fn approved_before_claim(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    comments: &[IssueComment],
+) -> Result<Option<(String, String)>, RunError> {
+    let login = &ctx.project.login;
+    let Some(claim_id) = comments
+        .iter()
+        .filter(|comment| newest_claim(std::slice::from_ref(comment), login).is_some())
+        .map(|comment| comment.id)
+        .max()
+    else {
+        return Ok(None);
+    };
+    let args = vec![
+        "api".to_string(),
+        format!("repos/{}/issues/{issue}/comments?per_page=100", ctx.repo()),
+        "--paginate".to_string(),
+    ];
+    let rows: Vec<ClaimRow> = gh_pages(ctx.tracker, &args, "JSON arrays of comments")?;
+    let claimed_at = rows
+        .into_iter()
+        .find(|row| row.id == claim_id)
+        .and_then(|row| row.created_at)
+        .unwrap_or_default();
+    let args = issue_query_args(ctx.repo(), APPROVAL_QUERY, issue)?;
+    let answer: HistoryAnswer = gh_json(ctx.tracker, &args, "a GraphQL response with the issue")?;
+    let found = answer.data.repository.issue;
+    let stamps = found
+        .timeline_items
+        .nodes
+        .iter()
+        .map(|node| match node {
+            TimelineNode::LabeledEvent(change) | TimelineNode::UnlabeledEvent(change) => {
+                change.created_at.as_str()
+            }
+            TimelineNode::RenamedTitleEvent(rename) => rename.created_at.as_str(),
+        })
+        .chain(
+            found
+                .user_content_edits
+                .nodes
+                .iter()
+                .map(|e| e.edited_at.as_str()),
+        )
+        .chain(found.last_edited_at.as_deref())
+        .chain([claimed_at.as_str()]);
+    for stamp in stamps {
+        if !is_utc_second(stamp) {
+            return Err(RunError::Invalid(format!(
+                "a timestamp as YYYY-MM-DDTHH:MM:SSZ, got {stamp:?}"
+            )));
+        }
+    }
+    let ready = State::Ready.label();
+    let newest = found
+        .timeline_items
+        .nodes
+        .iter()
+        .rev()
+        .find_map(|node| match node {
+            TimelineNode::LabeledEvent(change)
+                if change.label.name == ready
+                    && change.created_at.as_str() <= claimed_at.as_str() =>
+            {
+                Some(change)
+            }
+            _ => None,
+        });
+    let Some(label) = newest else {
+        return Ok(None);
+    };
+    let instructors = &ctx.config.instructors;
+    let Some(by) = label
+        .actor
+        .as_ref()
+        .filter(|actor| is_human_instructor(Some(actor), instructors))
+    else {
+        return Ok(None);
+    };
+    // The label is on the page, so the renames at or after it are too.
+    Ok(
+        (text_changes_since(&found, &label.created_at, instructors, true) == TextCheck::Unchanged)
+            .then(|| (label.created_at.clone(), by.login.clone())),
+    )
 }
 
 /// What a launch continues from.
