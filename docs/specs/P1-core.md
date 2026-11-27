@@ -286,7 +286,7 @@ P2 adds a lease per project on GitHub, so that claiming issues can never happen 
 
 - A release is a `v*` tag. Each machine downloads and verifies a newer tag on its own, and installs it when someone picks it in the UI. Holders are separate processes, so terminals survive.
 - [manual-updates.md](manual-updates.md) has the details: when a release is made ready, the machine record's version and waiting tag, the install endpoint and the UI's update badge.
-- The rollback from factory-on-paradev carries over: a version that starts three times without becoming healthy puts the previous version back and refuses that tag until a higher one exists.
+- The rollback from factory-on-paradev carries over: a version that starts three times without becoming healthy puts the previous version back and refuses that tag until a higher one is installed.
 - Sync messages carry a protocol version. A newer machine speaks the older form to an older peer, so a fleet can update one machine at a time.
 - The holder's protocol is versioned separately and changes rarely, since a running holder cannot be updated without ending its terminal.
 
