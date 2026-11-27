@@ -181,8 +181,7 @@ impl VimsError {
 /// Vims's refusal of a call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
-    /// Vims's code, such as `IDEMPOTENCY_KEY_REUSED`, `PRECONDITION_FAILED` or
-    /// `HOST_COMMAND_TIMEOUT`.
+    /// Vims's code, such as `IDEMPOTENCY_KEY_REUSED` or `PRECONDITION_FAILED`.
     pub code: String,
     /// What Vims said.
     pub message: String,
@@ -203,13 +202,14 @@ impl Refusal {
     }
 }
 
-/// The codes read as Vims's refusal, besides those of a [`Limit`]. P2c saw the first three;
-/// the rest are guesses at codes that only an answer from Vims can carry. Any other code,
-/// such as a server's or a gateway's, says nothing of whether Vims took the call.
-const REFUSALS: [&str; 13] = [
+/// The codes read as Vims's refusal, besides those of a [`Limit`]: each says Vims answered
+/// and took nothing. P2c saw the first two; the rest are guesses at codes that only an answer
+/// from Vims can carry. Any other code says nothing of whether Vims took the call: a server's
+/// or a gateway's, and those that say the work ran or is under way (`HOST_COMMAND_TIMEOUT`,
+/// `CONFLICT`, `ALREADY_EXISTS`).
+const REFUSALS: [&str; 10] = [
     "IDEMPOTENCY_KEY_REUSED",
     "PRECONDITION_FAILED",
-    "HOST_COMMAND_TIMEOUT",
     "NOT_FOUND",
     "UNAUTHORIZED",
     "UNAUTHENTICATED",
@@ -218,8 +218,6 @@ const REFUSALS: [&str; 13] = [
     "INVALID_ARGUMENT",
     "BAD_REQUEST",
     "VALIDATION_FAILED",
-    "CONFLICT",
-    "ALREADY_EXISTS",
 ];
 
 impl Refusal {
