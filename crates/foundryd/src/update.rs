@@ -2999,20 +2999,25 @@ mod tests {
         let home = installed_home();
         let path = home.path().to_path_buf();
         let held = lock(home.path()).unwrap();
+        let (staged_tx, staged) = std::sync::mpsc::channel();
         let hand = std::thread::spawn(move || {
             place_version(
                 &path,
                 "0.3.0",
                 |stage| {
                     release(stage, "0.3.0");
+                    staged_tx.send(stage.to_path_buf()).unwrap();
                     Ok(())
                 },
                 || Ok(()),
             )
             .unwrap();
         });
+        // The stage is filled while this thread holds the lock: the copy is made outside it.
+        let stage = staged.recv_timeout(Duration::from_secs(10)).unwrap();
         std::thread::sleep(Duration::from_millis(300));
 
+        assert!(stage.join("foundryd").is_file());
         assert!(!home.path().join("versions/0.3.0").exists());
         assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
 
@@ -3866,7 +3871,7 @@ mod tests {
     }
 
     #[test]
-    fn install_ready_saves_before_it_moves_current_and_restores_the_state_when_it_cannot() {
+    fn install_ready_restores_the_state_when_it_cannot_point_current() {
         let (home, exe) = ready_home(Some("v0.1.5"));
         let before = snapshot(home.path());
         // A directory with something in it cannot be removed as the old link, so `current`
@@ -3901,15 +3906,25 @@ mod tests {
 
     #[test]
     fn install_ready_keeps_a_higher_refusal_and_clears_a_lower_one() {
-        let (home, exe) = ready_home(Some("v0.9.2"));
-        install_ready(home.path(), "v0.2.0", "0.1.0", &exe).unwrap();
+        // A home on 0.9.0, run from `current`, with `v<ready>` ready and `v0.9.2` refused.
+        let on_090 = |ready: &str| {
+            let home = tempfile::tempdir().unwrap();
+            fs::create_dir_all(home.path().join("versions/0.9.0")).unwrap();
+            point_current(home.path(), "0.9.0").unwrap();
+            let exe = exe_in(home.path(), "0.9.0");
+            with_ready(home.path(), ready, Some("v0.9.2"));
+            (home, exe)
+        };
+
+        let (home, exe) = on_090("0.9.1");
+        install_ready(home.path(), "v0.9.1", "0.9.0", &exe).unwrap();
         assert_eq!(
             state(home.path()).unwrap().refused.as_deref(),
             Some("v0.9.2")
         );
 
-        let (home, exe) = ready_home(Some("v0.1.5"));
-        install_ready(home.path(), "v0.2.0", "0.1.0", &exe).unwrap();
+        let (home, exe) = on_090("0.9.3");
+        install_ready(home.path(), "v0.9.3", "0.9.0", &exe).unwrap();
         assert_eq!(state(home.path()).unwrap().refused, None);
     }
 
