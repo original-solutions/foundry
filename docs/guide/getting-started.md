@@ -30,6 +30,15 @@ The task is optional. With a name and no task, Foundry makes the workspace and s
 
 Below the box, the screen explains the three states every session shows: **Working**, **Needs you** and **Ready**. The board, the sidebar, the tab icon and every notification use them. [Session states](sessions.md#session-states) says what each one means and what to do.
 
+### With no project yet
+
+A new fleet has no projects, so the first-run screen starts one step earlier: **Two steps to Claude at work**.
+
+1. **Which repo should Claude work in?** Paste the repo's address, such as `git@github.com:you/shop.git`. Foundry names the project from it (`shop`) and shows the name in the **named** field; type over it to choose another. Press **Add** or `Enter`. If the daemon refuses, a red line says why and what you typed stays.
+2. **What should Claude work on?** Once the project arrives, step 1 gets a tick with the project's face and repo, and the task box opens here with your cursor in it and the new project picked. From here it works as described above.
+
+To add more projects later, use **Projects** in the task box.
+
 ## After you press Start
 
 While Foundry works, a line under the box says what it is doing: "Making fix-the-login-redirect from main…", then "Starting opus on your task…".
@@ -77,7 +86,7 @@ A project is a repo and a name, shared by every machine in the fleet. A machine 
 - **Remove a project.** Press **Remove** beside it, then **Remove from every machine** to confirm. **Cancel** backs out. Foundry refuses while a live workspace made from the project exists, and says so beside the project.
 - **Close** leaves the dialog and clears anything half typed.
 
-With no projects at all, the task box says "No projects yet" and offers **Add a project**.
+With no projects at all, the first-run screen asks for a repo first (see [With no project yet](#with-no-project-yet)), and the New task dialog says "No projects yet" and offers **Add a project**.
 
 Each project row also has the factory controls: a switch, the GitHub login it acts as, and a pause. They are covered in [The factory](factory.md).
 

@@ -12,7 +12,7 @@ const FACTORY_OFF = { on: false, login: "", paused: false };
  * Adds a project through the daemon, which sends it to the acting coordinator, under `id`; its
  * id as the daemon answers it.
  */
-async function addProject({ name, repo, id }: { name: string; repo: string; id: string }): Promise<string> {
+export async function addProject({ name, repo, id }: { name: string; repo: string; id: string }): Promise<string> {
   const { status, json } = await post("/api/projects", { name, repo, id });
   if (status !== 201) throw refused(status, json);
   return String(json.id);
@@ -28,7 +28,7 @@ async function removeProject(id: string): Promise<void> {
  * A new random v4 UUID. Made from `crypto.getRandomValues`, since `crypto.randomUUID` exists only
  * in a secure context, and the UI opened over a machine's plain-http Tailscale address is not one.
  */
-function newId(): string {
+export function newId(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   bytes[6] = (bytes[6] & 0x0f) | 0x40;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;

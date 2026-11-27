@@ -69,7 +69,8 @@ import { upNext } from "./needing";
  *
  * A fleet with no workspaces opens on one question, what Claude should work on, and a box to
  * answer it in: the task names the workspace and its branch, Start makes it and lands in its
- * session already at work, and the three states it will show are explained under it.
+ * session already at work, and the three states it will show are explained under it. With no
+ * project yet, it first asks for the repo, named from its address, then opens the task box on it.
  *
  * The machines view (`/machines`, from the board's switch or a machine's name in the sidebar)
  * shows every machine as a card: its status, when it was last heard, its load drawn over the last
