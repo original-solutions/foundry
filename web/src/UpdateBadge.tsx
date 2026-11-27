@@ -78,6 +78,10 @@ export function UpdateBadge({ machines, here }: { machines: MachineView[]; here:
   /** The tag the serving machine answered 202 for: it restarts, until its sample runs or refused that tag. */
   const [restartingTo, setRestartingTo] = useState<string>();
 
+  // Adjusted while rendering, hidden or not: once the serving machine's sample runs or refused the tag, it is back, for good.
+  const served = machines.find((m) => m.id === here)?.sample;
+  if (restartingTo !== undefined && (runs(served?.version, restartingTo) || served?.update_refused === restartingTo)) setRestartingTo(undefined);
+
   const waiting = machines.flatMap((m) => (m.listed && m.sample?.update_ready ? [{ machine: m, tag: m.sample.update_ready }] : []));
   if (waiting.length === 0 && !open) return null;
 
@@ -117,8 +121,7 @@ export function UpdateBadge({ machines, here }: { machines: MachineView[]; here:
     }
     setBusy(false);
   };
-  const served = machines.find((m) => m.id === here)?.sample;
-  const restarting = restartingTo !== undefined && !runs(served?.version, restartingTo) && served?.update_refused !== restartingTo;
+  const restarting = restartingTo !== undefined;
   const held = restarting ? "This machine is restarting on the new release. Install again once it is back." : busy ? "The last install is still out. Install again once it has answered." : undefined;
 
   const trigger = (
