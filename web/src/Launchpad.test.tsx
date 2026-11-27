@@ -155,6 +155,21 @@ describe("Launchpad", () => {
     expect((screen.getByLabelText("Workspace name") as HTMLInputElement).placeholder).toBe("review-loop pr 1181 2");
   });
 
+  it("shows the name a second Start sends, not the one an earlier create was numbered to", async () => {
+    mockFetch(json(409, { error: "a branch or worktree named fix-it already exists in this project" }), json(400, { error: "no base branch main" }));
+    await renderApp(<Harness />);
+
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.click(start());
+    expect((await screen.findByRole("alert")).textContent).toMatch(/no base branch main/);
+
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+    fireEvent.click(start());
+
+    expect(screen.getByLabelText("Branch").textContent).toBe("fix-it");
+    expect(await screen.findByText("Making fix-it from main…")).toBeDefined();
+  });
+
   it("gives up on a suggested name after 20 tries and says why", async () => {
     const calls = mockFetch(...Array.from({ length: 20 }, () => json(409, { error: "a branch or worktree named fix-it already exists in this project" })));
     await renderApp(<Harness />);
