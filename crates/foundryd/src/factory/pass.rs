@@ -1650,18 +1650,34 @@ impl<'a, 'w> Pass<'a, 'w> {
             (HeldUpKind::Stuck, State::Stuck),
             (HeldUpKind::NeedsInfo, State::NeedsInfo),
         ] {
-            let mut of_kind = waiting.iter().filter(|(_, k)| *k == kind).peekable();
-            if of_kind.peek().is_none() {
+            let of_kind: Vec<&Done> = waiting
+                .iter()
+                .filter(|(_, k)| *k == kind)
+                .map(|(done, _)| *done)
+                .collect();
+            if of_kind.is_empty() {
                 continue;
             }
-            let labelled: BTreeSet<u64> = world
-                .tracker
-                .list_issues(&world.project.repo, state)?
-                .items
-                .iter()
-                .map(|issue| issue.number)
-                .collect();
-            for (done, _) in of_kind {
+            let repo = &world.project.repo;
+            let listing = world.tracker.list_issues(repo, state)?;
+            let mut labelled: BTreeSet<u64> =
+                listing.items.iter().map(|issue| issue.number).collect();
+            if listing.cut {
+                // A cut listing leaves issues out. Those this kind's runs are on are read
+                // together, 100 to a call, and judged as the listing judges them: open and
+                // carrying the label.
+                let missing: Vec<u64> = of_kind
+                    .iter()
+                    .map(|done| done.run.run.issue())
+                    .filter(|issue| !labelled.contains(issue))
+                    .collect();
+                let read = world.tracker.issue_labels(repo, &missing)?;
+                labelled.extend(read.values().filter_map(|issue| {
+                    let carries = issue.labels.iter().any(|label| label == state.label());
+                    (!issue.closed && carries).then_some(issue.number)
+                }));
+            }
+            for done in of_kind {
                 if labelled.contains(&done.run.run.issue()) {
                     // A finished run's events are read only while a person holds it up. One
                     // that cannot be read names no workspace; it is still held up, and the
@@ -2042,6 +2058,23 @@ pub(crate) mod testing {
                 }
                 (Some("api"), Some("graphql")) if joined.contains("closedByPullRequestsReferences") => {
                     Ok(json!({"data": {"repository": {"issue": {"closedByPullRequestsReferences": {"nodes": []}}}}}).to_string())
+                }
+                (Some("api"), Some("graphql")) if joined.contains("resource(url:") => {
+                    // The batched read of issues' labels: each issue the hub has, or null. Each
+                    // URL comes as a `uN=<url>` variable.
+                    let mut data = serde_json::Map::new();
+                    for url in Self::flag_values(args, "-f").iter().filter_map(|v| v.strip_prefix('u')?.split_once('=').map(|(_, url)| url)) {
+                        let n: u64 = url.rsplit('/').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                        let found = state.issues.get(&n).map_or(Value::Null, |issue| {
+                            json!({
+                                "number": n,
+                                "state": if issue.closed { "CLOSED" } else { "OPEN" },
+                                "labels": {"nodes": issue.labels.iter().map(|l| json!({"name": l})).collect::<Vec<_>>()},
+                            })
+                        });
+                        data.insert(format!("i{n}"), found);
+                    }
+                    Ok(json!({"data": data}).to_string())
                 }
                 (Some("api"), Some("graphql")) => {
                     let _ = Self::number_arg(args);
@@ -5074,6 +5107,196 @@ mod tests {
             let run = held_up_run(&rig, 5, 1, State::Stuck, "no");
             rig.pass();
             rig.hub.fail("factory:stuck", 1);
+            let report = rig.pass();
+            assert!(report.failed.is_some(), "{report:?}");
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![run]);
+        }
+
+        /// 200 open issues with `label`, numbered below every issue a test runs on, so the
+        /// label's listing is cut and each issue a test runs on is past the cut.
+        fn fill_the_listing(rig: &Rig, label: &str) {
+            for n in 1..=200 {
+                rig.hub.issue(n, &[label]);
+            }
+        }
+
+        /// How many batched reads of issues' labels the passes so far made.
+        fn batched_reads(rig: &Rig) -> usize {
+            rig.hub
+                .calls()
+                .iter()
+                .filter(|args| args.join(" ").contains("resource(url:"))
+                .count()
+        }
+
+        #[test]
+        fn a_run_on_an_issue_past_the_cut_is_held_up_while_its_issue_keeps_the_label() {
+            let mut rig = Rig::new();
+            fill_the_listing(&rig, "factory:stuck");
+            rig.hub.issue(300, &["factory:stuck"]);
+            let run = held_up_run(&rig, 300, 1, State::Stuck, "the gate failed 3 times");
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(
+                rig.status().held_up,
+                vec![HeldUp {
+                    run,
+                    kind: HeldUpKind::Stuck,
+                    reason: "the gate failed 3 times".into(),
+                    workspaces: vec![workspace_of(300, 1)],
+                }]
+            );
+        }
+
+        #[test]
+        fn a_run_on_an_issue_past_the_cut_is_held_up_while_its_issue_needs_info() {
+            let mut rig = Rig::new();
+            fill_the_listing(&rig, "factory:needs-info");
+            rig.hub.issue(300, &["factory:needs-info"]);
+            let run = held_up_run(&rig, 300, 1, State::NeedsInfo, "Which login?");
+            rig.pass();
+            let held: Vec<(RunId, HeldUpKind)> = rig
+                .status()
+                .held_up
+                .into_iter()
+                .map(|h| (h.run, h.kind))
+                .collect();
+            assert_eq!(held, vec![(run, HeldUpKind::NeedsInfo)]);
+        }
+
+        #[test]
+        fn past_the_cut_a_run_whose_issue_left_the_label_or_was_closed_is_not_held_up() {
+            let mut rig = Rig::new();
+            fill_the_listing(&rig, "factory:stuck");
+            // A 201st, so the listing is cut without the issues the runs are on.
+            rig.hub.issue(201, &["factory:stuck"]);
+            rig.hub.issue(300, &[]);
+            rig.hub.issue(301, &["factory:stuck"]);
+            rig.hub.edit(301, |issue| issue.closed = true);
+            // Moved on to another factory label: not the one its run is held up for.
+            rig.hub.issue(302, &["factory:needs-info"]);
+            held_up_run(&rig, 300, 1, State::Stuck, "left the label");
+            held_up_run(&rig, 301, 1, State::Stuck, "closed");
+            held_up_run(&rig, 302, 1, State::Stuck, "asked a question since");
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert!(
+                rig.status().held_up.is_empty(),
+                "{:?}",
+                rig.status().held_up
+            );
+            assert_eq!(batched_reads(&rig), 1);
+        }
+
+        /// Judged as `gh issue list --label` judges it: the label alone, whatever other
+        /// `factory:*` label the issue carries beside it.
+        #[test]
+        fn past_the_cut_an_issue_with_the_label_and_another_factory_label_is_held_up() {
+            let mut rig = Rig::new();
+            fill_the_listing(&rig, "factory:stuck");
+            rig.hub.issue(300, &["factory:stuck", "factory:ready"]);
+            let run = held_up_run(&rig, 300, 1, State::Stuck, "no");
+            rig.pass();
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![run]);
+        }
+
+        #[test]
+        fn the_issues_a_cut_listing_left_out_are_read_in_one_call_per_pass() {
+            let mut rig = Rig::new();
+            fill_the_listing(&rig, "factory:stuck");
+            let runs: Vec<RunId> = (300..303)
+                .map(|n| {
+                    rig.hub.issue(n, &["factory:stuck"]);
+                    held_up_run(&rig, n, 1, State::Stuck, "no")
+                })
+                .collect();
+            rig.pass();
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, runs);
+            assert_eq!(batched_reads(&rig), 1);
+            rig.pass();
+            assert_eq!(batched_reads(&rig), 2, "each pass reads them again, once");
+        }
+
+        /// A cut listing still holds up the runs on the issues it returned, and the batched read
+        /// asks only for the issues it left out.
+        #[test]
+        fn a_cut_listing_holds_up_its_own_issues_runs_and_reads_only_the_rest() {
+            let mut rig = Rig::new();
+            fill_the_listing(&rig, "factory:stuck");
+            let listed = held_up_run(&rig, 5, 1, State::Stuck, "listed");
+            rig.hub.issue(300, &["factory:stuck"]);
+            let past = held_up_run(&rig, 300, 1, State::Stuck, "past the cut");
+            rig.pass();
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![listed, past]);
+            let reads: Vec<Vec<String>> = rig
+                .hub
+                .calls()
+                .into_iter()
+                .filter(|args| args.join(" ").contains("resource(url:"))
+                .collect();
+            assert_eq!(reads.len(), 1, "{reads:?}");
+            let asks = |n: u64| {
+                let url = format!("/issues/{n}");
+                reads[0].iter().any(|arg| arg.ends_with(&url))
+            };
+            assert!(asks(300), "{:?}", reads[0]);
+            assert!(!asks(5), "{:?}", reads[0]);
+        }
+
+        /// Past 100 missing issues the read takes a call per hundred, and a failed one fails the
+        /// pass as a failed listing does, keeping what the last good pass held up.
+        #[test]
+        fn more_than_100_issues_past_the_cut_are_read_100_to_a_call_and_any_failed_call_fails_the_pass()
+         {
+            let mut rig = Rig::new();
+            fill_the_listing(&rig, "factory:stuck");
+            let runs: Vec<RunId> = (300..=400)
+                .map(|n| {
+                    rig.hub.issue(n, &["factory:stuck"]);
+                    held_up_run(&rig, n, 1, State::Stuck, "no")
+                })
+                .collect();
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, runs);
+            assert_eq!(batched_reads(&rig), 2);
+            // Issue 400 is the 101st asked for, so only the second call reads it.
+            rig.hub.fail("/issues/400", 1);
+            let report = rig.pass();
+            assert!(report.failed.is_some(), "{report:?}");
+            assert_eq!(batched_reads(&rig), 4);
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, runs);
+        }
+
+        #[test]
+        fn an_uncut_listing_makes_no_batched_read() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            rig.hub.issue(6, &[]);
+            let run = held_up_run(&rig, 5, 1, State::Stuck, "no");
+            held_up_run(&rig, 6, 1, State::Stuck, "left the label");
+            rig.pass();
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![run]);
+            assert_eq!(batched_reads(&rig), 0);
+        }
+
+        /// The batched read fails the pass as a failed listing does, and the status keeps what
+        /// the last good pass held up.
+        #[test]
+        fn a_failed_batched_read_fails_the_pass_and_keeps_the_last_held_up_runs() {
+            let mut rig = Rig::new();
+            fill_the_listing(&rig, "factory:stuck");
+            rig.hub.issue(300, &["factory:stuck"]);
+            let run = held_up_run(&rig, 300, 1, State::Stuck, "no");
+            rig.pass();
+            rig.hub.fail("resource(url:", 1);
             let report = rig.pass();
             assert!(report.failed.is_some(), "{report:?}");
             let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();

@@ -4,7 +4,7 @@
 //! fake are read alike. Ported from the reading half of the runner's `src/tracker/github.ts`,
 //! and from `src/tracker/approvalHistory.ts`, the pure half of the approval rule.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::de::DeserializeOwned;
 
@@ -180,6 +180,16 @@ pub struct IssueDetail {
     pub closed: bool,
 }
 
+/// One issue as [`issue_labels`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueLabels {
+    pub number: u64,
+    /// The label names.
+    pub labels: Vec<String>,
+    /// GitHub has the issue closed.
+    pub closed: bool,
+}
+
 /// An open issue that blocks another one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Blocker {
@@ -283,6 +293,29 @@ struct RawIssueSummary {
 enum IssueState {
     Open,
     Closed,
+}
+
+/// The answer to [`issue_labels`]'s query: each alias with the issue it found, or null.
+#[derive(serde::Deserialize)]
+struct RawLabelledAnswer {
+    data: HashMap<String, Option<RawLabelled>>,
+}
+
+/// An issue the batched read found. GitHub answers an empty object for a number it has as
+/// something other than an issue, so every field may be missing.
+#[derive(serde::Deserialize)]
+struct RawLabelled {
+    #[serde(default)]
+    number: Option<u64>,
+    #[serde(default)]
+    state: Option<IssueState>,
+    #[serde(default)]
+    labels: Option<RawLabelNodes>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawLabelNodes {
+    nodes: Vec<RawLabel>,
 }
 
 #[derive(serde::Deserialize)]
@@ -557,6 +590,107 @@ pub fn issue<G: Tracker + ?Sized>(
         closed: raw.state == IssueState::Closed,
         labels,
     })
+}
+
+/// The fragment [`issue_labels`] reads each issue by. GitHub puts at most 100 labels on an
+/// issue, so one page holds them all.
+const LABELLED_FRAGMENT: &str =
+    "fragment Labelled on Issue { number state labels(first: 100) { nodes { name } } }";
+
+/// How many issues one [`issue_labels`] call reads, so a query stays well inside the argument
+/// size and GitHub's limits however many numbers are asked for.
+const LABELLED_PER_CALL: usize = 100;
+
+/// The labels and open or closed state of each issue numbered, read 100 to a GraphQL call
+/// (one call up to 100 numbers, none for no number); any failed call fails the read. A number
+/// GitHub has no issue for is not in the answer: each is looked up by its URL, which GitHub
+/// answers with null, where `issue(number:)` would fail the whole call.
+pub fn issue_labels<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    numbers: &[u64],
+) -> Result<BTreeMap<u64, IssueLabels>, TrackerError> {
+    let numbers: Vec<u64> = numbers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<u64>>()
+        .into_iter()
+        .collect();
+    if numbers.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    // Each URL names the repo, so one not written as a plain `owner/name` would send every
+    // lookup elsewhere and let every run go: refuse it before any call.
+    let plain = repo
+        .split_once('/')
+        .is_some_and(|(owner, name)| is_plain_segment(owner) && is_plain_segment(name));
+    if !plain {
+        return Err(invalid_argument(repo, "a repo written as owner/name"));
+    }
+    let mut found = BTreeMap::new();
+    for chunk in numbers.chunks(LABELLED_PER_CALL) {
+        found.extend(issue_labels_of(gh, repo, chunk)?);
+    }
+    Ok(found)
+}
+
+/// One call of [`issue_labels`]: `numbers`, at most [`LABELLED_PER_CALL`] of them. Each URL is
+/// passed as a variable, so the query text holds nothing read from outside.
+fn issue_labels_of<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    numbers: &[u64],
+) -> Result<BTreeMap<u64, IssueLabels>, TrackerError> {
+    let declared: Vec<String> = numbers.iter().map(|n| format!("$u{n}: URI!")).collect();
+    let asked: Vec<String> = numbers
+        .iter()
+        .map(|n| format!("i{n}: resource(url: $u{n}) {{ ...Labelled }}"))
+        .collect();
+    let mut args = vec![
+        "api".to_string(),
+        "graphql".into(),
+        "-f".into(),
+        format!(
+            "query=query({}) {{ {} }} {LABELLED_FRAGMENT}",
+            declared.join(", "),
+            asked.join(" ")
+        ),
+    ];
+    for n in numbers {
+        args.push("-f".into());
+        args.push(format!("u{n}=https://github.com/{repo}/issues/{n}"));
+    }
+    let answer: RawLabelledAnswer =
+        gh_json(gh, &args, "a GraphQL response with each issue asked for")?;
+    let mut found = BTreeMap::new();
+    for &number in numbers {
+        let Some(read) = answer.data.get(&format!("i{number}")) else {
+            return Err(parse_error(
+                &args,
+                &format!("a GraphQL response naming issue {number}"),
+            ));
+        };
+        // Null for no such issue, an object without a number for something other than an issue,
+        // and another number for an issue the URL led elsewhere: none is the issue asked for.
+        let Some(read) = read.as_ref().filter(|read| read.number == Some(number)) else {
+            continue;
+        };
+        let (Some(state), Some(labels)) = (&read.state, &read.labels) else {
+            return Err(parse_error(
+                &args,
+                &format!("issue {number} with its state and labels"),
+            ));
+        };
+        found.insert(
+            number,
+            IssueLabels {
+                number,
+                labels: labels.nodes.iter().map(|l| l.name.clone()).collect(),
+                closed: *state == IssueState::Closed,
+            },
+        );
+    }
+    Ok(found)
 }
 
 /// The open issues GitHub's dependency links say block `issue`.
@@ -2954,6 +3088,213 @@ mod tests {
             FakeTracker::answering([Answer::ok(issue_json(&["factory:ready"], &[], "\"b\""))]);
         issue(&fake, REPO, 7).unwrap();
         assert_eq!(fake.calls()[0][..3], args(&["issue", "view", "7"])[..]);
+    }
+
+    // Several issues' labels in one read.
+
+    /// The one call that reads the labels of `numbers`, as `issue_labels` makes it: each URL is
+    /// a variable, so the query text holds nothing read from outside.
+    fn issue_labels_call(numbers: &[u64]) -> Vec<String> {
+        let declared: Vec<String> = numbers.iter().map(|n| format!("$u{n}: URI!")).collect();
+        let asked: Vec<String> = numbers
+            .iter()
+            .map(|n| format!("i{n}: resource(url: $u{n}) {{ ...Labelled }}"))
+            .collect();
+        let mut call = args(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!(
+                "query=query({}) {{ {} }} fragment Labelled on Issue {{ number state labels(first: 100) {{ nodes {{ name }} }} }}",
+                declared.join(", "),
+                asked.join(" ")
+            ),
+        ]);
+        for n in numbers {
+            call.push("-f".into());
+            call.push(format!("u{n}=https://github.com/{REPO}/issues/{n}"));
+        }
+        call
+    }
+
+    /// GitHub's answer for each of `numbers`, found open with `factory:stuck`.
+    fn all_stuck(numbers: &[u64]) -> String {
+        let data: serde_json::Map<String, Value> = numbers
+            .iter()
+            .map(|n| (format!("i{n}"), labelled(*n, "OPEN", &["factory:stuck"])))
+            .collect();
+        json!({ "data": data }).to_string()
+    }
+
+    /// GitHub's answer for an issue the read found.
+    fn labelled(number: u64, state: &str, labels: &[&str]) -> Value {
+        json!({
+            "number": number,
+            "state": state,
+            "labels": {"nodes": labels.iter().map(|name| json!({"name": name})).collect::<Vec<_>>()},
+        })
+    }
+
+    #[test]
+    fn issue_labels_reads_the_labels_and_state_of_each_number_in_one_call() {
+        let fake = FakeTracker::new();
+        fake.on(
+            issue_labels_call(&[5, 7]),
+            Answer::ok(
+                json!({"data": {
+                    "i5": labelled(5, "OPEN", &["factory:stuck", "type:fix"]),
+                    "i7": labelled(7, "CLOSED", &["factory:stuck"]),
+                }})
+                .to_string(),
+            ),
+        );
+        // Asked out of order and twice: each number is read once, in one call.
+        let read = issue_labels(&fake, REPO, &[7, 5, 7]).unwrap();
+        assert_eq!(fake.calls().len(), 1, "{:?}", fake.calls());
+        assert_eq!(
+            read.into_iter().collect::<Vec<_>>(),
+            vec![
+                (
+                    5,
+                    IssueLabels {
+                        number: 5,
+                        labels: vec!["factory:stuck".into(), "type:fix".into()],
+                        closed: false,
+                    }
+                ),
+                (
+                    7,
+                    IssueLabels {
+                        number: 7,
+                        labels: vec!["factory:stuck".into()],
+                        closed: true,
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// A number GitHub has no issue for answers null, and one it has as something other than an
+    /// issue answers an empty object: neither is in the answer, and neither fails the read.
+    #[test]
+    fn issue_labels_leaves_out_a_number_github_does_not_return() {
+        let fake = FakeTracker::new();
+        fake.on(
+            issue_labels_call(&[5, 8, 9]),
+            Answer::ok(
+                json!({"data": {
+                    "i5": labelled(5, "OPEN", &[]),
+                    "i8": {},
+                    "i9": null,
+                }})
+                .to_string(),
+            ),
+        );
+        let read = issue_labels(&fake, REPO, &[5, 8, 9]).unwrap();
+        assert_eq!(read.keys().copied().collect::<Vec<_>>(), vec![5]);
+        assert_eq!(read[&5].labels, Vec::<String>::new());
+    }
+
+    /// A URL GitHub resolves to an issue with another number, such as one moved elsewhere, is
+    /// not the issue asked for: it is left out, not read as that number's labels.
+    #[test]
+    fn issue_labels_leaves_out_an_issue_github_answers_with_another_number() {
+        let fake = FakeTracker::new();
+        fake.on(
+            issue_labels_call(&[5, 6]),
+            Answer::ok(
+                json!({"data": {
+                    "i5": labelled(12, "OPEN", &["factory:stuck"]),
+                    "i6": labelled(6, "OPEN", &["factory:stuck"]),
+                }})
+                .to_string(),
+            ),
+        );
+        let read = issue_labels(&fake, REPO, &[5, 6]).unwrap();
+        assert_eq!(read.keys().copied().collect::<Vec<_>>(), vec![6]);
+    }
+
+    #[test]
+    fn issue_labels_of_no_number_makes_no_call() {
+        let fake = FakeTracker::new();
+        assert!(issue_labels(&fake, REPO, &[]).unwrap().is_empty());
+        assert!(fake.calls().is_empty());
+    }
+
+    /// More numbers than one call reads are read 100 to a call, lowest first, so no query
+    /// outgrows the argument size or GitHub's limits however many issues are asked for.
+    #[test]
+    fn issue_labels_reads_more_than_100_numbers_100_to_a_call() {
+        let fake = FakeTracker::new();
+        let first: Vec<u64> = (1..=100).collect();
+        fake.on(issue_labels_call(&first), Answer::ok(all_stuck(&first)));
+        fake.on(
+            issue_labels_call(&[101]),
+            Answer::ok(json!({"data": {"i101": labelled(101, "CLOSED", &[])}}).to_string()),
+        );
+        let asked: Vec<u64> = (1..=101).rev().collect();
+        let read = issue_labels(&fake, REPO, &asked).unwrap();
+        assert_eq!(fake.calls().len(), 2, "{:?}", fake.calls());
+        assert_eq!(
+            read.keys().copied().collect::<Vec<_>>(),
+            (1..=101).collect::<Vec<_>>()
+        );
+        assert!(read[&101].closed);
+        assert!(!read[&100].closed);
+    }
+
+    /// A failed call fails the whole read, whichever hundred it was reading.
+    #[test]
+    fn issue_labels_fails_when_any_of_its_calls_fails() {
+        let first: Vec<u64> = (1..=100).collect();
+        let fake = FakeTracker::answering([Answer::ok(all_stuck(&first)), Answer::fail(1, "boom")]);
+        let asked: Vec<u64> = (1..=101).collect();
+        let error = issue_labels(&fake, REPO, &asked).unwrap_err();
+        assert!(is_failed(&error), "{error}");
+        assert_eq!(fake.calls().len(), 2, "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn issue_labels_errors_are_typed() {
+        let failing = FakeTracker::answering([Answer::fail(1, "boom")]);
+        let failed = issue_labels(&failing, REPO, &[5]).unwrap_err();
+        assert!(is_failed(&failed), "{failed}");
+        assert!(failed.to_string().contains("status 1"), "{failed}");
+
+        for wrong in [
+            // Not an answer at all.
+            "[]".to_string(),
+            // No data.
+            json!({"data": null}).to_string(),
+            // A number asked for that the answer does not name.
+            json!({"data": {}}).to_string(),
+            // An issue without its labels.
+            json!({"data": {"i5": {"number": 5, "state": "OPEN"}}}).to_string(),
+            // An issue in a state GitHub does not have.
+            json!({"data": {"i5": labelled(5, "GONE", &[])}}).to_string(),
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(wrong.clone())]);
+            let error = issue_labels(&fake, REPO, &[5]).unwrap_err();
+            assert!(is_parse(&error), "{wrong}: {error}");
+        }
+    }
+
+    /// The repo is written into the query, so one that is not a plain `owner/name` is refused
+    /// before any call.
+    #[test]
+    fn issue_labels_refuses_a_repo_not_written_as_owner_name_before_any_call() {
+        for repo in [
+            "rawphp",
+            "rawphp/soft\"fac",
+            "rawphp/softfac/x",
+            "../softfac",
+            "/softfac",
+        ] {
+            let fake = FakeTracker::new();
+            let error = issue_labels(&fake, repo, &[5]).unwrap_err();
+            assert!(is_refused(&error), "{repo}: {error}");
+            assert!(fake.calls().is_empty(), "{repo}");
+        }
     }
 
     // Pull requests.
