@@ -22,23 +22,43 @@ export interface CreateInput {
   machine?: string;
   model: string;
   prompt?: string;
+  /**
+   * Set when `name` was suggested, not typed: a create refused as taken (409) is tried again as
+   * `${root} ${next}`, then `next` + 1, and so on.
+   */
+  numbered?: { root: string; next: number };
 }
+
+/** A suggested name is tried this many times in all before the refusal is shown. */
+const NAME_TRIES = 20;
 
 /**
  * Makes a workspace, then starts a session in it, saying which `step` it is on. `made` is true
  * once the workspace exists, even when its session then failed to start, since a second try
- * would only find its name taken. Letting Foundry choose sends the model and first prompt along:
+ * would only find its name taken. A suggested name that is taken is numbered and tried again, and
+ * `name` is the one last sent, so the box shows the name the workspace was made with. Letting Foundry choose sends the model and first prompt along:
  * when no machine qualifies the request waits (`session` is null), the waiting list is read
  * again to show it, and Foundry starts the session once it is placed.
  */
 export function useCreateWorkspace() {
   const [step, setStep] = useState<"branch" | "session">("branch");
+  const [name, setName] = useState("");
   const client = useQueryClient();
   const create = useMutation({
     mutationFn: async (input: CreateInput): Promise<{ session: string | null; warning: string | null }> => {
       setStep("branch");
       const session = input.machine === "choose" ? { model: input.model, prompt: input.prompt } : {};
-      const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name, machine: input.machine, ...session });
+      let workspace: Awaited<ReturnType<typeof createWorkspace>>;
+      for (let tries = 1, sent = input.name; ; tries++) {
+        setName(sent);
+        try {
+          workspace = await createWorkspace({ project: input.project, base: input.base, name: sent, machine: input.machine, ...session });
+          break;
+        } catch (error) {
+          if (!input.numbered || !(error instanceof ApiError) || error.status !== 409 || tries >= NAME_TRIES) throw error;
+          sent = `${input.numbered.root} ${input.numbered.next + tries - 1}`;
+        }
+      }
       if ("request" in workspace) {
         await client.invalidateQueries({ queryKey: placementsKey });
         return { session: null, warning: null };
@@ -56,7 +76,7 @@ export function useCreateWorkspace() {
     },
   });
   const made = create.isSuccess || create.error instanceof SessionNotStarted;
-  return { create, step, made };
+  return { create, step, made, name };
 }
 
 /** A create in hand: the mutation, its step and whether the workspace exists yet. */
@@ -66,14 +86,45 @@ export type Launch = ReturnType<typeof useCreateWorkspace>;
 const NAME_WORDS = 5;
 const NAME_AT_MOST = 40;
 
+/** A word that is a GitHub pull request or issue link: its kind and number, with a path, query or fragment after, or closing punctuation. */
+const GITHUB_LINK = /^https?:\/\/(?:www\.)?github\.com\/[^/]+\/[^/]+\/(pull|issues)\/(\d+)(?:[/?#].*|[.,;:!?)]*)$/;
+/** A word that is any link. */
+const LINK = /^https?:\/\//;
+/** `pr#12` or `issue#12`: a kind and a number in one word. */
+const KIND_NUMBER = /^(pr|issue)#(\d+)$/;
+/** `#12`, the number that follows a `pr` or `issue` word. */
+const HASH_NUMBER = /^#(\d+)$/;
+
+/** The words of `line` as a name has them: a pull request or issue link is its kind and number, other links are gone, and a slash command loses its slash. */
+function nameWords(line: string): string[] {
+  const words = line.trim().toLowerCase().split(/\s+/);
+  const out: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const word = i === 0 && words[0].startsWith("/") ? words[0].slice(1) : words[i];
+    const link = GITHUB_LINK.exec(word);
+    const joined = KIND_NUMBER.exec(word);
+    const spaced = (word === "pr" || word === "issue") && HASH_NUMBER.exec(words[i + 1] ?? "");
+    if (link) out.push(link[1] === "pull" ? "pr" : "issue", link[2]);
+    else if (joined) out.push(joined[1], joined[2]);
+    else if (spaced) {
+      out.push(word, spaced[1]);
+      i++;
+    } else if (word && !LINK.test(word)) out.push(word);
+  }
+  return out;
+}
+
 /**
  * The workspace name a task gives: the first words of its first line, in lower case, cut at a
- * word to 40 characters, without the punctuation that closes a sentence. Empty for a blank task.
+ * word to 40 characters, without the punctuation that closes a sentence. Before the cut, a link to
+ * a GitHub pull request or issue (or `PR#12`, `issue #12`) becomes `pr 12` or `issue 12`, any other
+ * link is dropped, and a first word that starts with a slash (a slash command) loses it. Empty for
+ * a blank task.
  */
 export function taskName(task: string): string {
   const line = task.split("\n").find((l) => l.trim() !== "") ?? "";
   let name = "";
-  for (const word of line.trim().toLowerCase().split(/\s+/).slice(0, NAME_WORDS)) {
+  for (const word of nameWords(line).slice(0, NAME_WORDS)) {
     const next = name ? `${name} ${word}` : word;
     if (next.length > NAME_AT_MOST) break;
     name = next;
@@ -87,12 +138,15 @@ function holder(name: string, project: Project | undefined, workspaces: Workspac
   return project ? workspaces.find((w) => w.project === project.name && sameBranch(w.branch, branch)) : undefined;
 }
 
-/** `name`, or `name 2`, `name 3`… when the project already has a workspace on its branch. */
-function freeName(name: string, project: Project | undefined, workspaces: WorkspaceView[]): string {
-  if (!name) return name;
+/**
+ * `name`, or `name 2`, `name 3`… when the project already has a workspace on its branch, and the
+ * number to try next when the daemon finds the name taken all the same.
+ */
+function freeName(name: string, project: Project | undefined, workspaces: WorkspaceView[]): { name: string; next: number } {
   let next = name;
-  for (let n = 2; holder(next, project, workspaces); n++) next = `${name} ${n}`;
-  return next;
+  let n = 2;
+  while (name && holder(next, project, workspaces)) next = `${name} ${n++}`;
+  return { name: next, next: n };
 }
 
 /**
@@ -150,14 +204,15 @@ export function Composer({
   const [managing, setManaging] = useState(false);
   const project = projects.find((p) => p.id === projectId) ?? projects[0];
   const prompt = promptOf(task);
-  const suggested = freeName(taskName(task), project, workspaces);
-  const chosen = name.trim() || suggested;
+  const root = taskName(task);
+  const suggested = freeName(root, project, workspaces);
+  const chosen = name.trim() || suggested.name;
   const taken = name.trim() ? holder(name.trim(), project, workspaces) : undefined;
-  const { create, step, made } = launch;
+  const { create, step, made, name: sent } = launch;
   const warning = create.data?.warning ?? null;
   const models = [...new Set(["opus", "sonnet", ...workspaces.flatMap((w) => w.sessions.map((s) => s.model))])];
   // Once sent, the name is the one sent: the new workspace arriving must not renumber it.
-  const shown = (create.isPending || made) && create.variables ? create.variables.name : chosen;
+  const shown = (create.isPending || made) && create.variables ? sent : chosen;
   const branch = safeBranch(shown);
   const ready = Boolean(project && chosen && base.trim() && model.trim()) && !taken && !create.isPending && !made;
   const bar = mode === "bar";
@@ -169,7 +224,7 @@ export function Composer({
   const submit = () => {
     if (!ready || !project) return;
     create.mutate(
-      { project: project.id, base: base.trim(), name: chosen, machine: machine || undefined, model: model.trim(), prompt },
+      { project: project.id, base: base.trim(), name: chosen, machine: machine || undefined, model: model.trim(), prompt, numbered: name.trim() ? undefined : { root, next: suggested.next } },
       {
         // A request that waits is shown in the waiting list; the box is done with it.
         onSuccess: ({ session, warning }) => (session ? onCreated(session, warning) : (onDone ?? clear)()),
@@ -321,7 +376,7 @@ export function Composer({
               spellCheck={false}
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder={suggested || "named from the task"}
+              placeholder={suggested.name || "named from the task"}
               className={`${inlineField} w-48 max-w-full font-sans`}
             />
             {shown && (
