@@ -42,7 +42,8 @@
 //!   {request, reasons}` and the request waits on this machine: see [`placement`](crate::placement)
 //!   for it and for `GET /api/placements` and `POST /api/placements/{id}/cancel`.
 //! - `POST /api/workspaces/{id}/archive` `{force}` (the body is optional): `204`, or `409` with
-//!   the uncommitted files, unpushed commits and submodules that hold it up.
+//!   the uncommitted files, unpushed commits and submodules that hold it up, and `detached`:
+//!   whether its folder is no longer a git worktree of its project, which holds it up too.
 //! - `POST /api/workspaces/{id}/sessions` `{model, prompt}` (`prompt` is optional): starts
 //!   Claude Code in the workspace, on `prompt` as its first prompt when one is given, `201 {id}`.
 //!   A blank prompt is none; one with a NUL or over 20,000 characters is `422`.
@@ -67,6 +68,9 @@
 //! - `GET /api/workspaces/{id}/pr`: whether the workspace's branch is on `origin`, what is only
 //!   on this machine, and its pull request, see [`pr`]. Only a workspace of this machine; a
 //!   `POST` of it is answered the same, and carried for another machine's.
+//!
+//!   These three reads of a workspace whose folder is no longer a git worktree of its project
+//!   are `404` too, saying so: archive it to remove the folder.
 //! - `GET /api/briefs`: what each session of this machine is for and doing, see [`briefs`].
 //! - `GET /api/sessions/{id}/trail`: every step a session of this machine took, see [`trail`].
 //!
@@ -453,14 +457,16 @@ impl IntoResponse for ApiError {
                     "uncommitted": redacted(&dirty.uncommitted),
                     "unpushed": redacted(&dirty.unpushed),
                     "submodules": redacted(&dirty.submodules),
+                    // The archive dialog's line for it is #323's, which #321 left it to.
+                    "detached": dirty.detached,
                 });
                 return (StatusCode::CONFLICT, Json(body)).into_response();
             }
             Self::Workspace(e) => (
                 match e {
-                    WorkspaceError::Unknown(_) | WorkspaceError::UnknownCommit(_) => {
-                        StatusCode::NOT_FOUND
-                    }
+                    WorkspaceError::Unknown(_)
+                    | WorkspaceError::UnknownCommit(_)
+                    | WorkspaceError::Detached(_) => StatusCode::NOT_FOUND,
                     WorkspaceError::UnknownProject(_)
                     | WorkspaceError::UnknownBase(_)
                     | WorkspaceError::BranchRefused(_)
