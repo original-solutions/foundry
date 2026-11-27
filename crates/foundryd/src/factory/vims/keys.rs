@@ -1,3 +1,105 @@
+//! The idempotency key of each `vims` call that makes or changes something (P2c, "Keys").
+//!
+//! A key is made only from the run, which names the repo, the workspace's role and round, the
+//! step and the attempt, so a new lease holder can work out every key the one before it could
+//! have sent. It reads `foundry/<run>/<role>/<step>/<attempt>`, for example
+//! `foundry/trilogy-care__tc-supplier-portal-v2__1680__2/build/provision:3/1`. The attempt is
+//! last and is a number, so no two calls share a key even when a step carries an operation id.
+//! Vims has said nothing of a limit on a key's characters or length; these keep to letters,
+//! digits and `_ - : /`.
+
+use std::fmt;
+
+use foundry_proto::factory::RunId;
+
+/// A workspace's role in its run, and its round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// The run's build workspace: `build`.
+    Build,
+    /// The k-th gate's workspace: `g<k>`.
+    Gate(u32),
+    /// The k-th resume's workspace: `r<k>`.
+    Resume(u32),
+    /// The k-th feedback round's workspace: `f<k>`.
+    Feedback(u32),
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Role::Build => f.write_str("build"),
+            Role::Gate(k) => write!(f, "g{k}"),
+            Role::Resume(k) => write!(f, "r{k}"),
+            Role::Feedback(k) => write!(f, "f{k}"),
+        }
+    }
+}
+
+/// One step done to a workspace. Anything done more than once to one workspace has its count in
+/// the step, so no two actions share a key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Step {
+    /// `vims new`: `create`.
+    Create,
+    /// The fetch of the repo: `fetch`.
+    Fetch,
+    /// The checkout of the branch or commit: `checkout`.
+    Checkout,
+    /// The i-th `provision` command: `provision:<i>`.
+    Provision(usize),
+    /// The i-th `gate` command: `gate:<i>`.
+    Gate(usize),
+    /// The body written for turn n: `body:<n>`.
+    Body(u32),
+    /// The launch of turn n: `turn:<n>`.
+    Turn(u32),
+    /// The gate's read-only grant: `grant`.
+    Grant,
+    /// The grant taken away: `ungrant`.
+    Ungrant,
+    /// The workspace's k-th pause: `pause:<k>`.
+    Pause(u32),
+    /// The workspace's k-th start: `start:<k>`.
+    Start(u32),
+    /// The cancel of an operation: `cancel:<operation>`.
+    Cancel(String),
+    /// The end of turn n: `end-turn:<n>`.
+    EndTurn(u32),
+    /// `vims stop`: `stop`.
+    Stop,
+    /// `vims remove`: `remove`.
+    Remove,
+}
+
+impl fmt::Display for Step {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Step::Create => f.write_str("create"),
+            Step::Fetch => f.write_str("fetch"),
+            Step::Checkout => f.write_str("checkout"),
+            Step::Provision(i) => write!(f, "provision:{i}"),
+            Step::Gate(i) => write!(f, "gate:{i}"),
+            Step::Body(n) => write!(f, "body:{n}"),
+            Step::Turn(n) => write!(f, "turn:{n}"),
+            Step::Grant => f.write_str("grant"),
+            Step::Ungrant => f.write_str("ungrant"),
+            Step::Pause(k) => write!(f, "pause:{k}"),
+            Step::Start(k) => write!(f, "start:{k}"),
+            Step::Cancel(operation) => write!(f, "cancel:{operation}"),
+            Step::EndTurn(n) => write!(f, "end-turn:{n}"),
+            Step::Stop => f.write_str("stop"),
+            Step::Remove => f.write_str("remove"),
+        }
+    }
+}
+
+/// The idempotency key of `step` on the workspace of `role` in `run`, at `attempt` (the first
+/// is 1). The run names the repo, the issue and the run's own attempt.
+pub fn key(run: &RunId, role: Role, step: &Step, attempt: u32) -> String {
+    format!("foundry/{run}/{role}/{step}/{attempt}")
+}
+
 #[cfg(test)]
 mod tests {
     use foundry_proto::factory::RunId;

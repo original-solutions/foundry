@@ -1,3 +1,320 @@
+//! The `vims` command line, each call ended within 30 seconds.
+//!
+//! [`VimsCli`] runs `vims --token-ref env:FOUNDRY_VIMS_TOKEN …` with the machine's Vims token
+//! in that variable, in the child's environment only: the token is never an argument, a log
+//! line or an error, and output that echoes it has it hidden before it is read. A call still
+//! running 30 seconds after it started, on the factory's clock, is killed with everything it
+//! started and is [`VimsError::Timeout`]. [`finish`] reads how a call ended, for the real
+//! `vims` and the fake alike.
+
+use std::fmt;
+use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+use serde_json::Value;
+
+use super::{Call, Refusal, Vims, VimsError};
+use crate::clock::Clock;
+
+/// How long one `vims` call may run before it is killed.
+pub const LIMIT: Duration = Duration::from_secs(30);
+
+/// The most `vims` may print on stdout or stderr. Output is never cut short: past this the call
+/// gives no answer that can be read.
+pub const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+
+/// The variable that holds the token in the child's environment.
+pub const TOKEN_VAR: &str = "FOUNDRY_VIMS_TOKEN";
+
+/// What `--token-ref` is given: the variable, never the token.
+pub const TOKEN_REF: &str = "env:FOUNDRY_VIMS_TOKEN";
+
+/// How often a running call is looked at.
+const POLL: Duration = Duration::from_millis(10);
+
+/// How one `vims` call ended, before it is read as an answer or a [`VimsError`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// `vims` exited: `status` is `None` when a signal ended it.
+    Exit {
+        status: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
+    /// `vims` was still running at [`LIMIT`] and was killed.
+    TimedOut,
+    /// `vims` printed more than [`OUTPUT_LIMIT`] bytes.
+    TooLarge,
+    /// `vims` could not be started, and why.
+    NotStarted(String),
+}
+
+/// Reads how `call` ended: its stdout, or the error it is.
+pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
+    let command = call.text();
+    match outcome {
+        Outcome::NotStarted(reason) => Err(VimsError::NotRun { command, reason }),
+        Outcome::TimedOut => Err(VimsError::Timeout {
+            command,
+            seconds: LIMIT.as_secs(),
+        }),
+        Outcome::TooLarge => Err(VimsError::Unknown {
+            command,
+            reason: format!("it printed more than {OUTPUT_LIMIT} bytes"),
+        }),
+        Outcome::Exit {
+            status: Some(0),
+            stdout,
+            ..
+        } => Ok(stdout),
+        // A shell's "command not found" and "not executable".
+        Outcome::Exit {
+            status: Some(status @ (126 | 127)),
+            stderr,
+            ..
+        } => Err(VimsError::NotRun {
+            command,
+            reason: match stderr.trim() {
+                "" => format!("the shell exited with status {status}"),
+                said => said.to_owned(),
+            },
+        }),
+        Outcome::Exit {
+            status,
+            stdout,
+            stderr,
+        } => {
+            if let Some(refusal) = refusal_in(&stdout).or_else(|| refusal_in(&stderr)) {
+                return Err(VimsError::Refused { command, refusal });
+            }
+            let said = match stderr.trim() {
+                "" => stdout.trim(),
+                said => said,
+            };
+            let reason = match status {
+                Some(status) => format!("it exited with status {status}: {said}"),
+                None => format!("a signal ended it: {said}"),
+            };
+            Err(VimsError::Unknown {
+                command,
+                reason: reason.trim_end_matches([':', ' ']).to_owned(),
+            })
+        }
+    }
+}
+
+/// Vims's refusal in `text`, when it holds one: JSON with `error.code` (or `code`, or an
+/// `error` that is a code), or a line that starts with a code, such as
+/// `Error: PRECONDITION_FAILED: …`. The checks saw the codes and not the shape they came in,
+/// so both are guesses.
+fn refusal_in(text: &str) -> Option<Refusal> {
+    let text = text.trim();
+    let json = serde_json::from_str::<Value>(text).ok().or_else(|| {
+        text.lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+    });
+    if let Some(value) = json.filter(Value::is_object) {
+        let field = |path: &[&str]| {
+            path.iter()
+                .try_fold(&value, |value, name| value.get(name))
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        };
+        let code = field(&["error", "code"])
+            .or_else(|| field(&["code"]))
+            .or_else(|| field(&["error"]).filter(|code| is_code(code)))?;
+        let message = field(&["error", "message"])
+            .or_else(|| field(&["message"]))
+            .unwrap_or_default();
+        return Some(Refusal::new(code, message));
+    }
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        let line = ["Error: ", "error: "]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+            .unwrap_or(line);
+        let (code, message) = line.split_once(':').unwrap_or((line, ""));
+        is_code(code).then(|| Refusal::new(code, message.trim()))
+    })
+}
+
+/// Whether `text` reads as one of Vims's codes: capitals, digits and `_`, with an `_` in it.
+fn is_code(text: &str) -> bool {
+    text.len() >= 3
+        && text.starts_with(|c: char| c.is_ascii_uppercase())
+        && text.contains('_')
+        && text
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The `vims` command line, signed in with the machine's Vims token.
+pub struct VimsCli {
+    token: String,
+    clock: Arc<dyn Clock>,
+    program: PathBuf,
+}
+
+impl fmt::Debug for VimsCli {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VimsCli")
+            .field("program", &self.program)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VimsCli {
+    /// The command line signed in with `token`, timing each call on `clock`.
+    pub fn new(token: impl Into<String>, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            token: token.into(),
+            clock,
+            program: PathBuf::from("vims"),
+        }
+    }
+
+    /// The same command line running `program` in place of `vims`, for tests.
+    pub fn with_program(mut self, program: impl Into<PathBuf>) -> Self {
+        self.program = program.into();
+        self
+    }
+
+    /// The command for one call: the token in its environment and named by reference in its
+    /// arguments.
+    fn command(&self, call: &Call) -> Command {
+        let mut command = Command::new(&self.program);
+        command
+            .arg("--token-ref")
+            .arg(TOKEN_REF)
+            .args(call.argv())
+            .env(TOKEN_VAR, &self.token)
+            .stdin(if call.stdin().is_empty() {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Its own process group, so a call killed at the limit takes what it started too.
+            .process_group(0);
+        command
+    }
+
+    /// Runs `vims` once for `call`. The call is killed, with everything it started, once
+    /// [`LIMIT`] has passed on the clock before `vims` has exited and closed its output.
+    fn run(&self, call: &Call) -> Outcome {
+        // Without a token `vims` could sign in as whoever its own configuration names.
+        if self.token.trim().is_empty() {
+            return Outcome::NotStarted("no Vims token is set".into());
+        }
+        if call.argv().iter().any(|arg| arg.contains('\0')) {
+            return Outcome::NotStarted("an argument contains a NUL byte".into());
+        }
+        let started = self.clock.now();
+        let mut child = match self.command(call).spawn() {
+            Ok(child) => child,
+            Err(error) => return Outcome::NotStarted(error.to_string()),
+        };
+        // The input goes in on a thread of its own, which is never waited on, so a `vims` that
+        // does not read it cannot hold the call past its limit. The pipe closes when the input
+        // is all written, or fails once nothing holds its other end.
+        if let Some(mut pipe) = child.stdin.take() {
+            let bytes = call.stdin().to_vec();
+            thread::spawn(move || {
+                let _ = pipe.write_all(&bytes);
+            });
+        }
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        let mut status = None;
+        loop {
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(found) => status = found,
+                    Err(error) => {
+                        kill_group(&mut child);
+                        return Outcome::NotStarted(error.to_string());
+                    }
+                }
+            }
+            if status.is_some() && stdout.is_finished() && stderr.is_finished() {
+                break;
+            }
+            if self.clock.now().saturating_sub(started) >= LIMIT {
+                kill_group(&mut child);
+                return Outcome::TimedOut;
+            }
+            thread::sleep(POLL);
+        }
+        let (stdout, over_out) = stdout.join().unwrap_or_default();
+        let (stderr, over_err) = stderr.join().unwrap_or_default();
+        if over_out || over_err {
+            return Outcome::TooLarge;
+        }
+        Outcome::Exit {
+            status: status.and_then(|status| status.code()),
+            stdout: self.hidden(&stdout),
+            stderr: self.hidden(&stderr),
+        }
+    }
+
+    /// `bytes` as text with the token hidden as `***`.
+    fn hidden(&self, bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).replace(&self.token, "***")
+    }
+}
+
+impl Vims for VimsCli {
+    fn call(&self, call: &Call) -> Result<String, VimsError> {
+        finish(call, self.run(call))
+    }
+}
+
+/// Kills the child's process group and reaps the child.
+fn kill_group(child: &mut Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Reads `pipe` to its end on a thread of its own, keeping at most [`OUTPUT_LIMIT`] bytes, and
+/// says whether there was more.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<(Vec<u8>, bool)> {
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut over = false;
+        let Some(mut pipe) = pipe else {
+            return (kept, over);
+        };
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = OUTPUT_LIMIT.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                    over |= n > room;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        (kept, over)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -31,9 +348,9 @@ mod tests {
         Call::new("exec")
             .arg("wsp_1")
             .arg("--no-wait")
-            .key("k1")
+            .keyed("k1")
             .after(["bash", "-lc", "true"])
-            .stdin(b"body".to_vec())
+            .input(b"body".to_vec())
     }
 
     fn assert_no_token(error: &VimsError) {
@@ -109,7 +426,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let program = fake_vims(dir.path(), "cat\necho done");
         let vims = vims_at(&program, Arc::new(SystemClock));
-        assert_eq!(vims.call(&Call::new("show").arg("wsp_1")).unwrap(), "done\n");
+        assert_eq!(
+            vims.call(&Call::new("show").arg("wsp_1")).unwrap(),
+            "done\n"
+        );
     }
 
     #[test]
@@ -342,7 +662,9 @@ mod tests {
         let vims = vims_at(&program, clock.clone());
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let call = Call::new("exec").arg("wsp_1").stdin(vec![b'x'; 1024 * 1024]);
+            let call = Call::new("exec")
+                .arg("wsp_1")
+                .input(vec![b'x'; 1024 * 1024]);
             let _ = tx.send(vims.call(&call));
         });
         let pid = pid_in(&pid_file);
@@ -350,7 +672,10 @@ mod tests {
         let result = rx
             .recv_timeout(Duration::from_secs(10))
             .expect("killed once 30 s passed on the clock");
-        assert!(matches!(result, Err(VimsError::Timeout { .. })), "{result:?}");
+        assert!(
+            matches!(result, Err(VimsError::Timeout { .. })),
+            "{result:?}"
+        );
         assert!(goes_away(pid), "vims outlived the call");
     }
 
