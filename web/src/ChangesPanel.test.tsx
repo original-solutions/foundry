@@ -2,7 +2,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Changes } from "./api";
-import { ChangesPanel } from "./ChangesPanel";
+import { CHANGES_EVERY, ChangesPanel } from "./ChangesPanel";
 import { loadViewed, saveViewed, seen } from "./review";
 import { expectFieldLook, FakeSocket, json, mockFetch, renderApp } from "./test-utils";
 
@@ -96,6 +96,18 @@ describe("ChangesPanel", () => {
     const { panel } = await opened(json(404, { error: "workspace w1 is not a live workspace of this machine" }));
     const alert = await within(panel).findByRole("alert");
     expect(alert.textContent).toBe("Could not read the changes: workspace w1 is not a live workspace of this machine.");
+  });
+
+  it("stops reading the changes again once the daemon answers 404", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const gone = await opened(json(404, { error: "workspace w1 not found" }));
+      await within(gone.panel).findByRole("alert");
+      await act(() => vi.advanceTimersByTimeAsync(CHANGES_EVERY * 5));
+      expect(gone.calls.filter((c) => c.url.endsWith("/changes"))).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("marks a file viewed: it folds, the count moves on, and this browser keeps it", async () => {

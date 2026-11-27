@@ -42,7 +42,7 @@ function fixLogin(): WorkspaceView {
 }
 
 /** Answers the changes read with `read` and each archive with the next of `archives`; gives back every request. */
-function stub(read: () => Response, ...archives: Response[]): Call[] {
+function stub(read: () => Response | Promise<Response>, ...archives: (Response | Promise<Response>)[]): Call[] {
   const calls: Call[] = [];
   vi.stubGlobal(
     "fetch",
@@ -128,11 +128,58 @@ describe("ArchiveDialog", () => {
   });
 
   it("still archives when its changes cannot be read, and says they could not be", async () => {
-    const calls = stub(() => json(500, { error: "git broke" }), new Response(null, { status: 204 }));
+    const calls = stub(() => Promise.reject(new TypeError("Failed to fetch")), new Response(null, { status: 204 }));
     const dialog = await show();
     expect(await within(dialog).findByText(/can.t be read from here/)).toBeDefined();
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
     await waitFor(() => expect(posts(calls)).toHaveLength(1));
+  });
+
+  it("says in what stays on the branch why the daemon could not read its changes", async () => {
+    const why = "workspace w1's folder is no longer a git worktree of its project; archive it to remove the folder";
+    stub(() => json(404, { error: why }));
+    const dialog = await show();
+    const kept = within(dialog).getByRole("region", { name: "Kept on fix-login" });
+    await waitFor(() => expect(kept.textContent).toContain(why));
+    expect(kept.textContent).not.toMatch(/can.t be read from here/);
+  });
+
+  it("says it is archiving while the archive runs, and Cancel still closes it", async () => {
+    const onClose = vi.fn();
+    stub(
+      () => json(200, changes),
+      new Promise<Response>(() => {}),
+    );
+    const dialog = await show(onClose);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
+
+    const busy = await within(dialog).findByRole("button", { name: "Archiving…" });
+    expect((busy as HTMLButtonElement).disabled).toBe(true);
+    expect(within(dialog).queryByRole("button", { name: "Archive" })).toBeNull();
+    const cancel = within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+    expect(cancel.disabled).toBe(false);
+    fireEvent.click(cancel);
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("says why it cannot check a workspace whose folder is no longer a git worktree, and still lists its unpushed commits", async () => {
+    const onArchived = vi.fn();
+    const calls = stub(
+      () => json(200, changes),
+      json(409, { error: "archive refused: its folder is no longer a git worktree", uncommitted: [], unpushed: ["abc123 wip"], submodules: [], detached: true }),
+      new Response(null, { status: 204 }),
+    );
+    const dialog = await show(vi.fn(), onArchived);
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
+    const held = await within(dialog).findByRole("region", { name: "Archiving now would lose this work" });
+    expect(held.textContent).toContain("Its folder is no longer a git worktree, so what is in it can't be checked. Archive anyway deletes the folder; branch fix-login stays.");
+    expect(within(held).getByText("fix-login").tagName).toBe("CODE");
+    expect(held.textContent).toContain("abc123 wip");
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Archive anyway" }));
+    await waitFor(() => expect(onArchived).toHaveBeenCalled());
+    expect(posts(calls).map((c) => c.body)).toEqual([{ force: false }, { force: true }]);
   });
 
   it("archives without force once confirmed, and says what it kept", async () => {
@@ -162,6 +209,7 @@ describe("ArchiveDialog", () => {
     expect(held.textContent).toContain("src/a.rs");
     expect(held.textContent).toContain("abc123 wip");
     expect(held.textContent).toContain("vendor/x");
+    expect(held.textContent).not.toMatch(/no longer a git worktree/);
     expect(within(dialog).getByRole("button", { name: "Archive anyway" }).className).toBe(dangerButton);
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive anyway" }));

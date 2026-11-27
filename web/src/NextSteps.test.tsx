@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Changes, Shipping } from "./api";
@@ -74,6 +75,37 @@ describe("NextSteps", () => {
     await screen.findByText("Not sent");
     fireEvent.click(screen.getByRole("button", { name: "Commit 1 file" }));
     await waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+  });
+
+  it("reads again on each mount, but not a read the daemon last answered 404", async () => {
+    const urls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        urls.push(url);
+        if (url === "/api/workspaces/w1/changes") return json(200, dirty);
+        if (url === "/api/workspaces/w1/pr") return json(404, { error: "workspace w1 is not a live workspace of this machine" });
+        if (url === "/api/workspaces/w2/changes" || url === "/api/workspaces/w2/pr") return json(404, { error: "workspace w2 not found" });
+        throw new Error(`unexpected request ${url}`);
+      }),
+    );
+    const client = new QueryClient();
+    const tree = (shown: boolean) => (
+      <QueryClientProvider client={client}>
+        {shown && <NextSteps workspace="w1" name="opus" send={() => {}} look="header" />}
+        {shown && <NextSteps workspace="w2" name="sonnet" send={() => {}} look="header" />}
+      </QueryClientProvider>
+    );
+    const view = render(tree(true));
+    await waitFor(() => expect(urls).toHaveLength(4));
+    await screen.findByRole("button", { name: "Commit 1 file" });
+
+    view.rerender(tree(false));
+    view.rerender(tree(true));
+    await waitFor(() => expect(urls.filter((u) => u === "/api/workspaces/w1/changes")).toHaveLength(2));
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(urls.filter((u) => u.endsWith("/pr")).sort()).toEqual(["/api/workspaces/w1/pr", "/api/workspaces/w2/pr"]);
+    expect(urls.filter((u) => u.startsWith("/api/workspaces/w2/"))).toHaveLength(2);
   });
 
   it("shows nothing when there is nothing to do next", async () => {
