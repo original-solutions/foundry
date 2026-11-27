@@ -13,7 +13,6 @@
 //!   syncs apart from the session's own can arrive late.
 //! - [`shorten_command_limit`] makes the gate's 30-minute limit on a command a few seconds.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -21,24 +20,15 @@ use std::time::Duration;
 use foundry_proto::factory::{FactoryBody, FactoryRecord, SessionTurn};
 use foundry_proto::ids::{MachineId, SessionId};
 use foundry_proto::record::{AnyRecord, Record, Session, Workspace};
-use foundryd::api::{self, Api};
+use foundryd::factory::SCAN;
 use foundryd::factory::gate::COMMAND_LIMIT;
 use foundryd::factory::messages::TIME_LIMIT;
 use foundryd::factory::runs::progress::LAUNCH_RESENDING;
 use foundryd::factory::runs::resume::CLAIM_MOVED;
 use foundryd::factory::runs::start::LAUNCH_TAKEN;
-use foundryd::factory::status::Freshness;
-use foundryd::factory::{Factory, SCAN};
-use foundryd::secrets::Secrets;
-use foundryd::sessions::{self, Gateway, Sessions};
 use foundryd::store::Applied;
-use foundryd::terminals::Terminals;
-use foundryd::workspaces::Workspaces;
-use tempfile::TempDir;
 
-use super::{
-    FleetHost, Harness, Held, Machine, Options, SHIM, WAIT, built, config, isolated, live,
-};
+use super::{Harness, Held, Machine, Options, WAIT, config, isolated, live};
 use crate::{Daemon, lock, sample, until};
 
 /// The pull request every run here reports.
@@ -304,137 +294,19 @@ async fn restart(h: &mut Harness, i: usize) {
         (data, home)
     };
     h.fleet.restart(i).await;
-    let machine = relaunch(
+    // A worker that holds the token and the skill, on the data folder the daemon before it used.
+    let machine = Machine::start(
         &h.fleet.daemons[i],
-        data,
-        home,
+        Held::new(true),
         &h.scripts,
         &h.marks,
         h.github.clone(),
         h.clock.clone(),
         h.sent.clone(),
+        Some((data, home)),
     )
     .await;
     h._machines[i] = machine;
-}
-
-/// What [`Machine::start`] starts, for a worker that holds the token and the skill, on the
-/// data folder `data` a daemon before it used: the terminals are reattached, the workspaces
-/// swept and the sessions adopted before anything is served, in `foundryd`'s order. Beside the
-/// factory's service it runs the cut-off, as `foundryd` does.
-#[allow(clippy::too_many_arguments)]
-async fn relaunch(
-    daemon: &Daemon,
-    data: TempDir,
-    home: TempDir,
-    scripts: &Path,
-    marks: &Path,
-    github: Arc<super::FakeTracker>,
-    clock: Arc<foundryd::clock::FakeClock>,
-    sent: Arc<std::sync::Mutex<Vec<super::Sent>>>,
-) -> Machine {
-    let (me, store, peers) = (daemon.id, daemon.store.clone(), daemon.peers.clone());
-    let secrets = Held::new(true);
-    let agent = built("foundry-fake-agent");
-    let claude: Vec<String> = vec![
-        "sh".into(),
-        "-c".into(),
-        SHIM.into(),
-        "sh".into(),
-        agent.display().to_string(),
-        scripts.display().to_string(),
-        marks.display().to_string(),
-    ];
-    let terminals = Arc::new(Terminals::new(
-        me,
-        store.clone(),
-        data.path(),
-        built("foundry-holder"),
-    ));
-    terminals.reattach_all().await.unwrap();
-    let held: Arc<dyn Secrets> = secrets.clone();
-    let workspaces = Arc::new(
-        Workspaces::new(me, store.clone(), data.path(), terminals.clone())
-            .with_secrets(held.clone()),
-    );
-    workspaces.sweep().await.unwrap();
-    let hooks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let sessions = Arc::new(
-        Sessions::new(
-            me,
-            store.clone(),
-            terminals.clone(),
-            data.path(),
-            sessions::Config {
-                claude,
-                claude_json: home.path().join(".claude.json"),
-                hook_port: hooks.local_addr().unwrap().port(),
-                gateway: Gateway {
-                    base_url: "http://127.0.0.1:9/gateway".into(),
-                    key: "unused".into(),
-                },
-            },
-        )
-        .with_secrets(held),
-    );
-    sessions.adopt().await;
-    let hook_router = sessions.router();
-    let api = Api::new(
-        store.clone(),
-        peers.clone(),
-        terminals,
-        workspaces,
-        sessions.clone(),
-        Vec::new(),
-    );
-    let listener = api::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    peers.serve_calls(addr);
-    let freshness = Arc::new(Freshness::new(clock.clone()));
-    peers.hear_statuses(freshness.clone());
-    let host = Arc::new(FleetHost {
-        me,
-        coordinator: daemon.coordinator(),
-        api: api.clone(),
-        secrets,
-        github,
-        clock: clock.clone(),
-        data: data.path().to_path_buf(),
-        runtime: tokio::runtime::Handle::current(),
-        sent,
-    });
-    let clock = clock as Arc<dyn foundryd::clock::Clock>;
-    let factory = Factory::new(
-        daemon.store.clone(),
-        me,
-        host,
-        freshness.clone(),
-        clock.clone(),
-    );
-    let (placing, served) = (api.clone(), api);
-    let servers = vec![
-        tokio::spawn(foundryd::placement::run(placing)),
-        tokio::spawn(async move {
-            axum::serve(
-                hooks,
-                hook_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .await
-            .unwrap();
-        }),
-        tokio::spawn(async move {
-            axum::serve(listener, api::router(served)).await.unwrap();
-        }),
-        tokio::spawn(factory.serve()),
-        tokio::spawn(foundryd::factory::cutoff::run(
-            store, me, sessions, freshness, clock,
-        )),
-    ];
-    Machine {
-        data,
-        servers,
-        _home: home,
-    }
 }
 
 #[test]
