@@ -1663,8 +1663,9 @@ impl<'a, 'w> Pass<'a, 'w> {
             let mut labelled: BTreeSet<u64> =
                 listing.items.iter().map(|issue| issue.number).collect();
             if listing.cut {
-                // A cut listing leaves issues out. Those this kind's runs are on are read in one
-                // call and judged as the listing judges them: open and carrying the label.
+                // A cut listing leaves issues out. Those this kind's runs are on are read
+                // together, 100 to a call, and judged as the listing judges them: open and
+                // carrying the label.
                 let missing: Vec<u64> = of_kind
                     .iter()
                     .map(|done| done.run.run.issue())
@@ -2059,10 +2060,10 @@ pub(crate) mod testing {
                     Ok(json!({"data": {"repository": {"issue": {"closedByPullRequestsReferences": {"nodes": []}}}}}).to_string())
                 }
                 (Some("api"), Some("graphql")) if joined.contains("resource(url:") => {
-                    // The batched read of issues' labels: each issue the hub has, or null.
+                    // The batched read of issues' labels: each issue the hub has, or null. Each
+                    // URL comes as a `uN=<url>` variable.
                     let mut data = serde_json::Map::new();
-                    for asked in joined.split("resource(url: \"").skip(1) {
-                        let url = asked.split('"').next().unwrap_or_default();
+                    for url in Self::flag_values(args, "-f").iter().filter_map(|v| v.strip_prefix('u')?.split_once('=').map(|(_, url)| url)) {
                         let n: u64 = url.rsplit('/').next().and_then(|n| n.parse().ok()).unwrap_or(0);
                         let found = state.issues.get(&n).map_or(Value::Null, |issue| {
                             json!({
@@ -5231,16 +5232,46 @@ mod tests {
             rig.pass();
             let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
             assert_eq!(held, vec![listed, past]);
-            let reads: Vec<String> = rig
+            let reads: Vec<Vec<String>> = rig
                 .hub
                 .calls()
                 .into_iter()
-                .map(|args| args.join(" "))
-                .filter(|call| call.contains("resource(url:"))
+                .filter(|args| args.join(" ").contains("resource(url:"))
                 .collect();
             assert_eq!(reads.len(), 1, "{reads:?}");
-            assert!(reads[0].contains("/issues/300\""), "{}", reads[0]);
-            assert!(!reads[0].contains("/issues/5\""), "{}", reads[0]);
+            let asks = |n: u64| {
+                let url = format!("/issues/{n}");
+                reads[0].iter().any(|arg| arg.ends_with(&url))
+            };
+            assert!(asks(300), "{:?}", reads[0]);
+            assert!(!asks(5), "{:?}", reads[0]);
+        }
+
+        /// Past 100 missing issues the read takes a call per hundred, and a failed one fails the
+        /// pass as a failed listing does, keeping what the last good pass held up.
+        #[test]
+        fn more_than_100_issues_past_the_cut_are_read_100_to_a_call_and_any_failed_call_fails_the_pass()
+         {
+            let mut rig = Rig::new();
+            fill_the_listing(&rig, "factory:stuck");
+            let runs: Vec<RunId> = (300..=400)
+                .map(|n| {
+                    rig.hub.issue(n, &["factory:stuck"]);
+                    held_up_run(&rig, n, 1, State::Stuck, "no")
+                })
+                .collect();
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, runs);
+            assert_eq!(batched_reads(&rig), 2);
+            // Issue 400 is the 101st asked for, so only the second call reads it.
+            rig.hub.fail("/issues/400", 1);
+            let report = rig.pass();
+            assert!(report.failed.is_some(), "{report:?}");
+            assert_eq!(batched_reads(&rig), 4);
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, runs);
         }
 
         #[test]

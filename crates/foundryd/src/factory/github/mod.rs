@@ -136,7 +136,7 @@ pub trait Tracker: Send + Sync {
         read::issue(self, repo, number)
     }
 
-    /// The labels and open or closed state of each issue numbered, read in one call; a number
+    /// The labels and open or closed state of each issue numbered, read 100 to a call; a number
     /// GitHub has no issue for is not in the answer.
     fn issue_labels(
         &self,

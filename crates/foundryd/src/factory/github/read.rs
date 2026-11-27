@@ -597,43 +597,73 @@ pub fn issue<G: Tracker + ?Sized>(
 const LABELLED_FRAGMENT: &str =
     "fragment Labelled on Issue { number state labels(first: 100) { nodes { name } } }";
 
-/// The labels and open or closed state of each issue numbered, in one GraphQL call; none for
-/// no number. A number GitHub has no issue for is not in the answer: each is looked up by its
-/// URL, which GitHub answers with null, where `issue(number:)` would fail the whole call.
+/// How many issues one [`issue_labels`] call reads, so a query stays well inside the argument
+/// size and GitHub's limits however many numbers are asked for.
+const LABELLED_PER_CALL: usize = 100;
+
+/// The labels and open or closed state of each issue numbered, read 100 to a GraphQL call
+/// (one call up to 100 numbers, none for no number); any failed call fails the read. A number
+/// GitHub has no issue for is not in the answer: each is looked up by its URL, which GitHub
+/// answers with null, where `issue(number:)` would fail the whole call.
 pub fn issue_labels<G: Tracker + ?Sized>(
     gh: &G,
     repo: &str,
     numbers: &[u64],
 ) -> Result<BTreeMap<u64, IssueLabels>, TrackerError> {
-    let numbers: BTreeSet<u64> = numbers.iter().copied().collect();
+    let numbers: Vec<u64> = numbers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<u64>>()
+        .into_iter()
+        .collect();
     if numbers.is_empty() {
         return Ok(BTreeMap::new());
     }
-    // The repo is written into the query, so only a plain `owner/name` is.
+    // Each URL names the repo, so one not written as a plain `owner/name` would send every
+    // lookup elsewhere and let every run go: refuse it before any call.
     let plain = repo
         .split_once('/')
         .is_some_and(|(owner, name)| is_plain_segment(owner) && is_plain_segment(name));
     if !plain {
         return Err(invalid_argument(repo, "a repo written as owner/name"));
     }
+    let mut found = BTreeMap::new();
+    for chunk in numbers.chunks(LABELLED_PER_CALL) {
+        found.extend(issue_labels_of(gh, repo, chunk)?);
+    }
+    Ok(found)
+}
+
+/// One call of [`issue_labels`]: `numbers`, at most [`LABELLED_PER_CALL`] of them. Each URL is
+/// passed as a variable, so the query text holds nothing read from outside.
+fn issue_labels_of<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    numbers: &[u64],
+) -> Result<BTreeMap<u64, IssueLabels>, TrackerError> {
+    let declared: Vec<String> = numbers.iter().map(|n| format!("$u{n}: URI!")).collect();
     let asked: Vec<String> = numbers
         .iter()
-        .map(|n| {
-            format!(
-                "i{n}: resource(url: \"https://github.com/{repo}/issues/{n}\") {{ ...Labelled }}"
-            )
-        })
+        .map(|n| format!("i{n}: resource(url: $u{n}) {{ ...Labelled }}"))
         .collect();
-    let args = vec![
+    let mut args = vec![
         "api".to_string(),
         "graphql".into(),
         "-f".into(),
-        format!("query=query {{ {} }} {LABELLED_FRAGMENT}", asked.join(" ")),
+        format!(
+            "query=query({}) {{ {} }} {LABELLED_FRAGMENT}",
+            declared.join(", "),
+            asked.join(" ")
+        ),
     ];
+    for n in numbers {
+        args.push("-f".into());
+        args.push(format!("u{n}=https://github.com/{repo}/issues/{n}"));
+    }
     let answer: RawLabelledAnswer =
         gh_json(gh, &args, "a GraphQL response with each issue asked for")?;
     let mut found = BTreeMap::new();
-    for number in numbers {
+    for &number in numbers {
         let Some(read) = answer.data.get(&format!("i{number}")) else {
             return Err(parse_error(
                 &args,
@@ -3062,23 +3092,38 @@ mod tests {
 
     // Several issues' labels in one read.
 
-    /// The one call that reads the labels of `numbers`, as `issue_labels` makes it.
+    /// The one call that reads the labels of `numbers`, as `issue_labels` makes it: each URL is
+    /// a variable, so the query text holds nothing read from outside.
     fn issue_labels_call(numbers: &[u64]) -> Vec<String> {
+        let declared: Vec<String> = numbers.iter().map(|n| format!("$u{n}: URI!")).collect();
         let asked: Vec<String> = numbers
             .iter()
-            .map(|n| {
-                format!("i{n}: resource(url: \"https://github.com/{REPO}/issues/{n}\") {{ ...Labelled }}")
-            })
+            .map(|n| format!("i{n}: resource(url: $u{n}) {{ ...Labelled }}"))
             .collect();
-        args(&[
+        let mut call = args(&[
             "api",
             "graphql",
             "-f",
             &format!(
-                "query=query {{ {} }} fragment Labelled on Issue {{ number state labels(first: 100) {{ nodes {{ name }} }} }}",
+                "query=query({}) {{ {} }} fragment Labelled on Issue {{ number state labels(first: 100) {{ nodes {{ name }} }} }}",
+                declared.join(", "),
                 asked.join(" ")
             ),
-        ])
+        ]);
+        for n in numbers {
+            call.push("-f".into());
+            call.push(format!("u{n}=https://github.com/{REPO}/issues/{n}"));
+        }
+        call
+    }
+
+    /// GitHub's answer for each of `numbers`, found open with `factory:stuck`.
+    fn all_stuck(numbers: &[u64]) -> String {
+        let data: serde_json::Map<String, Value> = numbers
+            .iter()
+            .map(|n| (format!("i{n}"), labelled(*n, "OPEN", &["factory:stuck"])))
+            .collect();
+        json!({ "data": data }).to_string()
     }
 
     /// GitHub's answer for an issue the read found.
@@ -3174,6 +3219,39 @@ mod tests {
         let fake = FakeTracker::new();
         assert!(issue_labels(&fake, REPO, &[]).unwrap().is_empty());
         assert!(fake.calls().is_empty());
+    }
+
+    /// More numbers than one call reads are read 100 to a call, lowest first, so no query
+    /// outgrows the argument size or GitHub's limits however many issues are asked for.
+    #[test]
+    fn issue_labels_reads_more_than_100_numbers_100_to_a_call() {
+        let fake = FakeTracker::new();
+        let first: Vec<u64> = (1..=100).collect();
+        fake.on(issue_labels_call(&first), Answer::ok(all_stuck(&first)));
+        fake.on(
+            issue_labels_call(&[101]),
+            Answer::ok(json!({"data": {"i101": labelled(101, "CLOSED", &[])}}).to_string()),
+        );
+        let asked: Vec<u64> = (1..=101).rev().collect();
+        let read = issue_labels(&fake, REPO, &asked).unwrap();
+        assert_eq!(fake.calls().len(), 2, "{:?}", fake.calls());
+        assert_eq!(
+            read.keys().copied().collect::<Vec<_>>(),
+            (1..=101).collect::<Vec<_>>()
+        );
+        assert!(read[&101].closed);
+        assert!(!read[&100].closed);
+    }
+
+    /// A failed call fails the whole read, whichever hundred it was reading.
+    #[test]
+    fn issue_labels_fails_when_any_of_its_calls_fails() {
+        let first: Vec<u64> = (1..=100).collect();
+        let fake = FakeTracker::answering([Answer::ok(all_stuck(&first)), Answer::fail(1, "boom")]);
+        let asked: Vec<u64> = (1..=101).collect();
+        let error = issue_labels(&fake, REPO, &asked).unwrap_err();
+        assert!(is_failed(&error), "{error}");
+        assert_eq!(fake.calls().len(), 2, "{:?}", fake.calls());
     }
 
     #[test]
