@@ -417,6 +417,20 @@ describe("Grouped by shipping", () => {
     expect(within(card("far off")).queryByRole("group", { name: /Next for/ })).toBeNull();
   });
 
+  it("offers Archive on the card of a workspace on another machine, and opens its dialog without reading its changes", async () => {
+    answers["/api/workspaces/w6/changes"] = () => json(404, { error: "workspace w6 is not a live workspace of this machine" });
+    await show(fleet(fleetOf(), listed()), vi.fn(), {}, true);
+    const far = card("far off");
+    const button = await within(far).findByRole("button", { name: "Archive far off" });
+    // Its card asks this machine's daemon, which does not have it; the dialog asks nothing.
+    await waitFor(() => expect(readsOf("w6")).toBe(1));
+    fireEvent.click(button);
+    const dialog = await screen.findByRole("dialog", { name: "Archive far off?" });
+    expect(within(dialog).getByRole("region", { name: "Kept on far-off" }).textContent).toContain("laptop lists any work that would be lost");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(readsOf("w6")).toBe(1);
+  });
+
   it("moves a card to its new lane when one of its terminals changes state, and lights it up once there", async () => {
     localStorage.setItem("foundry.group", "shipping");
     const { update } = await show(fleet(fleetOf("working"), listed()), vi.fn(), {}, true);

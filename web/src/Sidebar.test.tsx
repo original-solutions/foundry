@@ -120,6 +120,25 @@ describe("Sidebar", () => {
     expect(screen.getByRole("group", { name: "empty" })).toBeDefined();
   });
 
+  it("offers Archive for a workspace on another machine, which the daemon carries to it, and opens its dialog", async () => {
+    mockFetch(json(200, { id: ME }));
+    const view = fleet(
+      [sample(ME, 1), sample(OTHER, 1), workspace(OTHER, "w9", "remote job"), terminal(OTHER, "t9", "w9", "running")],
+      settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] }),
+    );
+    const noop = () => {};
+    await renderApp(
+      <TerminalActions machines={view} onOpen={noop} onBeside={noop} onSteps={noop} onChanges={noop} onFind={noop} onNewSession={noop}>
+        <Sidebar machines={view} {...props} />
+      </TerminalActions>,
+    );
+    unfold("remote job");
+
+    const group = screen.getByRole("group", { name: "remote job" });
+    fireEvent.click(await within(group).findByRole("button", { name: "Archive" }));
+    expect(await screen.findByRole("dialog", { name: "Archive remote job?" })).toBeDefined();
+  });
+
   it("names each session by its first prompt and says what a working one is doing", async () => {
     const records = [workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "working"), terminal(ME, "t2", "w1"), session(ME, "s2", "w1", "t2", "idle")];
     const briefs = {
