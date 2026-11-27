@@ -159,6 +159,20 @@ describe("Sidebar", () => {
     expect(onCreate).toHaveBeenCalled();
   });
 
+  it("keeps its header above the scrolling list, with only the title able to give way, so New task never runs past the sidebar's edge", async () => {
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    const nav = screen.getByRole("navigation", { name: "Workspaces" });
+    const title = screen.getByRole("heading", { name: "Foundry" });
+    const list = screen.getByRole("region", { name: "studio" }).parentElement!;
+    // The list scrolls on its own, so its scrollbar takes width from the list and not the header.
+    expect(list.className).toMatch(/(^| )overflow-y-auto( |$)/);
+    expect(list.contains(title)).toBe(false);
+    expect(nav.className).not.toMatch(/overflow-/);
+    // The buttons keep their size; the title is the part that shortens if the row runs out of room.
+    expect(screen.getByRole("button", { name: "New task" }).parentElement!.className).toMatch(/(^| )shrink-0( |$)/);
+    expect(title.className).toMatch(/(^| )min-w-0( |$)/);
+  });
+
   it("starts a shell in the workspace from New shell", async () => {
     const calls = mockFetch(json(201, { id: "t9" }));
     await renderApp(<Sidebar machines={machines()} {...props} />);
