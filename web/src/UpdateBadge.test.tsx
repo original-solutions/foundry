@@ -223,45 +223,45 @@ describe("UpdateBadge", () => {
     expect(within(dialog()).getByRole("button", { name: "Install" })).toBeDefined();
   });
 
-  it("gives an answer to the checklist that sent it, never to one opened since", async () => {
+  it("offers no Install while an earlier checklist's calls are still out, and shows none of their answers", async () => {
     show([at(ME, 1, { version: "0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
     fireEvent.click(badge());
     fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
     fireEvent.click(within(dialog()).getByRole("button", { name: "Close" }));
     fireEvent.click(badge());
-    fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+    expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(dialog()).getByText(/still out/i)).toBeDefined();
     act(() => sent.calls[0].answer({ status: 500, json: { error: "from the first checklist" } }));
     await settle();
-    expect(within(row("laptop")).getByText(/^Sending/)).toBeDefined();
-    act(() => sent.calls[1].answer({ status: 202, json: {} }));
-    await settle();
-    expect(within(row("laptop")).getByText(/^Restarting/)).toBeDefined();
+    expect(within(dialog()).queryByText(/from the first checklist/)).toBeNull();
+    expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(sent.calls).toHaveLength(1);
   });
 
-  it("never sends the serving machine's install once the checklist that queued it is closed", async () => {
+  it("sends the serving machine's install when its turn comes, even after the checklist that took it is closed", async () => {
     show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
     fireEvent.click(badge());
     fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
     fireEvent.click(within(dialog()).getByRole("button", { name: "Close" }));
     act(() => sent.calls[0].answer({ status: 202, json: {} }));
     await settle();
-    expect(sent.calls.map((c) => c.machine)).toEqual([OTHER]);
+    expect(sent.calls.map((c) => [c.machine, c.tag])).toEqual([
+      [OTHER, "v0.9.1"],
+      [ME, "v0.9.1"],
+    ]);
   });
 
-  it("holds the serving machine's call until the calls an earlier checklist left out have finished too", async () => {
+  it("offers no Install once the serving machine has answered 202, since it is restarting", async () => {
     show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
-    fireEvent.click(badge());
-    fireEvent.click(within(dialog()).getByRole("checkbox", { name: "studio v0.9.1" }));
-    fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
-    fireEvent.click(within(dialog()).getByRole("button", { name: "Close" }));
     fireEvent.click(badge());
     fireEvent.click(within(dialog()).getByRole("checkbox", { name: "laptop v0.9.1" }));
     fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+    act(() => sent.calls[0].answer({ status: 202, json: {} }));
     await settle();
-    expect(sent.calls.map((c) => c.machine)).toEqual([OTHER]);
-    act(() => sent.calls[0].drop(new TypeError("Failed to fetch")));
-    await settle();
-    expect(sent.calls.map((c) => c.machine)).toEqual([OTHER, ME]);
+    fireEvent.click(within(dialog()).getByRole("button", { name: "Close" }));
+    fireEvent.click(badge());
+    expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(dialog()).getByText(/this machine is restarting/i)).toBeDefined();
   });
 
   it("keeps a row after its machine's update_ready clears, until the checklist is closed", async () => {
