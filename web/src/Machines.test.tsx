@@ -58,6 +58,15 @@ describe("Machines", () => {
     expect(within(card("laptop")).queryByText("This machine")).toBeNull();
   });
 
+  it("shows the version each machine runs and the release waiting on it, or that its version is unknown", async () => {
+    const withVersion = { ...records[0], body: { ...records[0].body, version: "0.9.0", update_ready: "v0.9.1" } } as (typeof records)[number];
+    await renderApp(<Machines machines={fleet([withVersion, ...records.slice(1)], twoMachines)} history={{}} here={ME} connected />);
+    expect(within(card("studio")).getByText("0.9.0")).toBeDefined();
+    expect(within(card("studio")).getByText(/v0\.9\.1 waiting/)).toBeDefined();
+    expect(within(card("laptop")).getByText(/version unknown/i)).toBeDefined();
+    expect(within(card("laptop")).queryByText(/waiting/)).toBeNull();
+  });
+
   it("draws the load since the page opened, up to ten minutes, as a line saying its range", async () => {
     await show();
     const line = within(card("studio")).getByRole("img", { name: /load per core, last 1 min/i });
