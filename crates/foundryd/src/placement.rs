@@ -1001,6 +1001,75 @@ mod tests {
         reasons.iter().map(|r| r.text(names[&r.machine])).collect()
     }
 
+    /// One machine of a case in `web/src/placement_cases.json`.
+    #[derive(serde::Deserialize)]
+    struct CaseMachine {
+        id: MachineId,
+        name: String,
+        online: bool,
+        sample: Option<MachineSample>,
+        limits: Option<Limits>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Case {
+        about: String,
+        machines: Vec<CaseMachine>,
+        pick: Option<MachineId>,
+        #[serde(default)]
+        reasons: Vec<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Cases {
+        cases: Vec<Case>,
+    }
+
+    /// The cases the machines view's copy of this rule (`web/src/room.ts`) is tested on too.
+    #[test]
+    fn every_shared_placement_case_is_placed_as_it_says() {
+        let Cases { cases } =
+            serde_json::from_str(include_str!("../../../web/src/placement_cases.json")).unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let samples: Vec<Record<MachineSample>> = case
+                .machines
+                .iter()
+                .filter_map(|m| {
+                    m.sample.clone().map(|body| Record {
+                        owner: m.id,
+                        version: 1,
+                        deleted: false,
+                        body,
+                    })
+                })
+                .collect();
+            let limits = case
+                .machines
+                .iter()
+                .filter_map(|m| m.limits.clone().map(|l| (m.id, l)))
+                .collect();
+            let online = case
+                .machines
+                .iter()
+                .filter(|m| m.online)
+                .map(|m| m.id)
+                .collect();
+            let names: BTreeMap<MachineId, &str> = case
+                .machines
+                .iter()
+                .map(|m| (m.id, m.name.as_str()))
+                .collect();
+            match (place(&samples, &limits, &online), case.pick) {
+                (Ok(picked), Some(wanted)) => assert_eq!(picked, wanted, "{}", case.about),
+                (Err(reasons), None) => {
+                    assert_eq!(texts(&reasons, &names), case.reasons, "{}", case.about)
+                }
+                (got, wanted) => panic!("{}: placed {got:?}, wanted {wanted:?}", case.about),
+            }
+        }
+    }
+
     #[test]
     fn the_lowest_load_per_core_wins_among_machines_under_their_limits() {
         let [a, b, c] = [

@@ -1,10 +1,10 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fleet } from "./fleet";
+import { fleet, withFactory } from "./fleet";
 import { Sidebar } from "./Sidebar";
 import { TerminalActions } from "./TerminalMenu";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, mockFetch, renderApp } from "./test-utils";
 import type { SessionState } from "./api";
 
@@ -46,6 +46,14 @@ afterEach(() => {
 });
 
 describe("Sidebar", () => {
+  it("marks each workspace with its project's face, so a long list reads by project", async () => {
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    const face = within(screen.getByRole("group", { name: "fix login" })).getByTitle("demo");
+    expect(face.textContent).toBe("DE");
+    // It is a picture of what the row says in words once unfolded, so a screen reader skips it.
+    expect(face.getAttribute("aria-hidden")).toBe("true");
+  });
+
   it("shows each machine with its state (offline: one session is unreachable) and numbers", async () => {
     await renderApp(<Sidebar machines={machines()} {...props} />);
 
@@ -168,6 +176,20 @@ describe("Sidebar", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "New task" }));
     expect(onCreate).toHaveBeenCalled();
+  });
+
+  it("keeps its header above the scrolling list, with only the title able to give way, so New task never runs past the sidebar's edge", async () => {
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    const nav = screen.getByRole("navigation", { name: "Workspaces" });
+    const title = screen.getByRole("heading", { name: "Foundry" });
+    const list = screen.getByRole("region", { name: "studio" }).parentElement!;
+    // The list scrolls on its own, so its scrollbar takes width from the list and not the header.
+    expect(list.className).toMatch(/(^| )overflow-y-auto( |$)/);
+    expect(list.contains(title)).toBe(false);
+    expect(nav.className).not.toMatch(/overflow-/);
+    // The buttons keep their size; the title is the part that shortens if the row runs out of room.
+    expect(screen.getByRole("button", { name: "New task" }).parentElement!.className).toMatch(/(^| )shrink-0( |$)/);
+    expect(title.className).toMatch(/(^| )min-w-0( |$)/);
   });
 
   it("starts a shell in the workspace from New shell", async () => {
@@ -417,5 +439,160 @@ describe("Sidebar", () => {
     fireEvent.keyDown(field, { key: "Escape" });
     expect(within(studio).getByRole("link", { name: "studio" })).toBeDefined();
     expect(calls).toHaveLength(1);
+  });
+});
+
+/** Project p1's believed status: run 162 builds in w1, run 170 is held up in w2. */
+describe("Sidebar and the factory", () => {
+  const factoryMachines = () =>
+    fleet(
+      [sample(ME, 1), workspace(ME, "w1", "fac 162"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "stuck"), onCommit(ME, "w3", "on a commit")],
+      settings({ machines: [{ id: ME, name: "studio", address: "" }] }),
+    );
+
+  it("marks a factory run's workspace and links it to its issue, and names a quiet session so", async () => {
+    await renderApp(<Sidebar machines={withFactory(factoryMachines(), factoryStatuses())} {...props} />);
+    const run = screen.getByRole("group", { name: "fac 162" });
+    // Folded, the mark shows on the workspace's line.
+    expect(within(run).getByRole("link", { name: "factory #162" }).getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");
+    unfold("fac 162");
+    expect(within(run).getByText("Quiet 10+ min")).toBeDefined();
+    expect(within(screen.getByRole("group", { name: "on a commit" })).queryByRole("link", { name: /^factory/ })).toBeNull();
+  });
+
+  it("shows a workspace with no branch by its commit", async () => {
+    await renderApp(<Sidebar machines={factoryMachines()} {...props} />);
+    unfold("on a commit");
+    expect(within(screen.getByRole("group", { name: "on a commit" })).getByText("fedcba9 · demo")).toBeDefined();
+  });
+});
+
+describe("renaming a session", () => {
+  const noop = () => {};
+  const brief = { s1: { title: "fix the login redirect", now: null } };
+
+  function view(name?: string) {
+    const records = [
+      sample(ME, 1),
+      workspace(ME, "w1", "fix login"),
+      terminal(ME, "t1", "w1", "running"),
+      session(ME, "s1", "w1", "t1", "idle", { model: "sonnet", name }),
+      terminal(ME, "sh1", "w1", "running"),
+    ];
+    return fleet(records, settings({ machines: [{ id: ME, name: "studio", address: "" }] }), brief);
+  }
+
+  /** The workspace's group in a sidebar with terminal t1 open, inside the terminals' actions. */
+  async function sidebar(machines = view()) {
+    await renderApp(
+      <TerminalActions machines={machines} onOpen={noop} onBeside={noop} onSteps={noop} onChanges={noop} onFind={noop} onNewSession={noop}>
+        <Sidebar machines={machines} {...props} selected="t1" />
+      </TerminalActions>,
+    );
+    return within(screen.getByRole("group", { name: "fix login" }));
+  }
+
+  const renames = (calls: { url: string }[]) => calls.filter((c) => c.url.endsWith("/rename"));
+  /** Lets the page settle once a field opens, after which leaving it is the person's. */
+  const settle = () => act(() => new Promise((done) => setTimeout(done, 0)));
+
+  it("swaps a session's name for a field on a double-click, holding the name all selected, and Enter saves it trimmed", async () => {
+    const calls = mockFetch(json(200, { id: ME }), new Response(null, { status: 204 }));
+    const group = await sidebar();
+    const row = group.getByRole("link", { name: /^sonnet fix the login redirect/ });
+    expect(row.getAttribute("href")).toBe("/terminals/t1");
+
+    fireEvent.doubleClick(row);
+    const field = group.getByRole<HTMLInputElement>("textbox", { name: "Session name" });
+    expect(field.value).toBe("fix the login redirect");
+    expect(document.activeElement).toBe(field);
+    expect([field.selectionStart, field.selectionEnd]).toEqual([0, field.value.length]);
+    fireEvent.change(field, { target: { value: "  login redirect " } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(group.queryByRole("textbox", { name: "Session name" })).toBeNull());
+    expect(renames(calls)).toEqual([{ url: "/api/sessions/s1/rename", method: "POST", body: { name: "login redirect" } }]);
+  });
+
+  it("gives a shell no field on a double-click", async () => {
+    mockFetch(json(200, { id: ME }));
+    const group = await sidebar();
+    fireEvent.doubleClick(group.getByRole("link", { name: /^shell/ }));
+    expect(group.queryByRole("textbox")).toBeNull();
+  });
+
+  it("puts the name back on Escape, and on leaving the field unchanged, sending nothing", async () => {
+    const calls = mockFetch(json(200, { id: ME }));
+    const group = await sidebar();
+
+    fireEvent.doubleClick(group.getByRole("link", { name: /^sonnet/ }));
+    fireEvent.change(group.getByRole("textbox", { name: "Session name" }), { target: { value: "something else" } });
+    fireEvent.keyDown(group.getByRole("textbox", { name: "Session name" }), { key: "Escape" });
+    expect(group.queryByRole("textbox")).toBeNull();
+
+    fireEvent.doubleClick(group.getByRole("link", { name: /^sonnet/ }));
+    const field = group.getByRole<HTMLInputElement>("textbox", { name: "Session name" });
+    expect(field.value).toBe("fix the login redirect");
+    await settle();
+    fireEvent.blur(field);
+    expect(group.queryByRole("textbox")).toBeNull();
+    expect(group.getByRole("link", { name: /^sonnet fix the login redirect/ })).toBeDefined();
+    expect(renames(calls)).toEqual([]);
+  });
+
+  it("keeps the field open and takes the keyboard back when something else takes it as the field opens", async () => {
+    mockFetch(json(200, { id: ME }));
+    const group = await sidebar();
+    fireEvent.doubleClick(group.getByRole("link", { name: /^sonnet/ }));
+    const field = group.getByRole("textbox", { name: "Session name" });
+    const terminal = document.createElement("textarea");
+    document.body.append(terminal);
+    terminal.focus();
+    fireEvent.blur(field);
+    await settle();
+
+    expect(group.getByRole("textbox", { name: "Session name" })).toBe(field);
+    expect(document.activeElement).toBe(field);
+    terminal.remove();
+  });
+
+  it("saves a changed name when the field is left", async () => {
+    const calls = mockFetch(json(200, { id: ME }), new Response(null, { status: 204 }));
+    const group = await sidebar();
+    fireEvent.doubleClick(group.getByRole("link", { name: /^sonnet/ }));
+    const field = group.getByRole("textbox", { name: "Session name" });
+    fireEvent.change(field, { target: { value: "login redirect" } });
+    await settle();
+    fireEvent.blur(field);
+
+    await waitFor(() => expect(group.queryByRole("textbox")).toBeNull());
+    expect(renames(calls)).toEqual([{ url: "/api/sessions/s1/rename", method: "POST", body: { name: "login redirect" } }]);
+  });
+
+  it("clears a given name with Enter on an empty field, so the first prompt shows again", async () => {
+    const calls = mockFetch(json(200, { id: ME }), new Response(null, { status: 204 }));
+    const group = await sidebar(view("login redirect"));
+    const row = group.getByRole("link", { name: /^sonnet login redirect/ });
+
+    fireEvent.doubleClick(row);
+    const field = group.getByRole<HTMLInputElement>("textbox", { name: "Session name" });
+    expect(field.value).toBe("login redirect");
+    fireEvent.change(field, { target: { value: "" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(group.queryByRole("textbox")).toBeNull());
+    expect(renames(calls)).toEqual([{ url: "/api/sessions/s1/rename", method: "POST", body: { name: "" } }]);
+  });
+
+  it("shows a refused rename's error beside the field and keeps the text", async () => {
+    mockFetch(json(200, { id: ME }), json(503, { error: "build-box is offline" }));
+    const group = await sidebar();
+    fireEvent.doubleClick(group.getByRole("link", { name: /^sonnet/ }));
+    const field = group.getByRole<HTMLInputElement>("textbox", { name: "Session name" });
+    fireEvent.change(field, { target: { value: "login redirect" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    expect((await group.findByRole("alert")).textContent).toBe("build-box is offline");
+    expect(field.value).toBe("login redirect");
   });
 });

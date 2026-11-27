@@ -1,13 +1,15 @@
 import { useQuery } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
-import { Fragment, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { workspaceChanges, workspaceCommit, type Changes, type Commit, type FileChange } from "./api";
 import { diffLines, splitPath, totals } from "./changes";
-import type { SessionView } from "./fleet";
+import { CodeLine } from "./CodeLine";
+import { branchOf, type FactoryRun, type SessionView } from "./fleet";
 import { couldNot, plural } from "./labels";
 import { anchor, onLine, type Anchor, type Note } from "./notes";
 import { lineName, NoteBox, NoteRow, SendBar } from "./LineNotes";
 import { button } from "./Modal";
+import { paint } from "./paint";
 import { ShipLine } from "./Shipping";
 import { freshLines, loadViewed, nextUnviewed, progress, saveViewed, seen, standing, type Seen, type Standing, type Viewed } from "./review";
 
@@ -21,6 +23,9 @@ const SHIPPING_EVERY = 30_000;
 const FOLDED_PAST = 400;
 
 /** The query an open panel keeps fresh. The header reads its cached counts. */
+/** How often a glance at a workspace's changes reads them again: the header's count and Steps' Files view. */
+export const GLANCE_EVERY = 15_000;
+
 export const changesQuery = (workspace: string) => ({ queryKey: ["changes", workspace], queryFn: () => workspaceChanges(workspace) });
 
 export const fileStatus: Record<FileChange["status"], { letter: string; title: string; tone: string }> = {
@@ -35,8 +40,12 @@ interface Target {
   id: string;
   name: string;
   branch: string;
+  /** The branch or commit it started from, which names it when it has no branch (`branchOf`). */
+  base?: string;
   /** Its sessions, which can take the comments written on its diff. */
   sessions?: SessionView[];
+  /** The factory run it belongs to, which decides how its sessions read. */
+  factory?: FactoryRun;
 }
 
 /** The comment being written or changed: on a line of a file, and which comment when it is a change. */
@@ -189,7 +198,7 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
             <Dialog.Description asChild>
               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-neutral-400">
                 <span className="font-mono">
-                  <span className="text-neutral-200">{workspace.branch}</span>
+                  <span className="text-neutral-200">{branchOf(workspace)}</span>
                   <span className="px-1.5 text-neutral-600">←</span>
                   {data?.base ?? "…"}
                 </span>
@@ -236,7 +245,7 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
               ))}
             </nav>
             <div ref={body} className="min-w-0 flex-1 space-y-3 overflow-y-auto p-3 md:p-4">
-              {story.length > 0 && <Story commits={story} branch={workspace.branch} picked={picked} onPick={pick} />}
+              {story.length > 0 && <Story commits={story} branch={branchOf(workspace)} picked={picked} onPick={pick} />}
               {reading ? (
                 <>
                   <CommitHead commit={story[picked]} n={picked + 1} of={story.length} changes={commit.data} onPick={(d) => pick(picked + d)} />
@@ -278,7 +287,7 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
             </div>
           </div>
         )}
-        <SendBar notes={notes} sessions={workspace.sessions ?? []} onSent={() => onNotes([])} />
+        <SendBar notes={notes} sessions={workspace.sessions ?? []} factory={workspace.factory} onSent={() => onNotes([])} />
       </Dialog.Content>
     </>
   );
@@ -539,8 +548,10 @@ function LineButton({ at }: { at: Anchor & { onComment: (at: Anchor) => void } }
 
 /** One file's diff. The parent remounts it when its standing changes, so ticking Viewed folds it and a change since opens it. */
 function FileDiff({ file, readOnly, state, kept, current, onViewed, notes, editing, onComment, onEdit, onSave, onCancel, onDelete }: FileDiffProps) {
-  const lines = file.patch === null ? [] : diffLines(file.patch);
+  const lines = useMemo(() => (file.patch === null ? [] : diffLines(file.patch)), [file.patch]);
   const [open, setOpen] = useState(state !== "viewed" && lines.length <= FOLDED_PAST);
+  // Coloured once per patch, and only once the file is open: the sheet reads again every few seconds.
+  const painted = useMemo(() => (open ? paint(lines, file.path) : []), [open, lines, file.path]);
   const fresh = state === "changed" ? freshLines(lines, kept) : new Set<number>();
   const { dir, name } = splitPath(file.path);
   const anchors = lines.map(anchor);
@@ -628,7 +639,7 @@ function FileDiff({ file, readOnly, state, kept, current, onViewed, notes, editi
                       {marker[line.kind]}
                     </span>
                     <span role="cell" className="whitespace-pre pr-4">
-                      {line.text}
+                      <CodeLine pieces={painted[i]} kind={line.kind} />
                     </span>
                   </div>
                   {notes.filter((n) => onLine(n, file.path, anchors[i]!)).map(below)}

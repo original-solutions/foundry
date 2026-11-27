@@ -1,9 +1,9 @@
 import { fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fleet } from "./fleet";
+import { fleet, withFactory } from "./fleet";
 import { loadRail, saveRail } from "./collapsed";
 import { Rail } from "./Rail";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { renderApp } from "./test-utils";
 
 function machines() {
@@ -27,6 +27,20 @@ const handlers = () => ({ onExpand: vi.fn(), onJump: vi.fn(), onCreate: vi.fn() 
 afterEach(() => localStorage.clear());
 
 describe("Rail", () => {
+  it("says a live factory run's stuck session is quiet, as the board does", async () => {
+    const records = [sample(ME, 1), workspace(ME, "w1", "fac 162"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "stuck")];
+    const run = withFactory(fleet(records, settings()), factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1"] }));
+    await renderApp(<Rail machines={run} {...handlers()} />);
+    const group = within(screen.getByRole("navigation", { name: "Workspaces" })).getByRole("group", { name: "fac 162" });
+    expect(within(group).getByRole("link").getAttribute("aria-label")).toBe("fac 162 / opus: Quiet 10+ min");
+  });
+
+  it("heads each workspace's column with its project's face, so columns can be told apart", async () => {
+    await renderApp(<Rail machines={machines()} {...handlers()} />);
+    const login = screen.getByRole("group", { name: "fix login" });
+    expect(within(login).getByTitle("fix login · demo").textContent).toBe("DE");
+  });
+
   it("links to the factory beside the board", async () => {
     await renderApp(<Rail machines={machines()} onExpand={() => {}} onJump={() => {}} onCreate={() => {}} />);
     expect(screen.getByRole("link", { name: "The factory" }).getAttribute("href")).toBe("/factory");

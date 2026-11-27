@@ -4,7 +4,7 @@ import { machineQuery, sessionTrail } from "./api";
 import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
 import { totals } from "./changes";
-import { locate, rows, type MachineView, type WorkspaceView } from "./fleet";
+import { branchOf, locate, rows, type MachineView, type WorkspaceView } from "./fleet";
 import type { Destination } from "./jump";
 import { addsSteps, words, type Glyph } from "./labels";
 import { topFiles } from "./lanes";
@@ -87,7 +87,7 @@ export function Peek({ at, machines }: { at: Destination | undefined; machines: 
       <Shell label={`Preview of ${workspace.name}`}>
         <Head workspace={workspace} machine={owner.name} many={machines.length > 1} name={workspace.name} />
         <p className="text-xs text-neutral-400">
-          Starts a shell in {workspace.name}, in its worktree on {workspace.branch}.
+          Starts a shell in {workspace.name}, in its worktree on {branchOf(workspace)}.
         </p>
         {all.length > 0 && (
           <Part heading="Its terminals">
@@ -106,6 +106,31 @@ export function Peek({ at, machines }: { at: Destination | undefined; machines: 
           </Part>
         )}
         {owner.id === here ? <Changed workspace={workspace.id} glyphs={all.map((r) => r.glyph)} read={ready} /> : <Elsewhere machine={owner.name} />}
+      </Shell>
+    );
+  }
+  if (at.kind === "command") {
+    const c = at.command;
+    return (
+      <Shell label={`Preview of ${c.title}`}>
+        <header className="space-y-1.5">
+          <p className="text-[11px] font-medium tracking-wide text-neutral-500 uppercase">{c.group}</p>
+          <h3 className="flex items-center gap-2 text-base font-semibold text-neutral-50 [&_svg]:size-4">
+            {c.icon}
+            {c.title}
+          </h3>
+        </header>
+        <p className="text-xs leading-5 text-neutral-400">{c.about}</p>
+        {(c.hint || c.keys) && (
+          <p className="flex items-center gap-2 text-xs text-neutral-500">
+            {c.hint && <span className="text-neutral-300">{c.hint}</span>}
+            {c.keys && (
+              <span>
+                From anywhere: <kbd className="rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] text-neutral-300">{c.keys}</kbd>
+              </span>
+            )}
+          </p>
+        )}
       </Shell>
     );
   }
@@ -148,7 +173,7 @@ function Head({ glyph, label, name, workspace, machine, many }: { glyph?: Glyph;
         )}
       </h3>
       <p className="truncate font-mono text-[11px] text-neutral-500">
-        {workspace.project} · {workspace.branch}
+        {workspace.project} · {branchOf(workspace)}
         {many && ` · ${machine}`}
       </p>
     </header>

@@ -67,6 +67,10 @@ pub struct Session {
     /// The owner never writes `Unreachable`. Only a receiver shows it, while the owner is
     /// offline.
     pub state: SessionState,
+    /// The name a person gave it, shown in place of its first prompt. `None` until it is
+    /// renamed, once the name is cleared, and in a record from a peer that does not write it.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// The owner machine's load, memory, disk and session count.
@@ -181,6 +185,7 @@ pub(crate) mod tests {
                 terminal: TerminalId::random(),
                 model: "claude-opus-5-5".into(),
                 state: SessionState::WaitingForYou,
+                name: Some("tidy the cart".into()),
             },
         }
     }
@@ -238,6 +243,18 @@ pub(crate) mod tests {
         );
         let json = serde_json::to_value(machine_sample()).unwrap();
         assert_eq!(json["body"]["update_refused"], "v0.2.0");
+    }
+
+    #[test]
+    fn a_session_with_no_name_reads_as_unnamed_and_one_with_a_name_writes_it_under_its_name() {
+        let mut json = serde_json::to_value(session().body).unwrap();
+        assert_eq!(json["name"], "tidy the cart");
+        json.as_object_mut().unwrap().remove("name");
+        let unnamed: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(unnamed.name, None);
+        let mut record = session();
+        record.body.name = None;
+        assert_round_trip(&record);
     }
 
     #[test]
@@ -373,6 +390,7 @@ pub(crate) mod tests {
                         terminal: TerminalId(id(c)),
                         model: "m".into(),
                         state: SessionState::WaitingForYou,
+                        name: None,
                     },
                 }),
             ),

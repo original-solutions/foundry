@@ -16,6 +16,8 @@ One bar runs along the top of the terminal. From left to right:
 
 On a phone the bar also has a button that opens the workspaces list, and a **Jump to** button.
 
+When the bar is short of room, for example with the sidebar and Steps both open, what you need least gives way first, so nothing spills out of the bar. The next steps go first, then the machine name. Next, **Changes** and **Steps** shrink to their icons. At its narrowest, as on a phone, **Changes** and **Steps** move into **More**, and two or more tabs get a row of their own. The workspace name and the tab you are on always stay.
+
 **+** only shows for workspaces on this machine. For a workspace on another machine, the menu also leaves out the entries that start a session or a shell.
 
 ## Sessions and shells
@@ -35,6 +37,14 @@ Press **+**, then choose:
 
 ![The new-session dialog with a model and a first prompt](images/sessions-new-dialog.png)
 
+### Rename a session
+
+A session shows its first prompt beside its model until you name it. Double-click the name in the sidebar or in the tab strip, or pick **Rename** in the terminal's menu anywhere it is listed. Type the name and press `Enter`; `Esc` puts the old one back. The name shows everywhere the session is listed, on every machine. Clear the field and press `Enter` to go back to the first prompt. A shell keeps its name.
+
+## Go through what needs you
+
+While any session needs you, an amber strip heads every page: the board, the timeline, the machines, the factory and an open terminal. It says how many need you, then the workspace of the next one and what it asks. Click it, or press `Cmd+J` anywhere, to open that one. Answer it, then click the strip or press `Cmd+J` again for the one after. Over a terminal that still needs you, the strip counts the others as "1 more needs you" and stays quiet. Once you have answered, it fills and glows once. The order is the board's. After the last, `Cmd+J` goes round to the first.
+
 ## Session states
 
 The tab, the sidebar and the board all show a session's state the same way. Three states matter most.
@@ -42,10 +52,10 @@ The tab, the sidebar and the board all show a session's state the same way. Thre
 | State | What it means | What to do |
 | --- | --- | --- |
 | **Working** | Claude is in the middle of a turn. | Nothing. Watch the terminal or open **Steps**. |
-| **Needs you** | Claude asked a question or wants permission. | Open the terminal and answer. On a phone the key bar offers **1**, **2** and **3**. |
+| **Needs you** | Claude asked a question or wants permission. | Open the terminal and answer. On a phone the key bar offers **1**, **2** and **3**. The strip at the top of the page goes on to the next one. |
 | **Ready** | The turn is done and Claude waits for your next prompt. | Type a prompt, or pick a next step. |
 
-You may also see **Starting**, before the session has reported anything, and **Stuck**, after ten minutes with no output. Open a stuck session and see what it is doing. **Failed** and **Ended** mean it stopped. **Unreachable** means its machine cannot be reached right now.
+You may also see **Starting**, before the session has reported anything, and **Stuck**, after ten minutes with no output. Open a stuck session and see what it is doing. A session in a live factory run reads **Quiet 10+ min** instead, wherever it shows, because the factory watches it. See [Group the board](board.md#group-the-board). **Failed** and **Ended** mean it stopped. **Unreachable** means its machine cannot be reached right now.
 
 ## Steps
 
@@ -55,7 +65,9 @@ You may also see **Starting**, before the session has reported anything, and **S
 
 Each turn is a card. It starts with your prompt, then lists every tool call and every question Claude asked, each with how long ago it happened. Earlier turns fold up to their prompt, a count such as "2 edits · 1 read · 1 command" and how long they took. Click a card to open or fold it. The newest turn stays open and grows as Claude works, and the column keeps the newest step in view unless you scroll up.
 
-Each step has a small mark: `$` for a command, `±` for an edit or write, `R` for a read, `S` for a search, `W` for a web look-up, `A` for a sub-agent and `?` for a question.
+Each step has a small mark: `$` for a command, `±` for an edit or write, `R` for a read, `S` for a search, `W` for a web look-up, `A` for a sub-agent and `?` for a question. Click an edit to open that file's diff in **Changes**.
+
+Switch from **Turns** to **Files** to see the same steps by what they touched. Every file Claude read or changed is listed once, changed files first, with how many edits and reads. A file with changes shows its lines added and removed, and clicking it opens its diff. Below the files come the commands Claude ran and its other tools, each once, with how many times. Each row has a strip with a tick wherever along the session it was touched, and a gap where a new turn starts, so a file edited early and again at the end, or a test run four times, shows at a glance. Your choice of **Turns** or **Files** is kept in this browser.
 
 A shell has no steps. Open a session to follow what it does. On a phone Steps takes the whole screen.
 
@@ -84,7 +96,7 @@ On a narrow screen there is no Find button in the header. Use **Find in scrollba
 
 Only the machine that holds a workspace can read its changes. For a workspace on another machine, the sheet says it could not read them. Open that machine's own UI to see them.
 
-The top shows the branch and its base, the lines added and removed, the file count, how many files are **uncommitted** and how many commits there are. Below it is a list of files and each file's diff. A letter beside each file says whether it was added, modified, deleted or renamed, or is new and not yet in git.
+The top shows the branch and its base, the lines added and removed, the file count, how many files are **uncommitted** and how many commits there are. Below it is a list of files and each file's diff. A letter beside each file says whether it was added, modified, deleted or renamed, or is new and not yet in git. Each diff is coloured as code in its file's language. Where a line was changed rather than added, the words that changed are marked on the old line and the new one.
 
 Once the branch has something to say, one line under the title tells where it stands. It reads **Not pushed** with how many commits are only on this machine, **Pushed**, a draft or open **PR #n** with its checks and review, or **PR #n merged**. Checks read **Checks running**, **Checks pass** or **Checks failing**. The review reads **Review required**, **Approved** or **Changes requested**. The pull request's number links to GitHub.
 
@@ -121,7 +133,7 @@ When a session on this machine is **Ready**, Foundry looks at its workspace and 
 
 Nothing is offered once the pull request is merged or closed. After you press a chip, all of them stay dimmed until the session starts working, so the same step is never sent twice. If it did not reach the session, **Not sent** appears beside it.
 
-Next steps show in the header only on a wide screen with a mouse, outside a split. On a phone they lead the key bar. They also show under the session's row on [the board](board.md#reading-a-card).
+Next steps show in the header only when it has room, with a mouse and outside a split. On a phone they lead the key bar. They also show under the session's row on [the board](board.md#reading-a-card).
 
 ## Hand a file to Claude
 
@@ -159,7 +171,7 @@ Close a side with its **Close pane** button, or press `Cmd+\` again. The termina
 Press **More** in the header, right-click a terminal anywhere it is listed, long-press it on a touch screen, or press `Tab` on it in the jump palette. The menu lists what you can do:
 
 - **Open** for a terminal you are not on, and **Open beside** on a wide screen.
-- **Steps** for a session.
+- **Steps** and **Rename** for a session.
 - **Find in scrollback** on a narrow screen.
 - **Changes in** the workspace.
 - **New session in** and **New shell in** the workspace.
@@ -198,7 +210,8 @@ Press `?` outside a text field or the terminal, or the sidebar's **Keyboard** bu
 
 | Where | Keys | What it does |
 | --- | --- | --- |
-| Anywhere | `Cmd+K` | Jump to a terminal or workspace, or give Claude a new task |
+| Anywhere | `Cmd+K` | Jump to a terminal, a view or an action, or give Claude a new task |
+| | `Cmd+J` | Go to the next terminal that needs you |
 | | `Cmd+F` | Find in the open terminal |
 | | `Cmd+\` | Open a terminal beside this one, or close the split |
 | | `Cmd+B` | Collapse the workspaces list to a rail of states, or expand it |
@@ -211,6 +224,8 @@ Press `?` outside a text field or the terminal, or the sidebar's **Keyboard** bu
 | | `[` / `]` | Earlier / later commit; before the first, all changes |
 | | `Cmd+Enter` | Add the comment on a line |
 | | `Esc` | Drop the comment being written |
+| A name being edited | `Enter` | Save it; an empty session name clears it |
+| | `Esc` | Put the name back |
 | A reply box, on a card or a toast | `Enter` | Send the reply |
 | | `Esc` | Close the box; on a toast, dismiss it |
 

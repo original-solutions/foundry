@@ -1187,6 +1187,7 @@ mod tests {
                 terminal: TerminalId(uuid::Uuid::from_u128(0x5e6)),
                 model: "opus".into(),
                 state,
+                name: None,
             },
         }
     }

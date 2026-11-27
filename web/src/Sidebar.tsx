@@ -7,13 +7,16 @@ import { Named, Now } from "./Now";
 import { startShell } from "./api";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
-import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
+import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
+import { FactoryMark } from "./FactoryMark";
 import { MachineName } from "./Machines";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
+import { SessionNameField, useRenaming } from "./SessionName";
 import { SparkIcon } from "./FirstPrompt";
 import { Mark } from "./Mark";
+import { ProjectFace } from "./ProjectFace";
 import { ThemeButton } from "./ThemeButton";
 import { railKey } from "./collapsed";
 import type { MachineSample } from "./api";
@@ -134,16 +137,18 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
   };
   const tab = (id: string) => ({ tabIndex: id === stop ? 0 : -1, onFocus: () => setFocused(id) });
 
+  // The header sits above the list that scrolls, so a scrollbar takes its width from the list
+  // and the header always has the sidebar's full width for its buttons.
   return (
-    <nav id="sidebar" aria-label="Workspaces" onKeyDown={keys} className="flex h-full w-full shrink-0 flex-col gap-4 overflow-y-auto bg-neutral-900 p-3 text-sm text-neutral-100 md:w-80">
-      <div className="flex items-center justify-between gap-2">
-        <h1 className="text-lg font-semibold">
-          <Link to="/" onClick={onNavigate} title="The board" className="flex items-center gap-1.5 rounded">
-            <Mark className="size-3.5 text-emerald-400" />
-            Foundry
+    <nav id="sidebar" aria-label="Workspaces" onKeyDown={keys} className="flex h-full w-full shrink-0 flex-col bg-neutral-900 text-sm text-neutral-100 md:w-80">
+      <div className="flex shrink-0 items-center justify-between gap-2 px-3 pt-3">
+        <h1 className="min-w-0 text-lg font-semibold">
+          <Link to="/" onClick={onNavigate} title="The board" className="flex min-w-0 items-center gap-1.5 rounded">
+            <Mark className="size-3.5 shrink-0 text-emerald-400" />
+            <span className="truncate">Foundry</span>
           </Link>
         </h1>
-        <div className="flex items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-0.5">
           {onRail && (
             <button
               type="button"
@@ -175,86 +180,88 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
           )}
         </div>
       </div>
-      {machines.map((machine) => {
-        const ids = machine.workspaces.map((w) => w.id);
-        const allFolded = ids.length > 0 && ids.every((id) => !unfolded.has(id));
-        return (
-          <section key={machine.id} aria-label={machine.name} className="space-y-2">
-            <div className="px-1">
-              <div className="group/machine flex items-center gap-2">
-                <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${statusDot[machine.status]}`} />
-                <MachineName machine={machine} className="text-sm font-semibold">
-                  {(rename) => (
-                    <>
-                      <h2 className="min-w-0 truncate font-semibold">
-                        <Link
-                          to="/machines"
-                          onClick={onNavigate}
-                          title={`${machine.id}: its load, memory, disk and workspaces`}
-                          className="rounded hover:underline hover:decoration-neutral-600 hover:underline-offset-4"
-                        >
-                          {machine.name}
-                        </Link>
-                      </h2>
-                      {rename && (
-                        <Action
-                          label={`Rename ${machine.name}`}
-                          title="Rename"
-                          onClick={rename}
-                          className="shrink-0 pointer-fine:opacity-0 pointer-fine:group-hover/machine:opacity-100 pointer-fine:focus-visible:opacity-100"
-                        >
-                          <path d="M10.5 2.5l3 3L6 13H3v-3z" />
-                        </Action>
-                      )}
-                    </>
+      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-3 pt-4">
+        {machines.map((machine) => {
+          const ids = machine.workspaces.map((w) => w.id);
+          const allFolded = ids.length > 0 && ids.every((id) => !unfolded.has(id));
+          return (
+            <section key={machine.id} aria-label={machine.name} className="space-y-2">
+              <div className="px-1">
+                <div className="group/machine flex items-center gap-2">
+                  <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${statusDot[machine.status]}`} />
+                  <MachineName machine={machine} className="text-sm font-semibold">
+                    {(rename) => (
+                      <>
+                        <h2 className="min-w-0 truncate font-semibold">
+                          <Link
+                            to="/machines"
+                            onClick={onNavigate}
+                            title={`${machine.id}: its load, memory, disk and workspaces`}
+                            className="rounded hover:underline hover:decoration-neutral-600 hover:underline-offset-4"
+                          >
+                            {machine.name}
+                          </Link>
+                        </h2>
+                        {rename && (
+                          <Action
+                            label={`Rename ${machine.name}`}
+                            title="Rename"
+                            onClick={rename}
+                            className="shrink-0 pointer-fine:opacity-0 pointer-fine:group-hover/machine:opacity-100 pointer-fine:focus-visible:opacity-100"
+                          >
+                            <path d="M10.5 2.5l3 3L6 13H3v-3z" />
+                          </Action>
+                        )}
+                      </>
+                    )}
+                  </MachineName>
+                  <span className={`text-xs ${statusColour[machine.status]}`}>{machine.status}</span>
+                  {ids.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => fold(ids, !allFolded)}
+                      className="ml-auto shrink-0 rounded px-1 text-[11px] text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+                    >
+                      {allFolded ? "Unfold all" : "Fold all"}
+                    </button>
                   )}
-                </MachineName>
-                <span className={`text-xs ${statusColour[machine.status]}`}>{machine.status}</span>
-                {ids.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => fold(ids, !allFolded)}
-                    className="ml-auto shrink-0 rounded px-1 text-[11px] text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
-                  >
-                    {allFolded ? "Unfold all" : "Fold all"}
-                  </button>
-                )}
+                </div>
+                <div className="mt-1 flex items-start gap-2 text-xs text-neutral-400">
+                  {machine.sample && <LoadMeter sample={machine.sample} />}
+                  <span className="min-w-0" title={machineNumbers(machine.sample)}>
+                    {machineStats(machine.sample)}
+                  </span>
+                </div>
               </div>
-              <div className="mt-1 flex items-start gap-2 text-xs text-neutral-400">
-                {machine.sample && <LoadMeter sample={machine.sample} />}
-                <span className="min-w-0" title={machineNumbers(machine.sample)}>
-                  {machineStats(machine.sample)}
-                </span>
+              <div className="space-y-1">
+                {machine.workspaces.map((workspace) => (
+                  <Workspace
+                    key={workspace.id}
+                    workspace={workspace}
+                    folded={!unfolded.has(workspace.id)}
+                    onFold={(on) => fold([workspace.id], on)}
+                    selected={selected}
+                    onNavigate={onNavigate}
+                    onChanges={onChanges}
+                    tab={tab}
+                  />
+                ))}
               </div>
-            </div>
-            <div className="space-y-1">
-              {machine.workspaces.map((workspace) => (
-                <Workspace
-                  key={workspace.id}
-                  workspace={workspace}
-                  folded={!unfolded.has(workspace.id)}
-                  onFold={(on) => fold([workspace.id], on)}
-                  selected={selected}
-                  onNavigate={onNavigate}
-                  onChanges={onChanges}
-                  tab={tab}
-                />
-              ))}
-            </div>
-          </section>
-        );
-      })}
-      {onKeys && (
-        <button
-          type="button"
-          onClick={onKeys}
-          title="Every key Foundry answers"
-          className="mt-auto flex items-center gap-1.5 self-start rounded px-1 text-xs text-neutral-500 hover:text-neutral-200 pointer-coarse:hidden"
-        >
-          Keyboard
-          <kbd className="rounded border border-neutral-700 px-1 font-sans text-[11px] leading-4">?</kbd>
-        </button>
-      )}
+            </section>
+          );
+        })}
+        {onKeys && (
+          <button
+            type="button"
+            onClick={onKeys}
+            title="Every key Foundry answers"
+            className="mt-auto flex items-center gap-1.5 self-start rounded px-1 text-xs text-neutral-500 hover:text-neutral-200 pointer-coarse:hidden"
+          >
+            Keyboard
+            <kbd className="rounded border border-neutral-700 px-1 font-sans text-[11px] leading-4">?</kbd>
+          </button>
+        )}
+      </div>
     </nav>
   );
 }
@@ -310,15 +317,17 @@ function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges,
           <svg viewBox="0 0 16 16" aria-hidden="true" className={`size-3 shrink-0 text-neutral-500 transition-transform motion-reduce:transition-none ${folded ? "" : "rotate-90"}`} fill="currentColor">
             <path d="M6 3.5l5 4.5-5 4.5z" />
           </svg>
+          <ProjectFace project={workspace.project} className="size-[18px] text-[9px]" />
           <span className="truncate font-medium">{workspace.name}</span>
         </button>
+        {workspace.factory && <FactoryMark run={workspace.factory} />}
         {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
       </div>
       {!folded && (
         <>
           <div className="flex items-center gap-2 pl-6 pr-1">
             <span className="min-w-0 flex-1 truncate text-xs text-neutral-500">
-              {workspace.branch} · {workspace.project}
+              {branchOf(workspace)} · {workspace.project}
             </span>
             <div className="flex shrink-0 items-center gap-0.5 pointer-fine:hidden pointer-fine:group-focus-within/ws:flex pointer-fine:group-hover/ws:flex">
               {onChanges && (
@@ -418,9 +427,18 @@ function Action({ label, title, onClick, disabled, className = "", children }: {
 function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspace: string; selected?: string; onNavigate?: () => void; tab: WorkspaceProps["tab"] }) {
   const current = row.terminal === selected;
   const ended = row.glyph === "done" || row.glyph === "away";
+  const naming = useRenaming(row.terminal, "row");
+  if (naming?.editing && row.session) {
+    return (
+      <li className="flex items-center gap-2 rounded bg-neutral-800 px-2 py-1 md:py-0.5">
+        <StateGlyph glyph={row.glyph} />
+        <SessionNameField session={row.session} name={row.title ?? ""} onClose={naming.stop} className="text-sm" />
+      </li>
+    );
+  }
   return (
     <li>
-      <TerminalMenu id={row.terminal}>
+      <TerminalMenu id={row.terminal} place="row">
         <Link
           to="/terminals/$terminalId"
           params={{ terminalId: row.terminal }}
@@ -430,6 +448,7 @@ function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspa
           data-workspace={workspace}
           data-name={row.title ? `${row.name} ${row.title}` : row.name}
           {...tab(row.terminal)}
+          onDoubleClick={row.session ? naming?.start : undefined}
           title={row.title ? `${row.name}: ${row.title}` : undefined}
           className={`flex items-start gap-2 rounded px-2 py-1.5 hover:bg-neutral-800 md:py-1 ${current ? "bg-neutral-800 text-neutral-50" : ended ? "text-neutral-500" : ""}`}
         >

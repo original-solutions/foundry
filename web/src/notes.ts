@@ -1,6 +1,6 @@
 import type { DiffLine } from "./changes";
-import type { SessionView } from "./fleet";
-import { sessionGlyph, sessionLabel, type Glyph } from "./labels";
+import { sessionLabelIn, type FactoryRun, type SessionView } from "./fleet";
+import { sessionGlyph, type Glyph } from "./labels";
 
 /** Where a comment sits: a line of the file as it is now ("new") or a removed line of the base ("old"). */
 export interface Anchor {
@@ -63,10 +63,11 @@ export interface Taker {
 
 const TITLE_SHOWN = 40;
 
-export function takers(sessions: SessionView[]): Taker[] {
+/** The sessions that can take comments, labelled as the sidebar labels them in factory run `run`. */
+export function takers(sessions: SessionView[], run?: FactoryRun): Taker[] {
   return sessions.map((s) => {
     const title = s.title && (s.title.length > TITLE_SHOWN ? `${s.title.slice(0, TITLE_SHOWN - 1)}…` : s.title);
     const name = title ? `${s.name} · ${title}` : s.name;
-    return { terminal: s.terminal, name, ready: s.state === "idle", label: sessionLabel[s.state], glyph: sessionGlyph[s.state] };
+    return { terminal: s.terminal, name, ready: s.state === "idle", label: sessionLabelIn(s.state, run), glyph: sessionGlyph[s.state] };
   });
 }
