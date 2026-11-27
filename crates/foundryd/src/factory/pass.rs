@@ -4791,6 +4791,108 @@ mod tests {
         }
     }
 
+    mod the_held_up_runs_of_the_status {
+        use super::*;
+        use crate::factory::ledger::events::Outcome;
+
+        /// Attempt `attempt` of `issue`, which went `to` (`stuck` or `needs-info`) saying
+        /// `reason` and finished.
+        fn held_up_run(rig: &Rig, issue: u64, attempt: u32, to: State, reason: &str) -> RunId {
+            let run = rig.run_in(issue, attempt, State::Building);
+            let cause = Cause::new(CauseStep::Start, "test");
+            let (said, outcome) = if to == State::Stuck {
+                let said = Event::Stuck {
+                    reason: reason.into(),
+                    branch: None,
+                    commits_ahead: None,
+                };
+                (said, Outcome::Stuck)
+            } else {
+                let said = Event::QuestionsPosted {
+                    questions: reason.into(),
+                };
+                (said, Outcome::NeedsInfo)
+            };
+            for event in [
+                said,
+                Event::StateChanged {
+                    from: State::Building,
+                    to,
+                },
+                Event::Finished {
+                    outcome,
+                    total_ms: 0,
+                    gate_attempts: 0,
+                    review_cycles: None,
+                    pr_url: None,
+                    pr_end: None,
+                },
+            ] {
+                rig.ledger.write(&run, &event, &cause).unwrap();
+            }
+            run
+        }
+
+        #[test]
+        fn a_run_finished_stuck_is_held_up_while_its_issue_is_stuck() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = held_up_run(&rig, 5, 1, State::Stuck, "the gate failed 3 times");
+            rig.pass();
+            assert_eq!(
+                rig.status().held_up,
+                vec![HeldUp {
+                    run,
+                    kind: HeldUpKind::Stuck,
+                    reason: "the gate failed 3 times".into(),
+                }]
+            );
+        }
+
+        #[test]
+        fn a_run_finished_needs_info_is_held_up_while_its_issue_needs_info() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:needs-info"]);
+            let run = held_up_run(&rig, 5, 1, State::NeedsInfo, "Which login?");
+            rig.pass();
+            assert_eq!(
+                rig.status().held_up,
+                vec![HeldUp {
+                    run,
+                    kind: HeldUpKind::NeedsInfo,
+                    reason: "Which login?".into(),
+                }]
+            );
+        }
+
+        #[test]
+        fn a_held_up_run_is_let_go_once_its_issue_leaves_the_label() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            held_up_run(&rig, 5, 1, State::Stuck, "no");
+            rig.pass();
+            assert_eq!(rig.status().held_up.len(), 1);
+            rig.hub.edit(5, |issue| issue.labels.clear());
+            rig.pass();
+            assert!(rig.status().held_up.is_empty());
+        }
+
+        /// The label is the newest run's: an earlier attempt that went stuck is not held up
+        /// again, nor a run whose outcome is not the label the issue carries.
+        #[test]
+        fn only_the_newest_run_of_the_issue_is_held_up_and_only_for_its_own_label() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            held_up_run(&rig, 5, 1, State::Stuck, "the first time");
+            let newest = held_up_run(&rig, 5, 2, State::Stuck, "the second time");
+            rig.hub.issue(6, &["factory:stuck"]);
+            held_up_run(&rig, 6, 1, State::NeedsInfo, "Which login?");
+            rig.pass();
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![newest]);
+        }
+    }
+
     mod feedback_and_the_fleets_slots {
         use super::*;
 
