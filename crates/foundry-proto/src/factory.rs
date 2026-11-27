@@ -788,11 +788,13 @@ pub(crate) mod tests {
                     run: other.clone(),
                     kind: HeldUpKind::Stuck,
                     reason: "the gate failed".into(),
+                    workspaces: vec![WorkspaceId::random()],
                 },
                 HeldUp {
                     run: id.clone(),
                     kind: HeldUpKind::NeedsInfo,
                     reason: "1. Which login?".into(),
+                    workspaces: vec![],
                 },
             ],
             gate_infra: vec![other.clone()],
@@ -1177,5 +1179,18 @@ pub(crate) mod tests {
             let back: FactoryRecord = serde_json::from_value(json).unwrap();
             assert_eq!(back, record);
         }
+    }
+
+    /// A status from a peer built before held-up runs named their workspaces still parses,
+    /// each held-up run with none.
+    #[test]
+    fn a_held_up_run_from_an_older_peer_has_no_workspaces() {
+        let mut json = serde_json::to_value(status()).unwrap();
+        for held in json["held_up"].as_array_mut().unwrap() {
+            held.as_object_mut().unwrap().remove("workspaces");
+        }
+        let read: FactoryStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(read.held_up.len(), 2);
+        assert!(read.held_up.iter().all(|held| held.workspaces.is_empty()));
     }
 }

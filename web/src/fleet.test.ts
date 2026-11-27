@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AnyRecord, FactoryStatus, UiMessage } from "./api";
-import { apply, byUrgency, coordinatorOrder, emptyState, fleet, locate, machineNumbers, machineStats, rows, terminalRunning } from "./fleet";
+import { apply, branchOf, byUrgency, coordinatorOrder, emptyState, fleet, locate, machineNumbers, machineStats, rows, terminalRunning } from "./fleet";
 import type { Glyph } from "./labels";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
@@ -581,3 +581,21 @@ describe("the coordinator order", () => {
 function sampleOf(owner: string): AnyRecord {
   return sample(owner, 1);
 }
+
+describe("a workspace's base, project and branch", () => {
+  const commitOnly = (): AnyRecord => {
+    const record = workspace(ME, "w1", "review a commit");
+    if (record.kind === "workspace") record.body = { ...record.body, branch: "", base: "0123456789abcdef0123456789abcdef01234567" };
+    return record;
+  };
+
+  it("carries its record's base and its project's id beside the project's name", () => {
+    const [machine] = fleet([sample(ME, 1), workspace(ME, "w1", "fix login")], settings());
+    expect(machine.workspaces[0]).toMatchObject({ project: "demo", projectId: "p1", base: "main" });
+  });
+
+  it("shows its branch, or the first 7 characters of its commit when its branch is empty", () => {
+    const [machine] = fleet([sample(ME, 1), workspace(ME, "w2", "fix login"), commitOnly()], settings());
+    expect(machine.workspaces.map(branchOf)).toEqual(["fix-login", "0123456"]);
+  });
+});

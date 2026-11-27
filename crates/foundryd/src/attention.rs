@@ -1757,6 +1757,7 @@ mod tests {
             run: run(issue),
             kind,
             reason: reason.into(),
+            workspaces: vec![],
         }
     }
 

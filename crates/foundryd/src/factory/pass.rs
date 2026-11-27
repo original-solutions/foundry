@@ -4843,11 +4843,27 @@ mod tests {
         use super::*;
         use crate::factory::ledger::events::Outcome;
 
-        /// Attempt `attempt` of `issue`, which went `to` (`stuck` or `needs-info`) saying
-        /// `reason` and finished.
+        /// The workspace attempt `attempt` of `issue` builds in.
+        fn workspace_of(issue: u64, attempt: u32) -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(
+                0xb000 + u128::from(issue) * 0x10 + u128::from(attempt),
+            ))
+        }
+
+        /// Attempt `attempt` of `issue`, which built in [`workspace_of`], went `to` (`stuck` or
+        /// `needs-info`) saying `reason` and finished.
         fn held_up_run(rig: &Rig, issue: u64, attempt: u32, to: State, reason: &str) -> RunId {
             let run = rig.run_in(issue, attempt, State::Building);
             let cause = Cause::new(CauseStep::Start, "test");
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::StepChanged {
+                        step: format!("workspace-created {}", workspace_of(issue, attempt)),
+                    },
+                    &cause,
+                )
+                .unwrap();
             let (said, outcome) = if to == State::Stuck {
                 let said = Event::Stuck {
                     reason: reason.into(),
@@ -4893,6 +4909,7 @@ mod tests {
                     run,
                     kind: HeldUpKind::Stuck,
                     reason: "the gate failed 3 times".into(),
+                    workspaces: vec![workspace_of(5, 1)],
                 }]
             );
         }
@@ -4909,8 +4926,34 @@ mod tests {
                     run,
                     kind: HeldUpKind::NeedsInfo,
                     reason: "Which login?".into(),
+                    workspaces: vec![workspace_of(5, 1)],
                 }]
             );
+        }
+
+        /// A run the ledger shows stuck that has not finished yet names its workspace too.
+        #[test]
+        fn a_stuck_run_not_finished_yet_names_its_workspace() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = rig.run_in(5, 1, State::Building);
+            let cause = Cause::new(CauseStep::Start, "test");
+            for event in [
+                Event::StepChanged {
+                    step: format!("workspace-created {}", workspace_of(5, 1)),
+                },
+                Event::StateChanged {
+                    from: State::Building,
+                    to: State::Stuck,
+                },
+            ] {
+                rig.ledger.write(&run, &event, &cause).unwrap();
+            }
+            rig.pass();
+            let held = rig.status().held_up;
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert_eq!(held[0].run, run);
+            assert_eq!(held[0].workspaces, vec![workspace_of(5, 1)]);
         }
 
         #[test]
