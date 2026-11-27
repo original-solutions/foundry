@@ -540,6 +540,51 @@ describe("App", () => {
     expect(screen.getByRole("navigation", { name: "Workspaces" }).id).toBe("sidebar");
   });
 
+  const asking: UiMessage & { type: "state" } = {
+    ...live,
+    records: [
+      sample(ME, 1),
+      workspace(ME, "w1", "fix login"),
+      terminal(ME, "t1", "w1", "running"),
+      session(ME, "s1", "w1", "t1", "waiting_for_you", { model: "sonnet" }),
+      workspace(ME, "w2", "tidy cart"),
+      terminal(ME, "t3", "w2", "running"),
+      session(ME, "s3", "w2", "t3", "waiting_for_you"),
+      workspace(ME, "w3", "busy"),
+      terminal(ME, "t4", "w3", "running"),
+      session(ME, "s4", "w3", "t4", "working"),
+    ],
+  };
+
+  it("offers the next terminal that needs you in the header, and goes to it with its link or Cmd+J", async () => {
+    mockActions();
+    const router = await open("/terminals/t1", asking);
+
+    const next = screen.getByRole("link", { name: "Next that needs you: tidy cart / opus, 1 more needs you" });
+    expect(within(screen.getByLabelText("Open terminal")).getByRole("link", { name: /^Next that needs you/ })).toBe(next);
+
+    fireEvent.keyDown(window, { key: "j", metaKey: true });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t3"));
+    // Round again to the first.
+    expect(screen.getByRole("link", { name: "Next that needs you: fix login / sonnet, 1 more needs you" })).toBeDefined();
+    fireEvent.keyDown(window, { key: "j", metaKey: true });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+  });
+
+  it("takes Cmd+J from the board to the first that needs you, and offers nothing when only the open terminal does", async () => {
+    mockActions();
+    const router = await open("/", asking);
+    fireEvent.keyDown(window, { key: "j", metaKey: true });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+
+    act(() => {
+      sockets("/api/events")
+        .at(-1)!
+        .deliver(JSON.stringify({ ...asking, records: asking.records.map((r) => (r.kind === "session" && r.body.id === "s3" ? { ...r, version: 2, body: { ...r.body, state: "idle" } } : r)) }));
+    });
+    expect(screen.queryByRole("link", { name: /^Next that needs you/ })).toBeNull();
+  });
+
   it("opens collapsed in a window too narrow for the list and a terminal, while a phone's drawer still holds the whole list", async () => {
     vi.stubGlobal("innerWidth", 900);
     await open("/terminals/t1", live);

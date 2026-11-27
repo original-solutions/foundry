@@ -11,6 +11,7 @@ One bar runs along the top of the terminal. From left to right:
 - The workspace name, then the machine it runs on. Point at the name to see its branch and project.
 - One tab for each terminal in the workspace, sessions first, then shells. Click a tab to switch. The tab you are on shows its state. When a tab in the background changes state, it shows the new state in bold until you open it.
 - A **+** that starts another terminal in this workspace. See [Start a session or a shell](#start-a-session-or-a-shell).
+- **Next**, in amber, when another terminal needs you. It names that terminal's workspace and counts how many others need you. Point at it to read what it asks. Click it, or press `Cmd+J`, to go there. Once the terminal you are on no longer needs you, **Next** fills and glows once. See [Go through what needs you](#go-through-what-needs-you).
 - **Changes**, which opens what the workspace changed. Once you have opened it, the button also shows how many lines were added and removed.
 - **Steps**, **Find** and a split button. **More**, the three dots, holds the rest.
 
@@ -35,6 +36,10 @@ Press **+**, then choose:
 
 ![The new-session dialog with a model and a first prompt](images/sessions-new-dialog.png)
 
+## Go through what needs you
+
+When several sessions need you, answer them in turn without going back to the board. Press **Go through them** beside the **Needs you** count on the board, or `Cmd+J` anywhere, to open the first. Answer it, then press **Next** in the header, or `Cmd+J` again, for the one after. The order is the board's. After the last, `Cmd+J` goes round to the first.
+
 ## Session states
 
 The tab, the sidebar and the board all show a session's state the same way. Three states matter most.
@@ -42,7 +47,7 @@ The tab, the sidebar and the board all show a session's state the same way. Thre
 | State | What it means | What to do |
 | --- | --- | --- |
 | **Working** | Claude is in the middle of a turn. | Nothing. Watch the terminal or open **Steps**. |
-| **Needs you** | Claude asked a question or wants permission. | Open the terminal and answer. On a phone the key bar offers **1**, **2** and **3**. |
+| **Needs you** | Claude asked a question or wants permission. | Open the terminal and answer. On a phone the key bar offers **1**, **2** and **3**. **Next** in the header goes on to the next one. |
 | **Ready** | The turn is done and Claude waits for your next prompt. | Type a prompt, or pick a next step. |
 
 You may also see **Starting**, before the session has reported anything, and **Stuck**, after ten minutes with no output. Open a stuck session and see what it is doing. **Failed** and **Ended** mean it stopped. **Unreachable** means its machine cannot be reached right now.
@@ -199,6 +204,7 @@ Press `?` outside a text field or the terminal, or the sidebar's **Keyboard** bu
 | Where | Keys | What it does |
 | --- | --- | --- |
 | Anywhere | `Cmd+K` | Jump to a terminal or workspace, or give Claude a new task |
+| | `Cmd+J` | Go to the next terminal that needs you |
 | | `Cmd+F` | Find in the open terminal |
 | | `Cmd+\` | Open a terminal beside this one, or close the split |
 | | `Cmd+B` | Collapse the workspaces list to a rail of states, or expand it |

@@ -115,13 +115,14 @@ body {
   }
 }
 
-/* A state glyph's one pop when its state changes, the working glyph's ripple, the changes sheet sliding in, and a ship card arriving. */
+/* A state glyph's one pop when its state changes, the working glyph's ripple, the changes sheet sliding in, a ship card arriving, and the way to the next terminal that needs you lighting up. */
 @theme {
   --animate-state-in: state-in 450ms ease-out;
   --animate-ripple: ripple 1.2s ease-in-out infinite;
   --animate-sheet-in: sheet-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
   --animate-arrive: arrive 1.4s ease-out;
   --animate-drain: drain linear forwards;
+  --animate-nudge: nudge 1.4s ease-out;
   @keyframes state-in {
     0% {
       transform: scale(2.2);
@@ -153,6 +154,18 @@ body {
     }
     100% {
       box-shadow: 0 0 0 2px transparent;
+    }
+  }
+  /* The way to the next terminal that needs you glows once when the open one no longer does (NextUp). */
+  @keyframes nudge {
+    0% {
+      box-shadow: 0 0 0 0 var(--color-amber-400);
+    }
+    30% {
+      box-shadow: 0 0 0 4px color-mix(in oklab, var(--color-amber-400) 40%, transparent);
+    }
+    100% {
+      box-shadow: 0 0 0 8px transparent;
     }
   }
   /* The time left on a card that goes by itself (Toasts), as a line that empties. */

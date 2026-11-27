@@ -22,6 +22,8 @@ import { Said } from "./Said";
 import { BOARD_BUSY_EVERY, pollEvery } from "./poll";
 import { Timeline } from "./Timeline";
 import { Machines } from "./Machines";
+import { needing, type Needing } from "./needing";
+import { nextKey } from "./NextUp";
 import type { History } from "./samples";
 import { readStored, store } from "./storage";
 
@@ -124,6 +126,7 @@ export function Board({
   const launch = useCreateWorkspace();
   const board = lanes(machines);
   const needs = board.find((l) => l.lane === "needs")?.cards.length ?? 0;
+  const first = needing(machines).at(0);
   const [group, setGroup] = useState(loadGroup);
   const regroup = (next: Group) => {
     setGroup(next);
@@ -178,7 +181,15 @@ export function Board({
                     );
                   })
                 : board.map(({ lane, cards }) => (
-                    <LaneSection key={lane} title={laneTitle[lane]} hint={laneHint[lane]} tone={laneTone[lane]} icon={<StateGlyph glyph={laneGlyph[lane]} still />} count={cards.length}>
+                    <LaneSection
+                      key={lane}
+                      title={laneTitle[lane]}
+                      hint={laneHint[lane]}
+                      tone={laneTone[lane]}
+                      icon={<StateGlyph glyph={laneGlyph[lane]} still />}
+                      count={cards.length}
+                      action={lane === "needs" && first && <GoThrough first={first} />}
+                    >
                       {cards.map((card) => (
                         <WorkspaceCard key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
                       ))}
@@ -255,7 +266,24 @@ function StageMark({ lane }: { lane: ShipLane }) {
   return <span aria-hidden="true" className={`block h-2.5 w-2.5 rounded-sm border-2 border-current ${outline ? "" : "bg-current"}`} />;
 }
 
-function LaneSection({ title, hint, tone, icon, count, children }: { title: string; hint: string; tone: string; icon: React.ReactNode; count: number; children: React.ReactNode }) {
+function LaneSection({
+  title,
+  hint,
+  tone,
+  icon,
+  count,
+  action,
+  children,
+}: {
+  title: string;
+  hint: string;
+  tone: string;
+  icon: React.ReactNode;
+  count: number;
+  /** Shown after the lane's count. */
+  action?: React.ReactNode;
+  children: React.ReactNode;
+}) {
   const id = useId();
   return (
     <section aria-labelledby={id} className="flex flex-col gap-3">
@@ -265,10 +293,30 @@ function LaneSection({ title, hint, tone, icon, count, children }: { title: stri
           {title}
         </h2>
         <span className="rounded-full bg-neutral-800 px-1.5 text-[11px] text-neutral-400">{count}</span>
+        {action}
         <span aria-hidden="true" className="h-px flex-1 bg-neutral-800" />
       </div>
       <div className="grid grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] gap-3">{children}</div>
     </section>
+  );
+}
+
+/**
+ * The start of going through what needs you, at the head of its lane: it opens the first, and
+ * from there the bar above each terminal (or the key) leads to the next (`NextUp`).
+ */
+function GoThrough({ first }: { first: Needing }) {
+  return (
+    <Link
+      to="/terminals/$terminalId"
+      params={{ terminalId: first.terminal }}
+      aria-label={`Go through what needs you, from ${first.workspace} / ${first.name}`}
+      title={`Open each that needs you in turn (${nextKey})`}
+      className="-my-1 ml-1 flex shrink-0 items-center gap-1.5 rounded-full border border-amber-400/30 px-2.5 py-0.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-400/10"
+    >
+      Go through them
+      <kbd className="hidden font-sans text-[11px] text-amber-300/70 pointer-fine:inline">{nextKey}</kbd>
+    </Link>
   );
 }
 

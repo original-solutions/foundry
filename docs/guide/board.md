@@ -38,7 +38,7 @@ On cards of this machine, a line under the changes says how far the branch has t
 - **Working.** An agent is working or starting.
 - **Quiet.** Nothing is happening.
 
-Inside a group, the most urgent card comes first.
+Inside a group, the most urgent card comes first. **Go through them**, beside the **Needs you** count, opens the first session that needs you; from there **Next** in its header leads to the rest. See [Go through what needs you](sessions.md#go-through-what-needs-you).
 
 **Shipping** sorts by how far each workspace's work has gone on its way to the main branch.
 

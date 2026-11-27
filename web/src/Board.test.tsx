@@ -153,6 +153,13 @@ describe("Board", () => {
     expect(within(quiet).getByRole("article", { name: "far away" })).toBeDefined();
   });
 
+  it("starts going through what needs you from the head of its lane, at the first one", async () => {
+    await show(fleet(records(), settings()));
+    const start = within(screen.getByRole("region", { name: "Needs you" })).getByRole("link", { name: /^Go through what needs you/ });
+    expect(start.getAttribute("href")).toBe("/terminals/t3");
+    expect(start.title).toContain("J");
+  });
+
   it("lists no workspace of a machine the machine list does not hold, nor its terminals or sessions", async () => {
     const all = [
       ...records(),

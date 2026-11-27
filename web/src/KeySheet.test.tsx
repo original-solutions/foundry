@@ -24,7 +24,7 @@ describe("KeySheet", () => {
     fireEvent.keyDown(document.body, { key: "?" });
 
     const sheet = screen.getByRole("dialog", { name: "Keyboard" });
-    for (const what of ["Jump to a terminal or workspace, or give Claude a new task", "Find in the open terminal", "Move between workspaces and terminals", "Next file"]) {
+    for (const what of ["Jump to a terminal or workspace, or give Claude a new task", "Go to the next terminal that needs you", "Find in the open terminal", "Move between workspaces and terminals", "Next file"]) {
       expect(sheet.textContent).toContain(what);
     }
     expect(screen.getByRole("heading", { name: "The workspaces list" })).toBeDefined();

@@ -34,6 +34,7 @@ import { useMemory } from "./memory";
 import { MD, useMediaQuery } from "./media";
 import { AttentionList } from "./attention/AttentionList";
 import { WaitingList } from "./placement/WaitingList";
+import { upNext } from "./needing";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
@@ -46,10 +47,11 @@ import { WaitingList } from "./placement/WaitingList";
  * in this browser, and with none a window too narrow for the list beside a terminal starts so.
  *
  * One bar heads the terminal: its workspace, then the workspace's terminals as tabs with their
- * states, and a + that starts another session or shell in it. The few terminals shown last (and both sides of a split) keep
- * their pane attached behind the others, so going back to one is instant, from its tab or another
- * workspace; an older one attaches again when shown and gets its screen and scrollback back from
- * the holder.
+ * states, a + that starts another session or shell in it, and, when another terminal needs you,
+ * the way to the next one (Cmd+J from anywhere; the board's needs-you lane starts it too). The
+ * few terminals shown last (and both sides of a split) keep their pane attached behind the
+ * others, so going back to one is instant, from its tab or another workspace; an older one
+ * attaches again when shown and gets its screen and scrollback back from the holder.
  *
  * With nothing open, the board shows every workspace as a card with its live states and changes,
  * or, switched to its timeline, every session's turns on one clock; a turn opens its terminal
@@ -261,6 +263,8 @@ function Layout() {
   useShortcut("b", flipRail);
   useShortcut("f", terminalId ? () => setFinding((n) => n + 1) : undefined);
   useShortcut("\\", terminalId ? () => (split ? setSplit(undefined) : setJump("beside")) : undefined);
+  const next = upNext(machines, terminalId);
+  useShortcut("j", next ? () => show(next.next.terminal) : undefined);
 
   // Never had the daemon's state: say so, rather than show an empty fleet.
   if (!state.synced && link.lostAt !== undefined) return <Unreachable link={link} />;
@@ -350,6 +354,7 @@ function Layout() {
                         onClosePane={pair ? () => closePane(id) : undefined}
                         beside={id !== terminalId}
                         changed={changed}
+                        upNext={id === terminalId ? next : undefined}
                       />
                     </div>
                   ))}

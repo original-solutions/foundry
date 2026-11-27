@@ -5,10 +5,12 @@ import { findKey } from "./FindBar";
 import { totals } from "./changes";
 import type { Located } from "./fleet";
 import { machineQuery } from "./api";
-import { words } from "./labels";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { button, pressed } from "./Modal";
 import { NextSteps, offersNext } from "./NextSteps";
+import { NextUp } from "./NextUp";
+import type { Needing } from "./needing";
+import { needsYou, words } from "./labels";
 import { reply } from "./reply";
 import { StepsIcon } from "./StepsPanel";
 import { TabStrip } from "./TabStrip";
@@ -27,7 +29,8 @@ export const splitKey = jumpKey === "⌘K" ? "⌘\\" : "Ctrl \\";
  * lit edge and the other is dimmed. An idle session of this machine offers its workspace's next
  * steps (commit, open a pull request, fix failing checks) in the bar, each sent to it as a prompt;
  * with a mouse on a wide screen and outside a split only, where the bar has room (a phone's key
- * bar offers them).
+ * bar offers them). When another terminal needs you, the bar of the side with the keyboard leads
+ * the way to it (`NextUp`).
  */
 export function TerminalHeader({
   id,
@@ -44,6 +47,7 @@ export function TerminalHeader({
   onClosePane,
   beside = false,
   changed = none,
+  upNext,
 }: {
   /** The terminal it heads, for its menu. */
   id?: string;
@@ -67,6 +71,8 @@ export function TerminalHeader({
   beside?: boolean;
   /** Terminals whose state changed in the background since they were last shown. */
   changed?: Set<string>;
+  /** The next terminal that needs you, and how many do besides this one. */
+  upNext?: { next: Needing; others: number };
 }) {
   const { data: here } = useQuery(machineQuery);
   return (
@@ -98,6 +104,7 @@ export function TerminalHeader({
             </span>
           </div>
           {id ? <TabStrip workspace={located.workspace} machine={located.machine} active={id} changed={changed} apart={!!onClosePane} /> : <span className="flex-1" />}
+          {upNext && !beside && <NextUp next={upNext.next} others={upNext.others} answered={!needsYou.includes(located.glyph)} />}
           {id && !onClosePane && offersNext(located, here) && (
             <div className="hidden xl:pointer-fine:contents">
               <NextSteps workspace={located.workspace.id} name={located.name} send={(prompt) => reply(id, prompt)} look="header" />
