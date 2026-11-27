@@ -251,6 +251,9 @@ pub struct Memo {
 /// A finished run as the status shows it, with where its `finished` event stands.
 #[derive(Debug)]
 struct Done {
+    /// Why a run that finished stuck or needing information waits for a person: the summary's
+    /// reason, empty for any other run.
+    reason: String,
     /// The lease generation, the record's version and the writer of the `finished` event:
     /// the order the runs' events put it in, never the wall clock. `None` when not read.
     at: Option<(u64, u64, MachineId)>,
@@ -1621,11 +1624,75 @@ impl<'a, 'w> Pass<'a, 'w> {
             }
         }
         self.see_finished(&unfinished)?;
+        self.hold_up_finished(&unfinished);
         let mut done: Vec<&Done> = self.memo.finished.values().flatten().collect();
         // Newest first by where the `finished` event stands, then by run id for a tie.
         done.sort_by(|a, b| (&b.at, &b.run.run).cmp(&(&a.at, &a.run.run)));
         self.results.finished = done.into_iter().map(|done| done.run.clone()).collect();
         Ok(known)
+    }
+
+    /// Holds up the runs that finished stuck or needing information while their issue still
+    /// carries that label: `go_stuck` finishes the run, and a person's answer or a removed label
+    /// is what ends the wait. Only the newest attempt of an issue is held up. The issues with
+    /// each label are listed only when such a finished run exists. A listing that fails does not
+    /// end the pass, which is no one's step: what the last pass held up of these runs stays held
+    /// up until a listing is read.
+    fn hold_up_finished(&mut self, unfinished: &BTreeSet<RunId>) {
+        let world = self.world;
+        let newest = |run: &RunId| {
+            !unfinished
+                .iter()
+                .chain(self.memo.finished.keys())
+                .any(|other| other.issue() == run.issue() && other.attempt() > run.attempt())
+        };
+        let waiting: Vec<HeldUp> = self
+            .memo
+            .finished
+            .values()
+            .flatten()
+            .filter(|done| newest(&done.run.run))
+            .filter_map(|done| {
+                let kind = match done.run.outcome {
+                    RunOutcome::Stuck => HeldUpKind::Stuck,
+                    RunOutcome::NeedsInfo => HeldUpKind::NeedsInfo,
+                    _ => return None,
+                };
+                Some(HeldUp {
+                    run: done.run.run.clone(),
+                    kind,
+                    reason: done.reason.clone(),
+                })
+            })
+            .collect();
+        for (kind, state) in [
+            (HeldUpKind::Stuck, State::Stuck),
+            (HeldUpKind::NeedsInfo, State::NeedsInfo),
+        ] {
+            let of_kind: Vec<&HeldUp> = waiting.iter().filter(|held| held.kind == kind).collect();
+            if of_kind.is_empty() {
+                continue;
+            }
+            match world.tracker.list_issues(&world.project.repo, state) {
+                Ok(listing) => {
+                    let carrying: BTreeSet<u64> =
+                        listing.items.iter().map(|issue| issue.number).collect();
+                    for held in of_kind {
+                        if carrying.contains(&held.run.issue()) {
+                            self.results.held_up.push(held.clone());
+                        }
+                    }
+                }
+                Err(_) => {
+                    let before = self.memo.last.iter().flat_map(|last| &last.held_up);
+                    for held in before {
+                        if of_kind.iter().any(|now| now.run == held.run) {
+                            self.results.held_up.push(held.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Reads into the memo each run that is not in `unfinished` and not seen finished yet. A
@@ -1659,6 +1726,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                 &summary.id,
             );
             let id = summary.id.clone();
+            let reason = summary.reason.clone().unwrap_or_default();
             let run = summary.state.map(|state| FinishedRun {
                 title: summary.title.clone().unwrap_or_default(),
                 outcome: match state {
@@ -1672,7 +1740,7 @@ impl<'a, 'w> Pass<'a, 'w> {
             });
             self.memo
                 .finished
-                .insert(id, run.map(|run| Done { at, run }));
+                .insert(id, run.map(|run| Done { reason, at, run }));
         }
         Ok(())
     }
