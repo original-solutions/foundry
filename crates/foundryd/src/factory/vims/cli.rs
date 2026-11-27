@@ -560,6 +560,88 @@ mod tests {
     }
 
     #[test]
+    fn a_code_vims_is_not_known_to_refuse_with_is_no_answer_and_keeps_its_code() {
+        let dir = tempfile::tempdir().unwrap();
+        for (script, code) in [
+            (
+                "echo '{\"error\":{\"code\":\"SERVICE_UNAVAILABLE\",\"message\":\"upstream\"}}'\nexit 1",
+                Some("SERVICE_UNAVAILABLE"),
+            ),
+            (
+                "echo '{\"error\":{\"code\":\"GATEWAY_TIMEOUT\"}}'\nexit 1",
+                Some("GATEWAY_TIMEOUT"),
+            ),
+            (
+                "echo '{\"error\":{\"code\":\"NETWORK_ERROR\"}}'\nexit 1",
+                Some("NETWORK_ERROR"),
+            ),
+            (
+                "echo '{\"code\":\"INTERNAL_ERROR\"}' >&2\nexit 1",
+                Some("INTERNAL_ERROR"),
+            ),
+            (
+                "echo 'Error: CONNECTION_RESET: other side closed' >&2\nexit 1",
+                Some("CONNECTION_RESET"),
+            ),
+            ("echo 'FATAL: connection lost' >&2\nexit 1", None),
+            ("echo 'WARNING: retrying' >&2\nexit 1", None),
+        ] {
+            let program = fake_vims(dir.path(), script);
+            let error = vims_at(&program, Arc::new(SystemClock))
+                .call(&exec_call())
+                .unwrap_err();
+            match &error {
+                VimsError::Unknown { code: found, .. } => {
+                    assert_eq!(found.as_deref(), code, "{script}")
+                }
+                other => panic!("{script}: {other:?}"),
+            }
+            assert_eq!(error.refusal(), None, "{script}");
+        }
+    }
+
+    #[test]
+    fn a_code_that_says_vims_refused_is_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        for code in [
+            "IDEMPOTENCY_KEY_REUSED",
+            "PRECONDITION_FAILED",
+            "HOST_COMMAND_TIMEOUT",
+            "QUOTA_EXCEEDED",
+            "NOT_FOUND",
+            "UNAUTHORIZED",
+            "FORBIDDEN",
+            "INVALID_ARGUMENT",
+        ] {
+            let program = fake_vims(
+                dir.path(),
+                &format!("echo '{{\"error\":{{\"code\":\"{code}\"}}}}'\nexit 1"),
+            );
+            let error = vims_at(&program, Arc::new(SystemClock))
+                .call(&exec_call())
+                .unwrap_err();
+            assert_eq!(
+                error.refusal().map(|refusal| refusal.code.as_str()),
+                Some(code)
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_cut_inside_a_character_is_cut_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fake_vims(
+            dir.path(),
+            "i=0; while [ $i -lt 500 ]; do printf 'é'; i=$((i+1)); done\nprintf 'x' \nexit 1",
+        );
+        let text = vims_at(&program, Arc::new(SystemClock))
+            .call(&exec_call())
+            .unwrap_err()
+            .to_string();
+        assert!(text.ends_with("éx"), "{text}");
+    }
+
+    #[test]
     fn a_refusal_as_a_bare_error_code_or_after_other_output_is_read() {
         let dir = tempfile::tempdir().unwrap();
         let program = fake_vims(

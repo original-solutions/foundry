@@ -887,8 +887,56 @@ mod tests {
     }
 
     #[test]
+    fn an_operation_with_an_error_field_is_still_an_operation() {
+        for answer in [
+            r#"{"id":"op_5","status":"running","error":null}"#,
+            r#"{"id":"op_5","status":"cancelled","error":{"code":"CANCELLED"}}"#,
+            r#"{"id":"op_5","status":"failed","error":{"code":"PRECONDITION_FAILED"}}"#,
+        ] {
+            let fake = FakeVims::new();
+            fake.on("operation cancel", Reply::ok(answer));
+            assert!(
+                matches!(
+                    fake.cancel("op_5", "k1").unwrap(),
+                    Change::Operation(operation) if operation.id == "op_5"
+                ),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grant_answered_with_the_grant_is_made_and_one_with_an_error_cannot_be_read() {
+        let fake = FakeVims::new();
+        fake.on(
+            "workspace turn-grant put",
+            Reply::ok(
+                r#"{"turn":"fetch","connection":"conn_gh","expiresAt":"2026-11-28T10:30:00Z"}"#,
+            ),
+        )
+        .on(
+            "workspace turn-grant rm",
+            Reply::ok(r#"{"error":{"code":"PRECONDITION_FAILED"}}"#),
+        );
+        assert_eq!(
+            fake.grant("wsp_1", "fetch", "conn_gh", "30m", "k1")
+                .unwrap(),
+            Change::Done
+        );
+        let error = fake.ungrant("wsp_1", "fetch", "conn_gh", "k2").unwrap_err();
+        assert!(matches!(error, VimsError::Unknown { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("an operation, a workspace or nothing"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_change_answer_that_names_no_operation_or_workspace_cannot_be_read() {
         for answer in [
+            r#"{"error":{"code":"PRECONDITION_FAILED"},"id":"req_1"}"#,
             r#"{"error":{"code":"PRECONDITION_FAILED","message":"paused"}}"#,
             r#"{"status":"queued","workspaceId":"wsp_1"}"#,
             r#"{"operation":"op_9"}"#,
