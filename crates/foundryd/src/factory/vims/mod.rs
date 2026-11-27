@@ -145,11 +145,16 @@ pub enum VimsError {
     /// `vims` could not be started, so Vims never saw the call.
     #[error("cannot run `{command}`: {reason}")]
     NotRun { command: String, reason: String },
-    /// `vims` ran and gave no answer that can be read: it failed with no code of Vims's (a
-    /// transport failure's code is none), a signal ended it, or it printed too much or what the
-    /// call did not expect. Vims may have taken the call; its key finds out.
+    /// `vims` ran and gave no answer that can be read: it failed with no code Vims is known to
+    /// refuse with (a transport or server failure's code is none), a signal ended it, or it
+    /// printed too much or what the call did not expect. Vims may have taken the call; its key
+    /// finds out. `code` is the code the failure named, if any.
     #[error("`{command}` gave no answer Foundry can read: {reason}")]
-    Unknown { command: String, reason: String },
+    Unknown {
+        command: String,
+        reason: String,
+        code: Option<String>,
+    },
 }
 
 impl VimsError {
@@ -161,9 +166,15 @@ impl VimsError {
         }
     }
 
-    /// Vims's code, when it refused.
+    /// The code the failure named: Vims's, when it refused, or the code of a failure that is
+    /// no answer. Whether the call may be sent again under a new key is the variant's to say,
+    /// never the code's.
     pub fn code(&self) -> Option<&str> {
-        self.refusal().map(|refusal| refusal.code.as_str())
+        match self {
+            VimsError::Refused { refusal, .. } => Some(&refusal.code),
+            VimsError::Unknown { code, .. } => code.as_deref(),
+            _ => None,
+        }
     }
 }
 
@@ -189,6 +200,32 @@ impl Refusal {
             message: message.into(),
             limit,
         }
+    }
+}
+
+/// The codes read as Vims's refusal, besides those of a [`Limit`]. P2c saw the first three;
+/// the rest are guesses at codes that only an answer from Vims can carry. Any other code,
+/// such as a server's or a gateway's, says nothing of whether Vims took the call.
+const REFUSALS: [&str; 13] = [
+    "IDEMPOTENCY_KEY_REUSED",
+    "PRECONDITION_FAILED",
+    "HOST_COMMAND_TIMEOUT",
+    "NOT_FOUND",
+    "UNAUTHORIZED",
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "PERMISSION_DENIED",
+    "INVALID_ARGUMENT",
+    "BAD_REQUEST",
+    "VALIDATION_FAILED",
+    "CONFLICT",
+    "ALREADY_EXISTS",
+];
+
+impl Refusal {
+    /// Whether the code is one Vims refuses with, so Vims answered and took nothing.
+    fn is_vims_s(&self) -> bool {
+        REFUSALS.contains(&self.code.as_str()) || self.limit.is_some()
     }
 }
 
@@ -332,7 +369,7 @@ pub trait Vims: Send + Sync {
             &call,
             self.call(&call)?,
             Change::read,
-            "an operation or nothing",
+            "an operation, a workspace or nothing",
         )
     }
 
@@ -361,7 +398,7 @@ pub trait Vims: Send + Sync {
             &call,
             self.call(&call)?,
             Change::read,
-            "an operation or nothing",
+            "an operation, a workspace or nothing",
         )
     }
 
@@ -409,8 +446,8 @@ pub trait Vims: Send + Sync {
         read(
             &call,
             self.call(&call)?,
-            Change::read,
-            "an operation or nothing",
+            Change::read_made,
+            "an operation, a workspace or nothing",
         )
     }
 
@@ -433,8 +470,8 @@ pub trait Vims: Send + Sync {
         read(
             &call,
             self.call(&call)?,
-            Change::read,
-            "an operation or nothing",
+            Change::read_made,
+            "an operation, a workspace or nothing",
         )
     }
 
@@ -481,7 +518,7 @@ fn change<V: Vims + ?Sized>(
         &call,
         vims.call(&call)?,
         Change::read,
-        "an operation or nothing",
+        "an operation, a workspace or nothing",
     )
 }
 
@@ -503,6 +540,7 @@ fn read<T>(
             "expected {expected} in its {} bytes of output",
             stdout.len()
         ),
+        code: None,
     })
 }
 

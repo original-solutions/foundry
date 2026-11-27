@@ -136,10 +136,23 @@ pub enum Change {
 }
 
 impl Change {
-    /// The change `stdout` answers. An answer that holds an error, or names neither an
-    /// operation nor a workspace, cannot be read, so the caller finds out by the call's key
-    /// rather than take the change as made.
+    /// The change `stdout` answers. An answer that is an error, or names neither an operation
+    /// nor a workspace, cannot be read, so the caller finds out by the call's key rather than
+    /// take the change as made.
     pub(super) fn read(stdout: &str) -> Option<Self> {
+        Self::read_or(stdout, None)
+    }
+
+    /// As [`Change::read`], for a change whose answer may be the thing it made, such as a
+    /// grant: an answer that is no error and names neither an operation nor a workspace is
+    /// the change made. Guessed: P2c records no grant's answer.
+    pub(super) fn read_made(stdout: &str) -> Option<Self> {
+        Self::read_or(stdout, Some(Change::Done))
+    }
+
+    /// The change `stdout` answers, or `otherwise` for an answer that is no error and names
+    /// neither an operation nor a workspace.
+    fn read_or(stdout: &str, otherwise: Option<Self>) -> Option<Self> {
         if stdout.trim().is_empty() {
             return Some(Change::Done);
         }
@@ -148,7 +161,9 @@ impl Change {
         if fields.is_empty() {
             return Some(Change::Done);
         }
-        if fields.contains_key("error") {
+        // An error with no state of its own is the answer's error, not an operation's.
+        let failed = fields.get("error").is_some_and(|error| !error.is_null());
+        if failed && text(&value, &[&["status"], &["state"]]).is_none() {
             return None;
         }
         // Guessed: an operation is under `operation`, or is the answer when it has an
@@ -166,7 +181,7 @@ impl Change {
         if workspace {
             return Workspace::from_value(&value).map(Change::Workspace);
         }
-        None
+        otherwise
     }
 }
 

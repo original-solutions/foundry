@@ -71,6 +71,7 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
         Outcome::TooLarge => Err(VimsError::Unknown {
             command,
             reason: format!("it printed more than {OUTPUT_LIMIT} bytes"),
+            code: None,
         }),
         Outcome::Exit {
             status: Some(0),
@@ -82,8 +83,12 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
             stdout,
             stderr,
         } => {
-            if let Some(refusal) = refusal_in(&stdout).or_else(|| refusal_in(&stderr)) {
-                return Err(VimsError::Refused { command, refusal });
+            let coded = coded(&stdout).or_else(|| coded(&stderr));
+            if let Some(refusal) = coded.as_ref().filter(|coded| coded.is_vims_s()) {
+                return Err(VimsError::Refused {
+                    command,
+                    refusal: refusal.clone(),
+                });
             }
             let said = quoted(match stderr.trim() {
                 "" => stdout.trim(),
@@ -96,6 +101,7 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
             Err(VimsError::Unknown {
                 command,
                 reason: reason.trim_end_matches([':', ' ']).to_owned(),
+                code: coded.map(|coded| coded.code),
             })
         }
     }
@@ -111,12 +117,12 @@ fn quoted(text: &str) -> String {
     format!("{cut}{}", one_line(&text[start..]))
 }
 
-/// Vims's refusal in `text`, when it holds one: JSON with `error.code` (or `code`, or an
-/// `error` that is a code), or a line that starts with a code, such as
-/// `Error: PRECONDITION_FAILED: …`. The checks saw the codes and not the shape they came in,
-/// so both are guesses. Only a code shaped as Vims's is read ([`is_code`]): a transport
-/// failure's code says nothing of whether Vims took the call.
-fn refusal_in(text: &str) -> Option<Refusal> {
+/// The code and message of the failure `text` reports, when it names one: JSON with
+/// `error.code` (or `code`, or an `error` that is a code), or a line that starts with a code,
+/// such as `Error: PRECONDITION_FAILED: …`. The checks saw the codes and not the shape they came
+/// in, so both are guesses. Whether the code is a refusal of Vims's is
+/// [`Refusal::is_vims_s`]'s to say.
+fn coded(text: &str) -> Option<Refusal> {
     let text = text.trim();
     let json = serde_json::from_str::<Value>(text).ok().or_else(|| {
         text.lines()
@@ -152,18 +158,9 @@ fn refusal_in(text: &str) -> Option<Refusal> {
     })
 }
 
-/// Whether `text` reads as one of Vims's codes: capitals, digits and `_`, and none of the
-/// codes a client that lost its connection reports, which say nothing of whether Vims took the
-/// call: an errno (`ECONNRESET`, an `E` and no `_`) or Node's own (`ERR_…`, `UND_ERR_…`,
-/// `EAI_…`).
+/// Whether `text` reads as a code: capitals, digits and `_`.
 fn is_code(text: &str) -> bool {
-    let errno = text.starts_with('E') && !text.contains('_');
-    let node = ["ERR_", "UND_ERR", "EAI_"]
-        .iter()
-        .any(|prefix| text.starts_with(prefix));
-    !errno
-        && !node
-        && text.len() >= 3
+    text.len() >= 3
         && text.starts_with(|c: char| c.is_ascii_uppercase())
         && text
             .chars()
