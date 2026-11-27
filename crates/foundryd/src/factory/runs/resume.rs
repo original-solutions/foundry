@@ -86,7 +86,7 @@
 //!   JSON, fails the same way on every pass) sends the run stuck for a person
 //!   ([`TURN_UNREADABLE`]): no resume is spent, and nothing more is asked of the owner (no
 //!   archive, no sessions ended, since the session has ended), which would refuse it the same
-//!   way; a turn that may still exist on an older owner is never archived by force. Its first
+//!   way. The workspace is kept, as any stuck run's is, until the issue leaves `stuck`. Its first
 //!   failure is recorded before the error is returned (`resume-turn-failing <session> <turn>
 //!   <generation> <ms>`), on the sleep-counting clock as gating's `checks-waiting` is, so a
 //!   daemon restart keeps it and a takeover or a reset clock starts the count again. Any other
