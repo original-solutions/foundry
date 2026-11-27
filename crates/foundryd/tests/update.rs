@@ -121,7 +121,11 @@ fn a_daemon_asked_to_install_its_ready_release_answers_202_and_exits_onto_it_on_
     fs::write(home.path().join("update.json"), r#"{"ready":"v999.0.0"}"#).unwrap();
     // A stand-in for the Tailscale CLI that answers as a stopped Tailscale does.
     let tailscale = user.path().join("tailscale");
-    fs::write(&tailscale, "#!/bin/sh\necho 'Tailscale is stopped (fake).' >&2\nexit 1\n").unwrap();
+    fs::write(
+        &tailscale,
+        "#!/bin/sh\necho 'Tailscale is stopped (fake).' >&2\nexit 1\n",
+    )
+    .unwrap();
     fs::set_permissions(&tailscale, fs::Permissions::from_mode(0o755)).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()

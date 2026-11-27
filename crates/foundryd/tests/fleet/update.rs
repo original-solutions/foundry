@@ -169,7 +169,11 @@ async fn an_install_is_carried_to_the_machine_it_names_and_answered_as_that_mach
     assert!(answer["error"].is_string(), "{answer}");
 
     for (i, served) in served.iter().enumerate() {
-        assert_eq!(served.stops.load(Ordering::SeqCst), 0, "machine {i} stopped");
+        assert_eq!(
+            served.stops.load(Ordering::SeqCst),
+            0,
+            "machine {i} stopped"
+        );
         assert_eq!(
             std::fs::read_link(served.home.path().join("current")).unwrap(),
             Path::new("versions").join(VERSION),
