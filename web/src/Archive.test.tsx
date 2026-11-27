@@ -62,9 +62,9 @@ const posts = (calls: Call[]) => calls.filter((c) => c.method === "POST");
 const studio = { id: ME, name: "studio" };
 const attic = { id: OTHER, name: "attic" };
 
-/** Shows the dialog for "fix login" on `machine`, from the UI `here` serves (unknown when undefined). */
-async function show(onClose = vi.fn(), onArchived = vi.fn(), machine = studio, here: string | undefined = ME) {
-  await renderApp(<ArchiveDialog workspace={fixLogin()} machine={machine} here={here} onClose={onClose} onArchived={onArchived} />);
+/** Shows the dialog for "fix login" on `machine`, from the UI `here` serves (not known yet when null). */
+async function show(onClose = vi.fn(), onArchived = vi.fn(), machine = studio, here: string | null = ME) {
+  await renderApp(<ArchiveDialog workspace={fixLogin()} machine={machine} here={here ?? undefined} onClose={onClose} onArchived={onArchived} />);
   return screen.findByRole("dialog", { name: "Archive fix login?" });
 }
 
@@ -181,7 +181,7 @@ describe("ArchiveDialog", () => {
 
   it("reads and shows the changes while the machine serving the UI is not known yet", async () => {
     const calls = stub(() => json(200, changes));
-    const dialog = await show(vi.fn(), vi.fn(), attic, undefined);
+    const dialog = await show(vi.fn(), vi.fn(), attic, null);
     const kept = await within(dialog).findByRole("region", { name: "Kept on fix-login" });
     await waitFor(() => expect(kept.textContent).toContain("Check the session on login"));
     expect(within(dialog).getByRole("region", { name: "Lost with the worktree" }).textContent).toContain("README.md");
