@@ -320,6 +320,7 @@ function Layout() {
                   alerts={<NotifyButton {...notify} />}
                   onKeys={() => setKeysOpen(true)}
                   onRail={rail ? undefined : flipRail}
+                  statuses={state.factory}
                 />
               </div>
             )}
@@ -396,6 +397,7 @@ function Layout() {
                       onMenu={() => setDrawer(true)}
                       history={samples}
                       connected={connected}
+                      statuses={state.factory}
                       onSteps={(id) => {
                         setStepsOpen(true);
                         show(id);

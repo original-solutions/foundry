@@ -7,7 +7,8 @@ import { Named, Now } from "./Now";
 import { startShell } from "./api";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
-import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
+import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
+import { factoryRows, factoryRuns, type FactoryRun } from "./lanes";
 import { MachineName } from "./Machines";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
@@ -16,7 +17,7 @@ import { SparkIcon } from "./FirstPrompt";
 import { Mark } from "./Mark";
 import { ThemeButton } from "./ThemeButton";
 import { railKey } from "./collapsed";
-import type { MachineSample } from "./api";
+import type { FactoryStatus, MachineSample } from "./api";
 
 const statusColour = { online: "text-neutral-400", offline: "text-red-400", unknown: "text-neutral-400" };
 const statusDot = { online: "bg-emerald-400", offline: "bg-red-400", unknown: "bg-neutral-500" };
@@ -44,6 +45,8 @@ interface Props {
   onKeys?: () => void;
   /** Collapses the list to the rail, on a wide screen. */
   onRail?: () => void;
+  /** The believed factory statuses by project id, which name the workspaces of factory runs. */
+  statuses?: Record<string, FactoryStatus>;
 }
 
 /** The terminals a folded workspace (or the rail) shows: the most urgent first, and the open one always. */
@@ -63,7 +66,8 @@ const TYPEAHEAD_MS = 600;
  * unfolds or goes in), Home and End go to the ends, and typing a name's first letters goes to the
  * next one it starts. A workspace's actions show while the keyboard is in it, the Tab after it.
  */
-export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys, onRail }: Props) {
+export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys, onRail, statuses }: Props) {
+  const factoryOf = factoryRuns(statuses);
   // A workspace is one line of its states unless it is unfolded: the board already shows every
   // terminal, so the list stays an index. The workspace you are in unfolds, and folds again when
   // you leave it; one you unfold yourself stays open.
@@ -233,6 +237,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                   key={workspace.id}
                   workspace={workspace}
                   machine={machine.id}
+                  factory={factoryOf(workspace)}
                   folded={!unfolded.has(workspace.id)}
                   onFold={(on) => fold([workspace.id], on)}
                   selected={selected}
@@ -282,6 +287,8 @@ interface WorkspaceProps {
   workspace: WorkspaceView;
   /** The machine it is on. */
   machine: string;
+  /** The factory run it belongs to, if any. */
+  factory?: FactoryRun;
   folded: boolean;
   onFold: (on: boolean) => void;
   selected?: string;
@@ -291,10 +298,10 @@ interface WorkspaceProps {
   tab: (id: string) => { tabIndex: number; onFocus: () => void };
 }
 
-function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
+function Workspace({ workspace, machine, factory, folded, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
   const terminals = useTerminalActions();
-  const list = rows(workspace);
+  const list = factory ? factoryRows(rows(workspace)) : rows(workspace);
   const over = ended(workspace);
   return (
     <div role="group" aria-label={workspace.name} className="group/ws">
@@ -315,13 +322,14 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
           </svg>
           <span className="truncate font-medium">{workspace.name}</span>
         </button>
+        {factory && <FactoryMark run={factory} />}
         {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
       </div>
       {!folded && (
         <>
           <div className="flex items-center gap-2 pl-6 pr-1">
             <span className="min-w-0 flex-1 truncate text-xs text-neutral-500">
-              {workspace.branch} · {workspace.project}
+              {branchOf(workspace)} · {workspace.project}
             </span>
             <div className="flex shrink-0 items-center gap-0.5 pointer-fine:hidden pointer-fine:group-focus-within/ws:flex pointer-fine:group-hover/ws:flex">
               {onChanges && (
@@ -452,6 +460,18 @@ function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspa
 }
 
 /** A window with its left column marked: the sidebar, collapsed or expanded. */
+/** Says a workspace is a factory run's, as a link to its issue when the run names one. */
+export function FactoryMark({ run }: { run: FactoryRun }) {
+  const text = run.issue === undefined ? "factory" : `factory #${run.issue}`;
+  const shape = "shrink-0 rounded border border-violet-500/40 px-1 text-[10px] leading-4 font-medium text-violet-300";
+  if (!run.url) return <span className={shape}>{text}</span>;
+  return (
+    <a href={run.url} target="_blank" rel="noreferrer" title="Built by the factory: open its issue" className={`${shape} hover:bg-violet-500/10`}>
+      {text}
+    </a>
+  );
+}
+
 export function PanelIcon({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">

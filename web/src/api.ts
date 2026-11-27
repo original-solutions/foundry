@@ -113,6 +113,8 @@ export interface HeldUp {
   run: string;
   kind: "stuck" | "needs_info";
   reason: string;
+  /** The run's current workspaces. Missing in a status from a peer built before held-up runs named them. */
+  workspaces?: string[];
 }
 /** A run that ended. */
 export interface FinishedRun {

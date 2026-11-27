@@ -321,6 +321,10 @@ pub struct HeldUp {
     pub run: RunId,
     pub kind: HeldUpKind,
     pub reason: String,
+    /// The run's current workspaces, as a live run's are. Empty in a status from a peer built
+    /// before held-up runs named them.
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

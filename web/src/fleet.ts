@@ -83,8 +83,13 @@ export interface ShellView {
 export interface WorkspaceView {
   id: string;
   name: string;
+  /** Empty for a workspace on a commit, whose commit is its `base`. */
   branch: string;
+  /** The branch or commit it started from. */
+  base: string;
+  /** Its project's name. */
   project: string;
+  projectId: string;
   sessions: SessionView[];
   shells: ShellView[];
 }
@@ -157,7 +162,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
   const opened = new Map<string, number>();
   const liveSessions: { id: string; workspace: string; model: string; state: SessionState; terminal: string }[] = [];
   const liveTerminals: { workspace: string; view: Omit<ShellView, "name"> }[] = [];
-  const workspacesByOwner = new Map<string, { id: string; name: string; branch: string; project: string }[]>();
+  const workspacesByOwner = new Map<string, { id: string; name: string; branch: string; base: string; project: string; projectId: string }[]>();
 
   for (const r of records) {
     switch (r.kind) {
@@ -199,7 +204,9 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
             id: r.body.id,
             name: r.body.name,
             branch: r.body.branch,
+            base: r.body.base,
             project: projectNames.get(r.body.project) ?? r.body.project,
+            projectId: r.body.project,
           });
         }
         break;
@@ -268,6 +275,11 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
       };
     }),
   }));
+}
+
+/** What a workspace shows as its branch: its branch, or the first 7 characters of its commit when it is on one. */
+export function branchOf(workspace: WorkspaceView): string {
+  return workspace.branch || workspace.base.slice(0, 7);
 }
 
 /** Where terminal `id` sits in the fleet, with the name and state the sidebar gives it. */

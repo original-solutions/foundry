@@ -11,8 +11,9 @@ import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
 import { ShipLine, shippingQuery } from "./Shipping";
 import { splitPath, totals } from "./changes";
-import type { MachineView } from "./fleet";
-import type { Project } from "./api";
+import { branchOf, type MachineView } from "./fleet";
+import type { FactoryStatus, Project } from "./api";
+import { FactoryMark } from "./Sidebar";
 import { Composer, useCreateWorkspace } from "./Composer";
 import { plural, words, type Glyph } from "./labels";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
@@ -87,6 +88,7 @@ export function Board({
   onMenu,
   history,
   connected,
+  statuses,
 }: {
   machines: MachineView[];
   /** The fleet's projects, which a new task is started in. */
@@ -105,6 +107,8 @@ export function Board({
   history: History;
   /** Whether the page hears the daemon now, so the machines view can say its numbers stopped. */
   connected: boolean;
+  /** The believed factory statuses by project id, which name the workspaces of factory runs. */
+  statuses?: Record<string, FactoryStatus>;
 }) {
   const [kept, setKept] = useState(loadView);
   const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
@@ -122,7 +126,7 @@ export function Board({
   const offline = machines.filter((m) => m.status === "offline").length;
   const counts = [plural(sessions, "session"), plural(shells, "shell"), plural(workspaces.length, "workspace"), plural(machines.length, "machine"), ...(offline ? [`${offline} offline`] : [])].join(" · ");
   const launch = useCreateWorkspace();
-  const board = lanes(machines);
+  const board = lanes(machines, statuses);
   const needs = board.find((l) => l.lane === "needs")?.cards.length ?? 0;
   const [group, setGroup] = useState(loadGroup);
   const regroup = (next: Group) => {
@@ -314,6 +318,7 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
               workspace.name
             )}
           </h3>
+          {card.factory && <FactoryMark run={card.factory} />}
           {showMachine && (
             <span className="shrink-0 text-xs text-neutral-500" title={`Runs on ${machine.id}`}>
               {machine.name}
@@ -334,7 +339,7 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
           )}
         </div>
         <p className="truncate font-mono text-xs text-neutral-500">
-          {workspace.project} · {workspace.branch}
+          {workspace.project} · {branchOf(workspace)}
         </p>
       </header>
       <ul className="flex flex-col px-2 pb-2">

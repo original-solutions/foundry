@@ -1569,6 +1569,14 @@ impl<'a, 'w> Pass<'a, 'w> {
         let world = self.world;
         let known = self.known()?;
         let unfinished: BTreeSet<RunId> = known.iter().map(|k| k.info.id.clone()).collect();
+        // The workspace a run's progress names as its current one, if any.
+        let workspace_of = |seen: &super::runs::progress::Seen| -> Vec<WorkspaceId> {
+            seen.workspace
+                .as_deref()
+                .and_then(|w| w.parse().ok().map(WorkspaceId))
+                .into_iter()
+                .collect()
+        };
         for k in &known {
             let run = k.info.id.clone();
             match k.info.state {
@@ -1582,6 +1590,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                         run,
                         kind,
                         reason: k.seen.stuck.clone().unwrap_or_default(),
+                        workspaces: workspace_of(&k.seen),
                     });
                 }
                 _ if k.info.unreadable || !k.info.confirmed => {}
@@ -1603,13 +1612,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                         machine,
                         gate_retries_used: used,
                         minutes_used: k.seen.worked_ms / 60_000,
-                        workspaces: k
-                            .seen
-                            .workspace
-                            .as_deref()
-                            .and_then(|w| w.parse().ok().map(WorkspaceId))
-                            .into_iter()
-                            .collect(),
+                        workspaces: workspace_of(&k.seen),
                         sessions: k
                             .seen
                             .thread_id
@@ -1660,10 +1663,18 @@ impl<'a, 'w> Pass<'a, 'w> {
                 .collect();
             for (done, _) in of_kind {
                 if labelled.contains(&done.run.run.issue()) {
+                    // A finished run's events are read only while a person holds it up. One
+                    // that cannot be read names no workspace; it is still held up.
+                    let workspaces = self
+                        .ledger
+                        .read(&done.run.run)
+                        .map(|events| workspace_of(&read_progress(&events)))
+                        .unwrap_or_default();
                     self.results.held_up.push(HeldUp {
                         run: done.run.run.clone(),
                         kind,
                         reason: done.reason.clone().unwrap_or_default(),
+                        workspaces,
                     });
                 }
             }
