@@ -5173,8 +5173,11 @@ mod tests {
             rig.hub.issue(300, &[]);
             rig.hub.issue(301, &["factory:stuck"]);
             rig.hub.edit(301, |issue| issue.closed = true);
+            // Moved on to another factory label: not the one its run is held up for.
+            rig.hub.issue(302, &["factory:needs-info"]);
             held_up_run(&rig, 300, 1, State::Stuck, "left the label");
             held_up_run(&rig, 301, 1, State::Stuck, "closed");
+            held_up_run(&rig, 302, 1, State::Stuck, "asked a question since");
             let report = rig.pass();
             assert_eq!(report.failed, None, "{report:?}");
             assert!(
