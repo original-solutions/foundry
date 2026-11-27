@@ -1442,7 +1442,8 @@ impl Gate<'_, '_> {
             .clone()
             .filter(|pass| !log.moved.contains(&pass.attempt));
         let state = self.ctx.view.session_state(self.session);
-        let turn = self.ctx.view.session_turn(self.session).map(|t| t.turn);
+        let shown = self.ctx.view.session_turn(self.session);
+        let turn = shown.map(|t| t.turn);
         // A send begun and not recorded is finished first, whatever else moved.
         if let Some(owed) = seen
             .sending
@@ -1469,7 +1470,6 @@ impl Gate<'_, '_> {
                 let Some(state) = state else {
                     return self.stuck("session-gone", Stop::new(SESSION_GONE));
                 };
-                let shown = self.ctx.view.session_turn(self.session);
                 if busy(state, &seen, shown) || turn.is_none() || !seen.pr_reported {
                     return Ok(GateStep::NotReady);
                 }

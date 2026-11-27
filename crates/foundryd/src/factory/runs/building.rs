@@ -5585,6 +5585,21 @@ mod tests {
             }
         }
 
+        /// A session at rest when its machine was cut off, with no pull request reported, keeps
+        /// the run running: nothing is read, sent or launched to a machine that cannot answer.
+        #[test]
+        fn a_session_that_cannot_be_reached_with_no_pull_request_reported_keeps_the_run_running() {
+            let (mut rig, run) = built();
+            rig.step(&run, "turn-read 1");
+            show(&mut rig, SessionState::Unreachable, 1, 1);
+            let events = rig.events(&run).len();
+            assert_eq!(pass(&rig, &run), BuildStep::Running);
+            assert_eq!(rig.events(&run).len(), events);
+            assert_eq!(turn_reads(&rig), 0);
+            assert!(sends(&rig).is_empty());
+            no_writes(&rig);
+        }
+
         #[test]
         fn a_relaunch_decided_for_a_gate_failure_is_resumes() {
             let (rig, run) = built();
