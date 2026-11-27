@@ -2507,6 +2507,39 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_install_of_the_version_of_a_stranded_trial_starts_no_trial() {
+        let home = installed_home();
+        save(
+            home.path(),
+            &State {
+                trial: Some(Trial {
+                    version: "0.3.0".into(),
+                    previous: "0.1.0".into(),
+                    starts: 0,
+                }),
+                refused: None,
+                ready: None,
+            },
+        )
+        .unwrap();
+        let path = home.path().to_path_buf();
+
+        place_version(
+            home.path(),
+            "0.3.0",
+            |stage| {
+                release(stage, "0.3.0");
+                Ok(())
+            },
+            || placed_by_hand(&path, "0.3.0", Some("0.1.0")).map(drop),
+        )
+        .unwrap();
+
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.3.0"));
+        assert_eq!(state(home.path()).unwrap().trial, None);
+    }
+
+    #[test]
     fn a_hand_install_of_a_lower_version_below_a_lower_refusal_raises_it() {
         let home = tempfile::tempdir().unwrap();
         save(
@@ -3663,7 +3696,7 @@ mod tests {
             "v0.2.0",
             "0.1.0",
             None,
-            "v0.2.0 is not the ready tag",
+            "v0.2.0 is not ready: its binaries are gone",
             None,
         );
     }
