@@ -14,7 +14,7 @@ export default defineConfig([
     },
   },
   {
-    files: ["e2e/**", "*.config.ts"],
+    files: ["e2e/**", "*.config.ts", "guide.test.ts"],
     languageOptions: { globals: globals.node },
   },
 ]);

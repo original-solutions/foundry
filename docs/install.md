@@ -90,18 +90,18 @@ The unit runs as your user. Read the log with `journalctl -u foundryd`.
 ## Add a machine
 
 1. Install `foundryd` on the new machine, as above. It must be on the same tailnet as the fleet.
-2. Open the UI of any machine already in the fleet, go to the machines board and click **Add machine**.
+2. Open the UI of any machine already in the fleet, open the machines view (the **Machines** switch at the top of the board) and click **Add machine**.
 3. Type the new machine's Tailscale name, for example `trilogy-mac`, and click **Add**.
-4. On the new machine, run the command the dialog shows, for example `foundryd join 100.101.102.103 K7QX3M9PRT`. Run it in a shell with the same `FOUNDRY_HOME` and `FOUNDRY_PORT` you gave `install`, as `<home>/current/foundryd join …`, or as shown once `<home>/current/foundryd` is linked into a folder on your `PATH`. The code works once, within 10 minutes, and only on the machine whose name you typed. If the command says the machine could not be added to the machine list, run the same command again while the code is valid. When it names a machine that already has the name, rename that machine first. When it names one that already has the address, remove that machine first with **Remove from fleet** on its card on the machines board of another machine, and run the command again. A machine removed from the fleet has to be given a new identity before it can join again; see [Remove a machine](#remove-a-machine) for what that does. The new machine may show on the board all the same, when the fleet was only slow to answer, and running the command again is still what finishes the join.
+4. On the new machine, run the command the dialog shows, for example `foundryd join 100.101.102.103 K7QX3M9PRT`. Run it in a shell with the same `FOUNDRY_HOME` and `FOUNDRY_PORT` you gave `install`, as `<home>/current/foundryd join …`, or as shown once `<home>/current/foundryd` is linked into a folder on your `PATH`. The code works once, within 10 minutes, and only on the machine whose name you typed. If the command says the machine could not be added to the machine list, run the same command again while the code is valid. When it names a machine that already has the name, rename that machine first. When it names one that already has the address, remove that machine first with **Remove from fleet** on its card in the machines view of another machine, and run the command again. A machine removed from the fleet has to be given a new identity before it can join again; see [Remove a machine](#remove-a-machine) for what that does. The new machine may show in the machines view all the same, when the fleet was only slow to answer, and running the command again is still what finishes the join.
 5. Restart the service on the new machine: `launchctl kickstart -k gui/$(id -u)/io.github.original-solutions.foundryd` on macOS, `sudo systemctl restart foundryd` on Linux.
 
-The dialog says when the machine has joined, and its card shows on the board under the machine's own Tailscale name: the short name, even when you typed its full name or its address. There are two exceptions, and in both the card keeps the name you typed until you rename it. One is when `foundryd join` warned that it could not ask Tailscale what the machine is called. The other is an older `foundryd join`, which sends no name of its own.
+The dialog says when the machine has joined, and its card shows in the machines view under the machine's own Tailscale name: the short name, even when you typed its full name or its address. There are two exceptions, and in both the card keeps the name you typed until you rename it. One is when `foundryd join` warned that it could not ask Tailscale what the machine is called. The other is an older `foundryd join`, which sends no name of its own.
 
 Run `foundryd join` from a release at least as new as the one on the machine you join through. An older `foundryd join` still joins. But when the machine cannot be listed it says to ask for a new code, where running the same command again is what works, and it gives up after 10 seconds while the fleet may take half a minute to answer.
 
 ## Remove a machine
 
-Open the machines board of another machine in the fleet, click **Remove from fleet** on the card of the machine to remove, and confirm. A machine cannot be removed from its own UI. Every machine then refuses it: each revokes its key and closes its links, and the board stops listing its workspaces, terminals and sessions. Its workspaces stay on its disk.
+Open the machines view of another machine in the fleet, click **Remove from fleet** on the card of the machine to remove, and confirm. A machine cannot be removed from its own UI. Every machine then refuses it: each revokes its key and closes its links, and the board stops listing its workspaces, terminals and sessions. Its workspaces stay on its disk.
 
 The removed machine is sent its removal before its links close, and stops listing itself. A removal cannot be undone: a machine that missed it, or that took an entry the removed machine wrote for itself while cut off, drops that entry as soon as it hears from a machine that holds the removal.
 
@@ -161,7 +161,11 @@ On any other machine, copy the folder to `~/.claude/skills/factory-build/`. If t
 
 The project's repo URL must be `https://github.com/<owner>/<repo>`, because the factory reaches GitHub only over HTTPS. The repo's default branch must hold a `.dw/config.yml` whose `factory` block has `instructors`, `base`, `provision`, `gate`, `limits` with at least `gate_retries`, and `autonomy: pr`. This repo's own [`.dw/config.yml`](../.dw/config.yml) is one. A file that does not load leaves the project idle with an attention item.
 
-The UI has no factory switch yet, so use the daemon's API on any machine of the fleet. Find the project's id:
+In the UI, click **Projects** in the task box, then click the project's **Factory off** switch, which then reads **Factory on**. To name a GitHub login, type it in the box beside the switch and click **Save login**. Left blank, the project takes the acting coordinator's default login. **Pause claims** pauses the project's claims. The [Factory view](guide/factory.md) shows what the factory does after that. A refusal shows under the project, for example when the repo URL is not on `https://github.com/`, or when no login is named and the coordinator has no default.
+
+A project that is on acts as its login, so every later edit that keeps it on names the login. The UI sends the saved login for you.
+
+The daemon's API does the same on any machine of the fleet. Find the project's id:
 
 ```sh
 curl -s http://127.0.0.1:7433/api/factory
@@ -174,9 +178,7 @@ curl -s -X POST http://127.0.0.1:7433/api/projects/<project id>/factory \
   -H 'Content-Type: application/json' -d '{"on": true, "paused": false}'
 ```
 
-With no `login`, the project takes the acting coordinator's default login. Add `"login": "<login>"` to name another. The answer is `{"factory": {...}}` with the login it took. A `422` says why it refused, for example a repo URL that is not on `https://github.com/`, or no login named and no default on the coordinator.
-
-A project that is on acts as its login, so every later edit that keeps it on names the login. To pause its claims:
+With no `login`, the project takes the acting coordinator's default login. Add `"login": "<login>"` to name another. The answer is `{"factory": {...}}` with the login it took. A `422` says why it refused. To pause its claims:
 
 ```sh
 curl -s -X POST http://127.0.0.1:7433/api/projects/<project id>/factory \

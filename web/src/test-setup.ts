@@ -6,5 +6,6 @@ afterEach(() => {
   cleanup();
 });
 
-// jsdom does not implement scrolling; the router asks for it after each navigation.
-window.scrollTo = () => {};
+// jsdom does not implement scrolling; the router asks for it after each navigation. The guide test
+// runs under node, with no window.
+if (typeof window !== "undefined") window.scrollTo = () => {};

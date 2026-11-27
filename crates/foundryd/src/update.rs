@@ -645,9 +645,8 @@ pub(crate) fn place_version(
 /// Fills a fresh `versions/.staging-<version>-<pid>` with `fill` and checks that both binaries
 /// are there, made executable. Returns its path; a stage that fails is removed. The stage is this
 /// process's own, so a hand install and the daemon's check never wipe each other's. It takes no
-/// lock: nothing under it touches `update.json` or `current`. Crate-wide, like [`swap_in`], so
-/// #273's click install and hand install can build on it.
-pub(crate) fn stage_version(
+/// lock: nothing under it touches `update.json` or `current`.
+fn stage_version(
     home: &Path,
     version: &str,
     fill: impl FnOnce(&Path) -> Result<(), UpdateError>,
@@ -696,7 +695,7 @@ fn sweep_stages(home: &Path) {
 
 /// Renames `stage` to `versions/<version>`, replacing what is there. It takes no lock: a caller
 /// that must not race the check calls it under [`lock`], as [`make_ready`] does.
-pub(crate) fn swap_in(home: &Path, stage: &Path, version: &str) -> Result<(), UpdateError> {
+fn swap_in(home: &Path, stage: &Path, version: &str) -> Result<(), UpdateError> {
     let target = home.join("versions").join(version);
     match fs::remove_dir_all(&target) {
         Ok(()) => {}

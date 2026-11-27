@@ -15,7 +15,7 @@ export default defineConfig({
   server: { proxy: api },
   preview: { proxy: api },
   test: {
-    include: ["src/**/*.test.{ts,tsx}"],
+    include: ["src/**/*.test.{ts,tsx}", "guide.test.ts"],
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
     // theme.test.tsx reads these two as text, to check the light palette against Tailwind's.
