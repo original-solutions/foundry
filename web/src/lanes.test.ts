@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Changes, HeldUp } from "./api";
-import { factoryRuns, glance, lanes, QUIET, topFiles } from "./lanes";
-import { fleet } from "./fleet";
+import { glance, lanes, topFiles } from "./lanes";
+import { factoryRuns, fleet, QUIET, withFactory } from "./fleet";
 import { factoryStatus, ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const machines = fleet(
@@ -107,10 +107,10 @@ describe("lanes of factory runs", () => {
     const [w1, , w3] = board[0].workspaces;
     expect(of(w1)).toEqual({ run: "original-solutions__foundry__162__1", issue: 162, url: "https://github.com/original-solutions/foundry/issues/162" });
     expect(of(w3)).toBeUndefined();
-    const card = lanes(board, statuses)
+    const card = lanes(withFactory(board, statuses))
       .flatMap((l) => l.cards)
       .find((c) => c.workspace.id === "w1");
-    expect(card?.factory?.issue).toBe(162);
+    expect(card?.workspace.factory?.issue).toBe(162);
   });
 
   it("marks nothing for a status of another project that names the same workspace id", () => {
@@ -119,7 +119,7 @@ describe("lanes of factory runs", () => {
   });
 
   it("keeps a factory session P1 marks stuck under working, shown as Quiet 10+ min, while a session by hand that is stuck needs you", () => {
-    const result = lanes(board, factoryStatus("p1", { "o__r__162__1": ["w1"] }));
+    const result = lanes(withFactory(board, factoryStatus("p1", { "o__r__162__1": ["w1"] })));
     expect(named(result)).toEqual([
       ["needs", ["by hand"]],
       ["working", ["fac/162-1"]],
@@ -133,17 +133,17 @@ describe("lanes of factory runs", () => {
 
   it("moves a run's card to needs you when its run is stuck or needs info, and only then", () => {
     const statuses = factoryStatus("p1", { "o__r__162__1": ["w1"] }, { "o__r__170__1": { kind: "stuck", workspaces: ["w2"] } });
-    expect(named(lanes(board, statuses))).toEqual([
+    expect(named(lanes(withFactory(board, statuses)))).toEqual([
       ["needs", ["by hand", "fac/170-1"]],
       ["working", ["fac/162-1"]],
     ]);
     const info = factoryStatus("p1", {}, { "o__r__170__1": { kind: "needs_info", workspaces: ["w2"] } });
     // With no live run, w1's stuck session is P1's to show, so it needs you as any other would.
-    expect(named(lanes(board, info))).toEqual([["needs", ["fac/162-1", "by hand", "fac/170-1"]]]);
+    expect(named(lanes(withFactory(board, info)))).toEqual([["needs", ["fac/162-1", "by hand", "fac/170-1"]]]);
   });
 
   it("leaves a held-up run's stuck session saying Stuck, on its card under needs you", () => {
-    const result = lanes(board, factoryStatus("p1", {}, { "o__r__162__1": { kind: "stuck", workspaces: ["w1"] } }));
+    const result = lanes(withFactory(board, factoryStatus("p1", {}, { "o__r__162__1": { kind: "stuck", workspaces: ["w1"] } })));
     const card = result[0].cards.find((c) => c.workspace.id === "w1");
     expect(result[0].lane).toBe("needs");
     expect(card?.rows.map((r) => r.label)).toEqual(["Stuck"]);
@@ -151,12 +151,12 @@ describe("lanes of factory runs", () => {
 
   it("keeps a live run's session that waits for an answer out of needs you", () => {
     const asks = fleet([sample(ME, 1), workspace(ME, "w1", "fac/162-1"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "waiting_for_you")], settings({ machines: [] }));
-    expect(named(lanes(asks, factoryStatus("p1", { "o__r__162__1": ["w1"] })))).toEqual([["working", ["fac/162-1"]]]);
+    expect(named(lanes(withFactory(asks, factoryStatus("p1", { "o__r__162__1": ["w1"] }))))).toEqual([["working", ["fac/162-1"]]]);
   });
 
   it("reads statuses from an older peer whose held-up runs name no workspaces", () => {
     const statuses = factoryStatus("p1", {});
     statuses.p1.held_up = [{ run: "o__r__170__1", kind: "stuck", reason: "why" } as HeldUp];
-    expect(named(lanes(board, statuses))[0]).toEqual(["needs", ["fac/162-1", "by hand"]]);
+    expect(named(lanes(withFactory(board, statuses)))[0]).toEqual(["needs", ["fac/162-1", "by hand"]]);
   });
 });

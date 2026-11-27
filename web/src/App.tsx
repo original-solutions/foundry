@@ -19,7 +19,7 @@ import { touched, withoutTab } from "./tabs";
 import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
 import { TerminalActions } from "./TerminalMenu";
-import { fleet, locate, rows, terminalRunning } from "./fleet";
+import { fleet, locate, rows, terminalRunning, withFactory } from "./fleet";
 import { useShortcut } from "./shortcut";
 import { useBriefs } from "./useBriefs";
 import { machineQuery } from "./api";
@@ -123,7 +123,11 @@ function Layout() {
   const briefs = useBriefs(state.records);
   const { data: here } = useQuery(machineQuery);
   const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
-  const machines = useMemo(() => fleet(state.records, state.settings, briefs, state.online, here), [state.records, state.settings, briefs, state.online, here]);
+  // Each factory run's workspace carries its run, so every view reads its terminals the same way.
+  const machines = useMemo(
+    () => withFactory(fleet(state.records, state.settings, briefs, state.online, here), state.factory),
+    [state.records, state.settings, briefs, state.online, here, state.factory],
+  );
   const [drawer, setDrawer] = useState(false);
   /** Whether the sidebar is collapsed to the rail on a wide screen. */
   const [rail, setRail] = useState(() => loadRail(window.innerWidth));
@@ -212,7 +216,7 @@ function Layout() {
   );
   const show = (id: string) => void navigate({ to: "/terminals/$terminalId", params: { terminalId: id } });
   // News is told from the daemon's own states only, never from the change between the remembered fleet and them.
-  const { spoken, news, ...notify } = useAlerts(machines, sent.synced, show, state.factory);
+  const { spoken, news, ...notify } = useAlerts(machines, sent.synced, show);
   /** The sessions the catch-up card lists, whose news it already shows. */
   const [caughtUp, setCaughtUp] = useState<string[]>([]);
   /** Whether the list of keys is open. */
@@ -320,7 +324,6 @@ function Layout() {
                   alerts={<NotifyButton {...notify} />}
                   onKeys={() => setKeysOpen(true)}
                   onRail={rail ? undefined : flipRail}
-                  statuses={state.factory}
                 />
               </div>
             )}
@@ -397,7 +400,6 @@ function Layout() {
                       onMenu={() => setDrawer(true)}
                       history={samples}
                       connected={connected}
-                      statuses={state.factory}
                       onSteps={(id) => {
                         setStepsOpen(true);
                         show(id);
@@ -438,7 +440,7 @@ function Layout() {
             <LinkBanner link={link} remembered={remembering ? memory.at : undefined} />
             {!narrow && <AttentionList />}
             {!narrow && <WaitingList />}
-            {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} statuses={state.factory} />}
+            {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
             {taskWarning && (
               <div
                 role="alert"

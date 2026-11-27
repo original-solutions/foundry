@@ -7,8 +7,7 @@ import { Named, Now } from "./Now";
 import { startShell } from "./api";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
-import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
-import { factoryRuns, runRows, type FactoryRun } from "./lanes";
+import { branchOf, byUrgency, machineNumbers, machineStats, rows, type FactoryRun, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { MachineName } from "./Machines";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
@@ -17,7 +16,7 @@ import { SparkIcon } from "./FirstPrompt";
 import { Mark } from "./Mark";
 import { ThemeButton } from "./ThemeButton";
 import { railKey } from "./collapsed";
-import type { FactoryStatus, MachineSample } from "./api";
+import type { MachineSample } from "./api";
 
 const statusColour = { online: "text-neutral-400", offline: "text-red-400", unknown: "text-neutral-400" };
 const statusDot = { online: "bg-emerald-400", offline: "bg-red-400", unknown: "bg-neutral-500" };
@@ -45,8 +44,6 @@ interface Props {
   onKeys?: () => void;
   /** Collapses the list to the rail, on a wide screen. */
   onRail?: () => void;
-  /** The believed factory statuses by project id, which name the workspaces of factory runs. */
-  statuses?: Record<string, FactoryStatus>;
 }
 
 /** The terminals a folded workspace (or the rail) shows: the most urgent first, and the open one always. */
@@ -66,8 +63,7 @@ const TYPEAHEAD_MS = 600;
  * unfolds or goes in), Home and End go to the ends, and typing a name's first letters goes to the
  * next one it starts. A workspace's actions show while the keyboard is in it, the Tab after it.
  */
-export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys, onRail, statuses }: Props) {
-  const factoryOf = factoryRuns(statuses);
+export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys, onRail }: Props) {
   // A workspace is one line of its states unless it is unfolded: the board already shows every
   // terminal, so the list stays an index. The workspace you are in unfolds, and folds again when
   // you leave it; one you unfold yourself stays open.
@@ -236,7 +232,6 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                 <Workspace
                   key={workspace.id}
                   workspace={workspace}
-                  factory={factoryOf(workspace)}
                   folded={!unfolded.has(workspace.id)}
                   onFold={(on) => fold([workspace.id], on)}
                   selected={selected}
@@ -284,8 +279,6 @@ function LoadMeter({ sample }: { sample: MachineSample }) {
 
 interface WorkspaceProps {
   workspace: WorkspaceView;
-  /** The factory run it belongs to, if any. */
-  factory?: FactoryRun;
   folded: boolean;
   onFold: (on: boolean) => void;
   selected?: string;
@@ -295,10 +288,10 @@ interface WorkspaceProps {
   tab: (id: string) => { tabIndex: number; onFocus: () => void };
 }
 
-function Workspace({ workspace, factory, folded, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
+function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
   const terminals = useTerminalActions();
-  const list = runRows(workspace, factory);
+  const list = rows(workspace);
   const over = ended(workspace);
   return (
     <div role="group" aria-label={workspace.name} className="group/ws">
@@ -319,7 +312,7 @@ function Workspace({ workspace, factory, folded, onFold, selected, onNavigate, o
           </svg>
           <span className="truncate font-medium">{workspace.name}</span>
         </button>
-        {factory && <FactoryMark run={factory} />}
+        {workspace.factory && <FactoryMark run={workspace.factory} />}
         {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
       </div>
       {!folded && (

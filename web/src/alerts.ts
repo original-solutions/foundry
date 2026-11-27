@@ -1,6 +1,5 @@
-import type { FactoryStatus, SessionState } from "./api";
-import { byUrgency, rows, type MachineView } from "./fleet";
-import { factoryRuns, tendedByFactory } from "./lanes";
+import type { SessionState } from "./api";
+import { byUrgency, rows, tendedByFactory, type MachineView } from "./fleet";
 import { needsYou, sessionGlyph, type Glyph } from "./labels";
 import { shapes } from "./StateGlyph";
 
@@ -33,12 +32,11 @@ const says: Partial<Record<SessionState, string>> = {
  * its run is held up, a session that already waits, is stuck or failed needs you, and is raised
  * then. The first look, with nothing before it, raises nothing.
  */
-export function alertsFor(before: Seen | undefined, machines: MachineView[], statuses?: Record<string, FactoryStatus>): { alerts: Alert[]; seen: Seen } {
-  const factoryOf = factoryRuns(statuses);
+export function alertsFor(before: Seen | undefined, machines: MachineView[]): { alerts: Alert[]; seen: Seen } {
   const seen: Seen = new Map();
   const alerts: Alert[] = [];
   for (const workspace of machines.flatMap((m) => m.workspaces)) {
-    const tended = tendedByFactory(factoryOf(workspace));
+    const tended = tendedByFactory(workspace.factory);
     for (const s of workspace.sessions) {
       seen.set(s.id, { state: s.state, tended });
       if (!before) continue;
@@ -59,11 +57,8 @@ export interface Pulse {
 }
 
 /** The fleet's pulse. A live factory run's terminals that would need you are left out, as the board leaves its card under working. */
-export function pulse(machines: MachineView[], statuses?: Record<string, FactoryStatus>): Pulse {
-  const factoryOf = factoryRuns(statuses);
-  const all = machines.flatMap((m) =>
-    m.workspaces.flatMap((w) => (tendedByFactory(factoryOf(w)) ? rows(w).filter((r) => !needsYou.includes(r.glyph)) : rows(w))),
-  );
+export function pulse(machines: MachineView[]): Pulse {
+  const all = machines.flatMap((m) => m.workspaces.flatMap((w) => (tendedByFactory(w.factory) ? rows(w).filter((r) => !needsYou.includes(r.glyph)) : rows(w))));
   const count = (...glyphs: Glyph[]) => all.filter((r) => glyphs.includes(r.glyph)).length;
   return { glyph: byUrgency(all)[0]?.glyph, needYou: count(...needsYou), working: count("working") };
 }

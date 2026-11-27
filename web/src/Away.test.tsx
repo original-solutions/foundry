@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AnyRecord, Briefs, FactoryStatus, Mark, SessionState } from "./api";
 import { AWAY_KEY, AWAY_MS } from "./absence";
 import { Away } from "./Away";
-import { fleet } from "./fleet";
+import { fleet, withFactory } from "./fleet";
 import { factoryStatus, ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { json } from "./test-utils";
 
@@ -86,7 +86,7 @@ function view(records: AnyRecord[], onOpen = vi.fn(), statuses?: Record<string, 
   const client = new QueryClient();
   const ui = (r: AnyRecord[]) => (
     <QueryClientProvider client={client}>
-      <Away records={r} synced machines={fleet(r, settings(), briefs)} traced={new Set(["s1", "s2", "s3"])} onOpen={onOpen} statuses={statuses} />
+      <Away records={r} synced machines={withFactory(fleet(r, settings(), briefs), statuses)} traced={new Set(["s1", "s2", "s3"])} onOpen={onOpen} />
     </QueryClientProvider>
   );
   const rendered = render(ui(records));

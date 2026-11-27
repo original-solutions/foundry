@@ -45,7 +45,7 @@ The tab, the sidebar and the board all show a session's state the same way. Thre
 | **Needs you** | Claude asked a question or wants permission. | Open the terminal and answer. On a phone the key bar offers **1**, **2** and **3**. |
 | **Ready** | The turn is done and Claude waits for your next prompt. | Type a prompt, or pick a next step. |
 
-You may also see **Starting**, before the session has reported anything, and **Stuck**, after ten minutes with no output. Open a stuck session and see what it is doing. On the board, in the sidebar and in the **While you were away** card, a session in a live factory run reads **Quiet 10+ min** instead, because the factory watches it. Its terminal's tab still says **Stuck**. See [Group the board](board.md#group-the-board). **Failed** and **Ended** mean it stopped. **Unreachable** means its machine cannot be reached right now.
+You may also see **Starting**, before the session has reported anything, and **Stuck**, after ten minutes with no output. Open a stuck session and see what it is doing. A session in a live factory run reads **Quiet 10+ min** instead, wherever it shows, because the factory watches it. See [Group the board](board.md#group-the-board). **Failed** and **Ended** mean it stopped. **Unreachable** means its machine cannot be reached right now.
 
 ## Steps
 

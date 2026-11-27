@@ -8,7 +8,7 @@ import { router, routeTree } from "./App";
 import { button, dangerButton, pressed } from "./Modal";
 import { keep, KEEP_AFTER, recall } from "./memory";
 import { nextSteps } from "./next";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { FakeSocket, json, mockFetch, type Call } from "./test-utils";
 
 // What the stand-in terminals show on every row, and the link finder the last one opened registered.
@@ -812,6 +812,23 @@ describe("App", () => {
     expect(document.title).toBe("Foundry");
     expect(shown).toEqual([]);
     vi.restoreAllMocks();
+  });
+
+  it("says a live factory run's stuck session is quiet in its terminal's tab too", async () => {
+    mockActions();
+    await open("/terminals/t1", live);
+    const run = { run: "original-solutions__foundry__162__1", title: "t", step: "building", machine: ME, gate_retries_used: 0, minutes_used: 1, workspaces: ["w1"], sessions: ["s1"] };
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: { ...heldStatus(2), runs: [run] } })));
+    act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "stuck", { model: "sonnet", version: 2 }) })));
+    const strip = await screen.findByRole("tablist", { name: "Terminals in fix login" });
+    await waitFor(() => expect(within(strip).getByRole("tab", { selected: true }).getAttribute("title")).toBe("fix login / sonnet: Quiet 10+ min"));
+  });
+
+  it("names a workspace on a commit by its commit in the terminal's header", async () => {
+    mockActions();
+    await open("/terminals/t1", { ...live, records: [sample(ME, 1), onCommit(ME, "w1", "fix login"), terminal(ME, "t1", "w1", "running"), session(ME, "s1", "w1", "t1", "working", { model: "sonnet" })] });
+    expect(await screen.findByTitle("fedcba9 · demo")).toBeDefined();
   });
 
   it("says in the while-you-were-away card that a live factory run's stuck session is quiet", async () => {

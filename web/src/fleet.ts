@@ -1,4 +1,5 @@
-import type { AnyRecord, FactoryStatus, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
+import type { AnyRecord, FactoryStatus, HeldUp, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
+import { issueUrl, parseRun } from "./factory";
 import { busy, plural, sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, urgency, type Glyph } from "./labels";
 
 export interface FleetState {
@@ -92,6 +93,8 @@ export interface WorkspaceView {
   projectId: string;
   sessions: SessionView[];
   shells: ShellView[];
+  /** The factory run it belongs to, once `withFactory` has read the believed statuses. */
+  factory?: FactoryRun;
 }
 export interface MachineView {
   id: string;
@@ -277,6 +280,59 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
   }));
 }
 
+/** The factory run a workspace belongs to: its id, its issue where the id names one, and whether it waits on a person. */
+export interface FactoryRun {
+  run: string;
+  issue?: number;
+  url?: string;
+  held?: HeldUp["kind"];
+}
+
+/**
+ * What a factory session P1 marks stuck says instead: it is quiet, for at least P1's stuck
+ * threshold. A fixed text, so it reads the same on every machine and after a reload.
+ */
+export const QUIET = "Quiet 10+ min";
+
+/**
+ * The factory run each workspace belongs to, as the believed statuses name it: a live run's
+ * workspaces, and a held-up run's. A status names only workspaces of its own project.
+ */
+export function factoryRuns(statuses: Record<string, FactoryStatus> | undefined): (workspace: WorkspaceView) => FactoryRun | undefined {
+  const named = new Map<string, FactoryRun>();
+  for (const status of Object.values(statuses ?? {})) {
+    const runs: { run: string; workspaces: string[]; held?: HeldUp["kind"] }[] = [
+      ...status.runs.map((r) => ({ run: r.run, workspaces: r.workspaces })),
+      ...status.held_up.map((h) => ({ run: h.run, workspaces: h.workspaces ?? [], held: h.kind })),
+    ];
+    for (const { run, workspaces, held } of runs) {
+      const parts = parseRun(run);
+      const mark: FactoryRun = { run, ...(parts && { issue: parts.issue, url: issueUrl(parts) }), ...(held && { held }) };
+      for (const workspace of workspaces) named.set(`${status.project}/${workspace}`, mark);
+    }
+  }
+  return (workspace) => named.get(`${workspace.projectId}/${workspace.id}`);
+}
+
+/** Whether the factory tends a workspace: its run is live, not held up for a person, so nothing in it needs you (G14). */
+export const tendedByFactory = (run: FactoryRun | undefined): boolean => run !== undefined && !run.held;
+
+/**
+ * The fleet with each workspace a believed status names marked with its factory run, so every
+ * view that lists its terminals (`rows`) reads them the same way. Without statuses, the fleet as is.
+ */
+export function withFactory(machines: MachineView[], statuses: Record<string, FactoryStatus> | undefined): MachineView[] {
+  if (!statuses) return machines;
+  const runOf = factoryRuns(statuses);
+  return machines.map((machine) => ({
+    ...machine,
+    workspaces: machine.workspaces.map((workspace) => {
+      const factory = runOf(workspace);
+      return factory ? { ...workspace, factory } : workspace;
+    }),
+  }));
+}
+
 /** What a workspace shows as its branch: its branch, or the first 7 characters of its commit when it is on one. */
 export function branchOf(workspace: WorkspaceView): string {
   return workspace.branch || workspace.base.slice(0, 7);
@@ -336,10 +392,16 @@ const rests: Glyph[] = ["ready", "done"];
 
 /** A workspace's terminals in sidebar order: its sessions, then its shells. */
 export function rows(workspace: WorkspaceView): Row[] {
+  // A live factory run's stuck session is quiet, since the factory watches it; in a held-up run,
+  // which waits on a person, it stays stuck. It keeps P1's stuck glyph on purpose: that is P1's
+  // true state, and the label says why it is not urgent. A tended run's waiting session keeps
+  // its label too: the factory answers it.
+  const tended = tendedByFactory(workspace.factory);
   return [
     ...workspace.sessions.map((s) => {
       const glyph = sessionGlyph[s.state];
-      return { terminal: s.terminal, session: s.id, name: s.name, title: s.title, now: busy.includes(glyph) ? s.now : undefined, said: rests.includes(glyph) ? s.said : undefined, label: sessionLabel[s.state], glyph };
+      const label = tended && glyph === "stuck" ? QUIET : sessionLabel[s.state];
+      return { terminal: s.terminal, session: s.id, name: s.name, title: s.title, now: busy.includes(glyph) ? s.now : undefined, said: rests.includes(glyph) ? s.said : undefined, label, glyph };
     }),
     ...workspace.shells.map((t) => ({ terminal: t.id, name: t.name, label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
   ];

@@ -1,7 +1,6 @@
 import { Popover } from "radix-ui";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { alertsFor, favicon, pulse, rippleFrames, tabTitle, type Alert, type Seen } from "./alerts";
-import type { FactoryStatus } from "./api";
 import type { MachineView } from "./fleet";
 import { loadNotify, route, saveNotify, type Notify } from "./notify";
 
@@ -23,10 +22,10 @@ export interface News {
  * once: on the desktop while the page is not in front (when turned on and allowed), else as a card
  * in the page (`news`) while it shows; a click on a desktop alert opens that session's terminal,
  * and coming back to the page takes the alerts it raised off the desktop. Whatever is set, the
- * same news is `spoken`, for `Announcer` to tell a screen reader. A live factory run that a
- * believed status in `statuses` names never needs you here, as on the board.
+ * same news is `spoken`, for `Announcer` to tell a screen reader. A live factory run's sessions
+ * (`withFactory`) never need you here, as on the board.
  */
-export function useAlerts(machines: MachineView[], synced: boolean, onOpen: (terminal: string) => void, statuses?: Record<string, FactoryStatus>) {
+export function useAlerts(machines: MachineView[], synced: boolean, onOpen: (terminal: string) => void) {
   const [notify, setNotify] = useState(loadNotify);
   const [permission, setPermission] = useState(() => (supported() ? Notification.permission : undefined));
   const desktop: DesktopStatus = !supported() ? "unsupported" : permission === "denied" ? "blocked" : permission === "granted" ? "allowed" : "ask";
@@ -42,7 +41,7 @@ export function useAlerts(machines: MachineView[], synced: boolean, onOpen: (ter
   const raised = useRef<Notification[]>([]);
   useEffect(() => {
     if (!synced) return;
-    const next = alertsFor(seen.current, machines, statuses);
+    const next = alertsFor(seen.current, machines);
     seen.current = next.seen;
     if (next.alerts.length === 0) return;
     const said = next.alerts.map((a) => `${a.title}: ${a.body}`).join(". ");
@@ -64,7 +63,7 @@ export function useAlerts(machines: MachineView[], synced: boolean, onOpen: (ter
         // A browser that only shows notifications from a service worker (Chrome on Android).
       }
     }
-  }, [machines, synced, notify, desktop, statuses]);
+  }, [machines, synced, notify, desktop]);
 
   // Back at the page, its alerts on the desktop are old news: the page and the catch-up have it.
   useLayoutEffect(() => {
@@ -75,7 +74,7 @@ export function useAlerts(machines: MachineView[], synced: boolean, onOpen: (ter
     return () => window.removeEventListener("focus", back);
   }, []);
 
-  const now = useMemo(() => pulse(machines, statuses), [machines, statuses]);
+  const now = useMemo(() => pulse(machines), [machines]);
   const title = tabTitle(now);
   useEffect(() => {
     document.title = title;

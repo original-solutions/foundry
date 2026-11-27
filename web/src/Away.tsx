@@ -1,6 +1,6 @@
 import { useQueries } from "@tanstack/react-query";
 import { useLayoutEffect, useRef, useState } from "react";
-import { sessionTrail, type AnyRecord, type FactoryStatus, type Mark } from "./api";
+import { sessionTrail, type AnyRecord, type Mark } from "./api";
 import { AWAY_MS, keepLeft, leaving, moved, since, takeLeft, type Left, type Moved } from "./absence";
 import type { MachineView } from "./fleet";
 import { addsSteps, plural } from "./labels";
@@ -30,7 +30,6 @@ export function Away({
   traced,
   onOpen,
   onShown,
-  statuses,
 }: {
   records: AnyRecord[];
   synced: boolean;
@@ -39,13 +38,11 @@ export function Away({
   onOpen: (terminal: string) => void;
   /** The sessions the card lists now, so news of them raises no card of its own. */
   onShown?: (sessions: string[]) => void;
-  /** The believed factory statuses by project id: a live run's sessions need no one, as on the board. */
-  statuses?: Record<string, FactoryStatus>;
 }) {
   const left = useLeft(records, synced);
   const [gone, setGone] = useState<{ of?: number; ids: string[] }>({ ids: [] });
   const dismissed = gone.of === left.since?.at ? gone.ids : [];
-  const list = left.since && synced ? moved(left.since, records, machines, statuses).filter((m) => !dismissed.includes(m.row.session)) : [];
+  const list = left.since && synced ? moved(left.since, records, machines).filter((m) => !dismissed.includes(m.row.session)) : [];
   const trails = useQueries({
     queries: list.map((m) => ({
       enabled: traced.has(m.row.session),

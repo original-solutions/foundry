@@ -3,7 +3,7 @@ import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
 import { findKey } from "./FindBar";
 import { totals } from "./changes";
-import type { Located } from "./fleet";
+import { branchOf, type Located } from "./fleet";
 import { machineQuery } from "./api";
 import { words } from "./labels";
 import { jumpKey, SearchIcon } from "./JumpPalette";
@@ -90,7 +90,7 @@ export function TerminalHeader({
       {located ? (
         <>
           <div className={`flex h-11 min-w-0 shrink items-center gap-2 ${onClosePane ? "flex-1" : "max-md:flex-1 md:max-w-64"}`}>
-            <span className="truncate font-medium text-neutral-100" title={`${located.workspace.branch} · ${located.workspace.project}`}>
+            <span className="truncate font-medium text-neutral-100" title={`${branchOf(located.workspace)} · ${located.workspace.project}`}>
               {located.workspace.name}
             </span>
             <span className="hidden shrink-0 text-xs text-neutral-500 sm:inline" title={`Runs on ${located.machine.name}`}>

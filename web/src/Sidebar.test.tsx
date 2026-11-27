@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fleet } from "./fleet";
+import { fleet, withFactory } from "./fleet";
 import { Sidebar } from "./Sidebar";
 import { TerminalActions } from "./TerminalMenu";
 import { factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
@@ -429,7 +429,7 @@ describe("Sidebar and the factory", () => {
     );
 
   it("marks a factory run's workspace and links it to its issue, and names a quiet session so", async () => {
-    await renderApp(<Sidebar machines={factoryMachines()} statuses={factoryStatuses()} {...props} />);
+    await renderApp(<Sidebar machines={withFactory(factoryMachines(), factoryStatuses())} {...props} />);
     const run = screen.getByRole("group", { name: "fac 162" });
     // Folded, the mark shows on the workspace's line.
     expect(within(run).getByRole("link", { name: "factory #162" }).getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");

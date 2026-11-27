@@ -6,7 +6,7 @@ import { createContext, useContext, type ComponentProps } from "react";
 import type { AnyRecord, Changes, SessionState, Shipping } from "./api";
 import { archiveOf } from "./Archive";
 import { Board, BOARD_BUSY_EVERY } from "./Board";
-import { fleet, type MachineView } from "./fleet";
+import { fleet, withFactory, type MachineView } from "./fleet";
 import { factoryStatus, factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { RETRY_EVERY } from "./poll";
 import { TerminalActions } from "./TerminalMenu";
@@ -592,28 +592,28 @@ describe("Board and the factory", () => {
   });
 
   it("marks a factory run's card and links it to its issue", async () => {
-    await show(fleet(factoryRecords(), settings()), vi.fn(), { statuses: factoryStatuses() });
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses()));
     const mark = within(card("fac 162")).getByRole("link", { name: "factory #162" });
     expect(mark.getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");
     expect(within(card("far away")).queryByRole("link", { name: /^factory/ })).toBeNull();
   });
 
   it("marks a run whose id names no issue as plain text, with no link", async () => {
-    await show(fleet(factoryRecords(), settings()), vi.fn(), { statuses: factoryStatus("p1", { "not-a-run": ["w1"] }) });
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatus("p1", { "not-a-run": ["w1"] })));
     const run = card("fac 162");
     expect(within(run).getByText("factory").tagName).toBe("SPAN");
     expect(within(run).queryByRole("link", { name: /^factory/ })).toBeNull();
   });
 
   it("keeps a factory session P1 marks stuck under working, quiet 10+ min, and a held-up run's card under needs you", async () => {
-    await show(fleet(factoryRecords(), settings()), vi.fn(), { statuses: factoryStatuses() });
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses()));
     const working = screen.getByRole("region", { name: "Working" });
     expect(within(within(working).getByRole("article", { name: "fac 162" })).getByText("Quiet 10+ min")).toBeDefined();
     expect(within(screen.getByRole("region", { name: "Needs you" })).getByRole("article", { name: "fac 170" })).toBeDefined();
   });
 
   it("moves a needs-info run's card under needs you too", async () => {
-    await show(fleet(factoryRecords(), settings()), vi.fn(), { statuses: factoryStatuses("needs_info") });
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses("needs_info")));
     expect(within(screen.getByRole("region", { name: "Needs you" })).getByRole("article", { name: "fac 170" })).toBeDefined();
   });
 

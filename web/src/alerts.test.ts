@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AnyRecord, SessionState } from "./api";
 import { alertsFor, favicon, pulse, rippleFrames, tabTitle } from "./alerts";
-import { fleet } from "./fleet";
+import { fleet, withFactory } from "./fleet";
 import { shapes } from "./StateGlyph";
 import { factoryStatus, ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
@@ -64,34 +64,34 @@ describe("alertsFor and the factory", () => {
 
   it("raises nothing when a live factory run's session waits, is stuck or fails, since the factory tends it", () => {
     for (const state of ["waiting_for_you", "stuck", "failed"] as const) {
-      const { seen } = alertsFor(undefined, world("working"), live);
-      const next = alertsFor(seen, world(state), live);
+      const { seen } = alertsFor(undefined, withFactory(world("working"), live));
+      const next = alertsFor(seen, withFactory(world(state), live));
       expect(next.alerts).toEqual([]);
       expect(next.seen.get("s1")).toEqual({ state, tended: true });
     }
   });
 
   it("still says a live factory run's session finished its turn", () => {
-    const { seen } = alertsFor(undefined, world("working"), live);
-    expect(alertsFor(seen, world("idle"), live).alerts.map((a) => a.body)).toEqual(["opus finished its turn"]);
+    const { seen } = alertsFor(undefined, withFactory(world("working"), live));
+    expect(alertsFor(seen, withFactory(world("idle"), live)).alerts.map((a) => a.body)).toEqual(["opus finished its turn"]);
   });
 
   it("raises a session that went stuck in a live run once its run is held up, and once only", () => {
-    const quiet = alertsFor(alertsFor(undefined, world("working"), live).seen, world("stuck"), live);
+    const quiet = alertsFor(alertsFor(undefined, withFactory(world("working"), live)).seen, withFactory(world("stuck"), live));
     expect(quiet.alerts).toEqual([]);
-    const told = alertsFor(quiet.seen, world("stuck"), held);
+    const told = alertsFor(quiet.seen, withFactory(world("stuck"), held));
     expect(told.alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
-    expect(alertsFor(told.seen, world("stuck"), held).alerts).toEqual([]);
+    expect(alertsFor(told.seen, withFactory(world("stuck"), held)).alerts).toEqual([]);
     // Let go again, the run's stuck session is the factory's once more: no news.
-    expect(alertsFor(told.seen, world("stuck"), live).alerts).toEqual([]);
+    expect(alertsFor(told.seen, withFactory(world("stuck"), live)).alerts).toEqual([]);
   });
 
   it("raises a held-up run's session that is stuck, and any session outside a run", () => {
-    const { seen } = alertsFor(undefined, world("working"), held);
-    expect(alertsFor(seen, world("stuck"), held).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
+    const { seen } = alertsFor(undefined, withFactory(world("working"), held));
+    expect(alertsFor(seen, withFactory(world("stuck"), held)).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
     const other = factoryStatus("p1", { [RUN]: ["w9"] });
-    const before = alertsFor(undefined, world("working"), other).seen;
-    expect(alertsFor(before, world("stuck"), other).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
+    const before = alertsFor(undefined, withFactory(world("working"), other)).seen;
+    expect(alertsFor(before, withFactory(world("stuck"), other)).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
   });
 });
 
@@ -109,11 +109,11 @@ describe("pulse", () => {
   it("leaves a live factory run's sessions out of what needs you, and counts a held-up run's", () => {
     const RUN = "original-solutions__foundry__162__1";
     const machines = world("stuck", [workspace(ME, "w2", "other"), terminal(ME, "t2", "w2"), session(ME, "s2", "w2", "t2", "working")]);
-    expect(pulse(machines, factoryStatus("p1", { [RUN]: ["w1"] }))).toEqual({ glyph: "working", needYou: 0, working: 1 });
+    expect(pulse(withFactory(machines, factoryStatus("p1", { [RUN]: ["w1"] })))).toEqual({ glyph: "working", needYou: 0, working: 1 });
     for (const state of ["waiting_for_you", "failed"] as const) {
-      expect(pulse(world(state), factoryStatus("p1", { [RUN]: ["w1"] }))).toEqual({ glyph: undefined, needYou: 0, working: 0 });
+      expect(pulse(withFactory(world(state), factoryStatus("p1", { [RUN]: ["w1"] })))).toEqual({ glyph: undefined, needYou: 0, working: 0 });
     }
-    expect(pulse(machines, factoryStatus("p1", {}, { [RUN]: { kind: "stuck", workspaces: ["w1"] } }))).toEqual({ glyph: "stuck", needYou: 1, working: 1 });
+    expect(pulse(withFactory(machines, factoryStatus("p1", {}, { [RUN]: { kind: "stuck", workspaces: ["w1"] } })))).toEqual({ glyph: "stuck", needYou: 1, working: 1 });
     expect(pulse(machines)).toEqual({ glyph: "stuck", needYou: 1, working: 1 });
   });
 

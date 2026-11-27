@@ -1,6 +1,5 @@
-import type { AnyRecord, FactoryStatus, Mark } from "./api";
-import type { MachineView, Row } from "./fleet";
-import { factoryRuns, runRows, tendedByFactory } from "./lanes";
+import type { AnyRecord, Mark } from "./api";
+import { rows, tendedByFactory, type MachineView, type Row } from "./fleet";
 import { needsYou, urgency } from "./labels";
 import { turns } from "./trail";
 import { readStoredJson, storeJson, unstore } from "./storage";
@@ -42,14 +41,12 @@ export interface Moved {
  * needs you, as on the board: its rows read as the board's do. Records are compared by version,
  * never by time.
  */
-export function moved(left: Left, records: AnyRecord[], machines: MachineView[], statuses?: Record<string, FactoryStatus>): Moved[] {
-  const factoryOf = factoryRuns(statuses);
+export function moved(left: Left, records: AnyRecord[], machines: MachineView[]): Moved[] {
   const version = new Map(records.flatMap((r) => (r.kind === "session" && !r.deleted ? [[r.body.id, r.version] as const] : [])));
   const all = machines.flatMap((m) =>
     m.workspaces.flatMap((w) => {
-      const run = factoryOf(w);
-      const tended = tendedByFactory(run);
-      return runRows(w, run).flatMap((row) => {
+      const tended = tendedByFactory(w.factory);
+      return rows(w).flatMap((row) => {
         if (!row.session) return [];
         const before = left.versions[row.session];
         const changed = before === undefined || (version.get(row.session) ?? 0) > before;
