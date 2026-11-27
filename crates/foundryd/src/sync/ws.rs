@@ -12,7 +12,8 @@ use axum::routing::get;
 use foundry_proto::settings::Machine;
 use futures::future::BoxFuture;
 use futures::{Sink, SinkExt, Stream, StreamExt};
-use tokio_tungstenite::tungstenite;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite};
 
 use super::{Conn, Dialer, Peers};
 use crate::join::Keys;
@@ -29,9 +30,7 @@ impl Dialer for WsDialer {
     fn dial(&self, peer: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
         let url = url(&peer.address, self.port);
         Box::pin(async move {
-            let (socket, _) = tokio_tungstenite::connect_async(url)
-                .await
-                .map_err(io::Error::other)?;
+            let socket = open(url).await.map_err(io::Error::other)?;
             Ok(pump(
                 socket,
                 |message| match message {
@@ -42,6 +41,15 @@ impl Dialer for WsDialer {
             ))
         })
     }
+}
+
+/// A WebSocket to `url`, with Nagle's algorithm off, as on the connections the API accepts, so
+/// a key typed into another machine's terminal, and its echo, cross the link at once.
+async fn open(
+    url: String,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, tungstenite::Error> {
+    let (socket, _) = tokio_tungstenite::connect_async_with_config(url, None, true).await?;
+    Ok(socket)
 }
 
 /// The route that serves links peers open to this machine. A link names its machine in its
@@ -206,6 +214,26 @@ mod tests {
         drop(conn);
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(peer.is_closed(), "the socket is still held");
+    }
+
+    /// A key typed into another machine's terminal crosses the link as a few bytes, which with
+    /// Nagle's algorithm on wait for the acknowledgement of the last write before they go.
+    #[tokio::test]
+    async fn a_dialed_link_sends_small_writes_at_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+
+        let socket = open(url("127.0.0.1", port)).await.unwrap();
+
+        let MaybeTlsStream::Plain(tcp) = socket.get_ref() else {
+            panic!("the link is not a plain TCP stream");
+        };
+        assert!(tcp.nodelay().unwrap(), "Nagle's algorithm is on");
+        drop(served.await);
     }
 
     #[test]

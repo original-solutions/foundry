@@ -81,7 +81,17 @@
 //!   for the turn after the newest read. A turn the worker answers is written and not shown yet,
 //!   so nothing is decided until it shows (`building` reads it then); one the worker says was
 //!   never written (`NotWritten`) is the interruption; any other error of the call decides
-//!   nothing, and the next pass asks again.
+//!   nothing, and the next pass asks again. A call that answers `Failed` without a break for
+//!   [`TURN_FAILING_FOR`] (an owner that runs an older Foundry, or one whose answer is not
+//!   JSON, fails the same way on every pass) sends the run stuck for a person
+//!   ([`TURN_UNREADABLE`]): no resume is spent, and nothing more is asked of the owner (no
+//!   archive, no sessions ended, since the session has ended), which would refuse it the same
+//!   way. The workspace is kept, as any stuck run's is, until the issue leaves `stuck`. Its first
+//!   failure is recorded before the error is returned (`resume-turn-failing <session> <turn>
+//!   <generation> <ms>`), on the sleep-counting clock as gating's `checks-waiting` is, so a
+//!   daemon restart keeps it and a takeover or a reset clock starts the count again. Any other
+//!   answer to the same probe, or the fleet showing the session unreachable, clears it
+//!   (`resume-turn-answered <session> <turn>`).
 //! - Before a resumed session starts, the issue text is checked again against the approval the
 //!   ledger recorded, as the runner's `textStop` does: a text changed by someone who is not an
 //!   instructor, or whose edits cannot be judged, ends the run stuck and starts nothing. The
@@ -246,6 +256,7 @@
 //! - `is not resumed once a relaunch is decided, and nothing is written`
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use foundry_proto::factory::{RunEvent, RunId};
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, WorkspaceId};
@@ -283,6 +294,11 @@ use crate::workspaces::{Checkout, FactoryTag, Setup};
 /// The public reason of a run whose session's machine stayed unreachable.
 pub const MACHINE_UNREACHABLE: &str = "the session's machine has been unreachable for 15 minutes";
 
+/// The public reason of a run whose session ended and whose next turn could not be read for
+/// [`TURN_FAILING_FOR`]. The call's error stays in the ledger.
+pub const TURN_UNREADABLE: &str =
+    "the session's last turn could not be read from its machine for 15 minutes";
+
 /// The detail of the stop of a run whose pull request's branch is not a plain branch name: the
 /// runner's `branchRefused` words.
 pub const BRANCH_REFUSED: &str = "the pull request's branch is not a plain branch name";
@@ -315,6 +331,21 @@ pub const CLAIM_MOVED: &str = "claim-moved ";
 /// The step written when the machine a claim moved to was unreachable for 15 minutes before its
 /// workspace was answered: `claim-moved-given-up <id>`.
 pub const CLAIM_GIVEN_UP: &str = "claim-moved-given-up ";
+
+/// The step written before a turn probe's first `Failed` answer is acted on:
+/// `resume-turn-failing <session> <turn> <generation> <ms>`, with the lease generation and the
+/// sleep-counting clock's reading it was read under. A probe that keeps failing for
+/// [`TURN_FAILING_FOR`] from it sends the run stuck ([`TURN_UNREADABLE`]).
+pub const TURN_FAILING: &str = "resume-turn-failing ";
+/// The step written when the probe answers anything but `Failed`, or the fleet shows the
+/// session unreachable, while a first failure is on record, which clears it:
+/// `resume-turn-answered <session> <turn>`.
+pub const TURN_ANSWERED: &str = "resume-turn-answered ";
+/// How long a turn probe answers `Failed` without a break before the run goes stuck for a
+/// person: the 15 minutes an unreachable machine is waited for, on the same
+/// sleep-counting clock. An owner that runs an older Foundry, or answers with a body that is
+/// not JSON, fails the same way on every pass, and the run would otherwise never be decided.
+pub const TURN_FAILING_FOR: Duration = UNREACHABLE_FOR;
 
 /// What one pass of [`advance`] or [`placed`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -575,6 +606,9 @@ enum Ended {
     },
     /// Its machine has been unreachable for 15 minutes.
     Unreachable,
+    /// Its process ended and the turn after the newest read could not be read for
+    /// [`TURN_FAILING_FOR`]: the call's newest error.
+    TurnUnreadable(String),
 }
 
 impl Ended {
@@ -591,6 +625,14 @@ impl Ended {
                 },
             ),
             Ended::Unreachable => (STUCK_MACHINE, Stop::new(MACHINE_UNREACHABLE)),
+            Ended::TurnUnreadable(error) => (
+                STUCK_TURN,
+                Stop {
+                    reason: TURN_UNREADABLE.into(),
+                    detail: Some(format!("{TURN_UNREADABLE}: {error}")),
+                    ..Stop::default()
+                },
+            ),
         }
     }
 }
@@ -846,10 +888,12 @@ const STUCK_MACHINE: &str = "machine-unreachable";
 const STUCK_UNCONFIRMED: &str = "resume-approval-unconfirmed";
 const STUCK_LAUNCH: &str = "resume-launch-failed";
 const STUCK_SETUP: &str = "resume-setup-failed";
-const OWN_STUCK_CODES: [&str; 8] = [
+const STUCK_TURN: &str = "turn-unreadable";
+const OWN_STUCK_CODES: [&str; 9] = [
     STUCK_GONE,
     STUCK_ENDED,
     STUCK_MACHINE,
+    STUCK_TURN,
     STUCK_UNCONFIRMED,
     STUCK_LAUNCH,
     STUCK_SETUP,
@@ -992,7 +1036,12 @@ fn finish_own_stuck(
         (Some(round), record) if round.workspace.is_some() => record
             .filter(|record| !unreachable_long(ctx, record.owner))
             .map(|record| record.body.id.to_string()),
-        _ if decision.code == STUCK_MACHINE || old_machine_gone(ctx, run, events, seen) => None,
+        _ if decision.code == STUCK_MACHINE
+            || decision.code == STUCK_TURN
+            || old_machine_gone(ctx, run, events, seen) =>
+        {
+            None
+        }
         _ => at.worktree.take(),
     };
     let reason = stop.reason.clone();
@@ -1029,6 +1078,15 @@ fn ended(
     };
     match state {
         SessionState::Unreachable => {
+            // The probe is not asked while the owner is away, which breaks its failures.
+            let next = seen.turn_read.map_or(1, |read| read + 1);
+            probe_answered(
+                ctx,
+                run,
+                failing_since(events, session, next),
+                session,
+                next,
+            )?;
             let owner = seen
                 .worktree
                 .as_deref()
@@ -1051,14 +1109,32 @@ fn ended(
                 // session ended: the turn after the newest read is asked of the worker. One it
                 // answers is written and not shown yet, so nothing is decided until it shows. One
                 // it says was never written means the process ended before a result line. Any
-                // other error decides nothing: the next pass asks again.
+                // other error decides nothing: the next pass asks again, unless the call has
+                // failed without a break for `TURN_FAILING_FOR` (`probe_failed`), which sends the
+                // run stuck.
                 None => {
                     let next = seen.turn_read.map_or(1, |read| read + 1);
-                    ctx.held()?;
+                    let generation = ctx.held()?;
+                    let since = failing_since(events, session, next);
                     match ctx.worker.turn(session, next) {
-                        Ok(_) => return Ok(None),
-                        Err(WorkerError::NotWritten(_)) => None,
-                        Err(error) => return Err(error.into()),
+                        Ok(_) => {
+                            probe_answered(ctx, run, since, session, next)?;
+                            return Ok(None);
+                        }
+                        Err(WorkerError::NotWritten(_)) => {
+                            probe_answered(ctx, run, since, session, next)?;
+                            None
+                        }
+                        Err(error @ WorkerError::Failed(_)) => {
+                            if !probe_failed(ctx, run, since, generation, session, next)? {
+                                return Err(error.into());
+                            }
+                            return Ok(Some(Ended::TurnUnreadable(error.to_string())));
+                        }
+                        Err(error) => {
+                            probe_answered(ctx, run, since, session, next)?;
+                            return Err(error.into());
+                        }
                     }
                 }
                 Some(turn) => {
@@ -1082,6 +1158,79 @@ fn ended(
         | SessionState::WaitingForYou
         | SessionState::Stuck => Ok(None),
     }
+}
+
+/// The lease generation and clock reading of the first `Failed` answer to the probe of turn
+/// `turn` of `session` that is still on record: the newest `resume-turn-failing` line of that
+/// turn with no `resume-turn-answered` line of it after, in the ledger's order.
+fn failing_since(events: &[RunEvent], session: SessionId, turn: u64) -> Option<(u64, u64)> {
+    let key = format!("{session} {turn}");
+    let mut since = None;
+    for step in events.iter().filter_map(step_text) {
+        if let Some(rest) = step.strip_prefix(TURN_FAILING) {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            if let [id, n, generation, ms] = parts.as_slice()
+                && format!("{id} {n}") == key
+                && let (Ok(generation), Ok(ms)) = (generation.parse(), ms.parse())
+            {
+                since = Some((generation, ms));
+            }
+        } else if step.strip_prefix(TURN_ANSWERED) == Some(key.as_str()) {
+            since = None;
+        }
+    }
+    since
+}
+
+/// A `Failed` answer to the probe of turn `turn` of `session`: whether the call has failed
+/// without a break for [`TURN_FAILING_FOR`], counted on the sleep-counting clock from the
+/// first failure on record (`since`). With none, or one of another lease generation or above
+/// the clock now (a takeover, or a reboot that reset the clock), the first failure is recorded
+/// now, before the error is returned: a takeover can lengthen the wait, never end it early. A
+/// daemon restart keeps the generation and the clock, and so the first failure's time.
+fn probe_failed(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    since: Option<(u64, u64)>,
+    generation: u64,
+    session: SessionId,
+    turn: u64,
+) -> Result<bool, RunError> {
+    let now = u64::try_from(ctx.clock.now().as_millis()).unwrap_or(u64::MAX);
+    match since {
+        Some((from, at)) if from == generation && now >= at => {
+            Ok(Duration::from_millis(now - at) >= TURN_FAILING_FOR)
+        }
+        _ => {
+            note(
+                ctx,
+                run,
+                &format!("{TURN_FAILING}{session} {turn} {generation} {now}"),
+                "resume-turn-failing",
+            )?;
+            Ok(false)
+        }
+    }
+}
+
+/// An answer to the probe of turn `turn` of `session` that is not `Failed` breaks the
+/// failures: a first failure on record (`since`) is cleared. With none, nothing is written.
+fn probe_answered(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    since: Option<(u64, u64)>,
+    session: SessionId,
+    turn: u64,
+) -> Result<(), RunError> {
+    if since.is_none() {
+        return Ok(());
+    }
+    note(
+        ctx,
+        run,
+        &format!("{TURN_ANSWERED}{session} {turn}"),
+        "resume-turn-answered",
+    )
 }
 
 /// The workspace the run's newest session works in.
@@ -1288,6 +1437,12 @@ fn decide(
     // The machine is gone: nothing can be asked of it, and it ends its own sessions.
     if *ended == Ended::Unreachable {
         at.worktree = None;
+    }
+    // The owner fails every call the same way: the run is a person's, with no resume spent
+    // and nothing more asked of it. The session has ended, so there is none to end.
+    if matches!(ended, Ended::TurnUnreadable(_)) {
+        at.worktree = None;
+        return stuck(ctx, run, at, code, stop);
     }
     if used >= ctx.config.limits.interruption_resumes {
         return stuck(ctx, run, at, code, stop);
@@ -6155,7 +6310,8 @@ mod tests {
                 "{error}"
             );
             assert_eq!(rig.worker.calls(), vec![probe(1)]);
-            assert_eq!(event_count(&rig, &run), before);
+            // The one line written is the first failure's record.
+            assert_eq!(event_count(&rig, &run), before + 1);
             assert!(interruptions(&rig, &run).is_empty());
             assert!(archive_calls(&rig).is_empty());
             never_written(&rig);
@@ -6208,6 +6364,316 @@ mod tests {
                 )),
                 "{detail}"
             );
+        }
+    }
+
+    /// #268: a turn probe that answers `Failed` without a break for longer than
+    /// [`TURN_FAILING_FOR`] sends the run stuck for a person: no resume is spent, and nothing
+    /// more is asked of the owner, which refuses its calls the same way.
+    mod a_turn_probe_that_keeps_failing {
+        use std::sync::{Arc, Mutex};
+
+        use super::*;
+        use crate::clock::FakeClock;
+        use crate::factory::ledger::testing::{T0, ticking};
+        use crate::factory::worker::AlwaysHeld;
+        use crate::store::Store;
+
+        fn call_failed(rig: &Rig) {
+            rig.worker.on_turn(Err(WorkerError::Failed(
+                "the owner runs an older Foundry".into(),
+            )));
+        }
+
+        /// A pass whose probe fails: an error, and no interruption.
+        fn fails(rig: &Rig, run: &RunId) {
+            call_failed(rig);
+            let error = advance(&rig.ctx(), run).unwrap_err();
+            assert!(
+                matches!(error, RunError::Worker(WorkerError::Failed(_))),
+                "{error}"
+            );
+            assert!(interruptions(rig, run).is_empty());
+            assert!(archive_calls(rig).is_empty());
+        }
+
+        /// The pass past the limit: the probe fails once more and the run goes stuck for a
+        /// person. No resume is spent, and the owner is asked for nothing but the probe: no
+        /// archive, no workspace, no sessions ended.
+        fn goes_stuck(rig: &Rig, run: &RunId) {
+            call_failed(rig);
+            assert_eq!(
+                pass(rig, run),
+                ResumeStep::Stuck {
+                    reason: TURN_UNREADABLE.into()
+                }
+            );
+            assert!(interruptions(rig, run).is_empty());
+            assert!(
+                rig.worker
+                    .calls()
+                    .iter()
+                    .all(|call| matches!(call, Call::Turn { .. })),
+                "{:?}",
+                rig.worker.calls()
+            );
+            assert!(rig.finished(run));
+            assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+            let stuck = rig
+                .events(run)
+                .into_iter()
+                .find(|e| e.event == "stuck")
+                .unwrap();
+            assert_eq!(stuck.cause.unwrap()["reason"], STUCK_TURN);
+            // The call's error is kept in the ledger, never in the comment.
+            assert!(stuck.data.to_string().contains("older Foundry"));
+            let comment = the_stuck_comment(rig);
+            assert!(comment.contains(TURN_UNREADABLE), "{comment}");
+            assert!(!comment.contains("older Foundry"), "{comment}");
+        }
+
+        fn minutes(rig: &Rig, n: u64) {
+            rig.clock.advance(secs(n * 60));
+        }
+
+        /// The first-failure and answered lines of `run`, in order.
+        fn records(rig: &Rig, run: &RunId) -> Vec<String> {
+            rig.steps(run)
+                .into_iter()
+                .filter(|step| step.starts_with(TURN_FAILING) || step.starts_with(TURN_ANSWERED))
+                .collect()
+        }
+
+        fn failing(turn: u64, generation: u64, ms: u64) -> String {
+            format!("{TURN_FAILING}{SESSION} {turn} {generation} {ms}")
+        }
+
+        fn answered(turn: u64) -> String {
+            format!("{TURN_ANSWERED}{SESSION} {turn}")
+        }
+
+        #[test]
+        fn the_limit_is_the_unreachable_limit() {
+            assert_eq!(TURN_FAILING_FOR, UNREACHABLE_FOR);
+        }
+
+        #[test]
+        fn the_first_failure_is_recorded_on_the_clock_before_the_error_is_returned() {
+            let (rig, run) = failed_with_turns_unasked();
+            minutes(&rig, 3);
+            fails(&rig, &run);
+            assert_eq!(records(&rig, &run), [failing(1, 1, 180_000)]);
+            // A second failure keeps the first one's time.
+            minutes(&rig, 1);
+            fails(&rig, &run);
+            assert_eq!(records(&rig, &run), [failing(1, 1, 180_000)]);
+        }
+
+        #[test]
+        fn a_probe_that_keeps_failing_past_the_limit_goes_stuck_for_a_person() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 14);
+            fails(&rig, &run);
+            minutes(&rig, 1);
+            goes_stuck(&rig, &run);
+            assert_eq!(rig.worker.calls(), vec![probe(1), probe(1), probe(1)]);
+            // The stuck run is not carried on: a later pass asks nothing.
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(rig.worker.calls().len(), 3);
+        }
+
+        #[test]
+        fn a_probe_short_of_the_limit_is_still_an_error() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 14);
+            fails(&rig, &run);
+            assert!(!rig.finished(&run));
+            assert!(rig.sim.comments().is_empty());
+        }
+
+        #[test]
+        fn a_never_written_answer_clears_the_record() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            never_written(&rig);
+            pass_one(&rig, &run);
+            assert_eq!(records(&rig, &run), [failing(1, 1, 0), answered(1)]);
+        }
+
+        #[test]
+        fn the_fleet_showing_the_session_unreachable_breaks_the_failures() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            // The owner drops off the fleet for a minute: its session shows unreachable and
+            // the turn is not asked for.
+            rig.view = fleet(Some(SessionState::Unreachable))
+                .unreachable(m1(), secs(60))
+                .build();
+            let _ = advance(&rig.ctx(), &run);
+            assert_eq!(rig.worker.calls(), vec![probe(1)]);
+            assert_eq!(records(&rig, &run), [failing(1, 1, 0), answered(1)]);
+            // Back with the session failed: the count starts again from the next failure.
+            rig.view = failed();
+            minutes(&rig, 10);
+            fails(&rig, &run);
+            assert_eq!(
+                records(&rig, &run),
+                [failing(1, 1, 0), answered(1), failing(1, 1, 1_200_000)]
+            );
+        }
+
+        #[test]
+        fn a_failure_recorded_for_another_session_does_not_count() {
+            let (rig, run) = failed_with_turns_unasked();
+            let other = format!("{TURN_FAILING}{} 1 1 0", resumed_session());
+            rig.step(&run, &other);
+            minutes(&rig, 20);
+            fails(&rig, &run);
+            assert_eq!(records(&rig, &run), [other, failing(1, 1, 1_200_000)]);
+            assert!(!rig.finished(&run));
+        }
+
+        #[test]
+        fn a_stuck_path_cut_short_is_finished_asking_the_owner_nothing() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 15);
+            call_failed(&rig);
+            rig.sim.fail("could not finish this issue", 1);
+            assert!(advance(&rig.ctx(), &run).is_err());
+            assert!(!rig.finished(&run));
+            // The next pass finishes the path from the ledger, without asking the turn again.
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Stuck {
+                    reason: TURN_UNREADABLE.into()
+                }
+            );
+            assert!(rig.finished(&run));
+            assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+            assert_eq!(rig.worker.calls(), vec![probe(1), probe(1)]);
+        }
+
+        #[test]
+        fn a_probe_that_recovers_before_the_limit_decides_nothing_and_clears_the_record() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            // The turn is written and its record has not synced: nothing is decided.
+            say(&rig, DONE_MESSAGE);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert!(interruptions(&rig, &run).is_empty());
+            assert_eq!(records(&rig, &run), [failing(1, 1, 0), answered(1)]);
+            // A failure after the read counts from itself, not from the first.
+            minutes(&rig, 10);
+            fails(&rig, &run);
+            assert_eq!(
+                records(&rig, &run),
+                [failing(1, 1, 0), answered(1), failing(1, 1, 1_200_000)]
+            );
+            minutes(&rig, 14);
+            fails(&rig, &run);
+            minutes(&rig, 1);
+            goes_stuck(&rig, &run);
+        }
+
+        #[test]
+        fn a_read_with_no_failure_recorded_writes_nothing() {
+            let (rig, run) = failed_with_turns_unasked();
+            say(&rig, DONE_MESSAGE);
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+        }
+
+        #[test]
+        fn an_unreachable_answer_breaks_the_failures() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            rig.worker
+                .on_turn(Err(WorkerError::Unreachable("timed out".into())));
+            assert!(advance(&rig.ctx(), &run).is_err());
+            assert_eq!(records(&rig, &run), [failing(1, 1, 0), answered(1)]);
+            minutes(&rig, 10);
+            fails(&rig, &run);
+            assert_eq!(records(&rig, &run).len(), 3);
+        }
+
+        #[test]
+        fn a_restart_of_the_daemon_keeps_the_first_failure_time() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            // The daemon restarts: the ledger is opened again from its store, the lease is
+            // renewed at the same generation, and the clock has counted on.
+            let store = Store::open(rig._dir.path().join("foundry.db")).unwrap();
+            rig.ledger = crate::factory::ledger::testing::ledger(
+                &Arc::new(Mutex::new(store)),
+                MachineId(uuid::Uuid::from_u128(0x1)),
+                1,
+                ticking(T0 + 3_600_000, 1000),
+            );
+            assert_eq!(records(&rig, &run), [failing(1, 1, 0)]);
+            minutes(&rig, 4);
+            fails(&rig, &run);
+            minutes(&rig, 1);
+            goes_stuck(&rig, &run);
+        }
+
+        #[test]
+        fn a_takeover_starts_the_count_again_and_never_ends_it_early() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            minutes(&rig, 10);
+            rig.guard = Box::new(AlwaysHeld(2));
+            // 20 minutes since the first failure, but the count is a new coordinator's.
+            minutes(&rig, 10);
+            fails(&rig, &run);
+            assert_eq!(
+                records(&rig, &run),
+                [failing(1, 1, 0), failing(1, 2, 1_200_000)]
+            );
+            minutes(&rig, 14);
+            fails(&rig, &run);
+            minutes(&rig, 1);
+            goes_stuck(&rig, &run);
+        }
+
+        #[test]
+        fn a_clock_reading_below_the_record_starts_the_count_again() {
+            let (mut rig, run) = failed_with_turns_unasked();
+            minutes(&rig, 30);
+            fails(&rig, &run);
+            // A reboot reset the clock.
+            rig.clock = FakeClock::new();
+            minutes(&rig, 5);
+            fails(&rig, &run);
+            assert_eq!(
+                records(&rig, &run),
+                [failing(1, 1, 1_800_000), failing(1, 1, 300_000)]
+            );
+            minutes(&rig, 15);
+            goes_stuck(&rig, &run);
+        }
+
+        #[test]
+        fn a_failure_of_another_turn_does_not_count() {
+            let (rig, run) = failed_with_turns_unasked();
+            fails(&rig, &run);
+            // Building read turn 1 since: the probe asks for turn 2 now.
+            rig.step(&run, "turn-read 1");
+            minutes(&rig, 20);
+            fails(&rig, &run);
+            assert_eq!(
+                records(&rig, &run),
+                [failing(1, 1, 0), failing(2, 1, 1_200_000)]
+            );
+            assert_eq!(rig.worker.calls(), vec![probe(1), probe(2)]);
         }
     }
 }

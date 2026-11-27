@@ -1,5 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal, type ILink } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
@@ -44,6 +45,10 @@ const NAMES_FILE = /[\w-]\.[A-Za-z0-9]{1,10}\b/;
  * screen, where focus would raise the on-screen keyboard over what you came to read. There a
  * key bar (`name` and `glyph` say whose and in what state) carries the keys a phone lacks and
  * a box to write a message in.
+ *
+ * The screen is drawn with WebGL, so a program that redraws all the time, as Claude Code does,
+ * leaves the page free to take keys; it is drawn with the DOM where the browser has no WebGL, and
+ * from when the browser takes the WebGL context away.
  *
  * While `finding`, a find bar over the screen searches its whole scrollback.
  *
@@ -123,6 +128,13 @@ export const TerminalPane = memo(function TerminalPane({
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host.current!);
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => webgl.dispose());
+      term.loadAddon(webgl);
+    } catch {
+      // No WebGL2 here: the DOM draws the screen.
+    }
     fit.fit();
     shown.current = { term, fit };
 

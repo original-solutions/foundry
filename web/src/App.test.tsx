@@ -1332,32 +1332,42 @@ describe("App", () => {
     expect((await screen.findByRole("alert")).textContent).toMatch(/^Could not clear the terminal: no such terminal\./);
   });
 
-  it("offers no ending for another machine's terminals, which only that machine can end", async () => {
-    const calls = mockActions();
+  it("ends and clears another machine's terminals, which the daemon carries to it, from a menu that offers no start or archive there", async () => {
+    const calls = mockActions(new Response(null, { status: 204 }), new Response(null, { status: 204 }));
     await open("/terminals/t1", {
       ...ended,
       records: [
         ...ended.records,
         sample(OTHER, 1),
         workspace(OTHER, "w9", "remote job"),
-        terminal(OTHER, "t9", "w9", "exited", { exit_code: 0 }),
+        terminal(OTHER, "t9", "w9", "exited", { exit_code: 101 }),
         terminal(OTHER, "t8", "w9", "running"),
       ],
       settings: settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "attic", address: "10.0.0.2" }] }),
     });
     const remote = screen.getByRole("group", { name: "remote job" });
-    expect(within(remote).queryByRole("button", { name: /^Clear/ })).toBeNull();
-
-    for (const row of within(remote).getAllByRole("link", { name: /^shell/ })) {
+    const entries = async (row: HTMLElement) => {
       fireEvent.contextMenu(row);
-      const menu = await screen.findByRole("menu");
-      expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Open", "Open beside", "Changes in remote job"]);
-      fireEvent.keyDown(menu, { key: "Escape" });
-      await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
-    }
-    // This machine's own ended terminals can still be cleared.
-    expect(within(screen.getByRole("group", { name: "fix login" })).getByRole("button", { name: "Clear 2 ended" })).toBeDefined();
-    expect(calls).toEqual([]);
+      return within(await screen.findByRole("menu"))
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent);
+    };
+
+    const running = within(remote).getByRole("link", { name: /Running$/ });
+    const name = running.getAttribute("data-name");
+    expect(await entries(running)).toEqual(["Open", "Open beside", "Changes in remote job", `End ${name}…`, "Clear 1 ended in remote job"]);
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+
+    const failed = within(remote).getByRole("link", { name: /Failed · exit 101$/ });
+    expect(await entries(failed)).toEqual(["Open", "Open beside", "Changes in remote job", "Clear"]);
+    fireEvent.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: "Clear" }));
+    await waitFor(() => expect(calls).toEqual([{ url: "/api/terminals/t9/close", method: "POST", body: undefined }]));
+
+    fireEvent.click(within(remote).getByRole("button", { name: "remote job" }));
+    fireEvent.click(within(remote).getByRole("button", { name: "Clear 1 ended" }));
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]).toEqual({ url: "/api/terminals/t9/close", method: "POST", body: undefined });
   });
 
   it("archives a workspace from its board card after showing what stops, then says what it kept", async () => {

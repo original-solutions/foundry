@@ -19,7 +19,7 @@ On a phone the bar also has a button that opens the workspaces list, and a **Jum
 
 When the bar is short of room, for example with the sidebar and Steps both open, what you need least gives way first, so nothing spills out of the bar. The next steps go first, then the machine name and the workspace in **Next**. Next, **Changes** and **Steps** shrink to their icons. At its narrowest, as on a phone, **Changes** and **Steps** move into **More**, **Next** keeps only its count, and two or more tabs get a row of their own. The workspace name and the tab you are on always stay.
 
-**+** only shows for workspaces on this machine. For a workspace on another machine, the menu also leaves out the entries that start, end, clear or archive.
+**+** only shows for workspaces on this machine. For a workspace on another machine, the menu also leaves out the entries that start or archive.
 
 ## Sessions and shells
 
@@ -175,11 +175,11 @@ Press **More** in the header, right-click a terminal anywhere it is listed, long
 - **End** the terminal, or **Clear** it once it has ended, and **Clear N ended in** the workspace.
 - **Archive** the workspace.
 
-Only a workspace on this machine gets the new, end, clear and archive entries.
+Only a workspace on this machine gets the new and archive entries. End and clear show for any machine Foundry can reach.
 
 ## End, clear and archive
 
-These work only for terminals and workspaces on this machine. For another machine's, open that machine's own UI.
+End and clear work for a terminal on any machine Foundry can reach. This machine's daemon passes the request to the machine that runs the terminal. If that machine is offline, a refused End says so in its dialog, and a refused Clear in a line at the foot of the screen. Archive works only for a workspace on this machine. To archive another machine's, open that machine's own UI.
 
 - **End** stops a terminal that still runs. Foundry asks first and says what is lost: a turn in progress stops where it is, or Claude closes without your answer. The workspace, its worktree and its branch stay. It is in the terminal's menu.
 - **Clear** removes a terminal that has already ended, with its final screen, without asking. **Clear N ended** does it for every ended terminal of a workspace. Both are in the terminal's menu, and **Clear N ended** is also among the sidebar's workspace actions.

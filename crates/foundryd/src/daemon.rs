@@ -935,13 +935,25 @@ impl Tailscale {
 /// Serves `app` on `listener` until the server fails.
 async fn serve_on(listener: tokio::net::TcpListener, app: Router) {
     let served = axum::serve(
-        listener,
+        without_delay(listener),
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await;
     if let Err(error) = served {
         tracing::error!("the server failed: {error}");
     }
+}
+
+/// `listener`, with Nagle's algorithm off on each connection it accepts, so a terminal's small
+/// writes, such as the echo of a key, go out at once rather than wait on the client's delayed
+/// acknowledgement of the last one. A connection it cannot be turned off for is served as it is.
+fn without_delay(
+    listener: tokio::net::TcpListener,
+) -> axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)> {
+    use axum::serve::ListenerExt as _;
+    listener.tap_io(|tcp| {
+        let _ = tcp.set_nodelay(true);
+    })
 }
 
 #[cfg(test)]
@@ -1299,6 +1311,21 @@ mod tests {
 
         assert!(!tailscale.served.contains_key(&gone));
         assert!(stopped(tailscale).await);
+    }
+
+    /// A keystroke's echo is a few bytes, and with Nagle's algorithm on it waits for the
+    /// browser's delayed acknowledgement of the last write before it goes.
+    #[tokio::test]
+    async fn each_connection_the_api_accepts_sends_small_writes_at_once() {
+        use axum::serve::Listener as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut listener = without_delay(listener);
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let (accepted, _) = listener.accept().await;
+
+        assert!(accepted.nodelay().unwrap(), "Nagle's algorithm is on");
     }
 
     /// When Tailscale cannot be asked, it counts as reporting nothing: every server is stopped

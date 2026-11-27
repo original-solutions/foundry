@@ -18,6 +18,11 @@ const screenOps = vi.hoisted(() => ({
   focused: false,
   provider: null as ILinkProvider | null,
   rows: [] as string[],
+  /** What the screen is drawn with: `webgl` once its add-on is loaded, `dom` until then and after it is disposed. */
+  drawnWith: "dom" as "dom" | "webgl",
+  /** Whether this browser can draw with WebGL. */
+  webgl: true,
+  contextLost: null as (() => void) | null,
 }));
 
 vi.mock("@xterm/xterm", () => ({
@@ -28,7 +33,10 @@ vi.mock("@xterm/xterm", () => ({
       screenOps.term = this;
       screenOps.options = options;
     }
-    loadAddon() {}
+    // As xterm does: an add-on starts on the terminal it is loaded into, and its error is the load's.
+    loadAddon(addon: { activate?: () => void }) {
+      addon.activate?.();
+    }
     open() {}
     registerLinkProvider(provider: ILinkProvider) {
       screenOps.provider = provider;
@@ -72,6 +80,23 @@ vi.mock("@xterm/xterm", () => ({
   },
 }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
+// As the WebGL add-on does: it takes over drawing once loaded, cannot start where the browser has
+// no WebGL2, and hands drawing back to the DOM when disposed.
+vi.mock("@xterm/addon-webgl", () => ({
+  WebglAddon: class {
+    activate() {
+      if (!screenOps.webgl) throw new Error("WebGL2 not supported");
+      screenOps.drawnWith = "webgl";
+    }
+    onContextLoss(callback: () => void) {
+      screenOps.contextLost = callback;
+      return { dispose() {} };
+    }
+    dispose() {
+      screenOps.drawnWith = "dom";
+    }
+  },
+}));
 
 const bytes = (text: string) => new TextEncoder().encode(text).buffer;
 
@@ -83,6 +108,9 @@ beforeEach(() => {
   screenOps.focused = false;
   screenOps.provider = null;
   screenOps.rows = [];
+  screenOps.drawnWith = "dom";
+  screenOps.webgl = true;
+  screenOps.contextLost = null;
   FakeSocket.install();
   vi.stubGlobal(
     "ResizeObserver",
@@ -130,6 +158,33 @@ describe("TerminalPane", () => {
     mount();
     expect(screenOps.options?.scrollback).toBe(10_000);
     expect(screenOps.options?.allowProposedApi).toBe(true);
+  });
+
+  it("draws its screen with WebGL, which keeps the page free to take keys while a busy program redraws", () => {
+    mount();
+    expect(screenOps.drawnWith).toBe("webgl");
+  });
+
+  it("draws with the DOM, and still shows and takes keys, where the browser has no WebGL", () => {
+    screenOps.webgl = false;
+    const { socket } = mount();
+    act(() => socket.open());
+
+    act(() => socket.deliver(bytes("kept screen")));
+    act(() => screenOps.typed?.("y"));
+
+    expect(screenOps.drawnWith).toBe("dom");
+    expect(screenOps.ops).toEqual(["reset", "write:kept screen"]);
+    expect(new TextDecoder().decode(socket.sent.at(-1) as Uint8Array)).toBe("y");
+  });
+
+  it("goes back to drawing with the DOM when the browser takes its WebGL context away", () => {
+    mount();
+    expect(screenOps.drawnWith).toBe("webgl");
+
+    act(() => screenOps.contextLost?.());
+
+    expect(screenOps.drawnWith).toBe("dom");
   });
 
   it("sends typed keys as bytes", () => {

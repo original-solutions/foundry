@@ -296,8 +296,7 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
   const terminals = useTerminalActions();
   const list = rows(workspace);
-  // Only the machine serving the UI can clear its terminals.
-  const over = terminals?.here === machine ? ended(workspace) : [];
+  const over = ended(workspace);
   return (
     <div role="group" aria-label={workspace.name} className="group/ws">
       <div className="flex items-center gap-2 rounded-md px-1 py-1 hover:bg-neutral-800/60">
