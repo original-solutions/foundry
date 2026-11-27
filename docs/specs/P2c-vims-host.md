@@ -233,8 +233,8 @@ A build that does not know about Vims must never build a Vims project on the fle
 - The shared base of V13 is built (done 2026-11-25), and the project's build and gate templates rest on it. Both do since 2026-11-26: the gate template `tc-supplier-portal-v2-gate` and the build template `tc-supplier-portal-v2` (build 7, with build 6 as its set-back).
 - On 2026-11-25 a template's build reached Ubuntu's archive and was refused the PHP archive, nodejs.org and Composer's site, so the base installs from files in its build context, which `.vims/fetch-toolchain.sh` in the gate template fetches and checks in an open workspace. Since 2026-11-26 a build reaches Launchpad's PPAs, nodejs.org and getcomposer.org (seen 2026-11-27), so the next change to the base can install from them and drop that script.
 - `vims exec` runs as root, and Composer turns its plugins off for root. A template's start script sets `COMPOSER_ALLOW_SUPERUSER=1` with its path.
-- A closed workspace cannot reach nodejs.org (check 5). The gate template sets `npm_config_nodedir` to the base's Node, so a native module builds without fetching Node's headers. The Composer cache it carries under `/workspace`, filled by `.vims/warm-composer-cache.sh`, is no longer needed and can go with the next save.
-- A closed workspace's `composer install` works from its first command. On 2026-11-27 a fresh closed workspace was refused `repo.packagist.org` for about its first 90 seconds, because its node's egress CA covers the package cache's hosts only once a closed workspace is placed there and takes a minute to widen. The fix, which makes a node that can hold closed workspaces cover them beforehand, is Care-Vicinity/cv-workspaces#18 and is live.
+- A closed workspace cannot reach nodejs.org (check 5). The gate template sets `npm_config_nodedir` to the base's Node, so a native module builds without fetching Node's headers. The Composer cache it carries under `/workspace`, filled by `.vims/warm-composer-cache.sh`, is no longer needed once the next precondition holds, and can go with the first save after that.
+- A closed workspace's `composer install` works from its first command. On 2026-11-27 a fresh closed workspace was refused `repo.packagist.org` for about its first 90 seconds, because its node's egress CA covers the package cache's hosts only once a closed workspace is placed there and takes a minute to widen. The fix, which makes a node that can hold closed workspaces cover them beforehand, is Care-Vicinity/cv-workspaces#18, open on 2026-11-27, so this holds only once it ships. It is shown after #18 ships by two runs that must both pass: check 5 again, with `composer install` as the first command in a fresh closed workspace of the gate template, and a closed run of check 8 on a gate template with no Composer cache.
 - `vims` is installed, and `foundryd secret set vims` done, on every machine that can act as coordinator.
 - The `factory-build` skill is in Tom's Vims profile (`vims profile save`), so every workspace has it.
 - The project is added in Foundry with the URL `https://github.com/Trilogy-Care/tc-supplier-portal-v2`. P2 refuses a repo reached over SSH.
@@ -288,7 +288,7 @@ Each check that fails stops the plan, and this spec is revised. All but 9, 10 an
 
 ## What the checks have found so far
 
-Run on 2026-11-25 and 2026-11-26 in throwaway workspaces, all removed since. Checks 9, 10 and 13 are not run. Check 6 has no row of its own: of it, only `gh api user` answering `tomkaczocha` is recorded (see 3, 4).
+Run on 2026-11-25 to 2026-11-27 in throwaway workspaces, all removed since. Checks 9, 10 and 13 are not run. Check 6 has no row of its own: of it, only `gh api user` answering `tomkaczocha` is recorded (see 3, 4).
 
 | Check | Result |
 |---|---|
