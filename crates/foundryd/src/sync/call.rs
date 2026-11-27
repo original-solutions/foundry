@@ -800,6 +800,31 @@ mod tests {
         server.abort();
     }
 
+    /// Two daemons for one machine in one process, as tests run them: the stop one was given
+    /// is never fired by a carried call the other answers.
+    #[tokio::test]
+    async fn a_stop_given_to_one_peers_is_not_fired_by_another_for_the_same_machine() {
+        let (me, caller) = (MachineId::random(), MachineId::random());
+        let (_given_dir, given, _) = listing(me, caller);
+        let (_other_dir, other, _) = listing(me, caller);
+        let (stop, stops) = counted();
+        given.stop_after_calls(stop);
+        let (api, server) = owners_api().await;
+        other.serve_calls(api);
+
+        let install = format!("/api/machines/{me}/update");
+        let (link, status, _) = carried(&other, caller, &install).await;
+        assert_eq!(status, 202);
+        drop(link);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        server.abort();
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            0,
+            "another Peers for the same machine fired this stop"
+        );
+    }
+
     #[test]
     fn the_stop_of_a_machine_is_the_one_its_peers_were_given() {
         let (me, other) = (MachineId::random(), MachineId::random());
