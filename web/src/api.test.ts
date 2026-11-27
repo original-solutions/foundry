@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, createWorkspace, installUpdate, listMachines, sendFile, sessionBriefs, sessionTrail, thisMachine, workspaceChanges } from "./api";
+import { ApiError, createWorkspace, installUpdate, listMachines, sendFile, sessionBriefs, sessionTrail, thisMachine, workspaceChanges, workspaceShipping } from "./api";
 import { json } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -10,6 +10,7 @@ const reads = [
   ["briefs", () => sessionBriefs()],
   ["trail", () => sessionTrail("s1")],
   ["changes", () => workspaceChanges("w1")],
+  ["shipping", () => workspaceShipping("w1")],
   ["machines", () => listMachines()],
   ["machine", () => thisMachine()],
 ] as const;
@@ -43,6 +44,32 @@ describe("the reads", () => {
     expect(await workspaceChanges("w1")).toEqual({ base: "main", commits: [], files: [] });
     answer(json(200, { id: "m1" }));
     expect(await thisMachine()).toBe("m1");
+  });
+});
+
+describe("workspaceShipping", () => {
+  it("posts with no body, so another machine's workspace is carried to its owner, and gives back where the branch stands", async () => {
+    const shipping = { branch: "fix-login", pushed: true, unpushed: 0, pr: null, unreachable: false };
+    const sent: { url: string; method?: string; body?: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        sent.push({ url, method: init.method, body: init.body });
+        return json(200, shipping);
+      }),
+    );
+
+    expect(await workspaceShipping("w1")).toEqual(shipping);
+    expect(sent).toEqual([{ url: "/api/workspaces/w1/pr", method: "POST", body: undefined }]);
+  });
+
+  it("refuses any status but 200, as an owner on an older build answers 400", async () => {
+    for (const status of [201, 400, 503, 504]) {
+      answer(json(status, { error: "no such route" }));
+      const error = await workspaceShipping("w1").catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).status).toBe(status);
+    }
   });
 });
 
