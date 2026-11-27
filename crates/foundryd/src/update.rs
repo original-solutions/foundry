@@ -792,6 +792,17 @@ pub fn install_ready(
     running: &str,
     exe: &Path,
 ) -> Result<(), InstallError> {
+    install_ready_with(home, tag, running, exe, point_current)
+}
+
+/// [`install_ready`] with the step that points `current` given.
+fn install_ready_with(
+    home: &Path,
+    tag: &str,
+    running: &str,
+    exe: &Path,
+    point: impl FnOnce(&Path, &str) -> io::Result<()>,
+) -> Result<(), InstallError> {
     let _lock = lock(home).map_err(io_error("cannot lock the update state"))?;
     let mut held = state(home).map_err(io_error("cannot read the update state"))?;
     let cleared = clear_stranded_trial(home, &mut held);
@@ -843,7 +854,7 @@ pub fn install_ready(
         next.refused = None;
     }
     save(home, &next).map_err(io_error("cannot save the update state"))?;
-    if let Err(error) = point_current(home, version) {
+    if let Err(error) = point(home, version) {
         if let Err(restore) = save(home, &held) {
             tracing::warn!("the update state could not be put back: {restore}");
         }
