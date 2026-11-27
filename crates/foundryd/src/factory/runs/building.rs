@@ -5529,21 +5529,44 @@ mod tests {
             }
         }
 
+        /// A message sent after the report and shown in the prompt count, with the turn it began
+        /// read, does not hold the pull request back from its gate.
+        #[test]
+        fn a_session_that_cannot_be_reached_after_an_earlier_message_was_shown_waits_for_the_gate()
+        {
+            let (mut rig, run) = built();
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+            rig.step(&run, "send-intent forward-comment c1 1");
+            rig.step(&run, "send-typed forward-comment c1");
+            rig.step(&run, "turn-read 2");
+            show(&mut rig, SessionState::Unreachable, 2, 2);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+        }
+
         /// The fleet shows a session on a machine it cannot reach as it last saw it. One that may
         /// be at work there after it reported its pull request keeps the run running.
         #[test]
         fn a_session_that_cannot_be_reached_and_may_be_at_work_keeps_the_run_running() {
-            let cases: [(&str, u64, u64, Option<&str>); 3] = [
-                ("a prompt after its newest turn", 1, 2, None),
-                ("a newer turn not read", 2, 2, None),
+            let cases: [(&str, u64, u64, bool, Option<&str>); 4] = [
+                ("a prompt after its newest turn", 1, 2, false, None),
+                ("a newer turn not read", 2, 2, false, None),
+                ("a question waiting", 1, 1, true, None),
                 (
                     "a message sent and not shown yet",
                     1,
                     1,
+                    false,
                     Some("send-intent forward-comment c1 1"),
                 ),
             ];
-            for (case, turn, prompts, step) in cases {
+            for (case, turn, prompts, question, step) in cases {
                 let (mut rig, run) = built();
                 end_turn(&mut rig, 1, DONE_MESSAGE);
                 assert!(matches!(
@@ -5553,7 +5576,7 @@ mod tests {
                 if let Some(step) = step {
                     rig.step(&run, step);
                 }
-                show(&mut rig, SessionState::Unreachable, turn, prompts);
+                show_with(&mut rig, SessionState::Unreachable, turn, prompts, question);
                 let events = rig.events(&run).len();
                 assert_eq!(pass(&rig, &run), BuildStep::Running, "{case}");
                 assert_eq!(rig.events(&run).len(), events, "{case}");
