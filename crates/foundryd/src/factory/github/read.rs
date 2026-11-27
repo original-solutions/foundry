@@ -640,8 +640,9 @@ pub fn issue_labels<G: Tracker + ?Sized>(
                 &format!("a GraphQL response naming issue {number}"),
             ));
         };
-        // Null for no such issue; an object without a number for something other than an issue.
-        let Some(read) = read.as_ref().filter(|read| read.number.is_some()) else {
+        // Null for no such issue, an object without a number for something other than an issue,
+        // and another number for an issue the URL led elsewhere: none is the issue asked for.
+        let Some(read) = read.as_ref().filter(|read| read.number == Some(number)) else {
             continue;
         };
         let (Some(state), Some(labels)) = (&read.state, &read.labels) else {
