@@ -1365,9 +1365,7 @@ pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]
             _ => {}
         }
     }
-    // The page may be cut off just after the label, hiding a rename in its second.
-    let reaches = in_force.is_some_and(|label| timeline_reaches(issue, &label.created_at));
-    judge_chosen_label(issue, in_force, instructors, reaches)
+    judge_chosen_label(issue, in_force, instructors)
 }
 
 /// The approval a claim was made on, judged after the claim removed `ready`: [`judge_approval`]'s
@@ -1414,21 +1412,18 @@ pub fn judge_claimed_approval(
         }
         _ => None,
     };
-    // The page may be cut off just after the label, hiding a rename in its second.
-    let reaches = label.is_some_and(|label| timeline_reaches(issue, &label.created_at));
-    judge_chosen_label(issue, label, instructors, reaches)
+    judge_chosen_label(issue, label, instructors)
 }
 
 /// What both judges decide once they have chosen the label (or found none): a missing label is
 /// `label-history-incomplete` on a full page of a longer history and `label-not-found`
 /// otherwise; a label applied by anyone but a human instructor is refused; and every body edit
-/// and title rename from the label's second on must be an instructor's. `reaches` says the
-/// timeline page holds every rename at or after the label.
+/// and title rename from the label's second on must be an instructor's, with a timeline page
+/// that may hide a rename in that second leaving the text unjudged.
 fn judge_chosen_label(
     issue: &ApprovalIssue,
     label: Option<&LabelChange>,
     instructors: &[String],
-    reaches: bool,
 ) -> Approval {
     let Some(label) = label else {
         let timeline = &issue.timeline_items;
@@ -1449,6 +1444,8 @@ fn judge_chosen_label(
             labeled_at,
         });
     };
+    // The page may be cut off just after the label, hiding a rename in its second.
+    let reaches = timeline_reaches(issue, &labeled_at);
     match text_changes_since(issue, &labeled_at, instructors, reaches) {
         TextCheck::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
         TextCheck::Unjudged => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
@@ -5025,10 +5022,10 @@ mod tests {
             assert!(seen.contains(&outcome), "{outcome:?} in {seen:?}");
         }
 
-        // Both judges hand the label they chose to one tail with the same `reaches`: this pins
-        // the `reaches` each passes, and a refusal added to a single judge beside the tail shows
-        // wherever a case triggers it. On a cut-off page whose oldest event is the label, a
-        // rename in its second could be hidden, so both refuse it.
+        // Both judges hand the label they chose to one tail, which judges the cut-off page
+        // itself: a refusal added to a single judge beside the tail shows wherever a case
+        // triggers it. On a cut-off page whose oldest event is the label, a rename in its second
+        // could be hidden, so both refuse it.
         let mut oldest = vec![labeled(LABELED, "tom", READY)];
         oldest.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
         let oldest = issue_of(oldest, &[], Some(HISTORY_PAGE as u64 + 5), None);
@@ -5054,15 +5051,14 @@ mod tests {
                     }
                     _ => None,
                 });
-            let reaches = label.is_some_and(|label| timeline_reaches(issue, &label.created_at));
             assert_eq!(
                 judge_approval(issue, READY, &instructors),
-                judge_chosen_label(issue, label, &instructors, reaches),
+                judge_chosen_label(issue, label, &instructors),
                 "{issue:?}"
             );
             assert_eq!(
                 judge_claimed_approval(issue, READY, PROJECT, &instructors),
-                judge_chosen_label(issue, label, &instructors, reaches),
+                judge_chosen_label(issue, label, &instructors),
                 "{issue:?}"
             );
         }
