@@ -3649,8 +3649,16 @@ mod tests {
         fn the_reported_pull_request_of_a_session_that_cannot_be_reached_is_gated() {
             // Its last turn stands: the gate needs the pull request, not the session. A message
             // sent earlier and shown in the prompt count does not hold it back.
-            let cases: [(&str, u64, &[&str]); 2] = [
+            let cases: [(&str, u64, &[&str]); 3] = [
                 ("its first turn read", 1, &[]),
+                (
+                    "a message refused with nothing typed",
+                    1,
+                    &[
+                        "send-intent forward-comment c1 1",
+                        "send-refused forward-comment c1",
+                    ],
+                ),
                 (
                     "a message sent earlier and shown",
                     2,
