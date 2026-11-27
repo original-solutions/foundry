@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { installUpdate, refused } from "./api";
 import type { MachineView } from "./fleet";
 import { plural } from "./labels";
@@ -62,18 +62,20 @@ function rowSays(row: Row, machine: MachineView | undefined): { text: string; to
 /**
  * The release waiting on the fleet, in the page's top bar: each waiting tag and how many listed
  * machines wait on it. It opens a checklist that installs the tag shown for each machine ticked,
- * the machine serving the page (`here`) last, so its restart cuts off no other call. What the
- * checklist sent lives only here, until it closes or the page reloads. Nothing shows while no
- * listed machine has a release waiting and the checklist is closed.
+ * the machine serving the page (`here`) last, so its restart cuts off no other call. One batch is
+ * out at a time, and none goes once the serving machine has answered that it restarts. What the
+ * checklist sent lives only here, until it closes or the page reloads; a batch keeps going when
+ * its checklist closes. Nothing shows while no listed machine has a release waiting and the
+ * checklist is closed.
  */
 export function UpdateBadge({ machines, here }: { machines: MachineView[]; here: string | undefined }) {
   const [open, setOpen] = useState(false);
   const [ticked, setTicked] = useState<Set<string>>(new Set());
   const [rows, setRows] = useState<Row[]>();
-  /** The batch the open checklist sent: an answer to an earlier one, closed since, is dropped, and its serving machine's call never goes. */
-  const batch = useRef(0);
-  /** Every install call still out, from any batch: the serving machine's call waits for them all. */
-  const out = useRef(new Set<Promise<void>>());
+  /** A batch is out, from this checklist or one closed since: no other may start, so none is cut off by the serving machine's restart. */
+  const [busy, setBusy] = useState(false);
+  /** The serving machine answered 202: it restarts, and the page reloads when it is back. */
+  const [restarting, setRestarting] = useState(false);
 
   const waiting = machines.flatMap((m) => (m.listed && m.sample?.update_ready ? [{ machine: m, tag: m.sample.update_ready }] : []));
   if (waiting.length === 0 && !open) return null;
@@ -84,39 +86,37 @@ export function UpdateBadge({ machines, here }: { machines: MachineView[]; here:
   const summary = groups.map(([tag, n], i) => `${tag} on ${i === 0 ? plural(n, "machine") : n}`).join(", ");
 
   const onOpenChange = (next: boolean) => {
-    batch.current += 1;
     setOpen(next);
     setRows(undefined);
     setTicked(new Set(next ? waiting.map((w) => w.machine.id) : []));
   };
 
   const install = async () => {
-    const mine = batch.current;
     const picked: Row[] = waiting
       .filter((w) => ticked.has(w.machine.id))
       .map((w) => ({ id: w.machine.id, name: w.machine.name, tag: w.tag, call: { kind: w.machine.id === here ? "queued" : "out" } }));
     setRows(picked);
-    const settle = (id: string, call: Call) => {
-      if (batch.current === mine) setRows((now) => now?.map((r) => (r.id === id ? { ...r, call } : r)));
-    };
-    const send = (row: Row) => {
-      const call = installUpdate(row.id, row.tag)
-        .then(
-          ({ status, json }) => settle(row.id, { kind: "answered", status, json }),
-          () => settle(row.id, { kind: "dropped" }),
-        )
-        .finally(() => out.current.delete(call));
-      out.current.add(call);
+    setBusy(true);
+    // Once the checklist closes its rows are gone, and an answer has no row to land in.
+    const settle = (id: string, call: Call) => setRows((now) => now?.map((r) => (r.id === id ? { ...r, call } : r)));
+    const send = async (row: Row): Promise<Call> => {
+      const call: Call = await installUpdate(row.id, row.tag).then(
+        ({ status, json }) => ({ kind: "answered", status, json }),
+        () => ({ kind: "dropped" }),
+      );
+      settle(row.id, call);
       return call;
     };
-    for (const row of picked) if (row.id !== here) void send(row);
-    while (out.current.size > 0) await Promise.all(out.current);
+    await Promise.all(picked.filter((r) => r.id !== here).map(send));
     const last = picked.find((r) => r.id === here);
-    if (last && batch.current === mine) {
+    if (last) {
       settle(last.id, { kind: "out" });
-      await send(last);
+      const call = await send(last);
+      if (call.kind === "answered" && call.status === 202) setRestarting(true);
     }
+    setBusy(false);
   };
+  const held = restarting ? "This machine is restarting on the new release. The page reloads when it is back." : busy ? "The last install is still out. Install again once it has answered." : undefined;
 
   const trigger = (
     <button
@@ -176,12 +176,13 @@ export function UpdateBadge({ machines, here }: { machines: MachineView[]; here:
             {waiting.length === 0 && <li className="px-3 py-2 text-xs text-neutral-500">No machine has a release waiting.</li>}
           </ul>
         )}
+        {!rows && held && <p className="mt-3 text-xs text-amber-300">{held}</p>}
         <div className="mt-4 flex justify-end gap-2">
           <button type="button" className={button} onClick={() => onOpenChange(false)}>
             Close
           </button>
           {!rows && (
-            <button type="button" className={primaryButton} disabled={here === undefined || !waiting.some((w) => ticked.has(w.machine.id))} onClick={() => void install()}>
+            <button type="button" className={primaryButton} disabled={here === undefined || held !== undefined || !waiting.some((w) => ticked.has(w.machine.id))} onClick={() => void install()}>
               Install
             </button>
           )}
