@@ -443,14 +443,15 @@ impl IntoResponse for ApiError {
                     "uncommitted": redacted(&dirty.uncommitted),
                     "unpushed": redacted(&dirty.unpushed),
                     "submodules": redacted(&dirty.submodules),
+                    "detached": dirty.detached,
                 });
                 return (StatusCode::CONFLICT, Json(body)).into_response();
             }
             Self::Workspace(e) => (
                 match e {
-                    WorkspaceError::Unknown(_) | WorkspaceError::UnknownCommit(_) => {
-                        StatusCode::NOT_FOUND
-                    }
+                    WorkspaceError::Unknown(_)
+                    | WorkspaceError::UnknownCommit(_)
+                    | WorkspaceError::Detached(_) => StatusCode::NOT_FOUND,
                     WorkspaceError::UnknownProject(_)
                     | WorkspaceError::UnknownBase(_)
                     | WorkspaceError::BranchRefused(_)

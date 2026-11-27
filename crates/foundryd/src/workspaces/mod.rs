@@ -221,6 +221,12 @@ pub enum WorkspaceError {
     NoToken(#[from] NoToken),
     #[error("workspace {0} is not a live workspace of this machine")]
     Unknown(WorkspaceId),
+    /// The workspace's folder is there, but git lists no worktree of the project's clone in it.
+    #[error(
+        "workspace {0}'s folder is no longer a git worktree of its project; archive it to \
+         remove the folder"
+    )]
+    Detached(WorkspaceId),
     #[error(
         "a branch or worktree named {0} already exists in this project; give the workspace \
          another name"
@@ -272,11 +278,17 @@ pub struct Dirty {
     /// Submodules checked out in the worktree, as paths relative to it. Their own uncommitted
     /// and unpushed work cannot be checked from here and would go with the worktree.
     pub submodules: Vec<String>,
+    /// The folder is there, but git no longer lists it as a worktree of the project's clone, so
+    /// nothing in it can be read through git. Archiving anyway deletes it.
+    pub detached: bool,
 }
 
 impl Dirty {
     fn is_empty(&self) -> bool {
-        self.uncommitted.is_empty() && self.unpushed.is_empty() && self.submodules.is_empty()
+        self.uncommitted.is_empty()
+            && self.unpushed.is_empty()
+            && self.submodules.is_empty()
+            && !self.detached
     }
 }
 
@@ -294,6 +306,10 @@ impl fmt::Display for Dirty {
         }
         if !self.submodules.is_empty() {
             write!(f, "{sep} submodules {}", self.submodules.join(", "))?;
+            sep = ";";
+        }
+        if self.detached {
+            write!(f, "{sep} its folder is no longer a git worktree")?;
         }
         Ok(())
     }
@@ -1407,8 +1423,10 @@ impl Inner {
         let body = self.live(id).await?;
         let clone = self.clone_path(project);
         let worktree = self.folder(&body).await;
+        let detached = self.detached(&clone, &body, &worktree).await?;
         if !force {
-            self.refuse_dirty(&clone, &worktree, &body.branch).await?;
+            self.refuse_dirty(&clone, &worktree, &body.branch, detached)
+                .await?;
         }
         for terminal in self.terminals_of(id).await? {
             match self.terminals.close(terminal).await {
@@ -1419,10 +1437,14 @@ impl Inner {
         let there = tokio::fs::try_exists(&worktree).await?;
         if there && !force {
             // What the terminals wrote as they were hung up counts too.
-            self.refuse_dirty(&clone, &worktree, &body.branch).await?;
+            self.refuse_dirty(&clone, &worktree, &body.branch, detached)
+                .await?;
         }
         let _removing = Removing::mark(self, id);
-        if there {
+        if there && detached {
+            // Git cannot remove what it does not list; the folder is all there is to take away.
+            tokio::fs::remove_dir_all(&worktree).await?;
+        } else if there {
             self.remove_worktree(&clone, &worktree, force).await?;
         } else if let Some((listed, _)) = self.registered_either(&clone, &body).await? {
             // Removed by hand: git forgets this worktree, and only this one, so its branch can be
@@ -1441,6 +1463,18 @@ impl Inner {
         )
         .await;
         Ok(())
+    }
+
+    /// Whether `body`'s workspace is detached: its folder `worktree` is there, but git lists no
+    /// worktree for the workspace in `clone`.
+    async fn detached(
+        &self,
+        clone: &Path,
+        body: &Workspace,
+        worktree: &Path,
+    ) -> Result<bool, WorkspaceError> {
+        Ok(tokio::fs::try_exists(worktree).await?
+            && self.registered_either(clone, body).await?.is_none())
     }
 
     /// The worktree git has registered for `body`'s workspace, in the folder named by its id or,
@@ -1595,7 +1629,7 @@ impl Inner {
             }
             // A detached worktree has no branch to check, and `folder` is no branch of its own.
             let checked = match self
-                .refuse_dirty(&clone, &listed, branch.unwrap_or(folder))
+                .refuse_dirty(&clone, &listed, branch.unwrap_or(folder), false)
                 .await
             {
                 Ok(()) => self.ignored(&listed).await,
@@ -1800,12 +1834,14 @@ impl Inner {
     /// [`WorkspaceError::Dirty`] when the worktree has uncommitted files or a checked-out
     /// submodule, or the branch or the worktree's `HEAD` has commits no remote branch has. With
     /// the folder there, the `HEAD` is read inside it, which git resolves however the path is
-    /// spelled; with it gone, it is the one git keeps for the worktree.
+    /// spelled; with it gone, it is the one git keeps for the worktree. A `detached` folder is
+    /// always refused, and nothing is read inside it: only the branch is checked.
     async fn refuse_dirty(
         &self,
         clone: &Path,
         worktree: &Path,
         branch: &str,
+        detached: bool,
     ) -> Result<(), WorkspaceError> {
         // The branch can be renamed or deleted inside the workspace; the worktree's HEAD still
         // holds what was on it.
@@ -1814,8 +1850,10 @@ impl Inner {
         if !branch.is_empty() && self.has_ref(clone, &reference).await? {
             heads.push(reference);
         }
-        let present = tokio::fs::try_exists(worktree).await?;
-        if present {
+        let present = !detached && tokio::fs::try_exists(worktree).await?;
+        if detached {
+            // Git cannot read a `HEAD` in a folder it does not list.
+        } else if present {
             let head = self
                 .git(worktree, "rev-parse", ["--verify", "HEAD"])
                 .await?;
@@ -1861,6 +1899,7 @@ impl Inner {
             uncommitted,
             unpushed,
             submodules,
+            detached,
         };
         if dirty.is_empty() {
             Ok(())
