@@ -246,14 +246,27 @@ pub struct Memo {
     /// The runs seen finished, by run id: a finished run's summary never changes, so its
     /// events are read once. `None` for one this build cannot show.
     finished: BTreeMap<RunId, Option<Done>>,
+    /// What the last listing of `factory:stuck` and of `factory:needs-info` showed of the
+    /// finished runs that wait, in that order. A cadence, not an ordering of records.
+    listed: [Option<Listed>; 2],
+}
+
+/// One label's listing, as far as the held-up runs go.
+#[derive(Debug)]
+struct Listed {
+    /// When it was tried, on the clock, whatever came of it.
+    at: Duration,
+    /// The waiting runs it was tried for: one that is not here is read at the next pass.
+    tried: BTreeSet<RunId>,
+    /// The waiting runs the label was last seen on. A listing that is not cut off and does not
+    /// show a run takes it out, which is no more final than the next listing; one that fails or
+    /// is cut off changes nothing for a run it does not show.
+    shown: BTreeSet<RunId>,
 }
 
 /// A finished run as the status shows it, with where its `finished` event stands.
 #[derive(Debug)]
 struct Done {
-    /// A listing that was not cut off showed the run's issue without its label: the label
-    /// never comes back for a finished attempt, so the run is not looked for again.
-    released: bool,
     /// Why a run that finished stuck or needing information waits for a person: the summary's
     /// reason, empty for any other run.
     reason: String,
@@ -1635,15 +1648,22 @@ impl<'a, 'w> Pass<'a, 'w> {
         Ok(known)
     }
 
-    /// Holds up the runs that finished stuck or needing information while their issue still
-    /// carries that label: `go_stuck` finishes the run, and a person's answer or a removed label
-    /// is what ends the wait. Only the newest attempt of an issue is held up. The issues with
-    /// each label are listed only when such a finished run exists. A listing that fails does not
-    /// end the pass, which is no one's step: what the last pass held up of these runs stays held
-    /// up until a listing is read. A listing that is not cut off and lacks the issue releases
-    /// the run for good, so listings stop once no finished run waits.
+    /// Holds up the runs that finished stuck or needing information while GitHub lists their
+    /// issue with that label: `go_stuck` finishes the run, and a person's answer or a removed
+    /// label is what ends the wait. Only the newest attempt of an issue is held up.
+    ///
+    /// A listing is a search that can lag, and an issue can be closed and reopened, so no
+    /// absence from one is final. Each label is listed when a run waits on it and
+    /// [`STUCK_READ_EVERY`] has passed since it was last tried, or a run that waits was not in
+    /// the last try (one that just finished is read at once). In between, the runs the last
+    /// listing showed stay held up. A listing that fails or is cut off at its limit changes
+    /// nothing for a run it does not show, and still counts as a try, so a listing that keeps
+    /// failing is tried once per [`STUCK_READ_EVERY`]. It does not end the pass, which is no
+    /// one's step. Steady state is two listings per [`STUCK_READ_EVERY`], and none while no
+    /// finished run waits.
     fn hold_up_finished(&mut self, unfinished: &BTreeSet<RunId>) {
         let world = self.world;
+        let now = world.clock.now();
         let newest = |run: &RunId| {
             !unfinished
                 .iter()
@@ -1655,7 +1675,7 @@ impl<'a, 'w> Pass<'a, 'w> {
             .finished
             .values()
             .flatten()
-            .filter(|done| !done.released && newest(&done.run.run))
+            .filter(|done| newest(&done.run.run))
             .filter_map(|done| {
                 let kind = match done.run.outcome {
                     RunOutcome::Stuck => HeldUpKind::Stuck,
@@ -1669,47 +1689,48 @@ impl<'a, 'w> Pass<'a, 'w> {
                 })
             })
             .collect();
-        for (kind, state) in [
-            (HeldUpKind::Stuck, State::Stuck),
-            (HeldUpKind::NeedsInfo, State::NeedsInfo),
+        for (at, kind, state) in [
+            (0, HeldUpKind::Stuck, State::Stuck),
+            (1, HeldUpKind::NeedsInfo, State::NeedsInfo),
         ] {
             let of_kind: Vec<&HeldUp> = waiting.iter().filter(|held| held.kind == kind).collect();
             if of_kind.is_empty() {
                 continue;
             }
-            let kept = |memo: &Memo, results: &mut PassResults, of_kind: &[&HeldUp]| {
-                let before = memo.last.iter().flat_map(|last| &last.held_up);
-                for held in before {
-                    if of_kind.iter().any(|now| now.run == held.run) {
-                        results.held_up.push(held.clone());
-                    }
-                }
-            };
-            match world.tracker.list_issues(&world.project.repo, state) {
-                Ok(listing) => {
+            let due = self.memo.listed[at].as_ref().is_none_or(|last| {
+                now.saturating_sub(last.at) >= STUCK_READ_EVERY
+                    || of_kind.iter().any(|held| !last.tried.contains(&held.run))
+            });
+            if due {
+                let before = self.memo.listed[at].take();
+                let mut shown: BTreeSet<RunId> = before
+                    .map(|last| last.shown)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|run| of_kind.iter().any(|held| held.run == *run))
+                    .collect();
+                if let Ok(listing) = world.tracker.list_issues(&world.project.repo, state) {
                     let carrying: BTreeSet<u64> =
                         listing.items.iter().map(|issue| issue.number).collect();
-                    let mut missing = Vec::new();
-                    for held in of_kind {
+                    for held in &of_kind {
                         if carrying.contains(&held.run.issue()) {
-                            self.results.held_up.push(held.clone());
-                        } else {
-                            missing.push(held);
-                        }
-                    }
-                    if listing.cut {
-                        // A listing cut off at its limit may leave the issue out: no evidence
-                        // that the label is gone, so what the last pass held up stays.
-                        kept(&*self.memo, &mut self.results, &missing);
-                    } else {
-                        for held in missing {
-                            if let Some(Some(done)) = self.memo.finished.get_mut(&held.run) {
-                                done.released = true;
-                            }
+                            shown.insert(held.run.clone());
+                        } else if !listing.cut {
+                            shown.remove(&held.run);
                         }
                     }
                 }
-                Err(_) => kept(&*self.memo, &mut self.results, &of_kind),
+                self.memo.listed[at] = Some(Listed {
+                    at: now,
+                    tried: of_kind.iter().map(|held| held.run.clone()).collect(),
+                    shown,
+                });
+            }
+            let shown = self.memo.listed[at].as_ref().map(|last| &last.shown);
+            for held in of_kind {
+                if shown.is_some_and(|shown| shown.contains(&held.run)) {
+                    self.results.held_up.push(held.clone());
+                }
             }
         }
     }
@@ -1757,15 +1778,9 @@ impl<'a, 'w> Pass<'a, 'w> {
                 pr_url: summary.pr_url.clone(),
                 run: summary.id,
             });
-            self.memo.finished.insert(
-                id,
-                run.map(|run| Done {
-                    released: false,
-                    reason,
-                    at,
-                    run,
-                }),
-            );
+            self.memo
+                .finished
+                .insert(id, run.map(|run| Done { reason, at, run }));
         }
         Ok(())
     }
