@@ -17,7 +17,7 @@ Each workspace is one card. The coloured bar on its left edge takes the colour o
 - **What Claude said.** When a session on this machine is **Ready** or **Ended**, what Claude said at the end of its last turn shows under its row, three lines at a time. Click it to read it all.
 - **Reply.** For a **Ready** session, reading it all also opens a reply box. Type and press `Enter` to answer without leaving the board. The reply goes into the session's terminal as if you typed it there. Since what Claude said shows only for sessions on this machine, so does the box.
 - **Next step.** The first **Ready** session of a workspace on this machine also gets buttons under its row, such as **Commit 1 file**, **Push 1 commit**, **Open a PR**, **Fix failing checks** or **Address the review**. Press one and Foundry types that instruction to Claude for you. [Next steps for an idle session](sessions.md#next-steps-for-an-idle-session) lists them all.
-- **Archive.** The small box button at the top right of a card on this machine. With a mouse it shows when you point at the card. See [End, clear and archive](sessions.md#end-clear-and-archive).
+- **Archive.** The small box button at the top right of a card. With a mouse it shows when you point at the card. See [End, clear and archive](sessions.md#end-clear-and-archive).
 
 ### The changes line
 
@@ -111,7 +111,7 @@ Point at an unfolded workspace and a row of buttons shows at the right of its br
 - **New session.** Asks for a model and a first prompt, then starts Claude Code in this workspace.
 - **New shell.** Opens a shell in this workspace. It shows in the list, where you can open it.
 - **Clear N ended.** Only when some terminals have ended.
-- **Archive.** Only on this machine.
+- **Archive.** Shows for a workspace on any machine.
 
 [End, clear and archive](sessions.md#end-clear-and-archive) says what the last two do.
 

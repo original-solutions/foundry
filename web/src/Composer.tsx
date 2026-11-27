@@ -22,23 +22,40 @@ export interface CreateInput {
   machine?: string;
   model: string;
   prompt?: string;
+  /** Names to try in turn while the daemon refuses the one before as taken (409): none for a typed name. */
+  then?: string[];
 }
 
 /**
- * Makes a workspace, then starts a session in it, saying which `step` it is on. `made` is true
- * once the workspace exists, even when its session then failed to start, since a second try
- * would only find its name taken. Letting Foundry choose sends the model and first prompt along:
- * when no machine qualifies the request waits (`session` is null), the waiting list is read
+ * Makes a workspace, then starts a session in it, saying which `step` it is on and the `name` it
+ * is sent or was made under: the first of the input's names the daemon does not refuse as taken.
+ * `made` is true once the workspace exists, even when its session then failed to start, since a
+ * second try would only find its name taken. Letting Foundry choose sends the model and first
+ * prompt along: when no machine qualifies the request waits (`session` is null), the waiting list is read
  * again to show it, and Foundry starts the session once it is placed.
  */
 export function useCreateWorkspace() {
   const [step, setStep] = useState<"branch" | "session">("branch");
+  /** The name the create of `input` is on now. A create that waits offline has not set it yet. */
+  const [trying, setTrying] = useState<{ input: CreateInput; name: string } | null>(null);
   const client = useQueryClient();
   const create = useMutation({
     mutationFn: async (input: CreateInput): Promise<{ session: string | null; warning: string | null }> => {
       setStep("branch");
       const session = input.machine === "choose" ? { model: input.model, prompt: input.prompt } : {};
-      const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name, machine: input.machine, ...session });
+      const names = [input.name, ...(input.then ?? [])];
+      let workspace: Awaited<ReturnType<typeof createWorkspace>> | undefined;
+      for (const [i, name] of names.entries()) {
+        setTrying({ input, name });
+        try {
+          workspace = await createWorkspace({ project: input.project, base: input.base, name, machine: input.machine, ...session });
+          break;
+        } catch (error) {
+          // A refused try made nothing, so the next name is tried in its place.
+          if (!(error instanceof ApiError && error.status === 409) || i === names.length - 1) throw error;
+        }
+      }
+      if (!workspace) throw new Error("no workspace name to try");
       if ("request" in workspace) {
         await client.invalidateQueries({ queryKey: placementsKey });
         return { session: null, warning: null };
@@ -56,7 +73,8 @@ export function useCreateWorkspace() {
     },
   });
   const made = create.isSuccess || create.error instanceof SessionNotStarted;
-  return { create, step, made };
+  const name = create.variables && (trying?.input === create.variables ? trying.name : create.variables.name);
+  return { create, step, made, name };
 }
 
 /** A create in hand: the mutation, its step and whether the workspace exists yet. */
@@ -66,14 +84,48 @@ export type Launch = ReturnType<typeof useCreateWorkspace>;
 const NAME_WORDS = 5;
 const NAME_AT_MOST = 40;
 
+/** A GitHub pull request or issue link, with whatever path, query, fragment or full stop follows it. */
+const githubLink = /^https?:\/\/(?:www\.)?github\.com\/[^/]+\/[^/]+\/(pull|issues)\/(\d+)(?:[/?#]\S*)?$/;
+/** `pr#12` or `issue#12`, and the `#12` of `pr #12`. */
+const reference = /^(pr|issue)#(\d+)$/;
+const number = /^#(\d+)$/;
+
+/** `word` without the brackets around it or the punctuation that closes a sentence after it. */
+const bare = (word: string) => word.replace(/^[(<[]+/, "").replace(/[)>\].!?,;:…]+$/u, "");
+
 /**
- * The workspace name a task gives: the first words of its first line, in lower case, cut at a
- * word to 40 characters, without the punctuation that closes a sentence. Empty for a blank task.
+ * The words of a task's first line a name is made of: a GitHub pull request or issue link is
+ * `pr <n>` or `issue <n>`, so are `PR#<n>` and `issue #<n>`, any other link is dropped, and a first
+ * word that is a slash command loses its slash.
+ */
+function nameWords(line: string): string[] {
+  const words = line.trim().toLowerCase().split(/\s+/);
+  if (words[0]?.startsWith("/")) words[0] = words[0].slice(1);
+  const kept: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const word = bare(words[i]);
+    const link = githubLink.exec(word);
+    const ref = reference.exec(word);
+    const next = number.exec(bare(words[i + 1] ?? ""));
+    if (link) kept.push(link[1] === "pull" ? "pr" : "issue", link[2]);
+    else if (ref) kept.push(ref[1], ref[2]);
+    else if ((word === "pr" || word === "issue") && next) {
+      kept.push(word, next[1]);
+      i++;
+    } else if (!/^https?:\/\//.test(word) && words[i]) kept.push(words[i]);
+  }
+  return kept;
+}
+
+/**
+ * The workspace name a task gives: the first words of its first line (`nameWords`), in lower
+ * case, cut at a word to 40 characters, without the punctuation that closes a sentence. Empty for
+ * a blank task.
  */
 export function taskName(task: string): string {
   const line = task.split("\n").find((l) => l.trim() !== "") ?? "";
   let name = "";
-  for (const word of line.trim().toLowerCase().split(/\s+/).slice(0, NAME_WORDS)) {
+  for (const word of nameWords(line).slice(0, NAME_WORDS)) {
     const next = name ? `${name} ${word}` : word;
     if (next.length > NAME_AT_MOST) break;
     name = next;
@@ -87,18 +139,32 @@ function holder(name: string, project: Project | undefined, workspaces: Workspac
   return project ? workspaces.find((w) => w.project === project.name && sameBranch(w.branch, branch)) : undefined;
 }
 
-/** `name`, or `name 2`, `name 3`… when the project already has a workspace on its branch. */
-function freeName(name: string, project: Project | undefined, workspaces: WorkspaceView[]): string {
-  if (!name) return name;
-  let next = name;
-  for (let n = 2; holder(next, project, workspaces); n++) next = `${name} ${n}`;
-  return next;
+/** How many names a create made from a task tries before it gives up. */
+const NAME_TRIES = 20;
+
+/**
+ * The names to try for `name`, in turn: `name`, then `name 2`, `name 3`…, 20 at most, skipping
+ * those the project already has a workspace on the branch of and those whose branch an earlier
+ * one has (a long name's branch is cut before its number). Empty for an empty name.
+ */
+function freeNames(name: string, project: Project | undefined, workspaces: WorkspaceView[]): string[] {
+  if (!name) return [];
+  const names: string[] = [];
+  const branches: string[] = [];
+  for (let n = 1; n <= NAME_TRIES + workspaces.length && names.length < NAME_TRIES; n++) {
+    const next = n === 1 ? name : `${name} ${n}`;
+    const branch = safeBranch(next);
+    if (branches.some((b) => sameBranch(b, branch))) continue;
+    branches.push(branch);
+    if (!holder(next, project, workspaces)) names.push(next);
+  }
+  return names;
 }
 
 /**
  * The box a task is given to Claude in: the task names the workspace and its branch as it is
- * typed (numbered when the project already has that branch), the project, base and model sit
- * under it, and Start (or Cmd+Enter) makes the workspace and starts Claude Code on the task,
+ * typed (numbered when that branch is taken in the project's repo), the project, base and model
+ * sit under it, and Start (or Cmd+Enter) makes the workspace and starts Claude Code on the task,
  * handing the session to `onCreated` so the layout lands in it. The workspace is made on this
  * machine, or on another listed one when the fleet has one and it is picked, or on the one
  * Foundry picks when it is let choose; an offline machine is shown but cannot be picked. When
@@ -150,14 +216,18 @@ export function Composer({
   const [managing, setManaging] = useState(false);
   const project = projects.find((p) => p.id === projectId) ?? projects[0];
   const prompt = promptOf(task);
-  const suggested = freeName(taskName(task), project, workspaces);
+  const suggestions = freeNames(taskName(task), project, workspaces);
+  const suggested = suggestions[0] ?? "";
   const chosen = name.trim() || suggested;
-  const taken = name.trim() ? holder(name.trim(), project, workspaces) : undefined;
+  // A suggested name is taken only when no number frees it: its branch is cut before the number.
+  const unfree = !suggested && taskName(task) ? taskName(task) : "";
+  const taken = name.trim() ? holder(name.trim(), project, workspaces) : unfree ? holder(unfree, project, workspaces) : undefined;
   const { create, step, made } = launch;
   const warning = create.data?.warning ?? null;
   const models = [...new Set(["opus", "sonnet", ...workspaces.flatMap((w) => w.sessions.map((s) => s.model))])];
   // Once sent, the name is the one sent: the new workspace arriving must not renumber it.
-  const shown = (create.isPending || made) && create.variables ? create.variables.name : chosen;
+  // A suggested name the daemon refused as taken is shown numbered as it was made.
+  const shown = (create.isPending || made) && launch.name ? launch.name : chosen;
   const branch = safeBranch(shown);
   const ready = Boolean(project && chosen && base.trim() && model.trim()) && !taken && !create.isPending && !made;
   const bar = mode === "bar";
@@ -169,7 +239,15 @@ export function Composer({
   const submit = () => {
     if (!ready || !project) return;
     create.mutate(
-      { project: project.id, base: base.trim(), name: chosen, machine: machine || undefined, model: model.trim(), prompt },
+      {
+        project: project.id,
+        base: base.trim(),
+        name: chosen,
+        machine: machine || undefined,
+        model: model.trim(),
+        prompt,
+        then: name.trim() ? undefined : suggestions.slice(1),
+      },
       {
         // A request that waits is shown in the waiting list; the box is done with it.
         onSuccess: ({ session, warning }) => (session ? onCreated(session, warning) : (onDone ?? clear)()),
@@ -321,7 +399,7 @@ export function Composer({
               spellCheck={false}
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder={suggested || "named from the task"}
+              placeholder={(name.trim() ? suggested : shown) || "named from the task"}
               className={`${inlineField} w-48 max-w-full font-sans`}
             />
             {shown && (

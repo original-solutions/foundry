@@ -324,7 +324,7 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
               {machine.name}
             </span>
           )}
-          {terminals?.here === machine.id && (
+          {terminals && (
             <button
               type="button"
               aria-label={`Archive ${workspace.name}`}

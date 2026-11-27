@@ -16,13 +16,13 @@ One bar runs along the top of the terminal. From left to right:
 
 On a phone the bar also has a button that opens the workspaces list, and a **Jump to** button.
 
-**+** only shows for workspaces on this machine. For a workspace on another machine, the menu also leaves out the entries that start or archive.
+**+** only shows for workspaces on this machine. For a workspace on another machine, the menu also leaves out the entries that start a session or a shell.
 
 ## Sessions and shells
 
 A session is Claude Code. A shell is a plain command line in the same worktree, for running tests, checking git or making an edit yourself. Both show in the tab strip and the sidebar, and both take typing: click in the terminal and type.
 
-Only a session reports what it is doing. A shell shows **Running** while it is open, **Ended** after a clean exit and **Failed · exit N** after any other.
+Only a session reports what it is doing. A shell shows **Open** while it is open, **Ended** after a clean exit and **Failed · exit N** after any other.
 
 ### Start a session or a shell
 
@@ -166,15 +166,15 @@ Press **More** in the header, right-click a terminal anywhere it is listed, long
 - **End** the terminal, or **Clear** it once it has ended, and **Clear N ended in** the workspace.
 - **Archive** the workspace.
 
-Only a workspace on this machine gets the new and archive entries. End and clear show for any machine Foundry can reach.
+Only a workspace on this machine gets the new entries. End, clear and archive show for any machine Foundry can reach.
 
 ## End, clear and archive
 
-End and clear work for a terminal on any machine Foundry can reach. This machine's daemon passes the request to the machine that runs the terminal. If that machine is offline, a refused End says so in its dialog, and a refused Clear in a line at the foot of the screen. Archive works only for a workspace on this machine. To archive another machine's, open that machine's own UI.
+End and clear work for a terminal on any machine Foundry can reach. This machine's daemon passes the request to the machine that runs the terminal. If that machine is offline, a refused End says so in its dialog, and a refused Clear in a line at the foot of the screen. Archive works for a workspace on any machine Foundry can reach, and the request goes to the machine that owns it. For another machine's workspace, the dialog cannot list its changes first.
 
 - **End** stops a terminal that still runs. Foundry asks first and says what is lost: a turn in progress stops where it is, or Claude closes without your answer. The workspace, its worktree and its branch stay. It is in the terminal's menu.
 - **Clear** removes a terminal that has already ended, with its final screen, without asking. **Clear N ended** does it for every ended terminal of a workspace. Both are in the terminal's menu, and **Clear N ended** is also among the sidebar's workspace actions.
-- **Archive** stops a workspace's terminals and removes its worktree. It is in the terminal's menu, among the sidebar's workspace actions, behind the box button on a board card, and on the board card's pull request line once that pull request is merged. Foundry asks first. It shows that the branch and its commits stay, lists the uncommitted files that go with the worktree, and names every terminal that stops. If the daemon holds the archive up, it lists what would be lost, and **Archive anyway** forces it. The branch is always kept.
+- **Archive** stops a workspace's terminals and removes its worktree. It is in the terminal's menu, among the sidebar's workspace actions, behind the box button on a board card, and, for a workspace on this machine, on the board card's pull request line once that pull request is merged. Foundry asks first. It names every terminal that stops. For a workspace on this machine it also shows that the branch and its commits stay and lists the uncommitted files that go with the worktree. For another machine's workspace it cannot read those, and says that machine lists any work that would be lost before it archives. If the owning machine holds the archive up, it lists what would be lost, and **Archive anyway** forces it. The branch is always kept.
 
 When the open terminal goes, its neighbouring tab shows, or the board if it was the last.
 
