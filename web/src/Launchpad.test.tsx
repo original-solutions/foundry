@@ -211,6 +211,13 @@ describe("Launchpad", () => {
     expect(start().disabled).toBe(true);
   });
 
+  it("says nothing is taken while the box is empty, even when a workspace is on the branch an empty name gives", async () => {
+    const held = { project: "demo", branch: safeBranch(""), sessions: [] } as unknown as WorkspaceView;
+    await renderApp(<Harness workspaces={[held]} />);
+
+    expect(screen.queryByText(/already has a workspace/)).toBeNull();
+  });
+
   it("still tries 20 names when an open workspace holds one of the numbered ones", async () => {
     const held = { project: "demo", branch: "fix-it-2", sessions: [] } as unknown as WorkspaceView;
     const calls = mockFetch(...Array.from({ length: 20 }, () => json(409, { error: "a branch or worktree named that already exists in this project" })));
