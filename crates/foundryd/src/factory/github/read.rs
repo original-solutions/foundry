@@ -1260,6 +1260,80 @@ pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]
     }
 }
 
+/// The approval a claim was made on, judged after the claim removed `ready`: [`judge_approval`]'s
+/// checks, made as of the claim rather than now. Only the label's newest event is judged. A
+/// removal by `project_login` (in any letter case) is the claim's, and the label it took off is
+/// the event before it; a label still on is the approval, as when the claim's removal is not on
+/// the timeline. Any other newest event (a removal by anyone else, a removal after a removal, or
+/// none) approves nothing, refused as [`judge_approval`] refuses a label it does not find. The
+/// text is judged from the label's second on, and a timeline page that may hide a rename in that
+/// second leaves it unjudged.
+pub fn judge_claimed_approval(
+    issue: &ApprovalIssue,
+    ready: &str,
+    project_login: &str,
+    instructors: &[String],
+) -> Approval {
+    // The label's events, newest first: `true` for applied, `false` for removed.
+    let mut events = issue
+        .timeline_items
+        .nodes
+        .iter()
+        .rev()
+        .filter_map(|node| match node {
+            TimelineNode::LabeledEvent(change) if change.label.name == ready => {
+                Some((true, change))
+            }
+            TimelineNode::UnlabeledEvent(change) if change.label.name == ready => {
+                Some((false, change))
+            }
+            _ => None,
+        });
+    let label = match events.next() {
+        Some((true, label)) => Some(label),
+        Some((false, removal))
+            if removal
+                .actor
+                .as_ref()
+                .is_some_and(|actor| actor.login.eq_ignore_ascii_case(project_login)) =>
+        {
+            match events.next() {
+                Some((true, label)) => Some(label),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let Some(label) = label else {
+        let timeline = &issue.timeline_items;
+        let cut_off =
+            timeline.nodes.len() >= HISTORY_PAGE && timeline.total_count > HISTORY_PAGE as u64;
+        return Approval::Refused(if cut_off {
+            Refusal::LabelHistoryIncomplete
+        } else {
+            Refusal::LabelNotFound
+        });
+    };
+    let labeled_at = label.created_at.clone();
+    let actor = label.actor.as_ref();
+    let Some(applied_by) = actor.filter(|actor| is_human_instructor(Some(actor), instructors))
+    else {
+        return Approval::Refused(Refusal::LabeledByNonInstructor {
+            by: actor.map(|actor| actor.login.clone()),
+            labeled_at,
+        });
+    };
+    let reaches = timeline_reaches(issue, &labeled_at);
+    match text_changes_since(issue, &labeled_at, instructors, reaches) {
+        TextCheck::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
+        TextCheck::Unjudged => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
+        TextCheck::Unchanged => Approval::Approved {
+            labeled_at,
+            labeled_by: applied_by.login.clone(),
+        },
+    }
+}
+
 /// Whether anyone, an instructor included, edited the body or renamed the title at or after
 /// `since`. A timeline page that may hide a rename at or after the moment counts as a change.
 pub fn edited_since(issue: &ApprovalIssue, since: &str) -> bool {
@@ -1719,6 +1793,24 @@ pub fn approval<G: Tracker + ?Sized>(
 ) -> Result<Approval, TrackerError> {
     let found = read_history(gh, repo, issue)?;
     Ok(judge_approval(&found, State::Ready.label(), instructors))
+}
+
+/// The approval a takeover's claim was made on: [`judge_claimed_approval`] over one read of
+/// the issue's history, its timestamps checked.
+pub fn claimed_approval<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    issue: u64,
+    project_login: &str,
+    instructors: &[String],
+) -> Result<Approval, TrackerError> {
+    let found = read_history(gh, repo, issue)?;
+    Ok(judge_claimed_approval(
+        &found,
+        State::Ready.label(),
+        project_login,
+        instructors,
+    ))
 }
 
 /// Whether the issue text is as an instructor left it at `since`.
