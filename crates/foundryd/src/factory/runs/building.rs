@@ -11,7 +11,10 @@
 //! A turn is acted on once. The last line written for a turn that leaves the run going is the
 //! step `turn-read <n>` ([`TURN_READ`]); every write before it carries its own marker, so a
 //! pass cut short repeats nothing. A session that idles through a gate has its newest turn
-//! read already and is sent nothing.
+//! read already and is sent nothing. A session idle with no turn ended may not have taken its
+//! launch: the run is `start`'s pass then ([`BuildStep::Launch`]), which asks for the launch
+//! again by count, since the label moved to `building` with the start and the pass no longer
+//! routes the run to `start`.
 //!
 //! Where it differs from the runner:
 //!
@@ -101,7 +104,7 @@ use super::progress::{
     LAUNCH_RESENDING, RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, SendTries,
     TIME_LIMIT as TIME_LIMIT_CODE, TURN_READ, pending_relaunch, read_progress,
 };
-use super::start::StartStep;
+use super::start::{self, StartStep};
 use super::{
     ActionPayload, Closing, Progress, RunContext, RunError, Stop, StuckStop, abandon,
     apply_actions, closed_issue, end_own_merge, end_run, finish_building, go_stuck, pending_send,
@@ -279,7 +282,13 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
                 Some(turn) => step.act(&mut at, &turn),
                 // The newest turn was read already.
                 None if turn.as_ref().is_some_and(|turn| turn.turn > 0) => Ok(step.read_already()),
-                // No turn ended yet: the launch is `start`'s to send again.
+                // No turn ended yet. The label moved to `building` with the start, so the
+                // launch the session may not have taken is asked for again by `start` from here
+                // (the spec's step 3), which decides by the session's count. A session whose
+                // newest launch is a resume is `resume`'s, which sends the resume's words.
+                None if seen.interruption.is_none() => {
+                    Ok(BuildStep::Launch(start::advance(ctx, run)?))
+                }
                 None => Ok(BuildStep::Running),
             }
         }
