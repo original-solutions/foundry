@@ -352,7 +352,7 @@ mod tests {
         );
     }
 
-    /// A release build does not. CI runs this one in a release build.
+    /// A release build does not. CI runs this one with debug assertions off, as in a release build.
     #[cfg(not(debug_assertions))]
     #[test]
     fn this_release_build_ignores_foundry_tailscale() {

@@ -1,23 +1,29 @@
-# Runs the provision and gate commands on Linux. The factory gates on macOS. The steps mirror
-# factory.provision and factory.gate in .dw/config.yml: change both together.
+# Runs the provision and gate commands on Linux, split into jobs that run at the same time. The
+# factory gates on macOS. The commands mirror factory.provision and factory.gate in .dw/config.yml:
+# change both together. Every job starts with factory.provision (.github/actions/setup).
 #
-# Four steps are CI only and not in factory.gate: the e2e step, the upload of its traces and the
-# two release steps.
+#   lint     cargo fmt --all --check, cargo clippy
+#   test     cargo test --workspace, as cargo-nextest split over eight runners; the doc tests,
+#            which nextest does not run, are in the e2e job
+#   web      npm --prefix web run check
 #
-# `npm --prefix web run e2e` runs the browser test, web/e2e/ui.spec.ts: the real terminal against
-# a real daemon, with the fake agent as `claude`. It needs Google Chrome, which ubuntu-latest
-# ships. Its setup builds and starts the debug foundryd, foundry-holder and foundry-fake-agent; it
-# runs after the `cargo test` step, which leaves them in target/debug, so that build reuses most of
-# it. The factory gates on macOS, and the test starts a real daemon and a browser, so it runs here
-# only. When it fails, the step after it uploads web/test-results, where Playwright keeps the
-# failed test's trace (`trace: "retain-on-failure"` in web/playwright.config.ts): CI is the only
-# place the test runs, so the trace is the only record of a failure.
+# Three things are CI only and not in factory.gate:
 #
-# `cargo test --release -p foundryd --lib --locked` runs the tests that prove a release build
-# ignores the test-only overrides FOUNDRY_SECRETS and FOUNDRY_TAILSCALE, which a debug build cannot
-# run; the step before it builds the holder and the fake agent those library tests start. The
-# factory gates on macOS, where a release build ignores FOUNDRY_SECRETS, so a release test that
-# reaches the secret store would use the real login keychain.
+# The release-cfg job runs the foundryd library tests with debug assertions off, as in a release
+# build, to prove such a build ignores the test-only overrides FOUNDRY_SECRETS, FOUNDRY_TAILSCALE
+# and FOUNDRY_CLOCK_AHEAD, which a debug build cannot run. It uses the release-cfg profile in
+# Cargo.toml: the release profile's optimisation adds minutes and changes nothing those tests
+# check. The factory gates on macOS, where a release build ignores FOUNDRY_SECRETS, so a release
+# test that reaches the secret store would use the real login keychain.
+#
+# The e2e job runs the browser test, web/e2e/ui.spec.ts: the real terminal against a real daemon,
+# with the fake agent as `claude`. It needs Google Chrome, which ubuntu-latest ships. Its setup
+# builds and starts the debug foundryd, foundry-holder and foundry-fake-agent. When it fails, the
+# step after it uploads web/test-results, where Playwright keeps the failed test's trace
+# (`trace: "retain-on-failure"` in web/playwright.config.ts): CI is the only place the test runs,
+# so the trace is the only record of a failure.
+#
+# The test runs use nextest's test groups in .config/nextest.toml.
 name: check
 
 on:
@@ -34,39 +40,75 @@ concurrency:
   group: check-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
+env:
+  # No debug info in CI's builds: no test reads it, and it makes compiling and linking slower.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
-      # rustup on the runner installs the toolchain and components pinned in rust-toolchain.toml.
-      - name: Rust toolchain
-        run: rustup toolchain install
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: npm --prefix web ci
-        run: npm --prefix web ci
-      - name: npm --prefix web run build
-        run: npm --prefix web run build
-      - name: cargo fetch --locked
-        run: cargo fetch --locked
-
+      - uses: ./.github/actions/setup
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
       - name: cargo clippy --workspace --all-targets --locked -- -D warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: cargo test --workspace --locked
-        run: cargo test --workspace --locked
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          save-cache: ${{ matrix.partition == 1 }}
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest@0.9.151
+      - name: cargo nextest run --workspace --locked --partition hash:${{ matrix.partition }}/8
+        run: cargo nextest run --workspace --locked --partition hash:${{ matrix.partition }}/8
+
+  release-cfg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          save-cache: ${{ matrix.partition == 1 }}
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest@0.9.151
+      # The library tests start the holder and the fake agent built beside them.
+      - name: cargo build --profile release-cfg -p foundry-holder -p foundry-fake-agent --locked
+        run: cargo build --profile release-cfg -p foundry-holder -p foundry-fake-agent --locked
+      - name: cargo nextest run --cargo-profile release-cfg -p foundryd --lib --locked --partition hash:${{ matrix.partition }}/4
+        run: cargo nextest run --cargo-profile release-cfg -p foundryd --lib --locked --partition hash:${{ matrix.partition }}/4
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
       - name: npm --prefix web run e2e
         run: npm --prefix web run e2e
       - name: upload the browser test's traces
@@ -76,9 +118,24 @@ jobs:
           name: e2e-test-results
           path: web/test-results
           if-no-files-found: ignore
-      - name: cargo build --release -p foundry-holder -p foundry-fake-agent --locked
-        run: cargo build --release -p foundry-holder -p foundry-fake-agent --locked
-      - name: cargo test --release -p foundryd --lib --locked
-        run: cargo test --release -p foundryd --lib --locked
+      - name: cargo test --workspace --doc --locked
+        run: cargo test --workspace --doc --locked
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: npm --prefix web ci
+        run: npm --prefix web ci
+      - name: npm --prefix web run build
+        run: npm --prefix web run build
       - name: npm --prefix web run check
         run: npm --prefix web run check
