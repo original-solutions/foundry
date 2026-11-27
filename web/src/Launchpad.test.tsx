@@ -1,3 +1,4 @@
+import { onlineManager } from "@tanstack/react-query";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -155,7 +156,7 @@ describe("Launchpad", () => {
     expect((screen.getByLabelText("Workspace name") as HTMLInputElement).placeholder).toBe("review-loop pr 1181 2");
   });
 
-  it("shows the name a second Start sends, not the one an earlier create was numbered to", async () => {
+  it("shows the name a second Start will send, not the one an earlier create was numbered to, while it waits to go out", async () => {
     mockFetch(json(409, { error: "a branch or worktree named fix-it already exists in this project" }), json(400, { error: "no base branch main" }));
     await renderApp(<Harness />);
 
@@ -163,11 +164,15 @@ describe("Launchpad", () => {
     fireEvent.click(start());
     expect((await screen.findByRole("alert")).textContent).toMatch(/no base branch main/);
 
-    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
-    fireEvent.click(start());
-
-    expect(screen.getByLabelText("Branch").textContent).toBe("fix-it");
-    expect(await screen.findByText("Making fix-it from main…")).toBeDefined();
+    // Offline, the create waits without sending anything: the box shows the name it will send.
+    onlineManager.setOnline(false);
+    try {
+      fireEvent.click(start());
+      expect(await screen.findByText("Making fix-it from main…")).toBeDefined();
+      expect(screen.getByLabelText("Branch").textContent).toBe("fix-it");
+    } finally {
+      onlineManager.setOnline(true);
+    }
   });
 
   it("gives up on a suggested name after 20 tries and says why", async () => {
