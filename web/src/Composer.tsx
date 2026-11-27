@@ -220,7 +220,8 @@ export function Composer({
   const suggested = suggestions[0] ?? "";
   const chosen = name.trim() || suggested;
   // A suggested name is taken only when no number frees it: its branch is cut before the number.
-  const taken = name.trim() ? holder(name.trim(), project, workspaces) : suggested ? undefined : holder(taskName(task), project, workspaces);
+  const unfree = !suggested && taskName(task) ? taskName(task) : "";
+  const taken = name.trim() ? holder(name.trim(), project, workspaces) : unfree ? holder(unfree, project, workspaces) : undefined;
   const { create, step, made } = launch;
   const warning = create.data?.warning ?? null;
   const models = [...new Set(["opus", "sonnet", ...workspaces.flatMap((w) => w.sessions.map((s) => s.model))])];
