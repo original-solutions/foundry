@@ -68,10 +68,10 @@ const traced = new Set(["s1", "s2", "s3"]);
 /** Both machines the records are on are listed, since a machine the list does not hold shows nothing. */
 const listed = () => settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] });
 
-function show(onSteps = vi.fn()) {
+function show(onSteps = vi.fn(), all = records) {
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <Timeline machines={fleet(records, listed())} traced={traced} onSteps={onSteps} />
+      <Timeline machines={fleet(all, listed())} traced={traced} onSteps={onSteps} />
     </QueryClientProvider>,
   );
   return onSteps;
@@ -99,7 +99,7 @@ const wait = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms));
 
 const lane = (name: RegExp) => screen.getByRole("group", { name });
 /** The bars of a lane: one button per turn. */
-const barsOf = (name: RegExp) => within(lane(name)).getAllByRole("button", { name: /ago$|running for/ });
+const barsOf = (name: RegExp) => within(lane(name)).getAllByRole("button", { name: / ago\b|running for/ });
 
 describe("Timeline", () => {
   it("draws each session with turns in the last hour as a lane of bars, busy ones first", async () => {
@@ -125,9 +125,41 @@ describe("Timeline", () => {
     show();
     await waitFor(() => expect(screen.getAllByRole("group")).toHaveLength(1));
     fireEvent.click(screen.getByRole("radio", { name: "4h" }));
-    expect(screen.getAllByRole("group")).toHaveLength(2);
-    expect(barsOf(/sonnet · fix login/)[0].getAttribute("aria-label")).toBe("“tidy the docs”, 1 question, took 10m 0s, 2h ago");
+    expect(screen.getAllByRole("group", { name: /· fix login$/ })).toHaveLength(2);
+    expect(barsOf(/sonnet · fix login/)[0].getAttribute("aria-label")).toBe("“tidy the docs”, 1 question, took 10m 0s, 2h ago, waited on you 9m 0s");
     expect(screen.getByText(/1 question$/)).toBeDefined();
+  });
+
+  it("splits a turn waiting on your answer from the agent's work, and heads the lanes with how long you kept them waiting", async () => {
+    trails.s1 = [m("prompt", "migrate the theme", 30), tool("Bash", "$ npm run build", 29), m("ask", "Run the migration?", 20)];
+    const onSteps = show(vi.fn(), withS1("waiting_for_you"));
+    await waitFor(() => expect(screen.getByText(/1 turn/)).toBeDefined());
+    expect(screen.getByText("1 turn · 10m 0s of agent work · 20m 0s waiting on you · 1 tool call · 1 question")).toBeDefined();
+    expect(barsOf(/opus · fix login/)[0].getAttribute("aria-label")).toBe("“migrate the theme”, 1 command · 1 question, running for 30m 0s, waiting on you for 20m 0s");
+    expect(lane(/opus · fix login/).textContent).toContain("Needs you for 20m");
+
+    const you = lane(/^Waiting on you$/);
+    expect(you.textContent).toContain("20m 0s in the last hour · 1 now");
+    fireEvent.click(within(you).getByRole("button", { name: "Waiting on you: open opus in fix login, waiting longest, 20m 0s" }));
+    expect(onSteps).toHaveBeenCalledWith("t1");
+  });
+
+  it("counts an answered question as time the turn waited on you, not agent work", async () => {
+    trails.s1 = [m("prompt", "migrate the theme", 40), m("ask", "Run the migration?", 38), tool("Bash", "$ npm run migrate", 30), m("done", "", 25)];
+    show(vi.fn(), withS1("idle"));
+    await waitFor(() => expect(screen.getByText(/1 turn/)).toBeDefined());
+    expect(screen.getByText("1 turn · 7m 0s of agent work · 8m 0s waiting on you · 1 tool call · 1 question")).toBeDefined();
+    expect(barsOf(/opus · fix login/)[0].getAttribute("aria-label")).toBe("“migrate the theme”, 1 question · 1 command, took 15m 0s, 40m ago, waited on you 8m 0s");
+    // Nobody waits now, so the row only tells.
+    const you = lane(/^Waiting on you$/);
+    expect(you.textContent).toContain("8m 0s in the last hour");
+    expect(within(you).queryByRole("button")).toBeNull();
+  });
+
+  it("has no waiting row while no turn waited on you in the window", async () => {
+    show();
+    await waitFor(() => expect(screen.getAllByRole("group")).toHaveLength(1));
+    expect(screen.queryByRole("group", { name: /^Waiting on you$/ })).toBeNull();
   });
 
   it("opens a turn's terminal with its steps", async () => {

@@ -1,38 +1,22 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { ApiError, createWorkspace, listMachines, placementsKey, startSession, type Project } from "./api";
+import { listMachines, type Project } from "./api";
 import { safeBranch, sameBranch } from "./branch";
 import { promptOf, sendKey, SparkIcon } from "./FirstPrompt";
 import type { WorkspaceView } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { inlineField, primaryButton } from "./Modal";
+import { makeWorkspace, SessionNotStarted, type CreateInput } from "./launch";
 import { Projects } from "./Projects";
-
-/** The workspace was made, but its session did not start. */
-class SessionNotStarted extends ApiError {}
-
-/**
- * What a new workspace is made from: its project, base, name and machine (absent for this
- * machine, "choose" to let Foundry pick one), then its session's model and first prompt.
- */
-export interface CreateInput {
-  project: string;
-  base: string;
-  name: string;
-  machine?: string;
-  model: string;
-  prompt?: string;
-  /** Names to try in turn while the daemon refuses the one before as taken (409): none for a typed name. */
-  then?: string[];
-}
+import { BranchIcon, leftOver, PlannedList, SplitButton, useStartEach, type Planned } from "./SplitTasks";
+import { ITEM, listOf } from "./tasks";
+import { ProjectFace } from "./ProjectFace";
 
 /**
- * Makes a workspace, then starts a session in it, saying which `step` it is on and the `name` it
- * is sent or was made under: the first of the input's names the daemon does not refuse as taken.
- * `made` is true once the workspace exists, even when its session then failed to start, since a
- * second try would only find its name taken. Letting Foundry choose sends the model and first
- * prompt along: when no machine qualifies the request waits (`session` is null), the waiting list is read
- * again to show it, and Foundry starts the session once it is placed.
+ * Makes a workspace, then starts a session in it (`makeWorkspace`), saying which `step` it is on
+ * and the `name` it is sent or was made under: the first of the input's names the daemon does not
+ * refuse as taken. `made` is true once the workspace exists, even when its session then failed to
+ * start, since a second try would only find its name taken.
  */
 export function useCreateWorkspace() {
   const [step, setStep] = useState<"branch" | "session">("branch");
@@ -40,36 +24,9 @@ export function useCreateWorkspace() {
   const [trying, setTrying] = useState<{ input: CreateInput; name: string } | null>(null);
   const client = useQueryClient();
   const create = useMutation({
-    mutationFn: async (input: CreateInput): Promise<{ session: string | null; warning: string | null }> => {
+    mutationFn: (input: CreateInput) => {
       setStep("branch");
-      const session = input.machine === "choose" ? { model: input.model, prompt: input.prompt } : {};
-      const names = [input.name, ...(input.then ?? [])];
-      let workspace: Awaited<ReturnType<typeof createWorkspace>> | undefined;
-      for (const [i, name] of names.entries()) {
-        setTrying({ input, name });
-        try {
-          workspace = await createWorkspace({ project: input.project, base: input.base, name, machine: input.machine, ...session });
-          break;
-        } catch (error) {
-          // A refused try made nothing, so the next name is tried in its place.
-          if (!(error instanceof ApiError && error.status === 409) || i === names.length - 1) throw error;
-        }
-      }
-      if (!workspace) throw new Error("no workspace name to try");
-      if ("request" in workspace) {
-        await client.invalidateQueries({ queryKey: placementsKey });
-        return { session: null, warning: null };
-      }
-      setStep("session");
-      // The workspace is usable when its setup did not start, so its session is started all the same.
-      let started: string;
-      try {
-        started = await startSession(workspace.id, input.model, input.prompt);
-      } catch (error) {
-        const also = [workspace.error, workspace.warning].filter(Boolean).map((said) => ` Also: ${said}`).join("");
-        throw new SessionNotStarted(`The workspace was made, but its session did not start: ${error instanceof Error ? error.message : error}.${also}`);
-      }
-      return { session: started, warning: [workspace.error, workspace.warning].filter(Boolean).join(" ") || null };
+      return makeWorkspace(input, client, { onName: (name) => setTrying({ input, name }), onSession: () => setStep("session") });
     },
   });
   const made = create.isSuccess || create.error instanceof SessionNotStarted;
@@ -125,7 +82,7 @@ function nameWords(line: string): string[] {
 export function taskName(task: string): string {
   const line = task.split("\n").find((l) => l.trim() !== "") ?? "";
   let name = "";
-  for (const word of nameWords(line).slice(0, NAME_WORDS)) {
+  for (const word of nameWords(line.trim().replace(ITEM, "")).slice(0, NAME_WORDS)) {
     const next = name ? `${name} ${word}` : word;
     if (next.length > NAME_AT_MOST) break;
     name = next;
@@ -162,6 +119,21 @@ function freeNames(name: string, project: Project | undefined, workspaces: Works
 }
 
 /**
+ * The workspace each item of a split task makes, named from its item and numbered past the
+ * project's workspaces and the items before it, with the names to try in turn when the daemon
+ * refuses one as taken, as a single task's suggested name has.
+ */
+function planOf(items: string[], project: Project | undefined, workspaces: WorkspaceView[]): Planned[] {
+  const plan: Planned[] = [];
+  for (const prompt of items) {
+    const before = plan.map((p) => safeBranch(p.name));
+    const [name = "", ...then] = freeNames(taskName(prompt), project, workspaces).filter((next) => !before.some((b) => sameBranch(b, safeBranch(next))));
+    plan.push({ name, then, prompt });
+  }
+  return plan;
+}
+
+/**
  * The box a task is given to Claude in: the task names the workspace and its branch as it is
  * typed (numbered when that branch is taken in the project's repo), the project, base and model
  * sit under it, and Start (or Cmd+Enter) makes the workspace and starts Claude Code on the task,
@@ -173,6 +145,9 @@ function freeNames(name: string, project: Project | undefined, workspaces: Works
  * On the first-run page and in the New task dialog (`page`) it is open and big. At the top of
  * the board (`bar`) it is one line beside a way to jump until it is used, so starting the next
  * task is a click away from everything already running. It is the one way a workspace is made.
+ *
+ * A task written as a list offers to split: each item then makes its own workspace and session
+ * with the same project, base, model and machine, one after another, and none is landed in.
  */
 export function Composer({
   mode,
@@ -185,6 +160,7 @@ export function Composer({
   doneLabel,
   onDone,
   initialTask = "",
+  initialMachine = "",
 }: {
   mode: "page" | "bar";
   /** The task box's id, so a heading elsewhere can label it. */
@@ -203,6 +179,8 @@ export function Composer({
   onDone?: () => void;
   /** The task the box opens with. */
   initialTask?: string;
+  /** The machine the box opens set to: empty for this machine, `"choose"`, or another machine's id. */
+  initialMachine?: string;
 }) {
   const [task, setTask] = useState(initialTask);
   const [name, setName] = useState("");
@@ -210,10 +188,13 @@ export function Composer({
   const [model, setModel] = useState("opus");
   const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
   /** The machine picked: empty for this machine. */
-  const [machine, setMachine] = useState("");
+  const [machine, setMachine] = useState(initialMachine);
   const [focused, setFocused] = useState(false);
   /** Whether the Projects dialog is open. */
   const [managing, setManaging] = useState(false);
+  /** Whether a task written as a list makes a workspace per item. */
+  const [split, setSplit] = useState(false);
+  const each = useStartEach();
   const project = projects.find((p) => p.id === projectId) ?? projects[0];
   const prompt = promptOf(task);
   const suggestions = freeNames(taskName(task), project, workspaces);
@@ -229,15 +210,33 @@ export function Composer({
   // A suggested name the daemon refused as taken is shown numbered as it was made.
   const shown = (create.isPending || made) && launch.name ? launch.name : chosen;
   const branch = safeBranch(shown);
-  const ready = Boolean(project && chosen && base.trim() && model.trim()) && !taken && !create.isPending && !made;
+  const items = listOf(task);
+  // While a split start runs, the plan is the one sent, so workspaces arriving do not renumber it.
+  const sent = each.run.isPending ? each.run.variables : undefined;
+  const plan = sent ? sent.map((input) => ({ name: input.name, then: input.then, prompt: input.prompt ?? "" })) : split && items ? planOf(items, project, workspaces) : undefined;
+  const busy = create.isPending || each.run.isPending;
+  const ready = plan
+    ? Boolean(project && base.trim() && model.trim()) && plan.every((p) => p.name) && !busy
+    : Boolean(project && chosen && base.trim() && model.trim()) && !taken && !busy && !made;
   const bar = mode === "bar";
-  const open = !bar || focused || managing || task !== "" || name !== "" || create.isPending || create.isError;
+  const open = !bar || focused || managing || task !== "" || name !== "" || busy || create.isError || each.run.isSuccess;
+  const ended = each.run.data;
+  const trouble = ended && (ended.missed.length > 0 || ended.warned.length > 0) ? ended : undefined;
   // Read only once the box is open: the board's closed bar shows no machine.
   const listed = useQuery({ queryKey: ["machines"], queryFn: listMachines, retry: false, enabled: open });
   const others = listed.data ? listed.data.machines.filter((m) => m.id !== listed.data.me) : [];
 
   const submit = () => {
     if (!ready || !project) return;
+    each.run.reset();
+    if (plan) {
+      const inputs = plan.map((p) => ({ project: project.id, base: base.trim(), name: p.name, then: p.then, machine: machine || undefined, model: model.trim(), prompt: p.prompt }));
+      each.run.mutate(inputs, {
+        // Each one shows up on the board as it starts, so nothing is landed in; what did not start stays in the box.
+        onSuccess: ({ missed, warned }) => (missed.length === 0 && warned.length === 0 ? (onDone ?? clear)() : setTask(leftOver(missed))),
+      });
+      return;
+    }
     create.mutate(
       {
         project: project.id,
@@ -256,8 +255,10 @@ export function Composer({
   };
   const clear = () => {
     create.reset();
+    each.run.reset();
     setTask("");
     setName("");
+    setSplit(false);
   };
 
   return (
@@ -323,11 +324,12 @@ export function Composer({
                     return (
                       <label
                         key={p.id}
-                        className={`cursor-pointer rounded-full border px-2.5 py-1 font-medium has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-neutral-400 ${
+                        className={`flex cursor-pointer items-center gap-1.5 rounded-full border py-1 pr-2.5 pl-1 font-medium has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-neutral-400 ${
                           on ? "border-neutral-300 bg-neutral-100 text-neutral-900" : "border-neutral-700 text-neutral-300 hover:border-neutral-500"
                         }`}
                       >
                         <input type="radio" name="project" value={p.id} checked={on} onChange={() => setProjectId(p.id)} className="sr-only" />
+                        <ProjectFace project={p.name} />
                         {p.name}
                       </label>
                     );
@@ -381,14 +383,23 @@ export function Composer({
               <span className="ml-auto flex items-center gap-2">
                 <kbd className="rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] text-neutral-500 pointer-coarse:hidden">{sendKey}</kbd>
                 <button type="submit" disabled={!ready} className={`${primaryButton} px-3 py-1`}>
-                  Start
+                  {plan ? `Start ${plan.length}` : "Start"}
                 </button>
               </span>
             </div>
           )}
         </div>
 
-        {open && (
+        {open && plan && (
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-1 text-xs text-neutral-500">
+              <SplitButton count={plan.length} split disabled={busy} onToggle={() => setSplit(false)} />
+              <span>A workspace for each item, with Claude at work on it.</span>
+            </div>
+            <PlannedList plan={plan} at={sent ? each.at : undefined} started={each.started} />
+          </div>
+        )}
+        {open && !plan && (
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-1 text-xs text-neutral-500">
             <BranchIcon className="size-3.5 shrink-0" />
             <label htmlFor={`${id}-name`}>Workspace</label>
@@ -410,6 +421,7 @@ export function Composer({
                 </code>
               </>
             )}
+            {items && <SplitButton count={items.length} split={false} disabled={busy} onToggle={() => setSplit(true)} />}
           </div>
         )}
 
@@ -428,7 +440,30 @@ export function Composer({
         )}
         <p aria-live="polite" className={`px-1 text-xs text-neutral-400 ${bar ? "empty:hidden" : "min-h-4"}`}>
           {create.isPending && (step === "branch" ? `Making ${branch} from ${base.trim()}…` : prompt ? `Starting ${model.trim()} on your task…` : `Starting ${model.trim()}…`)}
+          {sent && `Starting ${each.at + 1} of ${sent.length}: ${sent[each.at]?.name}…`}
         </p>
+        {trouble && (
+          <div role={trouble.missed.length > 0 ? "alert" : "status"} className={`flex flex-wrap items-start gap-2 px-1 text-sm ${trouble.missed.length > 0 ? "text-red-400" : "text-amber-300"}`}>
+            <div className="min-w-0 flex-1 space-y-0.5">
+              <p>
+                Started {trouble.of - trouble.missed.length} of {trouble.of}.
+              </p>
+              {trouble.missed.map((m) => (
+                <p key={m.name}>
+                  {m.name}: {m.why}
+                </p>
+              ))}
+              {trouble.warned.map((w) => (
+                <p key={w} className="text-amber-300">
+                  {w}
+                </p>
+              ))}
+            </div>
+            <button type="button" onClick={onDone ?? clear} className="text-neutral-300 underline decoration-neutral-600 underline-offset-4 hover:text-neutral-100">
+              {doneLabel}
+            </button>
+          </div>
+        )}
         {(create.isError || warning) && (
           <div role={create.isError ? "alert" : "status"} className={`flex flex-wrap items-center gap-2 px-1 text-sm ${create.isError ? "text-red-400" : "text-amber-300"}`}>
             <span className="min-w-0 flex-1">{create.isError ? create.error?.message : warning}</span>
@@ -442,16 +477,5 @@ export function Composer({
       </form>
       <Projects open={managing} onOpenChange={setManaging} projects={projects} onAdded={setProjectId} />
     </>
-  );
-}
-
-export function BranchIcon({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-      <circle cx="4.5" cy="3.5" r="1.5" />
-      <circle cx="4.5" cy="12.5" r="1.5" />
-      <circle cx="11.5" cy="5.5" r="1.5" />
-      <path d="M4.5 5v6M11.5 7c0 3-7 2-7 4" strokeLinecap="round" />
-    </svg>
   );
 }

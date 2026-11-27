@@ -667,4 +667,72 @@ describe("Machines", () => {
       expect((await screen.findByRole("status")).textContent).toBe("trilogy-mac.tail459612.ts.net joined");
     });
   });
+
+  describe("room for the next task", () => {
+    /** Both machines online and sampled: studio at 0.5 per core, laptop at 0.3. */
+    const bothOnline = [
+      sample(ME, 2, { load: 0.5, sessions: 3 }),
+      workspace(ME, "w1", "fix login"),
+      terminal(ME, "t1", "w1"),
+      session(ME, "s1", "w1", "t1", "idle"),
+      sample(OTHER, 9, { load: 0.3, sessions: 1 }),
+    ];
+    const showRoom = async (given = twoMachines, online = [ME, OTHER], onCreate = vi.fn()) => {
+      await renderApp(<Machines machines={fleet(bothOnline, given, {}, online)} history={{}} here={ME} connected onCreate={onCreate} />);
+      return onCreate;
+    };
+    const head = () => screen.getByRole("region", { name: "Next task" });
+
+    it("names the machine Foundry would choose, and marks its card", async () => {
+      await showRoom();
+      expect(head().textContent).toMatch(/laptop takes the next task/);
+      expect(head().textContent).toMatch(/2 of 2 machines have room/);
+      expect(within(card("laptop")).getByText("Foundry's pick")).toBeDefined();
+      expect(within(card("studio")).getByText("Has room")).toBeDefined();
+    });
+
+    it("says which limits keep a machine from the next task, and that a task would wait when none has room", async () => {
+      const limited = settings({
+        machines: twoMachines.machines,
+        limits: {
+          [ME]: { max_sessions: 3, max_load_per_core: 1.5, min_free_disk: 1 },
+          [OTHER]: { max_sessions: 9, max_load_per_core: 0.25, min_free_disk: 1 },
+        },
+      });
+      await showRoom(limited);
+      expect(within(card("studio")).getByText("Full").parentElement?.textContent).toMatch(/sessions 3 at limit 3/);
+      expect(within(card("laptop")).getByText("Full").parentElement?.textContent).toMatch(/load 0\.3 over limit 0\.25/);
+      expect(head().textContent).toMatch(/No machine has room/);
+      expect(within(head()).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["studio: sessions 3 at limit 3", "laptop: load 0.3 over limit 0.25"]);
+    });
+
+    it("starts a task where Foundry chooses from the head, and on one machine from its card", async () => {
+      const onCreate = await showRoom();
+      fireEvent.click(within(head()).getByRole("button", { name: "New task, Foundry chooses the machine" }));
+      expect(onCreate).toHaveBeenLastCalledWith("choose");
+      fireEvent.click(within(card("studio")).getByRole("button", { name: "New task on studio" }));
+      // This machine is the task box's default, named by no id.
+      expect(onCreate).toHaveBeenLastCalledWith("");
+      fireEvent.click(within(card("laptop")).getByRole("button", { name: "New task on laptop" }));
+      expect(onCreate).toHaveBeenLastCalledWith(OTHER);
+    });
+
+    it("offers no task on an offline machine, and says nothing of its room beyond that it is offline", async () => {
+      await showRoom(twoMachines, [ME]);
+      expect(within(card("laptop")).queryByRole("button", { name: /New task/ })).toBeNull();
+      expect(within(card("laptop")).queryByText("Has room")).toBeNull();
+      expect(within(card("studio")).getByText("Foundry's pick")).toBeDefined();
+      expect(head().textContent).toMatch(/1 of 2 machines has room/);
+    });
+
+    it("has no head and no pick for a fleet of one machine, whose card still starts a task", async () => {
+      const onCreate = vi.fn();
+      const one = settings({ machines: [{ id: ME, name: "studio", address: "" }] });
+      await renderApp(<Machines machines={fleet(bothOnline.slice(0, 4), one, {}, [ME])} history={{}} here={ME} connected onCreate={onCreate} />);
+      expect(screen.queryByRole("region", { name: "Next task" })).toBeNull();
+      expect(within(card("studio")).queryByText("Foundry's pick")).toBeNull();
+      fireEvent.click(within(card("studio")).getByRole("button", { name: "New task on studio" }));
+      expect(onCreate).toHaveBeenCalledWith("");
+    });
+  });
 });

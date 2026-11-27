@@ -381,6 +381,22 @@ async fn a_makes_a_workspace_on_b_starts_a_session_and_a_shell_there_and_archive
         "A shows B's session"
     );
 
+    let path = format!("/api/sessions/{session}/rename");
+    let (status, answer) = on_a
+        .post(&path, Some(json!({"name": "  far  name "})))
+        .await;
+    assert_eq!(status, 204, "{answer}");
+    let is_named = |r: &AnyRecord| matches!(r, AnyRecord::Session(s) if s.body.id == session && s.body.name.as_deref() == Some("far name"));
+    assert!(
+        shown(&on_a.state().await, &is_named),
+        "A shows B's session under the name B wrote"
+    );
+    assert!(
+        a.held(|r| r.owner() == a.id && matches!(r, AnyRecord::Session(_)))
+            .is_none(),
+        "A wrote no session record"
+    );
+
     let path = format!("/api/workspaces/{workspace}/shells");
     let (status, answer) = on_a.post(&path, None).await;
     assert_eq!(status, 201, "{answer}");
@@ -2023,6 +2039,7 @@ async fn a_run_call_for_a_deleted_session_is_refused_as_not_here_yet_and_answere
                 terminal: TerminalId::random(),
                 model: "test-model".into(),
                 state: SessionState::Working,
+                name: None,
             },
         });
         // As sync applies B's records on A, and as A keeps its own.

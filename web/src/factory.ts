@@ -1,5 +1,6 @@
 import { createContext, useContext } from "react";
 import type { FactoryOverview, FactorySettings, FactoryStatus, ProjectFactory } from "./api";
+import { plural } from "./labels";
 
 /** The react-query key of the Factory view's overview. */
 export const factoryKey = ["factory"] as const;
@@ -97,4 +98,37 @@ export function projectLine(entry: FactoryOverview["projects"][number], status: 
   if (why?.kind === "no_token") return [`Idle: this coordinator holds no token for ${why.login}`];
   if (why?.kind === "held_by") return [`Idle here: ${name(why.machine)} holds the lease at generation ${why.generation}`];
   return [status.idle ? `Idle: ${status.idle}` : "Idle"];
+}
+
+/** How many issues stand at each station of the line: waiting to be claimed, being built, held up for a person, and finished. */
+export interface Tally {
+  ready: number;
+  building: number;
+  held: number;
+  finished: number;
+}
+
+/** What `statuses` hold at each station, summed; a project with no status yet adds nothing. */
+export function tally(statuses: (FactoryStatus | undefined)[]): Tally {
+  const sum: Tally = { ready: 0, building: 0, held: 0, finished: 0 };
+  for (const status of statuses) {
+    if (!status) continue;
+    sum.ready += status.ready.length;
+    sum.building += status.runs.length;
+    sum.held += status.held_up.length;
+    sum.finished += status.finished.length;
+  }
+  return sum;
+}
+
+/** The fleet's factory settings as one line to read when the form is folded. */
+export function settingsLine(s: FactorySettings): string {
+  return [
+    s.model,
+    `${s.effort} effort`,
+    `${plural(s.max_runs, "run")} at once`,
+    `${plural(s.max_gates, "gate")} at once`,
+    `looks every ${s.poll_seconds}s`,
+    `feedback every ${s.feedback_seconds}s`,
+  ].join(" · ");
 }

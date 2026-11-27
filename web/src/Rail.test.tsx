@@ -27,6 +27,12 @@ const handlers = () => ({ onExpand: vi.fn(), onJump: vi.fn(), onCreate: vi.fn() 
 afterEach(() => localStorage.clear());
 
 describe("Rail", () => {
+  it("heads each workspace's column with its project's face, so columns can be told apart", async () => {
+    await renderApp(<Rail machines={machines()} {...handlers()} />);
+    const login = screen.getByRole("group", { name: "fix login" });
+    expect(within(login).getByTitle("fix login · demo").textContent).toBe("DE");
+  });
+
   it("links to the factory beside the board", async () => {
     await renderApp(<Rail machines={machines()} onExpand={() => {}} onJump={() => {}} onCreate={() => {}} />);
     expect(screen.getByRole("link", { name: "The factory" }).getAttribute("href")).toBe("/factory");
