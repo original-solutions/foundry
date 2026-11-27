@@ -1,20 +1,12 @@
-# foundry: a Rust workspace (toolchain pinned in rust-toolchain.toml) that embeds a web UI built with npm.
-# The cloud image has Node but no Rust, and ~/.cargo/bin is not on the PATH a session's shell gets, so
-# rustup is installed from its checksum-verified binary and linked into /usr/local/bin.
+# foundry: a Rust workspace that embeds a web UI built with npm. The cloud image has Node but no Rust, and
+# ~/.cargo/bin is not on the PATH a session's shell gets, so rustup is installed from its checksum-verified
+# binary and linked into /usr/local/bin. Builds may not run inside the repo, so the toolchain is named here
+# as the default; in the repo, rust-toolchain.toml still picks it, and rustup installs a newer pin on first use.
+# npm ci, the web build and cargo fetch stay in .dw/config.yml's factory.provision, which runs in the repo.
 
 [install]                     # baked into the environment snapshot
 run = [
-  "T=$(uname -m)-unknown-linux-gnu && cd /tmp && curl --proto '=https' --tlsv1.2 -sSfO https://static.rust-lang.org/rustup/dist/$T/rustup-init && echo \"$(curl --proto '=https' --tlsv1.2 -sSf https://static.rust-lang.org/rustup/dist/$T/rustup-init.sha256 | awk '{print $1}')  rustup-init\" | sha256sum -c - && chmod +x rustup-init && ./rustup-init -y --profile minimal --default-toolchain none --no-modify-path && rm rustup-init",
+  "T=$(uname -m)-unknown-linux-gnu && cd /tmp && curl --proto '=https' --tlsv1.2 -sSfO https://static.rust-lang.org/rustup/dist/$T/rustup-init && echo \"$(curl --proto '=https' --tlsv1.2 -sSf https://static.rust-lang.org/rustup/dist/$T/rustup-init.sha256 | awk '{print $1}')  rustup-init\" | sha256sum -c - && chmod +x rustup-init && ./rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.99.1 -c rustfmt -c clippy && rm rustup-init",
   "sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/",
-  "rustup toolchain install",   # reads rust-toolchain.toml
-  "npm --prefix web ci --no-audit --no-fund",
-  "npm --prefix web run build",
-  "cargo fetch --locked",
-]
-
-[setup]                       # every boot/resume: re-sync deps in case the branch changed a lockfile
-run = [
-  "rustup toolchain install",
-  "npm --prefix web ci --prefer-offline --no-audit --no-fund",
-  "cargo fetch --locked",
+  "cargo --version && cargo fmt --version && cargo clippy --version",
 ]
