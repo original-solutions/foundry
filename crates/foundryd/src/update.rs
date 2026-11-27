@@ -3854,6 +3854,41 @@ mod tests {
     }
 
     #[test]
+    fn install_ready_holds_the_lock_until_current_is_pointed() {
+        let (home, exe) = ready_home(None);
+        let path = home.path().to_path_buf();
+        let (inside_tx, inside) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let install = std::thread::spawn(move || {
+            install_ready_with(&path, "v0.2.0", "0.1.0", &exe, |home, version| {
+                inside_tx.send(()).unwrap();
+                wait.recv().unwrap();
+                point_current(home, version)
+            })
+        });
+        inside.recv_timeout(Duration::from_secs(10)).unwrap();
+        let path = home.path().to_path_buf();
+        let taken = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = taken.clone();
+        let other = std::thread::spawn(move || {
+            let _held = lock(&path).unwrap();
+            flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert!(
+            !taken.load(Ordering::SeqCst),
+            "the lock was free while install_ready was pointing current"
+        );
+
+        go.send(()).unwrap();
+        install.join().unwrap().unwrap();
+        other.join().unwrap();
+        assert!(taken.load(Ordering::SeqCst));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+    }
+
+    #[test]
     fn install_ready_clears_a_stranded_trial_with_its_one_save() {
         let (home, exe) = ready_home(None);
         let mut held = state(home.path()).unwrap();
