@@ -1747,7 +1747,8 @@ mod tests {
         assert!(skips_keychain(Some(OsStr::new("file")), OVERRIDE));
     }
 
-    /// The same in a release build, which ignores it. CI runs this one in a release build.
+    /// The same in a release build, which ignores it. CI runs this one with debug assertions off,
+    /// as in a release build.
     #[cfg(not(debug_assertions))]
     #[test]
     fn this_release_build_ignores_foundry_secrets() {

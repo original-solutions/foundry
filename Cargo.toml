@@ -45,5 +45,15 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+# A release build's cfg without its optimisation: CI runs the foundryd library tests in this
+# profile to prove what a release build ignores (FOUNDRY_SECRETS, FOUNDRY_TAILSCALE,
+# FOUNDRY_CLOCK_AHEAD). Those tests turn on debug_assertions alone, and the release profile's
+# thin LTO and single codegen unit take minutes to compile.
+[profile.release-cfg]
+inherits = "dev"
+debug-assertions = false
+overflow-checks = false
+debug = false
+
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
