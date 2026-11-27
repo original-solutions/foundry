@@ -200,14 +200,27 @@ describe("Launchpad", () => {
     expect(sentNames(calls)).toEqual([long]);
   });
 
-  it("suggests no name when numbering a held name would not change its branch", async () => {
+  it("suggests no name, and says which workspace has it, when numbering a held name would not change its branch", async () => {
     const held = { project: "demo", branch: safeBranch(long), sessions: [] } as unknown as WorkspaceView;
     await renderApp(<Harness workspaces={[held]} />);
 
     fireEvent.change(promptBox(), { target: { value: long } });
 
     expect(screen.queryByLabelText("Branch")).toBeNull();
+    expect(screen.getByText(`demo already has a workspace on ${safeBranch(long)}. Pick another name.`)).toBeDefined();
     expect(start().disabled).toBe(true);
+  });
+
+  it("still tries 20 names when an open workspace holds one of the numbered ones", async () => {
+    const held = { project: "demo", branch: "fix-it-2", sessions: [] } as unknown as WorkspaceView;
+    const calls = mockFetch(...Array.from({ length: 20 }, () => json(409, { error: "a branch or worktree named that already exists in this project" })));
+    await renderApp(<Harness workspaces={[held]} />);
+
+    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
+    fireEvent.click(start());
+
+    await screen.findByRole("alert");
+    expect(sentNames(calls)).toEqual(["fix it", ...Array.from({ length: 19 }, (_, i) => `fix it ${i + 3}`)]);
   });
 
   it("says there is no project to work in when the fleet has none, and starts nothing", async () => {
