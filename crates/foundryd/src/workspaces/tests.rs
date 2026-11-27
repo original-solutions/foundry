@@ -999,6 +999,22 @@ async fn reads_of_a_detached_workspace_say_its_folder_is_no_longer_a_worktree() 
     );
 }
 
+/// The detached check runs only once a read has failed, so a read that worked is answered as it
+/// is, even in a folder git does not list.
+#[tokio::test]
+async fn a_read_that_worked_is_never_turned_into_detached() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "adrift").await;
+    let worktree = detach(&setup, remote.project, "adrift");
+
+    let read = setup
+        .workspaces
+        .read(id, &worktree, Ok::<_, WorkspaceError>("read"))
+        .await;
+    assert_eq!(read.unwrap(), "read");
+}
+
 #[tokio::test]
 async fn archive_of_a_detached_workspace_is_refused_naming_it_and_its_branchs_unpushed_commits() {
     let setup = Setup::new();
