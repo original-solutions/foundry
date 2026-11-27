@@ -290,20 +290,15 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
                 // launch the session may not have taken is asked for again here with `start`'s
                 // check (the spec's step 3), which decides by the session's count. Only
                 // `start`'s own launch: a run that has had an interruption is `resume`'s, and a
-                // session a feedback round launched is the round's, each with its own words. A
-                // launch the worker has refused because the count rose was typed, and is not
-                // asked for again. This pass's guards and reads stand: none of `start`'s own
-                // pass is run again. Each ask comes a full pass after the send before it and the
+                // session a feedback round launched is the round's, each with its own words.
+                // `start`'s check asks no more once the worker has refused the launch because
+                // the count rose. This pass's guards and reads stand: none of `start`'s own pass
+                // is run again. Each ask comes a full pass after the send before it and the
                 // worker decides, as the spec's step 3 says; P1 documents that a line typed and
                 // not yet counted can still be typed twice (`SendRefused::Failed`).
-                None if seen.interruption.is_none()
-                    && !feedback::round_owns(&events)
-                    && !start::launch_taken(&events) =>
-                {
-                    Ok(BuildStep::Launch(start::launched(
-                        ctx, run, &seen, &mut at,
-                    )?))
-                }
+                None if seen.interruption.is_none() && !feedback::round_owns(&events) => Ok(
+                    BuildStep::Launch(start::launched(ctx, run, &seen, &events, &mut at)?),
+                ),
                 None => Ok(BuildStep::Running),
             }
         }
@@ -1056,7 +1051,7 @@ mod tests {
     use foundry_proto::state::SessionState;
 
     use super::super::progress::LAUNCH_RESENDING;
-    use super::super::start::LAUNCH_TAKEN;
+    use super::super::start::{LAUNCH_RESENT, LAUNCH_TAKEN};
     use super::super::testing::*;
     use super::*;
     use crate::factory::github::{Hiding, Tracker, TrackerError};
@@ -5143,11 +5138,14 @@ mod tests {
 
         /// The spec's step 3: a building session idle with no turn ended has not taken its
         /// launch (a daemon restart lost it before it was typed), and `start` asks for it
-        /// again by count, though the label moved to `building` with the start.
+        /// again by count, though the label moved to `building` with the start. Each send the
+        /// worker takes has its own lines: a view still behind a pass later asks again, and the
+        /// ledger shows both.
         #[test]
         fn a_session_that_has_not_taken_its_launch_is_asked_for_it_again_by_count() {
             let (mut rig, run) = built();
             show(&mut rig, SessionState::Idle, 0, 0);
+            rig.worker.on_send(Ok(0));
             rig.worker.on_send(Ok(0));
             let before = rig.events(&run).len();
             assert_eq!(
@@ -5157,9 +5155,23 @@ mod tests {
             assert_eq!(sends(&rig), vec![launch_sent_again()]);
             assert_eq!(
                 steps_after(&rig, &run, before),
-                [format!("{LAUNCH_RESENDING}0")]
+                [format!("{LAUNCH_RESENDING}0"), format!("{LAUNCH_RESENT}0")]
             );
             assert_eq!(rig.sim.labels(), ["factory:building"]);
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Resent { session: session() })
+            );
+            assert_eq!(sends(&rig), vec![launch_sent_again(), launch_sent_again()]);
+            assert_eq!(
+                steps_after(&rig, &run, before),
+                [
+                    format!("{LAUNCH_RESENDING}0"),
+                    format!("{LAUNCH_RESENT}0"),
+                    format!("{LAUNCH_RESENDING}0"),
+                    format!("{LAUNCH_RESENT}0"),
+                ]
+            );
         }
 
         /// The worker decides: a launch whose count rose was typed, and nothing more is sent.
@@ -5182,7 +5194,10 @@ mod tests {
                 [format!("{LAUNCH_RESENDING}0"), format!("{LAUNCH_TAKEN}1")]
             );
             let events = rig.events(&run).len();
-            assert_eq!(pass(&rig, &run), BuildStep::Running);
+            assert_eq!(
+                pass(&rig, &run),
+                BuildStep::Launch(StartStep::Started { session: session() })
+            );
             assert_eq!(sends(&rig), vec![launch_sent_again()]);
             assert_eq!(rig.events(&run).len(), events);
         }
@@ -5241,7 +5256,7 @@ mod tests {
             assert_eq!(sends(&rig), vec![launch_sent_again(), launch_sent_again()]);
             assert_eq!(
                 steps_after(&rig, &run, before),
-                [format!("{LAUNCH_RESENDING}0")]
+                [format!("{LAUNCH_RESENDING}0"), format!("{LAUNCH_RESENT}0")]
             );
         }
 

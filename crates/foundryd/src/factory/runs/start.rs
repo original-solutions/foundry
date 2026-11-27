@@ -84,6 +84,10 @@ pub const FIRST_PROMPT_COUNT: u64 = 0;
 /// step 3 sends a message again only when it never did, so it is not asked for again.
 pub const LAUNCH_TAKEN: &str = "launch-taken ";
 
+/// The step written once the worker took the launch asked for again: `launch-resent <count>`.
+/// A pass that asks again after it writes its own `launch-resending` line.
+pub const LAUNCH_RESENT: &str = "launch-resent ";
+
 /// Who holds claims back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClaimPause {
@@ -735,7 +739,7 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StartStep, RunError>
         });
     }
     if seen.thread_id.is_some() {
-        return launched(ctx, run, &seen, &mut at);
+        return launched(ctx, run, &seen, &events, &mut at);
     }
     build(ctx, run, &seen, &detail, &mut at)
 }
@@ -1645,12 +1649,14 @@ fn record_launched(
 }
 
 /// A run whose session is launched: the label, and the launch asked for again by count when the
-/// session is idle a pass after it started. `building` asks through this too, once the label has
-/// moved, with the ledger and issue it has read already.
+/// session is idle a pass after it started, until the worker refuses it because the count rose
+/// ([`LAUNCH_TAKEN`]). `building` asks through this too, once the label has moved, with the
+/// ledger `events` its pass has read already.
 pub(super) fn launched(
     ctx: &RunContext<'_>,
     run: &RunId,
     seen: &Seen,
+    events: &[RunEvent],
     at: &mut Progress,
 ) -> Result<StartStep, RunError> {
     let Some(thread) = &seen.thread_id else {
@@ -1667,17 +1673,18 @@ pub(super) fn launched(
         .view
         .session_turn(session)
         .is_none_or(|turn| turn.turn == 0 && turn.prompts == FIRST_PROMPT_COUNT);
-    if !(idle && untouched) {
+    // A launch the worker refused because the count rose was typed: it is not asked for again.
+    if !(idle && untouched) || launch_taken(events) {
         return Ok(StartStep::Started { session });
     }
     let (base, resumed) = recorded_decision(ctx, run, seen)?;
     let message = launch_message(ctx, run, &base, resumed.as_ref());
-    // One line for asks in a row: when the ledger's newest step is this one, the pass before
-    // asked and nothing has happened since (the worker found the session busy, the send failed,
-    // or the view has not caught up), so a view that stays behind does not grow the ledger by a
-    // line a pass. The count guards each send either way.
+    // One line for asks in a row that typed nothing: when the ledger's newest step is this one,
+    // the ask before it was refused as busy or its send failed, and nothing has happened since,
+    // so a view that stays behind the worker's does not grow the ledger by a line a pass. A send
+    // the worker took is followed by `launch-resent`, so the next ask has its own line. The
+    // count guards each send either way.
     let resending = format!("{LAUNCH_RESENDING}{FIRST_PROMPT_COUNT}");
-    let events = ctx.ledger.read(run)?;
     if events.iter().rev().find_map(step_text) != Some(resending.as_str()) {
         ctx.record_step(
             run,
@@ -1686,7 +1693,14 @@ pub(super) fn launched(
         )?;
     }
     match ctx.send(session, message, Some(FIRST_PROMPT_COUNT)) {
-        Ok(_) => Ok(StartStep::Resent { session }),
+        Ok(_) => {
+            ctx.record_step(
+                run,
+                &format!("{LAUNCH_RESENT}{FIRST_PROMPT_COUNT}"),
+                &Cause::new(CauseStep::Start, "launch-resent"),
+            )?;
+            Ok(StartStep::Resent { session })
+        }
         // The worker decides: its count rose, so the message was typed, and the ledger says so
         // that no later pass asks again while the session's turn record is late.
         Err(RunError::Send(SendRefused::CountRose { now })) => {
@@ -1705,7 +1719,7 @@ pub(super) fn launched(
 
 /// Whether the ledger shows the worker refused the launch asked for again because the
 /// session's count rose ([`LAUNCH_TAKEN`]): the launch was typed, and is not asked for again.
-pub(super) fn launch_taken(events: &[RunEvent]) -> bool {
+fn launch_taken(events: &[RunEvent]) -> bool {
     events
         .iter()
         .filter_map(step_text)
