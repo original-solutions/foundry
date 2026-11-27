@@ -7,14 +7,14 @@
 //! - [`restart`] stops a worker's daemon and starts it again on the same data folder, as
 //!   `foundryd` restarts: what it held in memory is gone, its terminals and sessions are taken up
 //!   again.
-//! - [`Ticker`] stands in for the harness's ticker, so a test can hold the factory's clock or
-//!   hurry it through the 5, 10 and 15 minutes the factory waits.
+//! - [`hurry`] moves the factory's clock through the 5, 10 and 15 minutes the factory waits.
+//! - [`cut_off_at_claim`] cuts a machine off between its claim and the call that asks it for the
+//!   build.
 //! - [`hold_turns`] keeps a session's `session_turn` from the coordinator, as a record that
 //!   syncs apart from the session's own can arrive late.
 //! - [`shorten_command_limit`] makes the gate's 30-minute limit on a command a few seconds.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use foundry_proto::factory::{FactoryBody, FactoryRecord, SessionTurn};
@@ -55,36 +55,53 @@ fn marks(name: &str) -> String {
     format!(": > \"$MARKS/{name}\"\n")
 }
 
-/// The harness's ticker, replaced by one the test can hold: while it runs it moves the clock on
-/// as the harness's does, ten times as fast as the wall clock.
-struct Ticker {
-    running: Arc<AtomicBool>,
-}
-
-impl Ticker {
-    fn take(h: &mut Harness) -> Ticker {
-        h.ticker.abort();
-        let running = Arc::new(AtomicBool::new(true));
-        let (clock, on) = (h.clock.clone(), running.clone());
-        h.ticker = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                if on.load(Ordering::Acquire) {
-                    clock.advance(Duration::from_millis(500));
+/// Cuts off the machine a claim of issue `issue` names before the claim's pass asks it for the
+/// build, and answers that machine.
+///
+/// The `claimed` event is in the coordinator's store before the claim's GitHub edits, and the
+/// pass takes that store again, to write its next events and to read the machine list, before
+/// it dials the machine; a cut machine's dial is refused. So the event is read, and the machine
+/// cut off, while the watcher holds the store, on a thread of its own that takes each store again
+/// at once. A test that waits for the claim comment on GitHub instead can lose to the pass.
+fn cut_off_at_claim(h: &Harness, issue: u64) -> std::thread::JoinHandle<MachineId> {
+    let daemons: Vec<_> = h
+        .fleet
+        .daemons
+        .iter()
+        .map(|daemon| (daemon.id, daemon.store.clone()))
+        .collect();
+    let net = h.fleet.net.clone();
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let mut read = vec![0; daemons.len()];
+        loop {
+            for (at, (me, store)) in daemons.iter().enumerate() {
+                let store = lock(store);
+                for record in store.factory_since(*me, read[at], usize::MAX).unwrap() {
+                    read[at] = read[at].max(record.version);
+                    let FactoryBody::RunEvent(event) = record.body else {
+                        continue;
+                    };
+                    if event.event != "claimed" || event.run.issue() != issue {
+                        continue;
+                    }
+                    let named = &event.data["machine"];
+                    let machine = daemons
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .find(|id| named.as_str() == Some(id.to_string().as_str()))
+                        .expect("the claim names a machine of the fleet");
+                    eprintln!("fleet: cutting {machine} off at the claim");
+                    net.cut.send_modify(|cut| {
+                        cut.insert(machine);
+                    });
+                    return machine;
                 }
             }
-        });
-        Ticker { running }
-    }
-
-    /// Stops the clock: no pass, renewal or wait of the factory moves on until [`Ticker::go`].
-    fn hold(&self) {
-        self.running.store(false, Ordering::Release);
-    }
-
-    fn go(&self) {
-        self.running.store(true, Ordering::Release);
-    }
+            assert!(start.elapsed() < WAIT, "issue #{issue} is claimed");
+            std::thread::yield_now();
+        }
+    })
 }
 
 /// Moves the factory's clock on by `by` beside the ticker, two seconds every 50 ms, so every
@@ -559,8 +576,7 @@ fn a_claim_whose_machine_never_answers_is_launched_on_another() {
         module_path!(),
         "a_claim_whose_machine_never_answers_is_launched_on_another",
         || async {
-            let mut h = Harness::start(Options::default()).await;
-            let ticker = Ticker::take(&mut h);
+            let h = Harness::start(Options::default()).await;
             h.github.pull(PR, "fac/12-1", 12);
             h.script(
                 12,
@@ -568,35 +584,30 @@ fn a_claim_whose_machine_never_answers_is_launched_on_another() {
                     "{COMMITS}agent '- hook: {{event: SessionStart}}\n- wait_prompt\n{DONE}'\n"
                 ),
             );
+            // The claim names a machine, which is cut off before the claim's pass asks it for
+            // the build.
+            let cutting = cut_off_at_claim(&h, 12);
             h.ready(12, "Make the widgets faster");
-
-            // The claim names a machine; the clock stops before the pass that asks it for the
-            // build, and the machine is cut off before it is asked.
-            let named_in_claim = || {
-                let comments = h.github.comments_on(12);
-                [1, 2].into_iter().find(|&i| {
-                    let id = h.fleet.daemons[i].id.to_string();
-                    comments
-                        .iter()
-                        .any(|c| c.contains("<!-- foundry:claim ") && c.contains(&id))
-                })
-            };
-            let start = tokio::time::Instant::now();
-            let claimed = loop {
-                if let Some(i) = named_in_claim() {
-                    ticker.hold();
-                    break i;
-                }
-                assert!(start.elapsed() < WAIT, "the issue is claimed");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            };
+            until(WAIT, "the claimed machine is cut off", || {
+                cutting.is_finished()
+            })
+            .await;
+            let cut_off = cutting
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let claimed = index(&h, cut_off);
             let elsewhere = other([1, 2], claimed);
+            until(WAIT, "the claim comment names the machine cut off", || {
+                h.github
+                    .comments_on(12)
+                    .iter()
+                    .any(|c| c.contains("<!-- foundry:claim ") && c.contains(&cut_off.to_string()))
+            })
+            .await;
             assert!(
                 h.workspaces_named("fac/12-1").is_empty(),
-                "the build is not asked for in the claim's pass"
+                "the machine cut off is not asked for the build"
             );
-            h.fleet.cut(claimed);
-            ticker.go();
 
             hurry(&h, Duration::from_secs(15 * 60 + 30)).await;
             let build = h.made("fac/12-1").await;
