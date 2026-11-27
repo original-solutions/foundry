@@ -13,7 +13,7 @@ import { ShipLine, shippingQuery } from "./Shipping";
 import { splitPath, totals } from "./changes";
 import { branchOf, type MachineView } from "./fleet";
 import type { Project } from "./api";
-import { FactoryMark } from "./Sidebar";
+import { FactoryMark } from "./FactoryMark";
 import { Composer, useCreateWorkspace } from "./Composer";
 import { plural, words, type Glyph } from "./labels";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";

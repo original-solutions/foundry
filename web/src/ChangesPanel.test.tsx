@@ -218,6 +218,13 @@ describe("ChangesPanel", () => {
     });
   });
 
+  it("names a workspace on a commit by its commit, as the board does", async () => {
+    mockFetch(json(200, changes));
+    await renderApp(<ChangesPanel workspace={{ ...target, branch: "", base: "fedcba9876543210fedcba9876543210fedcba98" }} onClose={() => {}} />);
+    const panel = await screen.findByRole("dialog", { name: /changes in fix login/i });
+    expect(within(panel).getByText("fedcba9")).toBeDefined();
+  });
+
   describe("comments for Claude", () => {
     const sessions = [
       { id: "s1", model: "opus", name: "opus 1", state: "idle" as const, terminal: "t1" },

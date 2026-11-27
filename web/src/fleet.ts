@@ -95,6 +95,12 @@ export interface WorkspaceView {
   shells: ShellView[];
   /** The factory run it belongs to, once `withFactory` has read the believed statuses. */
   factory?: FactoryRun;
+  /**
+   * No believed status of its project is here: none has arrived since the fleet was last sent
+   * whole (a resend drops them all until they follow), or its project has none. Whether a run
+   * tends it is then not known.
+   */
+  statusUnknown?: true;
 }
 export interface MachineView {
   id: string;
@@ -326,7 +332,8 @@ export const needsYouIn = (glyph: Glyph, run: FactoryRun | undefined): boolean =
 
 /**
  * The fleet with each workspace a believed status names marked with its factory run, so every
- * view that lists its terminals (`rows`) reads them the same way. Without statuses, the fleet as is.
+ * view that lists its terminals (`rows`) reads them the same way, and each whose project has no
+ * status here marked `statusUnknown`. Without statuses, the fleet as is.
  */
 export function withFactory(machines: MachineView[], statuses: Record<string, FactoryStatus> | undefined): MachineView[] {
   if (!statuses) return machines;
@@ -335,14 +342,15 @@ export function withFactory(machines: MachineView[], statuses: Record<string, Fa
     ...machine,
     workspaces: machine.workspaces.map((workspace) => {
       const factory = runOf(workspace);
-      return factory ? { ...workspace, factory } : workspace;
+      if (factory) return { ...workspace, factory };
+      return workspace.projectId in statuses ? workspace : { ...workspace, statusUnknown: true as const };
     }),
   }));
 }
 
 /** What a workspace shows as its branch: its branch, or the first 7 characters of its commit when it is on one. */
-export function branchOf(workspace: WorkspaceView): string {
-  return workspace.branch || workspace.base.slice(0, 7);
+export function branchOf(workspace: { branch: string; base?: string }): string {
+  return workspace.branch || (workspace.base ?? "").slice(0, 7);
 }
 
 /** Where terminal `id` sits in the fleet, with the name and state the sidebar gives it. */

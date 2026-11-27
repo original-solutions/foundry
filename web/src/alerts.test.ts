@@ -89,13 +89,21 @@ describe("alertsFor and the factory", () => {
   it("raises nothing while a resend has dropped a tended run's mark, and raises once its run is held up", () => {
     const tended = alertsFor(alertsFor(undefined, withFactory(world("working"), live)).seen, withFactory(world("stuck"), live));
     expect(tended.alerts).toEqual([]);
-    // A state resend: the marks are gone until the statuses follow.
-    const bare = alertsFor(tended.seen, world("stuck"));
+    // A state resend: the statuses are gone until they follow it.
+    const bare = alertsFor(tended.seen, withFactory(world("stuck"), {}));
     expect(bare.alerts).toEqual([]);
     expect(alertsFor(bare.seen, withFactory(world("stuck"), live)).alerts).toEqual([]);
     expect(alertsFor(bare.seen, withFactory(world("stuck"), held)).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
     // A session that moves on meanwhile is news by the usual rules.
-    expect(alertsFor(bare.seen, world("failed")).alerts.map((a) => a.body)).toEqual(["opus failed"]);
+    expect(alertsFor(bare.seen, withFactory(world("failed"), {})).alerts.map((a) => a.body)).toEqual(["opus failed"]);
+  });
+
+  it("raises a stuck session once its project's status arrives and no longer names its run", () => {
+    const tended = alertsFor(alertsFor(undefined, withFactory(world("working"), live)).seen, withFactory(world("stuck"), live));
+    const bare = alertsFor(tended.seen, withFactory(world("stuck"), {}));
+    expect(alertsFor(bare.seen, withFactory(world("stuck"), factoryStatus("p1", {}))).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
+    // The run ended with no resend between: the same.
+    expect(alertsFor(tended.seen, withFactory(world("stuck"), factoryStatus("p1", {}))).alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
   });
 
   it("raises a held-up run's session that is stuck, and any session outside a run", () => {

@@ -11,7 +11,7 @@ import { TerminalMenu } from "./TerminalMenu";
 import { readStored, store } from "./storage";
 import { ProjectFace } from "./ProjectFace";
 import { branchOf } from "./fleet";
-import { FactoryMark } from "./Sidebar";
+import { FactoryMark } from "./FactoryMark";
 
 /** Whether the board draws its workspaces as cards or as a list of one line each, kept for this browser. */
 export type Layout = "cards" | "list";

@@ -39,10 +39,10 @@ export function alertsFor(before: Seen | undefined, machines: MachineView[]): { 
     const tended = tendedByFactory(workspace.factory);
     for (const s of workspace.sessions) {
       const was = before?.get(s.id);
-      // A resend of the fleet drops every factory mark until the statuses follow it, so a tended
-      // session that lost its mark with no change of its own is no news: it stays tended until a
-      // status says otherwise (held up, then it is raised).
-      const unmarked = was?.tended === true && was.state === s.state && workspace.factory === undefined;
+      // A resend of the fleet drops every status until they follow it, so a tended session whose
+      // project's status is not here yet, with no change of its own, is no news: it stays tended
+      // until its project's status arrives. Held up, or no longer named, it is raised then.
+      const unmarked = was?.tended === true && was.state === s.state && workspace.statusUnknown === true;
       seen.set(s.id, { state: s.state, tended: tended || unmarked });
       if (!before || unmarked) continue;
       if (was?.state === s.state && was.tended === tended) continue;

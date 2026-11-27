@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { rows, type MachineView } from "./fleet";
+import { branchOf, rows, type MachineView } from "./fleet";
 import type { Glyph } from "./labels";
 
 /** Something the palette does besides opening a terminal: going to one of the app's views, or one of its actions. */
@@ -32,7 +32,7 @@ export function destinations(machines: MachineView[], commands: Command[] = []):
   const shells: Destination[] = [];
   for (const machine of machines) {
     for (const w of machine.workspaces) {
-      const where = `${w.name} ${w.project} ${w.branch} ${machine.name}`;
+      const where = `${w.name} ${w.project} ${branchOf(w)} ${machine.name}`;
       const add = (terminal: string, name: string, label: string, glyph: Glyph, subtitle?: string) =>
         open.push({ kind: "terminal", key: terminal, terminal, title: `${w.name} / ${name}`, subtitle, label, glyph, machine: machine.name, words: `${where} ${name} ${label} ${subtitle ?? ""}` });
       // As the sidebar lists them, so a factory run's quiet session reads alike here.
