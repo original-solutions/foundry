@@ -21,7 +21,7 @@ import { touched, withoutTab } from "./tabs";
 import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
 import { TerminalActions } from "./TerminalMenu";
-import { fleet, locate, rows, terminalRunning } from "./fleet";
+import { fleet, locate, needsYouIn, rows, terminalRunning, withFactory } from "./fleet";
 import { useShortcut } from "./shortcut";
 import { useBriefs } from "./useBriefs";
 import { machineQuery } from "./api";
@@ -39,7 +39,6 @@ import { WaitingList } from "./placement/WaitingList";
 import { upNext } from "./needing";
 import { NextUp, useOpenStanding } from "./NextUp";
 import { SplitEnded } from "./SplitTasks";
-import { needsYou } from "./labels";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
@@ -149,7 +148,11 @@ function Layout() {
   const briefs = useBriefs(state.records);
   const { data: here } = useQuery(machineQuery);
   const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
-  const machines = useMemo(() => fleet(state.records, state.settings, briefs, state.online, here), [state.records, state.settings, briefs, state.online, here]);
+  // Each factory run's workspace carries its run, so every view reads its terminals the same way.
+  const machines = useMemo(
+    () => withFactory(fleet(state.records, state.settings, briefs, state.online, here), state.factory, state.settings.project_factory),
+    [state.records, state.settings, briefs, state.online, here, state.factory],
+  );
   const projectFaces = useMemo(() => faces(state.settings.projects), [state.settings.projects]);
   const [drawer, setDrawer] = useState(false);
   /** Whether the sidebar is collapsed to the rail on a wide screen. */
@@ -289,7 +292,7 @@ function Layout() {
   useShortcut("f", terminalId ? () => setFinding((n) => n + 1) : undefined);
   useShortcut("\\", terminalId ? () => (split ? setSplit(undefined) : setJump("beside")) : undefined);
   const next = upNext(machines, terminalId);
-  const standing = useOpenStanding(terminalId, located !== undefined && needsYou.includes(located.glyph));
+  const standing = useOpenStanding(terminalId, located !== undefined && needsYouIn(located.glyph, located.workspace.factory));
   useShortcut("j", next ? () => show(next.next.terminal) : undefined);
   const commands = useCommands({
     screen: terminalId ? "terminal" : onMachines ? "machines" : onFactory ? "factory" : "home",

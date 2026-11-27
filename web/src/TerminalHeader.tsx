@@ -4,7 +4,7 @@ import { useLeaving } from "./Archive";
 import { changesQuery, GLANCE_EVERY } from "./ChangesPanel";
 import { findKey } from "./FindBar";
 import { totals } from "./changes";
-import type { Located } from "./fleet";
+import { branchOf, type Located } from "./fleet";
 import { machineQuery } from "./api";
 import { useWidth } from "./media";
 import { jumpKey, SearchIcon } from "./JumpPalette";
@@ -119,7 +119,7 @@ export function TerminalHeader({
           <div className={`flex h-11 min-w-0 flex-1 items-center gap-2 ${apart ? "" : "md:max-w-64 md:grow-0 md:basis-auto"}`}>
             {/* On a phone the bar is short of room, and the workspace's name matters more than its project's face. */}
             <ProjectFace project={located.workspace.project} className="size-4 text-[8px] max-md:hidden" />
-            <span className="truncate font-medium text-neutral-100" title={`${located.workspace.branch} · ${located.workspace.project}`}>
+            <span className="truncate font-medium text-neutral-100" title={`${branchOf(located.workspace)} · ${located.workspace.project}`}>
               {located.workspace.name}
             </span>
             {fit === "wide" && (

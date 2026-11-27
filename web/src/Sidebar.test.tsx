@@ -1,10 +1,10 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fleet } from "./fleet";
+import { fleet, withFactory } from "./fleet";
 import { Sidebar } from "./Sidebar";
 import { TerminalActions } from "./TerminalMenu";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, mockFetch, renderApp } from "./test-utils";
 import type { SessionState } from "./api";
 
@@ -439,6 +439,31 @@ describe("Sidebar", () => {
     fireEvent.keyDown(field, { key: "Escape" });
     expect(within(studio).getByRole("link", { name: "studio" })).toBeDefined();
     expect(calls).toHaveLength(1);
+  });
+});
+
+/** Project p1's believed status: run 162 builds in w1, run 170 is held up in w2. */
+describe("Sidebar and the factory", () => {
+  const factoryMachines = () =>
+    fleet(
+      [sample(ME, 1), workspace(ME, "w1", "fac 162"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "stuck"), onCommit(ME, "w3", "on a commit")],
+      settings({ machines: [{ id: ME, name: "studio", address: "" }] }),
+    );
+
+  it("marks a factory run's workspace and links it to its issue, and names a quiet session so", async () => {
+    await renderApp(<Sidebar machines={withFactory(factoryMachines(), factoryStatuses())} {...props} />);
+    const run = screen.getByRole("group", { name: "fac 162" });
+    // Folded, the mark shows on the workspace's line.
+    expect(within(run).getByRole("link", { name: "factory #162" }).getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");
+    unfold("fac 162");
+    expect(within(run).getByText("Quiet 10+ min")).toBeDefined();
+    expect(within(screen.getByRole("group", { name: "on a commit" })).queryByRole("link", { name: /^factory/ })).toBeNull();
+  });
+
+  it("shows a workspace with no branch by its commit", async () => {
+    await renderApp(<Sidebar machines={factoryMachines()} {...props} />);
+    unfold("on a commit");
+    expect(within(screen.getByRole("group", { name: "on a commit" })).getByText("fedcba9 · demo")).toBeDefined();
   });
 });
 

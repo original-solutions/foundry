@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { fleet } from "./fleet";
+import { fleet, withFactory } from "./fleet";
 import { destinations, newWorkspace, search, type Command } from "./jump";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const machines = () =>
   fleet(
@@ -20,6 +20,17 @@ const machines = () =>
   );
 
 describe("destinations", () => {
+  it("finds a workspace on a commit by the commit it shows", () => {
+    const found = search(destinations(fleet([sample(ME, 1), onCommit(ME, "w1", "far away"), terminal(ME, "t1", "w1")], settings())), "fedcba9");
+    expect(found.map((d) => d.title)).toEqual(["far away / shell", "New shell in far away"]);
+  });
+
+  it("says a live factory run's stuck session is quiet, as every other view does", () => {
+    const records = [sample(ME, 1), workspace(ME, "w1", "fac 162"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "stuck")];
+    const run = withFactory(fleet(records, settings()), factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1"] }));
+    expect(destinations(run)[0]).toMatchObject({ kind: "terminal", terminal: "t1", label: "Quiet 10+ min", glyph: "stuck" });
+  });
+
   it("lists every terminal in the fleet with its workspace, name, state and machine, then a new shell per workspace", () => {
     const all = destinations(machines());
     expect(all.map((d) => d.title)).toEqual(["fix login / sonnet", "fix login / shell", "tidy readme / opus", "New shell in fix login", "New shell in tidy readme"]);

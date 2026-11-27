@@ -4,7 +4,7 @@ import { machineQuery, sessionTrail } from "./api";
 import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
 import { totals } from "./changes";
-import { locate, rows, type MachineView, type WorkspaceView } from "./fleet";
+import { branchOf, locate, rows, type MachineView, type WorkspaceView } from "./fleet";
 import type { Destination } from "./jump";
 import { addsSteps, words, type Glyph } from "./labels";
 import { topFiles } from "./lanes";
@@ -87,7 +87,7 @@ export function Peek({ at, machines }: { at: Destination | undefined; machines: 
       <Shell label={`Preview of ${workspace.name}`}>
         <Head workspace={workspace} machine={owner.name} many={machines.length > 1} name={workspace.name} />
         <p className="text-xs text-neutral-400">
-          Starts a shell in {workspace.name}, in its worktree on {workspace.branch}.
+          Starts a shell in {workspace.name}, in its worktree on {branchOf(workspace)}.
         </p>
         {all.length > 0 && (
           <Part heading="Its terminals">
@@ -173,7 +173,7 @@ function Head({ glyph, label, name, workspace, machine, many }: { glyph?: Glyph;
         )}
       </h3>
       <p className="truncate font-mono text-[11px] text-neutral-500">
-        {workspace.project} · {workspace.branch}
+        {workspace.project} · {branchOf(workspace)}
         {many && ` · ${machine}`}
       </p>
     </header>

@@ -1,6 +1,6 @@
 import type { Step } from "./api";
-import type { MachineView } from "./fleet";
-import { needsYou, type Glyph } from "./labels";
+import { needingRows, type MachineView } from "./fleet";
+import type { Glyph } from "./labels";
 import { lanes } from "./lanes";
 
 /** A terminal that needs a person: where it is, what it is called, and what it asks. */
@@ -16,15 +16,14 @@ export interface Needing {
 }
 
 /**
- * Every terminal in the fleet that needs a person (waiting, stuck or failed), in the order the
- * board shows them: workspace by workspace down its needs-you lane, most urgent first.
+ * Every terminal in the fleet that needs a person (waiting, stuck or failed, and a held-up factory
+ * run's most urgent one: `needingRows`), in the order the board shows them: workspace by workspace
+ * down its needs-you lane, most urgent first.
  */
 export function needing(machines: MachineView[]): Needing[] {
   const needs = lanes(machines).find((l) => l.lane === "needs")?.cards ?? [];
   return needs.flatMap((card) =>
-    card.rows
-      .filter((row) => needsYou.includes(row.glyph))
-      .map((row) => ({ terminal: row.terminal, workspace: card.workspace.name, name: row.name, glyph: row.glyph, label: row.label, now: row.now })),
+    needingRows(card.workspace).map((row) => ({ terminal: row.terminal, workspace: card.workspace.name, name: row.name, glyph: row.glyph, label: row.label, now: row.now })),
   );
 }
 

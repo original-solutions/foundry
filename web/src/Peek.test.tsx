@@ -1,9 +1,9 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { machineQuery, type Briefs, type Changes, type Mark } from "./api";
-import { fleet } from "./fleet";
+import { fleet, withFactory, type MachineView } from "./fleet";
 import { JumpPalette } from "./JumpPalette";
-import { ME, OTHER, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, ME, onCommit, OTHER, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, renderApp } from "./test-utils";
 
 const records = [
@@ -69,8 +69,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function open() {
-  const view = await renderApp(<JumpPalette machines={machines} open onOpenChange={() => {}} onCreate={() => {}} />);
+async function open(fleetNow: MachineView[] = machines) {
+  const view = await renderApp(<JumpPalette machines={fleetNow} open onOpenChange={() => {}} onCreate={() => {}} />);
   view.client.setQueryData(machineQuery.queryKey, ME);
   const dialog = await screen.findByRole("dialog", { name: "Jump to" });
   return { dialog, input: within(dialog).getByRole("combobox") };
@@ -129,6 +129,19 @@ describe("the jump palette's preview", () => {
     const peek = within(dialog).getByRole("region", { name: "Preview of tidy docs" });
     expect(within(peek).getByText("Working")).toBeDefined();
     expect(within(peek).getByText(/Starts a shell in tidy docs/)).toBeDefined();
+  });
+
+  it("says a live factory run's stuck session is quiet, and a workspace on a commit by its commit", async () => {
+    const at = [onCommit(OTHER, "w9", "far away"), terminal(OTHER, "t9", "w9"), session(OTHER, "s9", "w9", "t9", "stuck")];
+    const twoMachines = settings({ machines: [{ id: ME, name: "studio", address: "a" }, { id: OTHER, name: "laptop", address: "b" }] });
+    const run = withFactory(fleet(at, twoMachines), factoryStatus("p1", { "original-solutions__foundry__162__1": ["w9"] }));
+    const { dialog, input } = await open(run);
+    fireEvent.change(input, { target: { value: "far away" } });
+    const peek = within(dialog).getByRole("region", { name: "Preview of far away / opus" });
+    expect(within(peek).getByText("Quiet 10+ min")).toBeDefined();
+    expect(within(peek).getByText("demo · fedcba9 · laptop")).toBeDefined();
+    fireEvent.change(input, { target: { value: "new shell far" } });
+    expect(within(within(dialog).getByRole("region", { name: "Preview of far away" })).getByText(/in its worktree on fedcba9\./)).toBeDefined();
   });
 
   it("has no preview on a narrow screen, and reads nothing for one", async () => {
