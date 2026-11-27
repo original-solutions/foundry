@@ -299,7 +299,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use foundry_proto::factory::{RunEvent, RunId};
+use foundry_proto::factory::{RunEvent, RunId, SessionTurn};
 use foundry_proto::ids::{MachineId, SessionId, WorkspaceId};
 use foundry_proto::settings::SharedSettings;
 use foundry_proto::state::{SessionState, TerminalState};
@@ -956,17 +956,31 @@ fn can_take_a_message(state: SessionState) -> bool {
 
 /// Whether the session is at work, so that nothing is gated or read of it yet. A session that
 /// finished or failed is not: its last turn stands and is gated. Nor is one that cannot be
-/// reached: the gate needs the pull request it reported, not the session, and a gate in flight on
-/// its machine must be read to be found gone. Whether it can be sent a message is
-/// `can_take_a_message`'s, which is stricter.
-fn busy(state: SessionState) -> bool {
-    !matches!(
-        state,
-        SessionState::Idle
-            | SessionState::Finished
-            | SessionState::Failed
-            | SessionState::Unreachable
-    )
+/// reached and was [`at_rest`] when last seen: the gate needs the pull request it reported, not
+/// the session, and a gate in flight on its machine must be read to be found gone. Whether it can
+/// be sent a message is `can_take_a_message`'s, which is stricter.
+fn busy(state: SessionState, seen: &Seen, turn: Option<&SessionTurn>) -> bool {
+    match state {
+        SessionState::Idle | SessionState::Finished | SessionState::Failed => false,
+        SessionState::Unreachable => !at_rest(seen, turn),
+        _ => true,
+    }
+}
+
+/// Whether nothing shows that a session on a machine that cannot be reached is at work there:
+/// the fleet shows it as last seen, its newest turn read, no prompt after that turn and no
+/// question, and the ledger has no message sent to it that the fleet does not show yet.
+pub(super) fn at_rest(seen: &Seen, turn: Option<&SessionTurn>) -> bool {
+    turn.is_some_and(|turn| {
+        turn.turn > 0
+            && !turn.question
+            && turn.prompts <= turn.turn
+            && seen.turn_read.is_some_and(|read| read >= turn.turn)
+            && !seen
+                .sends
+                .values()
+                .any(|send| send.count >= turn.prompts && send.may_have_typed())
+    })
 }
 
 // ----- one pass -----
@@ -1454,7 +1468,8 @@ impl Gate<'_, '_> {
                 let Some(state) = state else {
                     return self.stuck("session-gone", Stop::new(SESSION_GONE));
                 };
-                if busy(state) || turn.is_none() || !seen.pr_reported {
+                let shown = self.ctx.view.session_turn(self.session);
+                if busy(state, &seen, shown) || turn.is_none() || !seen.pr_reported {
                     return Ok(GateStep::NotReady);
                 }
                 self.attempt(&seen, &log, slots, turn)

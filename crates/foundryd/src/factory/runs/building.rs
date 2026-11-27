@@ -102,7 +102,6 @@ use foundry_proto::factory::{RunId, SessionTurn};
 use foundry_proto::ids::SessionId;
 use foundry_proto::state::SessionState;
 
-use super::feedback;
 use super::progress::{
     RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, SendTries, TIME_LIMIT as TIME_LIMIT_CODE,
     TURN_READ, pending_relaunch, read_progress,
@@ -114,6 +113,7 @@ use super::{
     progress_from, record_send_typed, recorded_reason, send_once, session_id, stop_session,
     workspace_id,
 };
+use super::{feedback, gating};
 use crate::factory::github::{IssueDetail, OtherKind, PullRequest, TrackerError};
 use crate::factory::ledger::events::{Cause, CauseStep, Event, Outcome};
 use crate::factory::lifecycle::result_line::{
@@ -275,9 +275,13 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
         SessionState::Stuck | SessionState::Starting | SessionState::Working => {
             Ok(BuildStep::Running)
         }
-        // A machine that cannot be reached is `resume`'s to measure, but a pull request it
-        // reported stays with the gate, which reads a gate in flight on that machine.
-        SessionState::Unreachable => Ok(step.read_already()),
+        // A machine that cannot be reached is `resume`'s to measure, but a pull request its
+        // session reported stays with the gate, which reads a gate in flight on that machine,
+        // unless the session may be at work there.
+        SessionState::Unreachable if gating::at_rest(&seen, turn.as_ref()) => {
+            Ok(step.read_already())
+        }
+        SessionState::Unreachable => Ok(BuildStep::Running),
         SessionState::WaitingForYou => step.waiting(&mut at, turn.as_ref()),
         SessionState::Idle => {
             if waiting(&turn) {
