@@ -42,16 +42,15 @@ function newestFirst(a: string, b: string): number {
 /** What a sent row says, from its machine's sample and its call's answer, the first match winning. */
 function rowSays(row: Row, machine: MachineView | undefined): { text: string; tone: string } {
   const sample = machine?.sample;
-  if (sample?.update_refused === row.tag) return { text: "Refused: it rolled the release back", tone: "text-red-300" };
+  if (sample?.update_refused === row.tag) return { text: "Refused: it will not run this release", tone: "text-red-300" };
   if (runs(sample?.version, row.tag)) return { text: `Running ${row.tag}`, tone: "text-emerald-300" };
   const { call } = row;
   if (call.kind === "queued") return { text: "Waits for the others: this machine restarts last", tone: "text-neutral-400" };
   if (call.kind === "out") return { text: "Sending…", tone: "text-neutral-400" };
-  if (call.kind === "dropped") return { text: "Sent, outcome unknown", tone: "text-amber-300" };
+  if (call.kind === "dropped" || call.status === 504) return { text: "Sent, outcome unknown", tone: "text-amber-300" };
   const { status, json } = call;
   const error = refused(status, json).message;
   if (status === 202) return { text: "Restarting", tone: "text-sky-300" };
-  if (status === 504) return { text: "Sent, outcome unknown", tone: "text-amber-300" };
   if (status === 503 || status === 404) return { text: `Not sent: ${error}`, tone: "text-amber-300" };
   if (status === 409) {
     const ready = typeof json.ready === "string" ? ` · ${json.ready} is ready now` : "";
@@ -71,8 +70,10 @@ export function UpdateBadge({ machines, here }: { machines: MachineView[]; here:
   const [open, setOpen] = useState(false);
   const [ticked, setTicked] = useState<Set<string>>(new Set());
   const [rows, setRows] = useState<Row[]>();
-  /** The batch the open checklist sent: an answer to an earlier one, closed since, is dropped. */
+  /** The batch the open checklist sent: an answer to an earlier one, closed since, is dropped, and its serving machine's call never goes. */
   const batch = useRef(0);
+  /** Every install call still out, from any batch: the serving machine's call waits for them all. */
+  const out = useRef(new Set<Promise<void>>());
 
   const waiting = machines.flatMap((m) => (m.listed && m.sample?.update_ready ? [{ machine: m, tag: m.sample.update_ready }] : []));
   if (waiting.length === 0 && !open) return null;
@@ -98,14 +99,20 @@ export function UpdateBadge({ machines, here }: { machines: MachineView[]; here:
     const settle = (id: string, call: Call) => {
       if (batch.current === mine) setRows((now) => now?.map((r) => (r.id === id ? { ...r, call } : r)));
     };
-    const send = (row: Row) =>
-      installUpdate(row.id, row.tag).then(
-        ({ status, json }) => settle(row.id, { kind: "answered", status, json }),
-        () => settle(row.id, { kind: "dropped" }),
-      );
-    await Promise.all(picked.filter((r) => r.id !== here).map(send));
+    const send = (row: Row) => {
+      const call = installUpdate(row.id, row.tag)
+        .then(
+          ({ status, json }) => settle(row.id, { kind: "answered", status, json }),
+          () => settle(row.id, { kind: "dropped" }),
+        )
+        .finally(() => out.current.delete(call));
+      out.current.add(call);
+      return call;
+    };
+    for (const row of picked) if (row.id !== here) void send(row);
+    while (out.current.size > 0) await Promise.all(out.current);
     const last = picked.find((r) => r.id === here);
-    if (last) {
+    if (last && batch.current === mine) {
       settle(last.id, { kind: "out" });
       await send(last);
     }
