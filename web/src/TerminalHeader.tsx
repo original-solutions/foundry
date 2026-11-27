@@ -7,6 +7,7 @@ import { totals } from "./changes";
 import { branchOf, type Located } from "./fleet";
 import { machineQuery } from "./api";
 import { useWidth } from "./media";
+import { pollEvery } from "./poll";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { button, pressed } from "./Modal";
 import { NextSteps, offersNext } from "./NextSteps";
@@ -210,12 +211,13 @@ const none = new Set<string>();
 
 /**
  * Opens the workspace's changes. Once they have been opened, it shows their size and keeps it
- * fresh; until then it reads nothing, so a header costs the daemon nothing. Its word shows when
- * `worded`; it is its name either way.
+ * fresh on a timer, which stops once the daemon answers 404 for them. Until they are opened it
+ * reads nothing, so a header costs the daemon nothing. Its word shows when `worded`; it is its name
+ * either way.
  */
 function ChangesButton({ workspace, onClick, worded }: { workspace: string; onClick: () => void; worded: boolean }) {
   const leaving = useLeaving(workspace);
-  const { data } = useQuery({ ...changesQuery(workspace), enabled: (query) => !leaving && query.state.data !== undefined, refetchInterval: GLANCE_EVERY, retry: false });
+  const { data } = useQuery({ ...changesQuery(workspace), enabled: (query) => !leaving && query.state.data !== undefined, refetchInterval: pollEvery(GLANCE_EVERY, true), retry: false });
   const t = data && !leaving && totals(data);
   return (
     <button

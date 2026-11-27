@@ -4,6 +4,7 @@ import type { FileChange, Mark } from "./api";
 import { splitPath } from "./changes";
 import { changesQuery, fileStatus, GLANCE_EVERY } from "./ChangesPanel";
 import { plural } from "./labels";
+import { gone, pollEvery } from "./poll";
 import { touched, type FileTouch, type Ran, type Touch } from "./touched";
 
 /** How Steps shows a session: turn by turn, or by the files and commands it touched. */
@@ -15,16 +16,20 @@ export type Lens = "turns" | "files";
  * and its other tools, each once with how often. A file the workspace's changes hold shows its
  * lines and opens its diff. The changes are read on opening, when the session's state changes,
  * and every `GLANCE_EVERY` while this view is open, the header's pace, whether or not the header
- * has room for its changes button.
+ * has room for its changes button. A workspace the daemon answered 404 for is not asked again, on
+ * the timer or when the session's state changes.
  */
 export function StepsFiles({ trail, workspace, label, onFile }: { trail: Mark[]; workspace?: string; label: string; onFile?: (path: string) => void }) {
   const client = useQueryClient();
-  const { data } = useQuery({ ...changesQuery(workspace ?? ""), enabled: workspace !== undefined, refetchInterval: GLANCE_EVERY, retry: false });
+  const { data } = useQuery({ ...changesQuery(workspace ?? ""), enabled: workspace !== undefined, refetchInterval: pollEvery(GLANCE_EVERY, true), retry: false });
   const last = useRef(label);
   useEffect(() => {
     if (last.current === label || workspace === undefined) return;
     last.current = label;
-    void client.invalidateQueries({ queryKey: changesQuery(workspace).queryKey, exact: true });
+    const { queryKey } = changesQuery(workspace);
+    // A workspace the daemon last answered 404 for is not asked again when the state changes: it is another machine's, or gone.
+    if (gone(client.getQueryState(queryKey)?.error)) return;
+    void client.invalidateQueries({ queryKey, exact: true });
   }, [label, workspace, client]);
   const { files, commands, others, turns } = touched(trail);
   const changed = new Map((data?.files ?? []).map((f) => [f.path, f]));
