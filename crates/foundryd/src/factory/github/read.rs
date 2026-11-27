@@ -4658,6 +4658,48 @@ mod tests {
         ] {
             assert!(seen.contains(&outcome), "{outcome:?} in {seen:?}");
         }
+
+        // Both judges hand the label they chose to one tail, each with its own `reaches`: a
+        // refusal added to the tail reaches both, and one added to a single judge beside it
+        // shows here. The known difference is in it too: on a cut-off page whose oldest event
+        // is the label, each judge still answers as before.
+        let mut oldest = vec![labeled(LABELED, "tom", READY)];
+        oldest.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        let oldest = issue_of(oldest, &[], Some(HISTORY_PAGE as u64 + 5), None);
+        assert_eq!(
+            judge_approval(&oldest, READY, &instructors),
+            approved(LABELED, "tom")
+        );
+        assert_eq!(
+            judge_claimed_approval(&oldest, READY, PROJECT, &instructors),
+            refused(history_cut(LABELED))
+        );
+        cases.push(oldest);
+        for issue in &cases {
+            // Every case's label in force is its newest `ready` label.
+            let label = issue
+                .timeline_items
+                .nodes
+                .iter()
+                .rev()
+                .find_map(|node| match node {
+                    TimelineNode::LabeledEvent(change) if change.label.name == READY => {
+                        Some(change)
+                    }
+                    _ => None,
+                });
+            let reaches = label.is_some_and(|label| timeline_reaches(issue, &label.created_at));
+            assert_eq!(
+                judge_approval(issue, READY, &instructors),
+                judge_chosen_label(issue, label, &instructors, true),
+                "{issue:?}"
+            );
+            assert_eq!(
+                judge_claimed_approval(issue, READY, PROJECT, &instructors),
+                judge_chosen_label(issue, label, &instructors, reaches),
+                "{issue:?}"
+            );
+        }
     }
 
     // ---- claimed_approval ----
