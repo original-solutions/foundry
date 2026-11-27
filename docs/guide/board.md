@@ -166,7 +166,7 @@ Type a few words. A row matches when it holds every word, in any of its workspac
 
 ## Notifications
 
-You do not have to watch the board. Foundry tells you once when a session finishes its turn, and once when one needs you. A session needs you when it is waiting for you, stuck after ten minutes with no output, or failed. A session in a live factory run never needs you, since the factory tends it. It raises no toast or alert, the tab does not count it, and the **While you were away** card shows it as the board does. You get no toast for a terminal that is on screen.
+You do not have to watch the board. Foundry tells you once when a session finishes its turn, and once when one needs you. A session needs you when it is waiting for you, stuck after ten minutes with no output, or failed. A session in a live factory run never needs you, since the factory tends it. It raises no toast or alert, the tab does not count it, and the **While you were away** card shows it as the board does. If its run is then held up, a session in it that already waits, is stuck or failed needs you, and you are told then. You get no toast for a terminal that is on screen.
 
 **Notifications**, the bell in the sidebar header and at the foot of the rail, chooses how the news reaches you.
 

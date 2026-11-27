@@ -146,6 +146,19 @@ describe("Away", () => {
     expect(items.map((b) => b.getAttribute("aria-label"))).toEqual(["Open opus in tidy readme: Stuck", "Open opus in fix login: Ready"]);
   });
 
+  it("puts a session that needs you above a live factory run's session, whatever their states", async () => {
+    const { move } = view(fleetAt(), vi.fn(), factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1"] }));
+    vi.spyOn(Date, "now").mockReturnValue(at(0));
+    setVisibility("hidden");
+    move(fleetAt({ s2: "waiting_for_you", s3: "failed" }, { s2: 2, s3: 2 }));
+    vi.spyOn(Date, "now").mockReturnValue(at(12));
+    setVisibility("visible");
+
+    await within(panel()).findByRole("button", { name: /^Open opus in tidy readme/ });
+    const items = within(panel()).getAllByRole("button", { name: /^Open / });
+    expect(items.map((b) => b.getAttribute("aria-label")?.split(":")[0])).toEqual(["Open opus in tidy readme", "Open sonnet in fix login"]);
+  });
+
   it("stays out of the way after a short absence, or a long one in which nothing happened", () => {
     const { move } = view(fleetAt());
     away(0, 1);

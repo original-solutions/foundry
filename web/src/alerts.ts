@@ -16,8 +16,8 @@ export interface Alert {
   body: string;
 }
 
-/** Each session's state, by id, as last seen. */
-export type Seen = Map<string, SessionState>;
+/** Each session's state, by id, as last seen, and whether a live factory run tended it then. */
+export type Seen = Map<string, { state: SessionState; tended: boolean }>;
 
 /** What entering a state says, for the states worth an alert. */
 const says: Partial<Record<SessionState, string>> = {
@@ -29,8 +29,9 @@ const says: Partial<Record<SessionState, string>> = {
 /**
  * The alerts for what changed since `before`: a session that went from working to idle finished
  * its turn, and one that entered waiting, stuck or failed needs you (also when it shows up that
- * way). A live factory run's session never needs you, as on the board: the factory tends it. The
- * first look, with nothing before it, raises nothing.
+ * way). A live factory run's session never needs you, as on the board: the factory tends it. Once
+ * its run is held up, a session that already waits, is stuck or failed needs you, and is raised
+ * then. The first look, with nothing before it, raises nothing.
  */
 export function alertsFor(before: Seen | undefined, machines: MachineView[], statuses?: Record<string, FactoryStatus>): { alerts: Alert[]; seen: Seen } {
   const factoryOf = factoryRuns(statuses);
@@ -39,11 +40,11 @@ export function alertsFor(before: Seen | undefined, machines: MachineView[], sta
   for (const workspace of machines.flatMap((m) => m.workspaces)) {
     const tended = tendedByFactory(factoryOf(workspace));
     for (const s of workspace.sessions) {
-      seen.set(s.id, s.state);
+      seen.set(s.id, { state: s.state, tended });
       if (!before) continue;
       const was = before.get(s.id);
-      if (was === s.state) continue;
-      const phrase = was === "working" && s.state === "idle" ? "finished its turn" : tended ? undefined : says[s.state];
+      if (was?.state === s.state && was.tended === tended) continue;
+      const phrase = was?.state === "working" && s.state === "idle" ? "finished its turn" : tended ? undefined : says[s.state];
       if (phrase) alerts.push({ terminal: s.terminal, tag: s.id, glyph: sessionGlyph[s.state], title: workspace.name, body: `${s.name} ${phrase}` });
     }
   }

@@ -36,8 +36,8 @@ export interface Moved {
 }
 
 /**
- * Every session to tell about on coming back, what needs you first, then what is busy, then the
- * rest, ties in fleet order. Empty when no session's record moved: a session that was already
+ * Every session to tell about on coming back, what needs you first, then the rest by urgency
+ * (what is busy, then what rests), ties in fleet order. Empty when no session's record moved: a session that was already
  * waiting before the page was hidden is not news on its own. A live factory run's session never
  * needs you, as on the board: its rows read as the board's do. Records are compared by version,
  * never by time.
@@ -60,7 +60,7 @@ export function moved(left: Left, records: AnyRecord[], machines: MachineView[],
     }),
   );
   if (!all.some((m) => m.changed)) return [];
-  return all.sort((a, b) => urgency.indexOf(a.row.glyph) - urgency.indexOf(b.row.glyph));
+  return all.sort((a, b) => Number(b.needs) - Number(a.needs) || urgency.indexOf(a.row.glyph) - urgency.indexOf(b.row.glyph));
 }
 
 /**

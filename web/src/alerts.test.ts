@@ -14,7 +14,7 @@ describe("alertsFor", () => {
   it("raises nothing on first sight, and remembers every session's state", () => {
     const { alerts, seen } = alertsFor(undefined, world("waiting_for_you"));
     expect(alerts).toEqual([]);
-    expect(seen.get("s1")).toBe("waiting_for_you");
+    expect(seen.get("s1")).toEqual({ state: "waiting_for_you", tended: false });
   });
 
   it("says a session finished its turn when it goes from working to idle", () => {
@@ -67,13 +67,23 @@ describe("alertsFor and the factory", () => {
       const { seen } = alertsFor(undefined, world("working"), live);
       const next = alertsFor(seen, world(state), live);
       expect(next.alerts).toEqual([]);
-      expect(next.seen.get("s1")).toBe(state);
+      expect(next.seen.get("s1")).toEqual({ state, tended: true });
     }
   });
 
   it("still says a live factory run's session finished its turn", () => {
     const { seen } = alertsFor(undefined, world("working"), live);
     expect(alertsFor(seen, world("idle"), live).alerts.map((a) => a.body)).toEqual(["opus finished its turn"]);
+  });
+
+  it("raises a session that went stuck in a live run once its run is held up, and once only", () => {
+    const quiet = alertsFor(alertsFor(undefined, world("working"), live).seen, world("stuck"), live);
+    expect(quiet.alerts).toEqual([]);
+    const told = alertsFor(quiet.seen, world("stuck"), held);
+    expect(told.alerts.map((a) => a.body)).toEqual(["opus is stuck: no output for 10 minutes"]);
+    expect(alertsFor(told.seen, world("stuck"), held).alerts).toEqual([]);
+    // Let go again, the run's stuck session is the factory's once more: no news.
+    expect(alertsFor(told.seen, world("stuck"), live).alerts).toEqual([]);
   });
 
   it("raises a held-up run's session that is stuck, and any session outside a run", () => {
