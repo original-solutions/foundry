@@ -51,8 +51,8 @@ use super::{
     stop_session, workspace_id,
 };
 use crate::factory::github::read::{
-    gh_json, is_branch_path, is_plain_ref_name, is_safe_branch_name, is_utc_second,
-    issue_query_args,
+    APPROVAL_QUERY, ApprovalIssue, LabelChange, TimelineNode, gh_json, is_branch_path,
+    is_human_instructor, is_plain_ref_name, is_safe_branch_name, is_utc_second, issue_query_args,
 };
 use crate::factory::github::{
     Claim, IssueDetail, OpenPullRequest, OtherKind, Tracker, TrackerError, newest_claim,
@@ -840,13 +840,8 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
         }
         None => return skipped(format!("no claim comment names run {run}")),
     };
-    if let Approval::Approved {
-        labeled_at,
-        labeled_by,
-    } = ctx.tracker.approval(repo, issue, &ctx.config.instructors)?
-    {
-        let by = (!labeled_by.is_empty()).then_some(labeled_by.as_str());
-        record_approval(ctx, run, &labeled_at, by, CauseStep::Start)?;
+    if let Some((labeled_at, labeled_by)) = claimed_on(ctx, issue)? {
+        record_approval(ctx, run, &labeled_at, Some(&labeled_by), CauseStep::Start)?;
     }
     ctx.record(
         run,
@@ -857,6 +852,62 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
         &Cause::new(CauseStep::Start, "claim-found"),
     )?;
     Ok(None)
+}
+
+/// GitHub's answer to [`APPROVAL_QUERY`].
+#[derive(Deserialize)]
+struct LabelHistory {
+    data: LabelHistoryData,
+}
+
+#[derive(Deserialize)]
+struct LabelHistoryData {
+    repository: LabelHistoryRepository,
+}
+
+#[derive(Deserialize)]
+struct LabelHistoryRepository {
+    issue: ApprovalIssue,
+}
+
+/// The approval a claim was made on, read after the claim removed `factory:ready`: when and by
+/// whom the newest `factory:ready` label was applied, if an instructor applied it and the text
+/// is as an instructor left it since. These are `judge_approval`'s checks, except that the
+/// label need not still be in force: the claim's own removal took it off. `None` when that
+/// cannot be confirmed.
+fn claimed_on(ctx: &RunContext<'_>, issue: u64) -> Result<Option<(String, String)>, RunError> {
+    let repo = ctx.repo();
+    let instructors = &ctx.config.instructors;
+    let args = issue_query_args(repo, APPROVAL_QUERY, issue)?;
+    let history: LabelHistory = gh_json(ctx.tracker, &args, "a GraphQL response with the issue")?;
+    let ready = State::Ready.label();
+    let newest = history
+        .data
+        .repository
+        .issue
+        .timeline_items
+        .nodes
+        .into_iter()
+        .rev()
+        .find_map(|node| match node {
+            TimelineNode::LabeledEvent(change) if change.label.name == ready => Some(change),
+            _ => None,
+        });
+    let Some(LabelChange {
+        created_at,
+        actor: Some(actor),
+        ..
+    }) = newest
+    else {
+        return Ok(None);
+    };
+    if !is_human_instructor(Some(&actor), instructors) {
+        return Ok(None);
+    }
+    let text = ctx
+        .tracker
+        .text_check(repo, issue, &created_at, instructors)?;
+    Ok((text == TextCheck::Unchanged).then_some((created_at, actor.login)))
 }
 
 /// What a launch continues from.
