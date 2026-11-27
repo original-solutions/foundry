@@ -166,7 +166,8 @@ WantedBy=multi-user.target\n"
 /// Puts `exe` and the holder beside it in `versions/<version>` and points `current` there,
 /// and records the install: a version lower than the one `current` named is kept by refusing
 /// the higher one. Returns the tag a go-back left refused. A copy is made in a stage
-/// directory and renamed in; when `exe` already runs from that directory nothing is copied.
+/// directory outside the update lock and renamed in under it; when `exe` already runs from that
+/// directory nothing is copied.
 fn place(home: &Path, exe: &Path, version: &str) -> Result<Option<String>, UpdateError> {
     let from = exe.parent().unwrap_or(Path::new("."));
     let holder = from.join(HOLDER);
@@ -774,5 +775,19 @@ mod tests {
             service_home(Some(PathBuf::new())),
             Err(ServiceError::NoHome)
         ));
+    }
+
+    #[test]
+    fn a_hand_install_clears_the_ready_tag_for_a_version_below_equal_to_and_above_it() {
+        for version in ["0.1.0", "0.2.0", "0.3.0"] {
+            let home = tempfile::tempdir().unwrap();
+            let src = tempfile::tempdir().unwrap();
+            binaries(src.path(), version);
+            fs::write(home.path().join("update.json"), r#"{"ready":"v0.2.0"}"#).unwrap();
+
+            place(home.path(), &src.path().join("foundryd"), version).unwrap();
+
+            assert_eq!(update::state(home.path()).unwrap().ready, None, "{version}");
+        }
     }
 }
