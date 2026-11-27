@@ -1651,15 +1651,19 @@ impl<'a, 'w> Pass<'a, 'w> {
             if of_kind.peek().is_none() {
                 continue;
             }
-            let labelled: BTreeSet<u64> = world
-                .tracker
-                .list_issues(&world.project.repo, state)?
-                .items
-                .iter()
-                .map(|issue| issue.number)
-                .collect();
+            let repo = &world.project.repo;
+            let listing = world.tracker.list_issues(repo, state)?;
+            let labelled: BTreeSet<u64> = listing.items.iter().map(|issue| issue.number).collect();
             for (done, _) in of_kind {
-                if labelled.contains(&done.run.run.issue()) {
+                let issue = done.run.run.issue();
+                // A listing cut at its limit can leave out an issue that keeps the label: that
+                // issue is read alone.
+                let keeps = labelled.contains(&issue)
+                    || (listing.cut && {
+                        let detail = world.tracker.issue(repo, issue)?;
+                        !detail.closed && detail.state == Some(state)
+                    });
+                if keeps {
                     self.results.held_up.push(HeldUp {
                         run: done.run.run.clone(),
                         kind,
@@ -4951,6 +4955,80 @@ mod tests {
             rig.pass();
             let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
             assert_eq!(held, vec![newer]);
+        }
+
+        /// With no run finished stuck or needs-info, neither label is read: a read that would
+        /// fail cannot fail the pass.
+        #[test]
+        fn with_no_held_up_run_neither_label_is_read() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            rig.hub.issue(6, &["factory:needs-info"]);
+            rig.hub.fail("factory:stuck", 1);
+            rig.hub.fail("factory:needs-info", 1);
+            let report = rig.pass();
+            assert!(report.failed.is_none(), "{report:?}");
+            assert!(rig.status().held_up.is_empty());
+            let listed: Vec<String> = rig
+                .hub
+                .calls()
+                .into_iter()
+                .filter(|args| args.iter().any(|a| a == "list"))
+                .flat_map(|args| crate::factory::pass::testing::Hub::flag_values(&args, "--label"))
+                .collect();
+            assert!(
+                !listed
+                    .iter()
+                    .any(|l| l == "factory:stuck" || l == "factory:needs-info"),
+                "{listed:?}"
+            );
+        }
+
+        /// Issues numbered 1 to `count`, each labelled `factory:stuck`: more than a listing
+        /// holds once `count` passes its limit.
+        fn stuck_issues(rig: &Rig, count: u64) {
+            for number in 1..=count {
+                rig.hub.issue(number, &["factory:stuck"]);
+            }
+        }
+
+        /// A listing cut at its limit leaves out an issue that still carries the label: that
+        /// issue is read alone, and its run is held up.
+        #[test]
+        fn an_issue_past_a_cut_listing_that_keeps_the_label_is_held_up() {
+            let mut rig = Rig::new();
+            let last = crate::factory::github::read::LIST_LIMIT as u64 + 1;
+            stuck_issues(&rig, last);
+            let run = held_up_run(&rig, last, 1, State::Stuck, "no");
+            rig.pass();
+            let held: Vec<RunId> = rig.status().held_up.into_iter().map(|h| h.run).collect();
+            assert_eq!(held, vec![run]);
+        }
+
+        /// The same read lets go a run whose issue past a cut listing has left the label.
+        #[test]
+        fn an_issue_past_a_cut_listing_that_left_the_label_is_not_held_up() {
+            let mut rig = Rig::new();
+            let last = crate::factory::github::read::LIST_LIMIT as u64 + 1;
+            stuck_issues(&rig, last);
+            rig.hub.issue(last + 1, &[]);
+            held_up_run(&rig, last + 1, 1, State::Stuck, "no");
+            rig.pass();
+            assert!(rig.status().held_up.is_empty());
+        }
+
+        /// A closed issue is in no listing of open issues, cut or not: past a cut listing, one
+        /// that keeps the label is not held up either.
+        #[test]
+        fn a_closed_issue_past_a_cut_listing_is_not_held_up() {
+            let mut rig = Rig::new();
+            let last = crate::factory::github::read::LIST_LIMIT as u64 + 1;
+            stuck_issues(&rig, last);
+            rig.hub.issue(last + 1, &["factory:stuck"]);
+            rig.hub.edit(last + 1, |issue| issue.closed = true);
+            held_up_run(&rig, last + 1, 1, State::Stuck, "no");
+            rig.pass();
+            assert!(rig.status().held_up.is_empty());
         }
 
         /// The label is read from GitHub as the claims are: a read that fails ends the pass as

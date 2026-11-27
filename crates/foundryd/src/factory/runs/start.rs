@@ -3238,6 +3238,57 @@ mod tests {
                 goes_stuck_unapproved(&rig, &run);
             }
 
+            /// The claim's removal with no label before it on the timeline: nothing says what it
+            /// was approved on, so the run goes stuck.
+            #[test]
+            fn a_claims_removal_with_no_label_before_it_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                rig.sim
+                    .set_approval(timeline_of(claim_swap("2026-10-04T10:05:00Z").into(), &[]));
+                goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// A label whose actor GitHub gives as none (a deleted account) is no instructor's.
+            #[test]
+            fn a_label_the_claim_removed_with_no_actor_goes_stuck() {
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                let mut label =
+                    label_event("LabeledEvent", "factory:ready", LABELED_AT, "User", "tom");
+                label["actor"] = serde_json::Value::Null;
+                let mut nodes = vec![label];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                goes_stuck_unapproved(&rig, &run);
+            }
+
+            /// GitHub logins match whatever their case: a removal by the factory's login written
+            /// in another case is still the claim's.
+            #[test]
+            fn the_claims_removal_is_known_by_its_login_in_any_case() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    LABELED_AT,
+                    "User",
+                    "tom",
+                )];
+                nodes.push(label_event(
+                    "UnlabeledEvent",
+                    "factory:ready",
+                    "2026-10-04T10:05:00Z",
+                    "User",
+                    &LOGIN.to_uppercase(),
+                ));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.steps(&run)[0], format!("approved {LABELED_AT}"));
+            }
+
             /// A stranger's label in force at the claim is no approval, though an instructor's
             /// came before it.
             #[test]
