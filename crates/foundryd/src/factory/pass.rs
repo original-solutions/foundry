@@ -5451,6 +5451,166 @@ mod tests {
         }
     }
 
+    mod the_held_up_runs_of_the_status {
+        use super::*;
+        use crate::factory::ledger::events::Outcome;
+
+        /// A run of `issue`'s `attempt` that waited on a person and then finished, as
+        /// `go_stuck` leaves one: the `stuck` event (or the questions) and then `finished`.
+        fn finished_waiting(rig: &Rig, issue: u64, attempt: u32, state: State) -> RunId {
+            let run = rig.run_in(issue, attempt, state);
+            let cause = Cause::new(CauseStep::Start, "test");
+            let (event, outcome) = if state == State::Stuck {
+                (
+                    Event::Stuck {
+                        reason: format!("stuck {issue}-{attempt}"),
+                        branch: None,
+                        commits_ahead: None,
+                    },
+                    Outcome::Stuck,
+                )
+            } else {
+                (
+                    Event::QuestionsPosted {
+                        questions: format!("questions {issue}-{attempt}"),
+                    },
+                    Outcome::NeedsInfo,
+                )
+            };
+            rig.ledger.write(&run, &event, &cause).unwrap();
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::Finished {
+                        outcome,
+                        total_ms: 0,
+                        gate_attempts: 0,
+                        review_cycles: None,
+                        pr_url: None,
+                        pr_end: None,
+                    },
+                    &cause,
+                )
+                .unwrap();
+            run
+        }
+
+        fn held_up(rig: &Rig) -> Vec<(RunId, HeldUpKind, String)> {
+            rig.status()
+                .held_up
+                .into_iter()
+                .map(|held| (held.run, held.kind, held.reason))
+                .collect()
+        }
+
+        fn listed_waiting(rig: &Rig) -> usize {
+            rig.hub
+                .calls()
+                .iter()
+                .filter(|call| {
+                    call.iter()
+                        .any(|a| a == "factory:stuck" || a == "factory:needs-info")
+                })
+                .count()
+        }
+
+        #[test]
+        fn a_finished_stuck_run_is_held_up_while_its_issue_carries_the_label() {
+            let mut rig = Rig::new();
+            let run = finished_waiting(&rig, 3, 1, State::Stuck);
+            rig.hub.issue(3, &["factory:stuck"]);
+            rig.pass();
+            assert_eq!(
+                held_up(&rig),
+                vec![(run.clone(), HeldUpKind::Stuck, "stuck 3-1".to_owned())]
+            );
+            assert_eq!(rig.status().finished.len(), 1, "it is still finished");
+        }
+
+        #[test]
+        fn a_finished_needs_info_run_is_held_up_while_its_issue_carries_the_label() {
+            let mut rig = Rig::new();
+            let run = finished_waiting(&rig, 4, 1, State::NeedsInfo);
+            rig.hub.issue(4, &["factory:needs-info"]);
+            rig.pass();
+            assert_eq!(
+                held_up(&rig),
+                vec![(run, HeldUpKind::NeedsInfo, "questions 4-1".to_owned())]
+            );
+        }
+
+        #[test]
+        fn a_finished_run_whose_issue_lost_the_label_is_not_held_up() {
+            let mut rig = Rig::new();
+            finished_waiting(&rig, 3, 1, State::Stuck);
+            rig.hub.issue(3, &["factory:stuck"]);
+            rig.pass();
+            assert_eq!(held_up(&rig).len(), 1);
+            rig.hub
+                .edit(3, |issue| issue.labels = vec!["factory:ready".into()]);
+            rig.pass();
+            assert!(held_up(&rig).is_empty(), "{:?}", held_up(&rig));
+            assert_eq!(rig.status().finished.len(), 1);
+        }
+
+        #[test]
+        fn only_the_newest_attempt_of_an_issue_is_held_up() {
+            let mut rig = Rig::new();
+            finished_waiting(&rig, 3, 1, State::Stuck);
+            let newest = finished_waiting(&rig, 3, 2, State::Stuck);
+            // A newer run of issue 5 is still going: its finished older attempt is behind it.
+            finished_waiting(&rig, 5, 1, State::Stuck);
+            rig.run_in(5, 2, State::Building);
+            rig.hub.issue(3, &["factory:stuck"]);
+            rig.hub.issue(5, &["factory:stuck"]);
+            rig.pass();
+            assert_eq!(
+                held_up(&rig),
+                vec![(newest, HeldUpKind::Stuck, "stuck 3-2".to_owned())]
+            );
+        }
+
+        #[test]
+        fn a_pass_with_no_finished_run_that_waited_reads_no_issue_with_those_labels() {
+            let mut rig = Rig::new();
+            rig.hub.issue(1, &["factory:stuck"]);
+            rig.pass();
+            assert_eq!(listed_waiting(&rig), 0, "{:?}", rig.hub.calls());
+            let done = rig.run_in(2, 1, State::Building);
+            rig.ledger
+                .write(
+                    &done,
+                    &Event::Finished {
+                        outcome: Outcome::PrOpen,
+                        total_ms: 0,
+                        gate_attempts: 0,
+                        review_cycles: None,
+                        pr_url: None,
+                        pr_end: None,
+                    },
+                    &Cause::new(CauseStep::Start, "test"),
+                )
+                .unwrap();
+            rig.pass();
+            assert_eq!(listed_waiting(&rig), 0, "{:?}", rig.hub.calls());
+        }
+
+        #[test]
+        fn a_listing_that_fails_does_not_end_the_pass_and_keeps_what_the_last_pass_held_up() {
+            let mut rig = Rig::new();
+            let run = finished_waiting(&rig, 3, 1, State::Stuck);
+            rig.hub.issue(3, &["factory:stuck"]);
+            rig.pass();
+            rig.hub.fail("--label factory:stuck", usize::MAX);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(
+                held_up(&rig),
+                vec![(run, HeldUpKind::Stuck, "stuck 3-1".to_owned())]
+            );
+        }
+    }
+
     mod the_sweep_when_the_store_fails {
         use super::*;
         use crate::factory::ledger::events::Outcome;
