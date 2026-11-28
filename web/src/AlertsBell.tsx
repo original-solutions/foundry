@@ -1,4 +1,4 @@
-import { Popover } from "radix-ui";
+import { Link } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { alertsFor, favicon, pulse, rippleFrames, tabTitle, type Alert, type Seen } from "./alerts";
 import type { MachineView } from "./fleet";
@@ -128,63 +128,36 @@ export function Announcer({ spoken }: { spoken: string }) {
   );
 }
 
-const blockedHint: Partial<Record<DesktopStatus, string>> = {
+export const blockedHint: Partial<Record<DesktopStatus, string>> = {
   blocked: "Blocked for this site: allow notifications in the browser's site settings.",
   unsupported: "This browser has no desktop alerts for a page.",
 };
 
 /**
- * The bell: one place to choose how news of a session reaches you. Each event comes once, as a
- * card while you are at the page or a desktop alert while you are not; the catch-up sums up what
- * happened after a while away. Filled when desktop alerts are on, struck through when nothing is.
+ * The bell: a link to Settings → Notifications, where how news of a session reaches you is
+ * chosen. Filled when desktop alerts are on, struck through when nothing is.
  */
-export function NotifyButton({ notify, desktop, onChoose }: { notify: Notify; desktop: DesktopStatus; onChoose: (change: Partial<Notify>) => void }) {
+export function NotifyButton({ notify, desktop }: { notify: Notify; desktop: DesktopStatus; onChoose: (change: Partial<Notify>) => void }) {
   const desktopOn = notify.desktop && desktop === "allowed";
   const silent = !notify.cards && !desktopOn && !notify.away;
   return (
-    <Popover.Root>
-      <Popover.Trigger
-        aria-label="Notifications"
-        title="Notifications: how a session that finishes or needs you reaches you"
-        className={`rounded p-1 hover:bg-neutral-800 data-[state=open]:bg-neutral-800 ${desktopOn ? "text-sky-400 hover:text-sky-300" : "text-neutral-400 hover:text-neutral-200"}`}
-      >
-        <svg viewBox="0 0 16 16" className="size-4" fill={desktopOn ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
-          <path d="M8 2.2a3.8 3.8 0 0 0-3.8 3.8v2.6L3 10.8h10l-1.2-2.2V6A3.8 3.8 0 0 0 8 2.2Z" strokeLinejoin="round" />
-          <path d="M6.6 12.8a1.5 1.5 0 0 0 2.8 0" strokeLinecap="round" fill="none" />
-          {silent && <path d="M2.5 2.5l11 11" strokeLinecap="round" />}
-        </svg>
-      </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content
-          aria-label="Notifications"
-          align="end"
-          sideOffset={6}
-          collisionPadding={8}
-          className="z-50 w-[min(21rem,calc(100vw-1rem))] rounded-xl border border-neutral-700 bg-neutral-900 text-sm text-neutral-100 shadow-2xl shadow-black/50 motion-safe:animate-sheet-in"
-        >
-          <header className="border-b border-neutral-800 px-4 pt-3 pb-2.5">
-            <h2 className="font-semibold">Notifications</h2>
-            <p className="mt-0.5 text-xs leading-4 text-neutral-400">When a session you are not looking at finishes its turn or needs you. Each one reaches you once.</p>
-          </header>
-          <div className="flex flex-col gap-1 p-1.5">
-            <Choice label="Cards in the page" checked={notify.cards} onChange={(cards) => onChoose({ cards })} disabled={false}>
-              While you are at Foundry: what Claude said or asks, to open or answer.
-            </Choice>
-            <Choice label="Desktop alerts" checked={desktopOn} onChange={(on) => onChoose({ desktop: on })} disabled={desktop === "blocked" || desktop === "unsupported"}>
-              {blockedHint[desktop] ?? "While Foundry is in the background, instead of a card. Cleared when you come back."}
-            </Choice>
-            <Choice label="Catch-up when you come back" checked={notify.away} onChange={(away) => onChoose({ away })} disabled={false}>
-              After two minutes away: what each session did meanwhile.
-            </Choice>
-          </div>
-          <p className="border-t border-neutral-800 px-4 py-2.5 text-[11px] leading-4 text-neutral-500">Always on: the tab's title and icon show what needs you, and a screen reader hears each one.</p>
-        </Popover.Content>
-      </Popover.Portal>
-    </Popover.Root>
+    <Link
+      to="/settings/$category"
+      params={{ category: "notifications" }}
+      aria-label="Notifications"
+      title="Notifications: how a session that finishes or needs you reaches you"
+      className={`rounded p-1 hover:bg-neutral-800 ${desktopOn ? "text-sky-400 hover:text-sky-300" : "text-neutral-400 hover:text-neutral-200"}`}
+    >
+      <svg viewBox="0 0 16 16" className="size-4" fill={desktopOn ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+        <path d="M8 2.2a3.8 3.8 0 0 0-3.8 3.8v2.6L3 10.8h10l-1.2-2.2V6A3.8 3.8 0 0 0 8 2.2Z" strokeLinejoin="round" />
+        <path d="M6.6 12.8a1.5 1.5 0 0 0 2.8 0" strokeLinecap="round" fill="none" />
+        {silent && <path d="M2.5 2.5l11 11" strokeLinecap="round" />}
+      </svg>
+    </Link>
   );
 }
 
-function Choice({ label, checked, disabled, onChange, children }: { label: string; checked: boolean; disabled: boolean; onChange: (on: boolean) => void; children: ReactNode }) {
+export function Choice({ label, checked, disabled, onChange, children }: { label: string; checked: boolean; disabled: boolean; onChange: (on: boolean) => void; children: ReactNode }) {
   return (
     <button
       type="button"

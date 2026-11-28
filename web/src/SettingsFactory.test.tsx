@@ -22,7 +22,12 @@ async function show(...answers: Response[]) {
   await screen.findByLabelText("Max runs");
   return { calls, client: view.client as QueryClient };
 }
-const overviewChanges = (client: QueryClient, over: Partial<FactorySettings>) => act(() => void client.setQueryData(factoryKey, overview(over)));
+const overviewChanges = (client: QueryClient, over: Partial<FactorySettings>) =>
+  act(async () => {
+    client.setQueryData(factoryKey, overview(over));
+    // The query client tells its observers on the next tick.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 
 describe("SettingsFactory", () => {
   it("shows today's fields from the overview, and no review bar until the first edit", async () => {
@@ -94,7 +99,7 @@ describe("SettingsFactory", () => {
   it("marks a row whose field changed elsewhere while it is being edited, and Save asks again", async () => {
     const { calls, client } = await show(json(200, { settings: { ...saved, max_runs: 5 } }), json(200, overview({ max_runs: 5 })));
     type("Max runs", "5");
-    overviewChanges(client, { max_runs: 4 });
+    await overviewChanges(client, { max_runs: 4 });
     expect(row("Max runs").textContent).toContain("changed elsewhere");
     expect(row("Max runs").getAttribute("data-stale")).toBe("true");
     expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("5");
@@ -111,7 +116,7 @@ describe("SettingsFactory", () => {
 
   it("does not mark a field that changed elsewhere while it was untouched", async () => {
     const { client } = await show();
-    overviewChanges(client, { max_runs: 4 });
+    await overviewChanges(client, { max_runs: 4 });
     expect(row("Max runs").getAttribute("data-stale")).toBeNull();
     expect(bar()).toBeNull();
   });
@@ -119,7 +124,7 @@ describe("SettingsFactory", () => {
   it("lets untouched fields follow the overview, and keeps what was typed", async () => {
     const { client } = await show();
     type("Max gates", "9");
-    overviewChanges(client, { model: "sonnet", max_gates: 1, max_runs: 6 });
+    await overviewChanges(client, { model: "sonnet", max_gates: 1, max_runs: 6 });
     expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("sonnet");
     expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("6");
     expect((screen.getByLabelText("Max gates") as HTMLInputElement).value).toBe("9");
@@ -130,7 +135,7 @@ describe("SettingsFactory", () => {
   it("puts back the newest saved values on Discard", async () => {
     const { client } = await show();
     type("Max gates", "9");
-    overviewChanges(client, { max_gates: 1 });
+    await overviewChanges(client, { max_gates: 1 });
     fireEvent.click(screen.getByRole("button", { name: "Discard" }));
     expect(bar()).toBeNull();
     expect((screen.getByLabelText("Max gates") as HTMLInputElement).value).toBe("1");
