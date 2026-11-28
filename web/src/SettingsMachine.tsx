@@ -140,7 +140,7 @@ const without = <T extends object>(from: T, keys: readonly (keyof T)[]): T => {
  */
 function Shared({ machine }: { machine: MachineView }) {
   const id = useId();
-  const [draft, setDraft] = useState<{ edits: Partial<Texts>; from: Partial<Texts>; sending?: Partial<Texts> }>({ edits: {}, from: {} });
+  const [draft, setDraft] = useState<{ edits: Partial<Texts>; from: Partial<Texts> }>({ edits: {}, from: {} });
   // What a save sent, by field, with the saved value then: shown until the saved value moves.
   const [sentOut, setSentOut] = useState<Partial<Record<Key, { value: string; was: string }>>>({});
   const [refusals, setRefusals] = useState<Refusal[]>([]);
@@ -172,9 +172,8 @@ function Shared({ machine }: { machine: MachineView }) {
       let edits = { ...d.edits };
       let from = { ...d.from };
       for (const key of keys) {
-        // Typed back to exactly what the settings hold, it is untouched again and follows them,
-        // unless its save is out: what the save makes the settings hold decides whether it is a change.
-        if (patch[key] === now[key] && !(key in (d.sending ?? {}))) {
+        // Typed back to exactly what the settings hold, it is untouched again and follows them.
+        if (patch[key] === now[key]) {
           edits = without(edits, [key]);
           from = without(from, [key]);
         } else {
@@ -182,7 +181,7 @@ function Shared({ machine }: { machine: MachineView }) {
           from[key] = now[key];
         }
       }
-      return { ...d, edits, from };
+      return { edits, from };
     });
   };
 
@@ -196,7 +195,6 @@ function Shared({ machine }: { machine: MachineView }) {
 
   const save = async (): Promise<Refusal[]> => {
     const sending: Partial<Texts> = { ...edits };
-    setDraft((d) => ({ ...d, sending }));
     const name = values.name.trim();
     const renaming = changes.some((c) => c.key === "name");
     const limiting = changes.some((c) => c.key !== "name");
@@ -220,7 +218,7 @@ function Shared({ machine }: { machine: MachineView }) {
     const done = results.filter((r) => !r.error).flatMap((r) => r.keys);
     const sentValues: Texts = { ...values, name };
     setSentOut((s) => ({ ...s, ...Object.fromEntries(done.map((key) => [key, { value: sentValues[key], was: saved[key] }])) }));
-    // Typing since the send is kept. The draft drops `sending`: the save is over.
+    // Typing since the send is kept.
     setDraft((d) => {
       const kept = done.filter((key) => d.edits[key] !== sending[key]);
       const gone = done.filter((key) => !kept.includes(key));
@@ -229,7 +227,6 @@ function Shared({ machine }: { machine: MachineView }) {
       for (const key of kept) from[key] = sentValues[key];
       return { edits: without(d.edits, gone), from };
     });
-
     const found = results.flatMap((r) => (r.error ? [r.error] : []));
     setRefusals(found);
     return found;

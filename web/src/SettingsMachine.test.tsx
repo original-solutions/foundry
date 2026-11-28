@@ -356,19 +356,6 @@ describe("SettingsMachine", () => {
     expect(screen.getByRole("button", { name: "Save 1 change" })).toBeDefined();
   });
 
-  it("keeps a field typed back to its saved value while its save was out", async () => {
-    const out = held();
-    await show(OTHER);
-    type("Name", "desk");
-    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
-    await waitFor(() => expect(out).toHaveLength(1));
-    type("Name", "laptop");
-    await act(async () => out[0].answer(new Response(null, { status: 204 })));
-    expect(field("Name").value).toBe("laptop");
-    expect(bar()?.textContent).toContain("1 change");
-    expect(bar()?.textContent).toContain("Name desk → laptop");
-  });
-
   describe("the update", () => {
     const ready = (id: string) => [at(ME, 1, id === ME ? { version: "0.9.0", update_ready: "v0.9.1" } : {}), at(OTHER, 1, id === OTHER ? { version: "0.9.0", update_ready: "v0.9.1" } : {})];
 
