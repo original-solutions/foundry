@@ -21,7 +21,8 @@ pub struct Scrollback {
     start: u64,
     /// Stream offset of every newline in `bytes`, oldest first.
     newlines: VecDeque<u64>,
-    /// False when a byte cap cut the oldest line, so `bytes` starts part way through it.
+    /// False while a byte cap's cut has left `bytes` part way through its oldest line, until
+    /// [`Self::push`] drops the rest of that line or keeps it.
     on_line: bool,
     max_lines: usize,
     max_bytes: usize,
@@ -51,6 +52,12 @@ impl Scrollback {
     }
 
     /// Appends output, then drops the oldest lines over either limit.
+    ///
+    /// A byte cap that cuts a line drops the rest of that line too, so what is kept starts on a
+    /// line, when that rest is at most half the cap. A longer rest is kept from the cut on, and
+    /// so is a line whose end has not come yet: a terminal that writes megabytes with no newline,
+    /// such as a progress display drawn with cursor moves, would otherwise lose all it kept at
+    /// that line's end.
     pub fn push(&mut self, mut data: &[u8]) {
         if data.len() > self.max_bytes {
             let skipped = data.len() - self.max_bytes;
@@ -118,11 +125,16 @@ impl Scrollback {
         }
     }
 
-    /// Drops through the oldest newline kept, so what is left starts on a line.
+    /// Drops through the oldest newline kept, so what is left starts on a line, when that drops
+    /// at most half the cap. Else the cut line is kept from the cut on.
     fn drop_to_next_line(&mut self) {
-        if let Some(&at) = self.newlines.front() {
-            let n = usize::try_from(at + 1 - self.start).unwrap_or(self.bytes.len());
-            self.drop_front(n);
+        let rest = self
+            .newlines
+            .front()
+            .map(|&at| usize::try_from(at + 1 - self.start).unwrap_or(self.bytes.len()));
+        match rest {
+            Some(n) if n <= self.max_bytes / 2 => self.drop_front(n),
+            _ => self.on_line = true,
         }
     }
 }
@@ -226,6 +238,10 @@ mod tests {
         kept.extend_from_slice(b"FAILED\ndone\n");
         assert_eq!(scrollback.snapshot(), kept);
         assert_eq!(scrollback.start(), 6 + 40 + 6 + 6 - 32);
+        // A later cut into the same line keeps it too, now that its end is kept.
+        scrollback.push(b"x\n");
+        assert!(scrollback.snapshot().ends_with(b"FAILED\ndone\nx\n"));
+        assert_eq!(scrollback.len(), 32);
     }
 
     /// A cut whose line ends within what is kept still drops the rest of that line, so the
