@@ -1,4 +1,5 @@
 import { act, fireEvent, screen } from "@testing-library/react";
+import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { Change } from "./reviewDiff";
 import { ReviewBar } from "./ReviewBar";
@@ -63,5 +64,45 @@ describe("ReviewBar", () => {
     expect(onSave).not.toHaveBeenCalled();
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Save 2 changes" })));
     expect(onSave).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a refusal keyed to a field with no change beside Save", async () => {
+    const onSave = vi.fn(async () => [{ key: "model", message: "no such model" }]);
+    await bar({ onSave, changes: [runs] });
+    fireEvent.click(await screen.findByRole("button", { name: "Save 1 change" }));
+    const note = await screen.findByText("no such model");
+    expect(note.closest("[data-beside]")?.getAttribute("data-beside")).toBe("save");
+  });
+
+  it("tells onLook when Look again is pressed, and sends nothing", async () => {
+    const onLook = vi.fn();
+    const onSave = vi.fn(async () => []);
+    await bar({ onSave, onLook, stale: ["max_runs"] });
+    fireEvent.click(await screen.findByRole("button", { name: "Look again" }));
+    expect(onLook).toHaveBeenCalledTimes(1);
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it("asks for a fresh look again when a field goes stale again, or a different one does", async () => {
+    let set: (stale: string[]) => void = () => {};
+    function Harness() {
+      const [stale, setStale] = useState<string[]>(["max_runs"]);
+      set = setStale;
+      return <ReviewBar changes={[runs, paused]} onSave={async () => []} onDiscard={() => {}} stale={stale} />;
+    }
+    await renderApp(<Harness />);
+    fireEvent.click(await screen.findByRole("button", { name: "Look again" }));
+    expect(screen.getByRole("button", { name: "Save 2 changes" })).toBeDefined();
+
+    // Looked at, then no longer stale, then stale again: the look does not carry over.
+    act(() => set([]));
+    expect(screen.getByRole("button", { name: "Save 2 changes" })).toBeDefined();
+    act(() => set(["max_runs"]));
+    expect(screen.getByRole("button", { name: "Look again" })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Look again" }));
+
+    // A different field going stale on top of the looked-at one asks again.
+    act(() => set(["max_runs", "paused"]));
+    expect(screen.getByRole("button", { name: "Look again" })).toBeDefined();
   });
 });
