@@ -1948,8 +1948,9 @@ describe("App", () => {
     expect(calls[1]).toEqual({ url: "/api/terminals/t9/close", method: "POST", body: undefined });
   });
 
-  it("archives a workspace from its board card after showing what stops, then says what it kept", async () => {
-    const calls = mockActions(new Response(null, { status: 204 }));
+  it("archives a workspace from its board card after showing what stops, closing at once and saying it archives until it is done", async () => {
+    let answer: (response: Response) => void = () => {};
+    const calls = mockActions(new Promise<Response>((resolve) => (answer = resolve)));
     await open("/", live);
     const card = screen.getByRole("article", { name: "fix login" });
 
@@ -1959,9 +1960,87 @@ describe("App", () => {
     expect(calls).toEqual([]);
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
 
-    await waitFor(() => expect(calls).toEqual([{ url: "/api/workspaces/w1/archive", method: "POST", body: { force: false } }]));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(calls).toEqual([{ url: "/api/workspaces/w1/archive", method: "POST", body: { force: false } }]);
+    expect(await within(card).findAllByText("Archiving…")).not.toEqual([]);
+    expect(within(screen.getByRole("group", { name: "fix login" })).getByText("Archiving…")).toBeDefined();
+    expect(screen.queryByRole("status")).toBeNull();
+
+    answer(new Response(null, { status: 204 }));
     expect((await screen.findByRole("status")).textContent).toMatch(/Archived fix login.*fix-login.*kept/);
+  });
+
+  it("opens the dialog again with what holds an archive up, and archives anyway with force from it", async () => {
+    const calls = mockActions(
+      json(409, { error: "workspace has unsaved work", uncommitted: ["src/a.rs"], unpushed: ["abc123 wip"], submodules: [] }),
+      new Response(null, { status: 204 }),
+    );
+    await open("/", live);
+    fireEvent.click(within(screen.getByRole("article", { name: "fix login" })).getByRole("button", { name: "Archive fix login" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Archive fix login?" })).getByRole("button", { name: "Archive" }));
+
+    const held = await screen.findByRole("region", { name: "Archiving now would lose this work" });
+    expect(held.textContent).toContain("src/a.rs");
+    expect(held.textContent).toContain("abc123 wip");
+    expect(screen.queryByText("Archiving…")).toBeNull();
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Archive fix login?" })).getByRole("button", { name: "Archive anyway" }));
+
+    expect((await screen.findByRole("status")).textContent).toMatch(/Archived fix login/);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(calls.map((c) => c.body)).toEqual([{ force: false }, { force: true }]);
+  });
+
+  it("does nothing when Archive is chosen again for a workspace that is still archiving", async () => {
+    const calls = mockActions(new Promise<Response>(() => {}));
+    await open("/", live);
+    const card = screen.getByRole("article", { name: "fix login" });
+    fireEvent.click(within(card).getByRole("button", { name: "Archive fix login" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Archive fix login?" })).getByRole("button", { name: "Archive" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(await within(card).findAllByText("Archiving…")).not.toEqual([]);
+
+    fireEvent.click(within(card).getByRole("button", { name: "Archive fix login" }));
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(calls).toEqual([{ url: "/api/workspaces/w1/archive", method: "POST", body: { force: false } }]);
+  });
+
+  it("shows each archive held up, one dialog at a time, leaving one already open in place", async () => {
+    const both: UiMessage & { type: "state" } = { ...live, records: [...live.records, workspace(ME, "w2", "add search"), terminal(ME, "t3", "w2", "running")] };
+    let answerFirst: (response: Response) => void = () => {};
+    mockActions(
+      new Promise<Response>((resolve) => (answerFirst = resolve)),
+      json(409, { error: "workspace has unsaved work", uncommitted: ["src/b.rs"], unpushed: [], submodules: [] }),
+    );
+    await open("/", both);
+    fireEvent.click(within(screen.getByRole("article", { name: "fix login" })).getByRole("button", { name: "Archive fix login" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Archive fix login?" })).getByRole("button", { name: "Archive" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.click(within(screen.getByRole("article", { name: "add search" })).getByRole("button", { name: "Archive add search" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Archive add search?" })).getByRole("button", { name: "Archive" }));
+    const second = await screen.findByRole("dialog", { name: "Archive add search?" });
+    expect((await within(second).findByRole("region", { name: "Archiving now would lose this work" })).textContent).toContain("src/b.rs");
+
+    answerFirst(json(409, { error: "workspace has unsaved work", uncommitted: ["src/a.rs"], unpushed: [], submodules: [] }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(screen.getByRole("dialog", { name: "Archive add search?" })).toBeDefined();
+    expect(screen.queryByRole("dialog", { name: "Archive fix login?" })).toBeNull();
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Archive add search?" })).getByRole("button", { name: "Cancel" }));
+    const first = await screen.findByRole("dialog", { name: "Archive fix login?" });
+    expect(within(first).getByRole("region", { name: "Archiving now would lose this work" }).textContent).toContain("src/a.rs");
+  });
+
+  it("opens the dialog again saying why an archive failed", async () => {
+    mockActions(json(500, { error: "disk on fire" }));
+    await open("/", live);
+    fireEvent.click(within(screen.getByRole("article", { name: "fix login" })).getByRole("button", { name: "Archive fix login" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Archive fix login?" })).getByRole("button", { name: "Archive" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Archive fix login?" });
+    expect((await within(dialog).findByRole("alert")).textContent).toBe("Could not archive fix login: disk on fire.");
+    expect(screen.queryByText("Archiving…")).toBeNull();
   });
 
   it("shows a card's merged pull request, linked to GitHub, and archives the workspace from it", async () => {
