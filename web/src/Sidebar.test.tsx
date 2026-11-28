@@ -275,7 +275,10 @@ describe("Sidebar", () => {
       expect(box.className).toMatch(/(^| )flex( |$)/);
       expect(box.className).not.toMatch(/(^| )flex-(col|wrap)( |$)/);
     }
-    expect(within(working).getByText("opus 1").className).toMatch(/(^| )text-neutral-500( |$)/);
+    // The name is cut at half the line, so a long one leaves room for the step.
+    const name = within(working).getByText("opus 1");
+    expect(name.className).toMatch(/(^| )text-neutral-500( |$)/);
+    for (const cls of ["max-w-1/2", "shrink-0", "truncate"]) expect(name.className.split(" ")).toContain(cls);
   });
 
   it("shows a busy session with no title yet by its name and step alone", async () => {

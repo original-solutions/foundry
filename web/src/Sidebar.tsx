@@ -3,7 +3,7 @@ import { Link } from "@tanstack/react-router";
 import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
-import { Named, Now } from "./Now";
+import { Named } from "./Now";
 import { startShell } from "./api";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
@@ -527,14 +527,8 @@ function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspa
         >
           <StateGlyph glyph={row.glyph} />
           <span className="flex min-w-0 flex-1 items-baseline gap-2 leading-5">
-            {row.now ? (
-              // Busy: the step takes the title's place on the line; the title stays for screen readers and the tooltip.
-              <span className="flex min-w-0 flex-1 items-baseline gap-2">
-                <span className={`max-w-1/2 shrink-0 truncate ${row.title ? "text-neutral-500" : ""}`}>{row.name}</span> {row.title && <span className="sr-only">{row.title}</span>} <Now step={row.now} className="min-w-0 flex-1" />
-              </span>
-            ) : (
-              <Named name={row.name} title={row.title} />
-            )}{" "}
+            {/* Busy: the step takes the title's place on the line; the title stays for screen readers and the tooltip. */}
+            <Named name={row.name} title={row.title} step={row.now} />{" "}
             <span className={`shrink-0 text-xs ${ended ? "" : glyphText[row.glyph]}`}>{row.label}</span>
           </span>
         </Link>
