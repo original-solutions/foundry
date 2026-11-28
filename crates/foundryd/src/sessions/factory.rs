@@ -1771,13 +1771,16 @@ exec "$agent" "$@""#;
             value(&seen, "GIT_ALLOW_PROTOCOL=").as_deref(),
             Some("https")
         );
-        // The owner's config is kept: we give the session no isolation. (The test process's
-        // own environment is inherited, so only the values we would have set are refused.)
-        assert_ne!(
-            value(&seen, "GIT_CONFIG_GLOBAL=").as_deref(),
-            Some("/dev/null")
-        );
-        assert_ne!(value(&seen, "GIT_CONFIG_NOSYSTEM=").as_deref(), Some("1"));
+        // The owner's config is kept: we give the session no isolation. The test process's own
+        // environment is inherited, so the session sees exactly the value the test process has,
+        // which a factory gate's terminal sets to `/dev/null` and `1`, and nothing we set.
+        for name in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"] {
+            assert_eq!(
+                value(&seen, &format!("{name}=")),
+                std::env::var(name).ok(),
+                "{name} {seen}"
+            );
+        }
 
         let mark = f.mark_file(id);
         assert_eq!(std::fs::read_to_string(&mark).unwrap(), project.to_string());
