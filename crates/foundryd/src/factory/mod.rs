@@ -952,7 +952,7 @@ impl NoWorker {
 impl Worker for NoWorker {
     fn create(
         &self,
-        _: MachineId,
+        _: worker::Target,
         _: worker::CreateWorkspace,
     ) -> Result<foundry_proto::ids::WorkspaceId, worker::WorkerError> {
         Err(Self::refused())
@@ -990,6 +990,18 @@ impl Worker for NoWorker {
         Err(Self::refused())
     }
     fn archive(&self, _: foundry_proto::ids::WorkspaceId) -> Result<(), worker::WorkerError> {
+        Err(Self::refused())
+    }
+    fn advance(&self, _: foundry_proto::ids::WorkspaceId) -> Result<(), worker::WorkerError> {
+        Err(Self::refused())
+    }
+    fn rest(&self, _: foundry_proto::ids::WorkspaceId) -> Result<(), worker::WorkerError> {
+        Err(Self::refused())
+    }
+    fn wake(&self, _: foundry_proto::ids::WorkspaceId) -> Result<(), worker::WorkerError> {
+        Err(Self::refused())
+    }
+    fn keep(&self, _: foundry_proto::ids::WorkspaceId) -> Result<(), worker::WorkerError> {
         Err(Self::refused())
     }
 }

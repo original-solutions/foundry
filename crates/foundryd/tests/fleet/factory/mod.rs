@@ -46,7 +46,7 @@ use foundryd::factory::lease::Lease;
 use foundryd::factory::ledger::Hide;
 use foundryd::factory::messages::Message;
 use foundryd::factory::status::Freshness;
-use foundryd::factory::worker::{CreateWorkspace, Worker, WorkerError};
+use foundryd::factory::worker::{CreateWorkspace, Target, Worker, WorkerError};
 use foundryd::factory::{Answering, Factory, Host, Leasing, Watched};
 use foundryd::git_auth::GitAuth;
 use foundryd::secrets::{Edit, Secrets, SecretsError};
@@ -373,12 +373,8 @@ impl Recording {
 }
 
 impl Worker for Recording {
-    fn create(
-        &self,
-        machine: MachineId,
-        request: CreateWorkspace,
-    ) -> Result<WorkspaceId, WorkerError> {
-        self.inner.create(machine, request)
+    fn create(&self, target: Target, request: CreateWorkspace) -> Result<WorkspaceId, WorkerError> {
+        self.inner.create(target, request)
     }
 
     fn start_session(
@@ -423,6 +419,22 @@ impl Worker for Recording {
 
     fn archive(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
         self.inner.archive(workspace)
+    }
+
+    fn advance(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
+        self.inner.advance(workspace)
+    }
+
+    fn rest(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
+        self.inner.rest(workspace)
+    }
+
+    fn wake(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
+        self.inner.wake(workspace)
+    }
+
+    fn keep(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
+        self.inner.keep(workspace)
     }
 }
 

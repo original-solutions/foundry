@@ -189,14 +189,14 @@ impl RunContext<'_> {
         Ok(self.tracker.mark_pr_draft(self.repo(), pr)?)
     }
 
-    /// A workspace made on `machine`.
+    /// A workspace made at `target`.
     pub fn create(
         &self,
-        machine: foundry_proto::ids::MachineId,
+        target: super::worker::Target,
         request: super::worker::CreateWorkspace,
     ) -> Result<WorkspaceId, RunError> {
         self.held()?;
-        Ok(self.worker.create(machine, request)?)
+        Ok(self.worker.create(target, request)?)
     }
 
     /// A factory session started in `workspace` with `first` as its first message.
@@ -237,6 +237,30 @@ impl RunContext<'_> {
     pub fn archive(&self, workspace: WorkspaceId) -> Result<(), RunError> {
         self.held()?;
         Ok(self.worker.archive(workspace)?)
+    }
+
+    /// One more step of the setup of `workspace` taken.
+    pub fn advance(&self, workspace: WorkspaceId) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.worker.advance(workspace)?)
+    }
+
+    /// `workspace` put at rest.
+    pub fn rest(&self, workspace: WorkspaceId) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.worker.rest(workspace)?)
+    }
+
+    /// `workspace` woken from rest.
+    pub fn wake(&self, workspace: WorkspaceId) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.worker.wake(workspace)?)
+    }
+
+    /// `workspace` kept, with its files, and what it runs ended.
+    pub fn keep(&self, workspace: WorkspaceId) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.worker.keep(workspace)?)
     }
 
     /// `event` written to `run`'s ledger.
@@ -658,6 +682,12 @@ fn send_once(
     let intent = |count: u64| step("send-intent", format!("{SEND_INTENT}{key} {count}"));
     let refused = || step("send-refused", format!("{SEND_REFUSED}{key}"));
     let typed = || record_send_typed(ctx, &at.run, at.step, key);
+    // A workspace put at rest is woken before anything is sent to its session. The wake checks
+    // the lease as the send does, and comes before the intent, so a wake that fails leaves no
+    // try that may have typed.
+    if let Some(workspace) = &at.worktree {
+        ctx.wake(workspace_id(workspace)?)?;
+    }
     ctx.held()?;
     intent(count)?;
     // The lease was checked just above, so no lost lease can follow the intent and leave a try
@@ -893,11 +923,11 @@ pub fn recorded_reason(stop: &Stop) -> String {
     }
 }
 
-/// The stuck path. The session is stopped first (see [`stop_session`]), so a failure leaves the
-/// issue as it was and the next pass retries. Then `after_stop`, the actions
-/// [`transition`] asks for, `state_changed` and the summary line. A comment the ledger already
-/// records is skipped, a ready pull request goes back to draft first, and `code` is the reason
-/// of every line written.
+/// The stuck path. The session is stopped first (see [`stop_session`]) and the run's workspace
+/// kept, so a failure leaves the issue as it was and the next pass retries. Then `after_stop`,
+/// the actions [`transition`] asks for, `state_changed` and the summary line. A comment the
+/// ledger already records is skipped, a ready pull request goes back to draft first, and
+/// `code` is the reason of every line written.
 pub fn go_stuck(
     ctx: &RunContext<'_>,
     issue: u64,
@@ -906,13 +936,45 @@ pub fn go_stuck(
     stop: Stop,
     after_stop: Option<&dyn Fn() -> Result<(), RunError>>,
 ) -> Result<(), RunError> {
+    go_stuck_after(ctx, issue, at, code, stop, after_stop, Ending::Stop)
+}
+
+/// Who ends the session of a run going stuck, and so which workspace [`go_stuck_after`] keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// The stuck path stops the session (see [`stop_session`]) and keeps the run's worktree.
+    Stop,
+    /// The caller ended the session itself: nothing is stopped, and `keep` is kept, if any.
+    Ended { keep: Option<WorkspaceId> },
+}
+
+/// [`go_stuck`], with the session ended as `ending` says. A run already stuck is only
+/// finished: nothing is stopped or kept again.
+pub fn go_stuck_after(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    at: &mut Progress,
+    code: &str,
+    stop: Stop,
+    after_stop: Option<&dyn Fn() -> Result<(), RunError>>,
+    ending: Ending,
+) -> Result<(), RunError> {
     let cause = Cause::new(at.step, code);
     if at.state == State::Stuck {
         ctx.ledger
             .finish(&at.run, Outcome::Stuck, None, None, &cause, None)?;
         return Ok(());
     }
-    stop_session(ctx, at)?;
+    let keep = match ending {
+        Ending::Stop => {
+            stop_session(ctx, at)?;
+            at.worktree.as_deref().map(workspace_id).transpose()?
+        }
+        Ending::Ended { keep } => keep,
+    };
+    if let Some(workspace) = keep {
+        ctx.keep(workspace)?;
+    }
     if let Some(after_stop) = after_stop {
         after_stop()?;
     }
@@ -1113,7 +1175,7 @@ pub(crate) mod testing {
     use crate::factory::config::Limits;
     use crate::factory::github::{Hiding, OtherKind, Tracker};
     use crate::factory::ledger::testing::{T0, open_store, ticking};
-    use crate::factory::worker::{AlwaysHeld, FakeWorker};
+    use crate::factory::worker::{AlwaysHeld, FakeWorker, Target};
 
     pub const REPO: &str = "rawphp/softfac";
     pub const LOGIN: &str = "softfac-bot";
@@ -1681,8 +1743,10 @@ pub(crate) mod testing {
 
         /// The claim comment as Foundry posts it, as the project's login.
         pub fn foundry_claim(&self, run: &RunId, machine: MachineId) -> u64 {
-            self.sim
-                .comment_as(LOGIN, &crate::factory::github::claim_comment(run, &machine))
+            self.sim.comment_as(
+                LOGIN,
+                &crate::factory::github::claim_comment(run, &Target::Machine(machine)),
+            )
         }
     }
 }
@@ -1695,7 +1759,7 @@ mod tests {
     use super::*;
     use crate::factory::github::STATUS_MARKER;
     use crate::factory::ledger::events::ResumedFrom;
-    use crate::factory::worker::{Call, Lost};
+    use crate::factory::worker::{Call, HostCall, Lost, Target};
 
     const SESSION: &str = "00000000-0000-0000-0000-0000000005e5";
     const WORKSPACE: &str = "00000000-0000-0000-0000-000000000a11";
@@ -1926,6 +1990,49 @@ mod tests {
                 }]
             );
             assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
+        }
+
+        #[test]
+        fn a_forward_wakes_the_runs_workspace_before_it_is_sent() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            let payload = ActionPayload {
+                forward: Some(ForwardPayload {
+                    message: Message {
+                        line: "see this".into(),
+                        body: None,
+                    },
+                    step: None,
+                }),
+                ..ActionPayload::default()
+            };
+            let actions = [Action::ForwardComment {
+                comment_id: "c1".into(),
+            }];
+            rig.view = FleetView::builder()
+                .turn(foundry_proto::factory::SessionTurn {
+                    session: session_id(SESSION).unwrap(),
+                    workspace: workspace_id(WORKSPACE).unwrap(),
+                    project: project_id(),
+                    turn: 1,
+                    prompts: 1,
+                    question: false,
+                })
+                .build();
+            rig.worker.on_send(Ok(1));
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            assert_eq!(
+                rig.worker.host_calls(),
+                [(
+                    0,
+                    HostCall::Wake {
+                        workspace: workspace_id(WORKSPACE).unwrap()
+                    }
+                )]
+            );
+            assert!(matches!(rig.worker.calls()[0], Call::Send { .. }));
         }
 
         #[test]
@@ -2467,6 +2574,33 @@ mod tests {
             assert_eq!(send_counts(&rig), vec![Some(4)]);
         }
 
+        /// A wake that fails sends nothing and records no try, so the next pass wakes again and
+        /// sends under the count it reads then.
+        #[test]
+        fn a_send_whose_wake_fails_records_no_try_and_sends_nothing() {
+            let (rig, run, payload, actions) = forward_rig(3);
+            rig.worker
+                .on_wake(Err(crate::factory::worker::WorkerError::Failed(
+                    "still asleep".into(),
+                )));
+            assert!(matches!(
+                forward(&rig, &run, &payload, &actions),
+                Err(RunError::Worker(_))
+            ));
+            assert!(rig.worker.calls().is_empty());
+            assert!(
+                !rig.steps(&run)
+                    .iter()
+                    .any(|step| step.starts_with(SEND_INTENT)),
+                "{:?}",
+                rig.steps(&run)
+            );
+            rig.worker.on_send(Ok(3));
+            forward(&rig, &run, &payload, &actions).unwrap();
+            assert_eq!(send_counts(&rig), vec![Some(3)]);
+            assert_eq!(rig.worker.host_calls().len(), 2);
+        }
+
         /// A send with no count to go under (the fleet shows no turn for the session) waits:
         /// nothing is written and nothing is asked of the worker, and the next pass that shows
         /// a turn sends under its count.
@@ -2784,7 +2918,10 @@ mod tests {
             ("comment_on_pr", ctx.comment_on_pr(1, "x")),
             ("mark_pr_ready", ctx.mark_pr_ready(1)),
             ("mark_pr_draft", ctx.mark_pr_draft(1)),
-            ("create", ctx.create(machine(), request).map(|_| ())),
+            (
+                "create",
+                ctx.create(Target::Machine(machine()), request).map(|_| ()),
+            ),
             (
                 "start_session",
                 ctx.start_session(workspace, start, message.clone())
@@ -2794,12 +2931,17 @@ mod tests {
             ("send", ctx.send(session, message, None).map(|_| ())),
             ("end_sessions", ctx.end_sessions(workspace)),
             ("archive", ctx.archive(workspace)),
+            ("advance", ctx.advance(workspace)),
+            ("rest", ctx.rest(workspace)),
+            ("wake", ctx.wake(workspace)),
+            ("keep", ctx.keep(workspace)),
         ];
         for (name, result) in results {
             assert!(matches!(result, Err(RunError::LeaseLost(_))), "{name}");
         }
         assert!(rig.sim.calls().is_empty());
         assert!(rig.worker.calls().is_empty());
+        assert!(rig.worker.host_calls().is_empty());
     }
 
     mod going_stuck {
@@ -3173,6 +3315,28 @@ mod tests {
             assert_eq!(rig.names(&run), before);
         }
 
+        /// A keep that fails writes nothing either: the run is not stuck yet, and the next try
+        /// stops the session and keeps the workspace again.
+        #[test]
+        fn a_workspace_that_cannot_be_kept_writes_nothing_and_the_next_try_keeps_it() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.worker
+                .on_keep(Err(WorkerError::Failed("no room".into())));
+            let before = rig.names(&run);
+            let mut at = progress(&rig, &run, State::Building);
+            let result = go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None);
+            assert!(matches!(result, Err(RunError::Worker(_))));
+            assert!(rig.sim.writes().is_empty());
+            assert_eq!(rig.names(&run), before);
+            assert!(!rig.finished(&run));
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            assert!(rig.finished(&run));
+            assert_eq!(rig.worker.host_calls().len(), 2);
+        }
+
         #[test]
         fn a_lost_lease_changes_nothing() {
             let mut rig = Rig::new();
@@ -3210,6 +3374,48 @@ mod tests {
                     .all(|c| !c.contains("could not finish"))
             );
             assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+        }
+
+        #[test]
+        fn a_run_going_stuck_keeps_its_build_workspace_once_its_session_is_stopped() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            let workspace = workspace_id(WORKSPACE).unwrap();
+            let kept = rig.worker.host_calls();
+            assert_eq!(kept.len(), 1, "{kept:?}");
+            let (before, call) = kept[0];
+            assert_eq!(call, HostCall::Keep { workspace });
+            assert!(
+                rig.worker.calls()[..before]
+                    .iter()
+                    .any(|call| matches!(call, Call::EndSessions { .. })),
+                "the session is stopped before the workspace is kept"
+            );
+        }
+
+        #[test]
+        fn a_run_with_no_workspace_keeps_nothing_when_it_goes_stuck() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            rig.step(&run, "approved x");
+            let mut at = progress(&rig, &run, State::Triage);
+            assert_eq!(at.worktree, None);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            assert!(rig.worker.host_calls().is_empty());
+        }
+
+        #[test]
+        fn a_run_already_stuck_is_not_kept_again() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.moved(&run, State::Building, State::Stuck);
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            assert!(rig.worker.host_calls().is_empty());
         }
 
         #[test]

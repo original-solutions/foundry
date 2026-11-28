@@ -312,7 +312,7 @@ use crate::factory::messages::{
 };
 use crate::factory::placing::{self, Reserved, Slots};
 use crate::factory::text;
-use crate::factory::worker::{CreateWorkspace, WorkerError};
+use crate::factory::worker::{CreateWorkspace, Target, WorkerError, fleet_machine};
 use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
 use crate::workspaces::{Checkout, FactoryTag, Setup};
 
@@ -830,10 +830,6 @@ fn second_before(ms: u64) -> String {
     format!("{}Z", &text[..19])
 }
 
-fn parse_machine(text: &str) -> Option<MachineId> {
-    uuid::Uuid::parse_str(text).ok().map(MachineId)
-}
-
 /// The id feedback on the issue carries, so that it cannot collide with a review's or a pull
 /// request comment's.
 fn issue_comment_feedback_id(id: &str) -> String {
@@ -944,7 +940,7 @@ struct Round {
     items: Vec<String>,
     /// The body of the first message.
     message: String,
-    machine: Option<MachineId>,
+    target: Option<Target>,
     /// The workspace the archive is of, as written: an id.
     archiving: Option<String>,
     archive_asked: bool,
@@ -999,12 +995,12 @@ impl Round {
             } else if numbered(step, ARCHIVE_ASKED, n).is_some() {
                 round.archive_asked = true;
             } else if numbered(step, MACHINE_GIVEN_UP, n).is_some() {
-                round.machine = None;
+                round.target = None;
                 round.requested = false;
                 round.workspace = None;
                 round.sending = false;
             } else if let Some(rest) = numbered(step, MACHINE, n) {
-                round.machine = parse_machine(rest);
+                round.target = rest.parse().ok();
                 round.requested = false;
                 round.workspace = None;
                 round.sending = false;
@@ -1209,7 +1205,7 @@ fn read_and_decide(
         };
         return stuck(ctx, run, &mut at, STUCK_BRANCH, stop);
     }
-    let Ok(machine) = placing::place_run(ctx.view, shared, &ctx.project.login, reserved) else {
+    let Ok(target) = placing::place_run(ctx.view, shared, &ctx.project.login, reserved) else {
         return Ok(FeedbackStep::Waiting {
             reason: NO_MACHINE.into(),
         });
@@ -1238,11 +1234,11 @@ fn read_and_decide(
     note(
         ctx,
         run,
-        &format!("{MACHINE}{n} {machine}"),
+        &format!("{MACHINE}{n} {target}"),
         "feedback-machine",
     )?;
     let round = Round {
-        machine: Some(machine),
+        target: Some(target),
         ..round
     };
     decision_phase(ctx, run, events, seen, &round, last, &mut at)?;
@@ -1478,7 +1474,7 @@ fn decision_phase(
 ) -> Result<bool, RunError> {
     let issue = run.issue();
     let mut did = false;
-    let Some(machine) = round.machine else {
+    let Some(target) = round.target else {
         return Ok(false);
     };
     if seen.state == Some(State::PrOpen) {
@@ -1487,7 +1483,7 @@ fn decision_phase(
             &LifecycleEvent::InstructorFeedback { pr: last.pr },
         )?;
         at.state = State::PrOpen;
-        at.machine = Some(machine.to_string());
+        at.machine = Some(target.to_string());
         at.thread_id = None;
         apply_actions(
             ctx,
@@ -1662,11 +1658,11 @@ fn carry_on(
         title = Some(detail.title);
     }
     // The machine: recorded with the decision, or placed again when the pass was cut before it.
-    let machine = match round.machine {
-        Some(machine) => machine,
+    let target = match round.target {
+        Some(target) => target,
         None => {
-            let machine = match placing::place_run(ctx.view, shared, &ctx.project.login, reserved) {
-                Ok(machine) => machine,
+            let target = match placing::place_run(ctx.view, shared, &ctx.project.login, reserved) {
+                Ok(target) => target,
                 Err(reasons) => {
                     return Ok(FeedbackStep::Waiting {
                         reason: waiting_reason(&reasons),
@@ -1676,20 +1672,20 @@ fn carry_on(
             note(
                 ctx,
                 run,
-                &format!("{MACHINE}{n} {machine}"),
+                &format!("{MACHINE}{n} {target}"),
                 "feedback-machine",
             )?;
-            machine
+            target
         }
     };
     if moving {
         slots.runs_free -= 1;
     }
     let placed = Round {
-        machine: Some(machine),
+        target: Some(target),
         ..round.clone()
     };
-    at.machine = Some(machine.to_string());
+    at.machine = Some(target.to_string());
     if decision_phase(ctx, run, events, seen, &placed, last, &mut at)? {
         return Ok(FeedbackStep::Decided {
             round: n,
@@ -1710,20 +1706,20 @@ fn carry_on(
         }
     }
     // A machine that stays away for 15 minutes before the session started is given up.
-    if unreachable_long(ctx, machine) {
+    if unreachable_long(ctx, fleet_machine(target)?) {
         note(
             ctx,
             run,
-            &format!("{MACHINE_GIVEN_UP}{n} {machine}"),
+            &format!("{MACHINE_GIVEN_UP}{n} {target}"),
             "feedback-machine-given-up",
         )?;
         let next = placing::place_run(ctx.view, shared, &ctx.project.login, reserved);
         return match next {
-            Ok(machine) => {
+            Ok(target) => {
                 note(
                     ctx,
                     run,
-                    &format!("{MACHINE}{n} {machine}"),
+                    &format!("{MACHINE}{n} {target}"),
                     "feedback-machine",
                 )?;
                 Ok(FeedbackStep::Preparing(Wait::Workspace))
@@ -1751,13 +1747,12 @@ fn carry_on(
                 )?;
             }
             // A record the fleet shows with its setup started is the first create's answer.
-            let id = match named
-                .iter()
-                .find(|record| record.owner == machine && record.body.setup.is_some())
-            {
+            let id = match named.iter().find(|record| {
+                Target::Machine(record.owner) == target && record.body.setup.is_some()
+            }) {
                 Some(record) => record.body.id,
                 None => ctx.create(
-                    machine,
+                    target,
                     CreateWorkspace {
                         project: ctx.project.id,
                         name: name.clone(),
@@ -1799,7 +1794,10 @@ fn carry_on(
                 };
                 return stuck(ctx, run, &mut at, STUCK_SETUP, stop);
             }
-            _ => return Ok(FeedbackStep::Preparing(Wait::Setup)),
+            _ => {
+                ctx.advance(workspace)?;
+                return Ok(FeedbackStep::Preparing(Wait::Setup));
+            }
         }
     }
     let launch = Launch {
@@ -1807,7 +1805,7 @@ fn carry_on(
         seen,
         round,
         workspace,
-        machine,
+        target,
         title,
     };
     // A factory session the fleet already shows in the workspace (one with a turn record) for a
@@ -1870,7 +1868,7 @@ struct Launch<'a> {
     seen: &'a Seen,
     round: &'a Round,
     workspace: WorkspaceId,
-    machine: MachineId,
+    target: Target,
     title: Option<String>,
 }
 
@@ -1910,7 +1908,7 @@ impl Launch<'_> {
             self.run.issue(),
             &messages::status(
                 State::Building,
-                &self.machine.to_string(),
+                &self.target.to_string(),
                 Some(&session.to_string()),
                 at.pr,
             ),
@@ -1989,7 +1987,9 @@ mod tests {
     use crate::factory::lifecycle::State;
     use crate::factory::messages::{self, LAUNCH_FAILED};
     use crate::factory::runs::resume::BRANCH_REFUSED;
-    use crate::factory::worker::{Call, CreateWorkspace, FleetView, FleetViewBuilder, WorkerError};
+    use crate::factory::worker::{
+        Call, CreateWorkspace, FleetView, FleetViewBuilder, HostCall, Target, WorkerError,
+    };
     use crate::sessions::factory::BODY_PATH;
     use crate::workspaces::{Checkout, FactoryTag, Setup};
 
@@ -3063,10 +3063,10 @@ mod tests {
             // setup, named for the round.
             world.rig.worker.on_create(Ok(fresh()));
             assert_eq!(world.go(), FeedbackStep::Preparing(Wait::Workspace));
-            let Call::Create { machine, request } = world.creates().remove(0) else {
+            let Call::Create { target, request } = world.creates().remove(0) else {
                 unreachable!()
             };
-            assert_eq!(machine, m1());
+            assert_eq!(target, Target::Machine(m1()));
             assert_eq!(
                 request,
                 CreateWorkspace {
@@ -4132,6 +4132,27 @@ mod tests {
     mod feedback_carrying_a_round_on {
         use super::*;
 
+        /// A round whose recorded target is a host is refused as the fleet worker refuses a
+        /// host, naming its kind, before the machine's 15 minutes are judged.
+        #[test]
+        fn a_round_recorded_at_a_host_is_refused_naming_the_kind() {
+            let world = World::reviewed();
+            assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+            world.rig.step(&world.run, "feedback-machine 1 vims");
+            let Err(RunError::Worker(WorkerError::Failed(said))) = world.try_go() else {
+                panic!("a host is refused");
+            };
+            assert!(said.contains("vims"), "{said}");
+            assert!(
+                !world
+                    .rig
+                    .worker
+                    .calls()
+                    .iter()
+                    .any(|call| matches!(call, Call::Create { .. }))
+            );
+        }
+
         #[test]
         fn building_and_resume_leave_a_round_being_set_up_alone() {
             let mut world = World::reviewed();
@@ -4472,17 +4493,20 @@ mod tests {
             let ours = WorkspaceId(uuid::Uuid::from_u128(0xb23));
             world.rig.worker.on_create(Ok(ours));
             assert_eq!(pass(&world), FeedbackStep::Preparing(Wait::Workspace));
-            let creates: Vec<(MachineId, String)> = world
+            let creates: Vec<(Target, String)> = world
                 .creates()
                 .into_iter()
                 .map(|call| match call {
-                    Call::Create { machine, request } => (machine, request.name),
+                    Call::Create { target, request } => (target, request.name),
                     _ => unreachable!(),
                 })
                 .collect();
             assert_eq!(
                 creates,
-                [(m1(), "fac/8-1-f1".into()), (m2, "fac/8-1-f1".into())]
+                [
+                    (Target::Machine(m1()), "fac/8-1-f1".into()),
+                    (Target::Machine(m2), "fac/8-1-f1".into())
+                ]
             );
             // Its record shows on m2 with the setup done: the session starts there, once.
             let mut record = workspace_record(ours, "fac/8-1-f1", Some(setup_terminal()));
@@ -4801,6 +4825,37 @@ mod tests {
             assert!(comments.contains("npm ERR! boom"), "{comments}");
             // Its workspace is kept for a person to look at.
             assert!(world.archives().is_empty());
+        }
+
+        #[test]
+        fn a_setup_that_runs_is_advanced_each_pass_and_one_that_exited_is_not() {
+            let mut world = World::reviewed();
+            world.rig.worker.on_create(Ok(fresh()));
+            assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+            assert_eq!(world.go(), FeedbackStep::Preparing(Wait::Workspace));
+            let with_setup = |state, code| {
+                fleet()
+                    .workspace(workspace_record(
+                        fresh(),
+                        "fac/8-1-f1",
+                        Some(setup_terminal()),
+                    ))
+                    .terminal(terminal_record(state, code))
+                    .build()
+            };
+            world.rig.view = with_setup(TerminalState::Running, None);
+            assert_eq!(world.go(), FeedbackStep::Preparing(Wait::Setup));
+            let advanced: Vec<_> = world
+                .rig
+                .worker
+                .host_calls()
+                .into_iter()
+                .map(|(_, call)| call)
+                .collect();
+            assert_eq!(advanced, [HostCall::Advance { workspace: fresh() }]);
+            world.rig.view = with_setup(TerminalState::Exited, Some(0));
+            assert!(matches!(world.go(), FeedbackStep::Started { .. }));
+            assert_eq!(world.rig.worker.host_calls().len(), 1);
         }
 
         #[test]

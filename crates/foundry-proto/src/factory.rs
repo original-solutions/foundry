@@ -108,6 +108,41 @@ fn canonical<T: FromStr>(text: &str) -> Option<T> {
     }
 }
 
+/// A host that makes a run's workspaces itself, in place of a machine of the fleet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostKind {
+    /// Vims.
+    Vims,
+}
+
+impl HostKind {
+    /// The kind's name, as a claim marker and the ledger write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vims => "vims",
+        }
+    }
+}
+
+impl fmt::Display for HostKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for HostKind {
+    type Err = String;
+
+    /// Parses exactly the spelling [`HostKind::as_str`] gives.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "vims" => Ok(Self::Vims),
+            _ => Err(format!("{text:?} is not a host kind this build knows")),
+        }
+    }
+}
+
 impl fmt::Display for RunId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (owner, name) = self.repo.split_once('/').unwrap_or((&self.repo, ""));
@@ -479,6 +514,17 @@ pub(crate) mod tests {
 
     fn run(text: &str) -> RunId {
         text.parse().expect(text)
+    }
+
+    #[test]
+    fn a_host_kind_is_written_in_lower_case_and_read_back() {
+        assert_eq!(serde_json::to_string(&HostKind::Vims).unwrap(), "\"vims\"");
+        let back: HostKind = serde_json::from_str("\"vims\"").unwrap();
+        assert_eq!(back, HostKind::Vims);
+        assert_eq!(HostKind::Vims.to_string(), "vims");
+        assert_eq!("vims".parse::<HostKind>(), Ok(HostKind::Vims));
+        assert!("Vims".parse::<HostKind>().is_err());
+        assert!("kubernetes".parse::<HostKind>().is_err());
     }
 
     fn new_run(repo: &str, issue: u64, attempt: u32) -> RunId {

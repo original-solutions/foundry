@@ -167,7 +167,7 @@ use super::runs::start::{self, ClaimOutcome, StartStep};
 use super::runs::stop::{self, ReconcileStep, StopStep};
 use super::runs::{RunContext, RunError, RunProject, RunSettings, run_config};
 use super::status::{self, PassResults};
-use super::worker::{FleetView, Guard, Worker};
+use super::worker::{FleetView, Guard, Target, Worker, fleet_machine};
 use crate::clock::Clock;
 use crate::store::{Applied, Store, StoreError};
 
@@ -1084,12 +1084,18 @@ impl<'a, 'w> Pass<'a, 'w> {
 
     /// Whose claim `issue` carries: a run of Foundry's, named by Foundry's newest claim
     /// comment or, with no claim comment at all, by the fleet's workspace names; another
-    /// factory's, or another login's comment is none; or nothing at all.
+    /// factory's, or Foundry's at a host; another login's comment is none; or nothing at all.
     fn found_claim(&mut self, issue: &IssueSummary) -> Result<Found, Ended> {
         let world = self.world;
         let repo = &world.project.repo;
         let comments = world.tracker.issue_comments(repo, issue.number)?;
         match newest_claim(&comments, &world.project.login) {
+            // A claim at a host is left alone, as before a claim could name one: this build
+            // makes no workspace on a host. #360 lifts this.
+            Some(Claim::Foundry {
+                target: Target::Host(_),
+                ..
+            }) => Ok(Found::Foreign),
             Some(Claim::Foundry { run, .. })
                 if run.repo().eq_ignore_ascii_case(repo) && run.issue() == issue.number =>
             {
@@ -1168,10 +1174,10 @@ impl<'a, 'w> Pass<'a, 'w> {
                         &world.project.login,
                         reserved,
                     ) {
-                        Ok(machine) => {
+                        Ok(target) => {
                             // Its machine is reserved now, whatever the ledger shows of it later.
                             self.counted.insert(run.clone());
-                            Ok(format!("resume: {:?}", resume::placed(&ctx, run, machine)?))
+                            Ok(format!("resume: {:?}", resume::placed(&ctx, run, target)?))
                         }
                         Err(reasons) => Ok(format!(
                             "the resume waits for a machine: {}",
@@ -1390,13 +1396,13 @@ impl<'a, 'w> Pass<'a, 'w> {
                 }
             };
             let before = reserved.clone();
-            let machine = match placing::place_run(
+            let target = match placing::place_run(
                 world.view,
                 world.shared,
                 &world.project.login,
                 reserved,
             ) {
-                Ok(machine) => machine,
+                Ok(target) => target,
                 Err(reasons) => {
                     give_back(book);
                     let reason = format!("no machine can take it now: {}", reasons.join("; "));
@@ -1406,7 +1412,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                 }
             };
             let ctx = self.ctx(self.config);
-            let outcome = match start::claim(&ctx, n, machine) {
+            let outcome = match start::claim(&ctx, n, target) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     *reserved = before;
@@ -1425,14 +1431,22 @@ impl<'a, 'w> Pass<'a, 'w> {
                     self.report.claimed.push(run.clone());
                     // Its machine is reserved now, whatever the ledger shows of it later.
                     self.counted.insert(run.clone());
-                    book.place(ticket, machine);
+                    // Placement answers a machine of the fleet: a host is refused as the fleet
+                    // worker refuses one.
                     let ctx = self.ctx(self.config);
-                    let said = match start::advance(&ctx, &run) {
+                    let started =
+                        fleet_machine(target)
+                            .map_err(RunError::from)
+                            .and_then(|machine| {
+                                book.place(ticket, machine);
+                                start::advance(&ctx, &run)
+                            });
+                    let said = match started {
                         Ok(step) => match step {
                             StartStep::Started { .. } => "claimed, session started".to_owned(),
-                            other => format!("claimed on {machine}: {other:?}"),
+                            other => format!("claimed on {target}: {other:?}"),
                         },
-                        Err(error) => format!("claimed on {machine}; {}", ending(error)?),
+                        Err(error) => format!("claimed on {target}; {}", ending(error)?),
                     };
                     self.note(&run, said);
                 }
@@ -2210,8 +2224,8 @@ mod tests {
     use crate::factory::messages::Message;
     use crate::factory::runs::RunProject;
     use crate::factory::worker::{
-        AlwaysHeld, Call, CreateWorkspace, FakeWorker, FleetView, Guard, LeaseLost, Lost, Worker,
-        WorkerError,
+        AlwaysHeld, Call, CreateWorkspace, FakeWorker, FleetView, Guard, LeaseLost, Lost, Target,
+        Worker, WorkerError,
     };
     use crate::sessions::factory::{FactoryStart, SendRefused};
     use crate::sessions::turns::TurnText;
@@ -2285,7 +2299,7 @@ mod tests {
     }
 
     impl Worker for Watched {
-        fn create(&self, m: MachineId, r: CreateWorkspace) -> Result<WorkspaceId, WorkerError> {
+        fn create(&self, m: Target, r: CreateWorkspace) -> Result<WorkspaceId, WorkerError> {
             self.note("create");
             self.inner.create(m, r)
         }
@@ -2319,6 +2333,22 @@ mod tests {
                 hook(w);
             }
             archived
+        }
+        fn advance(&self, w: WorkspaceId) -> Result<(), WorkerError> {
+            self.note("advance");
+            self.inner.advance(w)
+        }
+        fn rest(&self, w: WorkspaceId) -> Result<(), WorkerError> {
+            self.note("rest");
+            self.inner.rest(w)
+        }
+        fn wake(&self, w: WorkspaceId) -> Result<(), WorkerError> {
+            self.note("wake");
+            self.inner.wake(w)
+        }
+        fn keep(&self, w: WorkspaceId) -> Result<(), WorkerError> {
+            self.note("keep");
+            self.inner.keep(w)
         }
     }
 
@@ -2995,7 +3025,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             let report = rig.pass();
             assert!(rig.claimed_issues().is_empty());
@@ -3022,7 +3052,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             // The claim's build workspace, with its setup terminal, is on the machine the comment
             // names: a record with no setup would have the create asked again.
@@ -3104,7 +3134,10 @@ mod tests {
                 rig.hub.comment_as(
                     5,
                     LOGIN,
-                    &crate::factory::github::claim_comment(&named, &builder_machine()),
+                    &crate::factory::github::claim_comment(
+                        &named,
+                        &Target::Machine(builder_machine()),
+                    ),
                 );
                 let report = rig.pass();
                 assert_eq!(report.failed, None, "{named}: {report:?}");
@@ -3130,6 +3163,43 @@ mod tests {
             }
         }
 
+        /// The login's newest claim comment is Foundry's claim of this issue's run at a host,
+        /// which this build makes no workspace on: it is a foreign claim, as it was before a
+        /// claim could name a host. No run is carried on from it.
+        #[test]
+        fn a_foundry_claim_at_a_host_is_foreign() {
+            let mut rig = Rig::new();
+            let run = RunId::new(REPO, 5, 1).unwrap();
+            rig.hub.issue(5, &["factory:triage"]);
+            rig.hub
+                .edit(5, |issue| issue.assignees = vec![LOGIN.into()]);
+            rig.hub.comment_as(
+                5,
+                LOGIN,
+                &crate::factory::github::claim_comment(
+                    &run,
+                    &Target::Host(foundry_proto::factory::HostKind::Vims),
+                ),
+            );
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(
+                report.foreign,
+                vec![ForeignClaim {
+                    issue: 5,
+                    title: "Issue 5".into(),
+                    state: "triage".into(),
+                }]
+            );
+            assert!(rig.ledger.read(&run).unwrap().is_empty());
+            assert!(rig.creates().is_empty(), "{:?}", rig.creates());
+            assert!(
+                rig.hub.writes().iter().all(|w| !w.contains(" 5 ")),
+                "{:?}",
+                rig.hub.writes()
+            );
+        }
+
         #[test]
         fn a_claim_marker_in_another_logins_comment_is_no_claim_of_ours() {
             let mut rig = Rig::new();
@@ -3138,7 +3208,7 @@ mod tests {
             rig.hub.comment_as(
                 4,
                 "mallory",
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             let report = rig.pass();
             // No claim of the login is on the issue, so it is neither ours nor foreign.
@@ -3734,7 +3804,7 @@ mod tests {
             rig.hub.comment_as(
                 issue,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             run
         }
@@ -4030,7 +4100,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.pass();
             assert_eq!(
@@ -4137,7 +4207,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.hub.ready(6);
             rig.worker
@@ -5596,7 +5666,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.hub.ready(6);
             let report = rig.pass();
@@ -5616,7 +5686,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.hub.ready(6);
             let report = rig.pass();
@@ -5833,7 +5903,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.tracker = Hiding::new(
                 Arc::new(PanicsOnceClaimed {
@@ -6155,7 +6225,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.tracker = Hiding::new(
                 Arc::new(FailsOnceClaimed {
@@ -6200,7 +6270,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&carried, &me()),
+                &crate::factory::github::claim_comment(&carried, &Target::Machine(me())),
             );
             rig.hub.ready(6);
             let report = rig.pass();

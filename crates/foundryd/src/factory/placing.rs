@@ -1,5 +1,8 @@
 //! Which machine takes a run or a gate.
 //!
+//! Placement is for the fleet: it is not asked for a project built on a host, so it answers a
+//! [`Target::Machine`] and never a host.
+//!
 //! A machine qualifies for the factory only when it is online, has published a
 //! [`MachineHeld`] (a machine on protocol 4 never does, so the factory places nothing there),
 //! holds a token for the project's login and has the `factory-build` skill. Among those, P1's
@@ -22,7 +25,7 @@ use foundry_proto::record::{MachineSample, Record};
 use foundry_proto::settings::{Limits, SharedSettings};
 
 use crate::factory::ledger::list::{RunInfo, holds_slot};
-use crate::factory::worker::FleetView;
+use crate::factory::worker::{FleetView, Target};
 use crate::placement;
 
 /// The runs placed or held on each machine in one pass, each counting its machine one session
@@ -64,25 +67,27 @@ pub struct Slots {
 /// one reason per machine passed over, in the order of the view's samples, such as
 /// `vps: no token for rawphp` or `mac: sessions 4 at limit 4`. Each machine named by
 /// `settings`, or by its id when they do not name it. The machine picked is counted one session
-/// fuller in `reserved` for the rest of the pass; a refusal reserves nothing.
+/// fuller in `reserved` for the rest of the pass; a refusal reserves nothing. The answer is
+/// always a [`Target::Machine`].
 pub fn place_run(
     view: &FleetView,
     settings: &SharedSettings,
     login: &str,
     reserved: &mut Reserved,
-) -> Result<MachineId, Vec<String>> {
+) -> Result<Target, Vec<String>> {
     let machine = pick(view, settings, login, reserved, &settings.limits)?;
     reserved.hold(machine);
-    Ok(machine)
+    Ok(Target::Machine(machine))
 }
 
 /// The machine a gate goes to: as [`place_run`], but with no session limit, since a gate has
-/// no session. The load and disk limits still hold. Reserves nothing.
+/// no session. The load and disk limits still hold. Reserves nothing. The answer is always a
+/// [`Target::Machine`].
 pub fn place_gate(
     view: &FleetView,
     settings: &SharedSettings,
     login: &str,
-) -> Result<MachineId, Vec<String>> {
+) -> Result<Target, Vec<String>> {
     let limits = settings
         .limits
         .iter()
@@ -92,7 +97,7 @@ pub fn place_gate(
             (*machine, limits)
         })
         .collect();
-    pick(view, settings, login, &Reserved::default(), &limits)
+    pick(view, settings, login, &Reserved::default(), &limits).map(Target::Machine)
 }
 
 /// The run and gate slots free: `max_runs` less the `runs` that hold a slot as
@@ -291,8 +296,14 @@ mod tests {
             .online(vps)
             .build();
         let mut reserved = Reserved::default();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
-        assert_eq!(place_gate(&view, &settings, LOGIN), Ok(vps));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(vps))
+        );
+        assert_eq!(
+            place_gate(&view, &settings, LOGIN),
+            Ok(Target::Machine(vps))
+        );
     }
 
     #[test]
@@ -340,8 +351,14 @@ mod tests {
             .online(vps)
             .build();
         let mut reserved = Reserved::default();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
-        assert_eq!(place_gate(&view, &settings, LOGIN), Ok(vps));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(vps))
+        );
+        assert_eq!(
+            place_gate(&view, &settings, LOGIN),
+            Ok(Target::Machine(vps))
+        );
 
         let alone = FleetView::builder()
             .sample(sample(mac, 0, 0.1))
@@ -367,8 +384,14 @@ mod tests {
             .online(vps)
             .build();
         let mut reserved = Reserved::default();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
-        assert_eq!(place_gate(&view, &settings, LOGIN), Ok(vps));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(vps))
+        );
+        assert_eq!(
+            place_gate(&view, &settings, LOGIN),
+            Ok(Target::Machine(vps))
+        );
     }
 
     #[test]
@@ -399,8 +422,14 @@ mod tests {
             .online(vps)
             .build();
         let mut reserved = Reserved::default();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
-        assert_eq!(place_gate(&view, &settings, LOGIN), Ok(vps));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(vps))
+        );
+        assert_eq!(
+            place_gate(&view, &settings, LOGIN),
+            Ok(Target::Machine(vps))
+        );
 
         let alone = FleetView::builder()
             .sample(sample(mac, 0, 0.1))
@@ -425,8 +454,14 @@ mod tests {
             .online(vps)
             .build();
         let mut reserved = Reserved::default();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(mac));
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(mac))
+        );
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(vps))
+        );
     }
 
     #[test]
@@ -438,7 +473,10 @@ mod tests {
             .online(mac)
             .build();
         let mut reserved = Reserved::default();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(mac));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(mac))
+        );
         assert_eq!(
             place_run(&view, &settings, LOGIN, &mut reserved),
             Err(vec!["mac: sessions 4 at limit 4".to_owned()])
@@ -446,7 +484,7 @@ mod tests {
         // A new pass starts with nothing reserved.
         assert_eq!(
             place_run(&view, &settings, LOGIN, &mut Reserved::default()),
-            Ok(mac)
+            Ok(Target::Machine(mac))
         );
     }
 
@@ -470,7 +508,10 @@ mod tests {
             .online(mac)
             .online(vps)
             .build();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(mac));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(mac))
+        );
     }
 
     #[test]
@@ -486,7 +527,10 @@ mod tests {
             place_run(&view, &settings, LOGIN, &mut reserved),
             Err(vec!["mac: sessions 4 at limit 4".to_owned()])
         );
-        assert_eq!(place_gate(&view, &settings, LOGIN), Ok(mac));
+        assert_eq!(
+            place_gate(&view, &settings, LOGIN),
+            Ok(Target::Machine(mac))
+        );
     }
 
     #[test]
@@ -526,7 +570,10 @@ mod tests {
             .online(vps)
             .build();
         let mut reserved = Reserved::default();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(vps))
+        );
 
         // The same samples with the newer one held first: the version decides, not the order.
         let mut newer = sample(mac, 4, 0.1);
@@ -541,7 +588,10 @@ mod tests {
             .online(vps)
             .build();
         let mut reserved = Reserved::default();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(vps))
+        );
     }
 
     #[test]
@@ -560,7 +610,10 @@ mod tests {
             .online(vps)
             .build();
         let mut reserved = Reserved::default();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(vps))
+        );
     }
 
     #[test]
@@ -601,8 +654,14 @@ mod tests {
             .online(mac)
             .build();
         let mut reserved = Reserved::default();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(mac));
-        assert_eq!(place_gate(&view, &settings, LOGIN), Ok(mac));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(mac))
+        );
+        assert_eq!(
+            place_gate(&view, &settings, LOGIN),
+            Ok(Target::Machine(mac))
+        );
     }
 
     #[test]
@@ -674,7 +733,10 @@ mod tests {
             .online(mac)
             .online(vps)
             .build();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(vps))
+        );
 
         let mut reserved = Reserved::default();
         reserved.hold(mac);
@@ -702,7 +764,10 @@ mod tests {
         let mut reserved = Reserved::default();
         reserved.hold(mac);
         reserved.hold(mac);
-        assert_eq!(place_run(&alone, &settings, LOGIN, &mut reserved), Ok(mac));
+        assert_eq!(
+            place_run(&alone, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(mac))
+        );
         assert_eq!(
             place_run(&alone, &settings, LOGIN, &mut reserved),
             Err(vec!["mac: sessions 4 at limit 4".to_owned()])
@@ -718,9 +783,18 @@ mod tests {
             .online(vps)
             .build();
         let mut reserved = Reserved::default();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(mac));
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(mac));
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(mac))
+        );
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(mac))
+        );
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(vps))
+        );
     }
 
     #[test]
@@ -738,7 +812,10 @@ mod tests {
             .online(mac)
             .online(vps)
             .build();
-        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
+        assert_eq!(
+            place_run(&view, &settings, LOGIN, &mut reserved),
+            Ok(Target::Machine(vps))
+        );
     }
 
     fn run(issue: u64, state: Option<State>, confirmed: bool, pr_reported: bool) -> RunInfo {

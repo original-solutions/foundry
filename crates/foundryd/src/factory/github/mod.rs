@@ -21,10 +21,10 @@ pub mod write;
 use std::sync::Arc;
 
 use foundry_proto::factory::RunId;
-use foundry_proto::ids::MachineId;
 
 use super::lifecycle::State;
 use super::lifecycle::approval::{Approval, TextCheck};
+use super::worker::Target;
 
 pub use fake::FakeTracker;
 pub use gh::{Answer, Gh};
@@ -366,14 +366,14 @@ pub trait Commenting: Tracker {
         write::upsert_status_comment(self, repo, issue, login, body)
     }
 
-    /// Posts Foundry's claim comment for `run` on `machine`: [`claim_comment`].
+    /// Posts Foundry's claim comment for `run` at `target`: [`claim_comment`].
     fn post_claim(
         &self,
         repo: &str,
         issue: u64,
         run: &RunId,
-        machine: &MachineId,
+        target: &Target,
     ) -> Result<(), TrackerError> {
-        write::post_claim(self, repo, issue, run, machine)
+        write::post_claim(self, repo, issue, run, target)
     }
 }
