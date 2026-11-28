@@ -6,7 +6,7 @@ import { fleet, withFactory } from "./fleet";
 import { Sidebar } from "./Sidebar";
 import { CHECKS_EVERY } from "./Shipping";
 import { TerminalActions } from "./TerminalMenu";
-import { factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, mockFetch, renderApp } from "./test-utils";
 import type { PullRequest, SessionState, Shipping } from "./api";
 
@@ -563,6 +563,16 @@ describe("Sidebar and the factory", () => {
     expect(header.children[2]).toBe(within(run).getByRole("link", { name: "factory #162" }));
     expect(within(run).getByText("Quiet 10+ min")).toBeDefined();
     expect(within(screen.getByRole("group", { name: "on a commit" })).queryByRole("link", { name: /^factory/ })).toBeNull();
+  });
+
+  it("says factory alone on the mark of a run whose id names no issue", async () => {
+    await renderApp(<Sidebar machines={withFactory(factoryMachines(), factoryStatus("p1", { "not-a-run": ["w1"] }))} {...props} />);
+    const run = screen.getByRole("group", { name: "fac 162" });
+    const header = within(run).getByRole("button", { name: "fac 162" }).parentElement!;
+    const mark = within(header).getByText("factory", { exact: true });
+    expect(mark.tagName).toBe("SPAN");
+    expect(mark.hasAttribute("aria-label")).toBe(false);
+    expect(header.textContent).not.toContain("#");
   });
 
   it("shows a workspace with no branch by its commit", async () => {
