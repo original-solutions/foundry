@@ -38,6 +38,7 @@ use crate::factory::lifecycle::State;
 use crate::factory::lifecycle::approval::TextCheck;
 use crate::factory::messages::{CANNOT_CONFIRM, CANNOT_VERIFY_DURING_BUILD, CHANGED_DURING_BUILD};
 use crate::factory::text::{elapsed_ms, is_commit_id};
+use crate::factory::worker::Target;
 
 /// The ledger step that says a launch call is about to be sent.
 pub const LAUNCH_SENDING: &str = "launch-sending";
@@ -1556,7 +1557,7 @@ impl Live {
         } else {
             UNREACHABLE_FOR
         };
-        ctx.view.unreachable_for(self.machine) >= after
+        ctx.view.unreachable_for(Target::Machine(self.machine)) >= after
     }
 }
 
