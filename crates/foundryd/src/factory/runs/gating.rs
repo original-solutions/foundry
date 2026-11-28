@@ -17,9 +17,13 @@
 //!    owing (the build session ended, the build workspace archived: see 7).
 //! 2. A send owed from an earlier pass (`gate-sending` with no `gate_sent_back`) is finished
 //!    first, under the turn it was begun for, whatever the session or the head is doing now.
-//!    Then a session still at work (starting, working, waiting for a person, or
-//!    unreachable), one with no turn record, one that has run no turn since a failure was sent
-//!    under the newest, and a run with no pull request reported are [`GateStep::NotReady`].
+//!    Then a session still at work (starting, working, or waiting for a person), one with no
+//!    turn record, one that has run no turn since a failure was sent under the newest, and a run
+//!    with no pull request reported are [`GateStep::NotReady`]. A session that cannot be reached
+//!    and was at rest when last seen ([`at_rest`]) is not at work: its reported pull request is
+//!    gated, and a gate in flight on its machine is read, so a cut-off build machine's gate could
+//!    not run as any other's. One that may be at work there is waited for, and with its pull
+//!    request reported nothing interrupts it: `limits.minutes` ends the run (#367).
 //!    A session the fleet does not show is stuck (`session-gone`).
 //! 3. A pull request that is gone, from a fork, off the base or off the run's branches is stuck
 //!    (`pr-not-bound`); one that was merged or closed before a pass is recorded ends the run
@@ -297,7 +301,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use foundry_proto::factory::{RunEvent, RunId};
+use foundry_proto::factory::{RunEvent, RunId, SessionTurn};
 use foundry_proto::ids::{MachineId, SessionId, WorkspaceId};
 use foundry_proto::settings::SharedSettings;
 use foundry_proto::state::{SessionState, TerminalState};
@@ -952,14 +956,33 @@ fn can_take_a_message(state: SessionState) -> bool {
     state == SessionState::Idle
 }
 
-/// Whether the session is at work, or cannot be reached, so that nothing is gated or read of it
-/// yet. A session that finished or failed is not: its last turn stands and is gated. Whether it can
+/// Whether the session is at work, so that nothing is gated or read of it yet. A session that
+/// finished or failed is not: its last turn stands and is gated. Nor is one that cannot be
+/// reached and was [`at_rest`] when last seen: the gate needs the pull request it reported, not
+/// the session, and a gate in flight on its machine must be read to be found gone. Whether it can
 /// be sent a message is `can_take_a_message`'s, which is stricter.
-fn busy(state: SessionState) -> bool {
-    !matches!(
-        state,
-        SessionState::Idle | SessionState::Finished | SessionState::Failed
-    )
+fn busy(state: SessionState, seen: &Seen, turn: Option<&SessionTurn>) -> bool {
+    match state {
+        SessionState::Idle | SessionState::Finished | SessionState::Failed => false,
+        SessionState::Unreachable => !at_rest(seen, turn),
+        _ => true,
+    }
+}
+
+/// Whether nothing shows that a session on a machine that cannot be reached is at work there:
+/// the fleet shows it as last seen, its newest turn read, no prompt after that turn and no
+/// question, and the ledger has no message sent to it that the fleet does not show yet.
+pub(super) fn at_rest(seen: &Seen, turn: Option<&SessionTurn>) -> bool {
+    turn.is_some_and(|turn| {
+        turn.turn > 0
+            && !turn.question
+            && turn.prompts <= turn.turn
+            && seen.turn_read.is_some_and(|read| read >= turn.turn)
+            && !seen
+                .sends
+                .values()
+                .any(|send| send.count >= turn.prompts && send.may_have_typed())
+    })
 }
 
 // ----- one pass -----
@@ -1150,16 +1173,12 @@ impl Gate<'_, '_> {
     ) -> Result<Duration, RunError> {
         let generation = self.ctx.held()?;
         let now = u64::try_from(self.ctx.clock.now().as_millis()).unwrap_or(u64::MAX);
-        match since {
-            Some((from, at)) if from == generation && now >= at => {
-                Ok(Duration::from_millis(now - at))
-            }
-            _ => {
-                let reason = prefix.split(' ').next().unwrap_or(prefix);
-                self.step(&format!("{prefix}{generation} {now}"), reason, attempt)?;
-                Ok(Duration::ZERO)
-            }
+        if let Some(waited) = super::time_waited(since, generation, now) {
+            return Ok(waited);
         }
+        let reason = prefix.split(' ').next().unwrap_or(prefix);
+        self.step(&format!("{prefix}{generation} {now}"), reason, attempt)?;
+        Ok(Duration::ZERO)
     }
 
     /// The run is stuck: a workspace of it can never be archived, which the issue's acceptance
@@ -1424,7 +1443,8 @@ impl Gate<'_, '_> {
             .clone()
             .filter(|pass| !log.moved.contains(&pass.attempt));
         let state = self.ctx.view.session_state(self.session);
-        let turn = self.ctx.view.session_turn(self.session).map(|t| t.turn);
+        let shown = self.ctx.view.session_turn(self.session);
+        let turn = shown.map(|t| t.turn);
         // A send begun and not recorded is finished first, whatever else moved.
         if let Some(owed) = seen
             .sending
@@ -1451,7 +1471,7 @@ impl Gate<'_, '_> {
                 let Some(state) = state else {
                     return self.stuck("session-gone", Stop::new(SESSION_GONE));
                 };
-                if busy(state) || turn.is_none() || !seen.pr_reported {
+                if busy(state, &seen, shown) || turn.is_none() || !seen.pr_reported {
                     return Ok(GateStep::NotReady);
                 }
                 self.attempt(&seen, &log, slots, turn)
@@ -2942,6 +2962,7 @@ mod tests {
                 terminal: TerminalId(uuid::Uuid::from_u128(0x5e6)),
                 model: "opus".into(),
                 state,
+                name: None,
             },
         }
     }
@@ -3010,6 +3031,20 @@ mod tests {
     /// The fleet shows the session in `state` with the newest turn `turn` (and as many prompts),
     /// and the gate workspaces `gates`. `turn` 0 shows no turn record.
     fn show(rig: &mut Rig, run: &RunId, state: SessionState, turn: u64, gates: &[G]) {
+        show_prompts(rig, run, state, turn, turn, false, gates);
+    }
+
+    /// As [`show`], the session having had `prompts` prompts by its turn `turn`, and a question
+    /// waiting when `question`.
+    fn show_prompts(
+        rig: &mut Rig,
+        run: &RunId,
+        state: SessionState,
+        turn: u64,
+        prompts: u64,
+        question: bool,
+        gates: &[G],
+    ) {
         let mut view = gate_machine(FleetView::builder()).session(session_record(state));
         if turn > 0 {
             view = view.turn(SessionTurn {
@@ -3017,8 +3052,8 @@ mod tests {
                 workspace: workspace(),
                 project: project_id(),
                 turn,
-                prompts: turn,
-                question: false,
+                prompts,
+                question,
             });
         }
         for (workspace, terminal) in gate_records(run, gates) {
@@ -3029,9 +3064,21 @@ mod tests {
 
     /// As [`show`], with the gate's machine offline for `span`.
     fn show_gone(rig: &mut Rig, run: &RunId, turn: u64, gates: &[G], span: Duration) {
+        show_gone_with(rig, run, SessionState::Idle, turn, gates, span);
+    }
+
+    /// As [`show_gone`], with the session shown `state`.
+    fn show_gone_with(
+        rig: &mut Rig,
+        run: &RunId,
+        state: SessionState,
+        turn: u64,
+        gates: &[G],
+        span: Duration,
+    ) {
         let mut view = FleetView::builder()
             .online(builder())
-            .session(session_record(SessionState::Idle))
+            .session(session_record(state))
             .turn(SessionTurn {
                 session: session(),
                 workspace: workspace(),
@@ -3587,7 +3634,6 @@ mod tests {
                 SessionState::Starting,
                 SessionState::Working,
                 SessionState::WaitingForYou,
-                SessionState::Unreachable,
             ] {
                 let (mut rig, run, hub) = built();
                 show(&mut rig, &run, state, 1, &[]);
@@ -3598,6 +3644,109 @@ mod tests {
                 assert_eq!(rig.events(&run).len(), before, "{state:?}");
                 assert_eq!(hub.reads(), Vec::<String>::new(), "{state:?}");
             }
+        }
+
+        #[test]
+        fn the_reported_pull_request_of_a_session_that_cannot_be_reached_is_gated() {
+            // Its last turn stands: the gate needs the pull request, not the session. A message
+            // sent earlier and shown in the prompt count does not hold it back.
+            let cases: [(&str, u64, &[&str]); 3] = [
+                ("its first turn read", 1, &[]),
+                (
+                    "a message refused with nothing typed",
+                    1,
+                    &[
+                        "send-intent forward-comment c1 1",
+                        "send-refused forward-comment c1",
+                    ],
+                ),
+                (
+                    "a message sent earlier and shown",
+                    2,
+                    &[
+                        "send-intent forward-comment c1 1",
+                        "send-typed forward-comment c1",
+                        "turn-read 2",
+                    ],
+                ),
+            ];
+            for (case, turn, steps) in cases {
+                let (mut rig, run, _hub) = built();
+                for step in steps {
+                    rig.step(&run, step);
+                }
+                show(&mut rig, &run, SessionState::Unreachable, turn, &[]);
+                rig.worker.on_create(Ok(gate_ws(1)));
+                assert_eq!(go(&rig, &run), GateStep::Running, "{case}");
+                assert!(
+                    has_step(&rig, &run, &format!("{GATE_REQUESTED}1 1 {HEAD}")),
+                    "{case}: {:?}",
+                    rig.steps(&run)
+                );
+            }
+        }
+
+        /// The fleet shows a session on a machine it cannot reach as it last saw it. One that may
+        /// be at work there is waited for, as one shown working is, so its work is not passed by.
+        #[test]
+        fn the_pull_request_of_a_session_that_cannot_be_reached_and_may_be_at_work_is_not_gated() {
+            let cases: [(&str, u64, u64, bool, Option<&str>); 4] = [
+                ("a prompt after its newest turn", 1, 2, false, None),
+                ("a newer turn not read", 2, 2, false, None),
+                ("a question waiting", 1, 1, true, None),
+                (
+                    "a message sent and not shown yet",
+                    1,
+                    1,
+                    false,
+                    Some("send-intent forward-comment c1 1"),
+                ),
+            ];
+            for (case, turn, prompts, question, step) in cases {
+                let (mut rig, run, hub) = built();
+                if let Some(step) = step {
+                    rig.step(&run, step);
+                }
+                show_prompts(
+                    &mut rig,
+                    &run,
+                    SessionState::Unreachable,
+                    turn,
+                    prompts,
+                    question,
+                    &[],
+                );
+                let before = rig.events(&run).len();
+                assert_eq!(go(&rig, &run), GateStep::NotReady, "{case}");
+                no_writes(&rig);
+                assert_eq!(calls(&rig), vec![], "{case}");
+                assert_eq!(rig.events(&run).len(), before, "{case}");
+                assert_eq!(hub.reads(), Vec::<String>::new(), "{case}");
+            }
+        }
+
+        #[test]
+        fn a_failure_found_while_the_session_cannot_be_reached_waits_for_it_and_is_sent_once() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show(
+                &mut rig,
+                &run,
+                SessionState::Unreachable,
+                1,
+                &[exited(1, 101)],
+            );
+            rig.worker.on_tail(Ok(FAIL_TAIL.into()));
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            // The gate was read while the session was away: its verdict is on record.
+            assert_eq!(event_count(&rig, &run, "gate_finished"), 1);
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert_eq!(sends(&rig), vec![]);
+            assert_eq!(step_count(&rig, &run, "send-intent"), 0);
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 101)]);
+            assert_eq!(go(&rig, &run), GateStep::SentBack { attempt: 1 });
+            assert_eq!(sends(&rig).len(), 1);
+            assert_eq!(rig.ctx().seen(&run).unwrap().sent_back_attempts.len(), 1);
         }
 
         #[test]
@@ -5437,6 +5586,47 @@ mod tests {
         }
 
         #[test]
+        fn a_gate_on_the_build_machine_cut_off_could_not_run_and_is_tried_again_while_the_session_is_away()
+         {
+            // The fleet's one-machine case in the rig: the session is shown unreachable while
+            // its gate's machine is cut off mid-gate.
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            let cut_off = |rig: &mut Rig, minutes: u64| {
+                show_gone_with(
+                    rig,
+                    &run,
+                    SessionState::Unreachable,
+                    1,
+                    &[running(1)],
+                    Duration::from_secs(minutes * 60),
+                );
+            };
+            cut_off(&mut rig, 4);
+            assert_eq!(go(&rig, &run), GateStep::Running);
+            cut_off(&mut rig, 6);
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
+            assert!(
+                rig.steps(&run).iter().any(
+                    |step| step.starts_with(GATE_COULD_NOT_RUN) && step.contains("unreachable")
+                )
+            );
+            assert!(!gate_running(&rig.events(&run)));
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 0 });
+            // The session is still away: the gate is placed again all the same.
+            show(&mut rig, &run, SessionState::Unreachable, 1, &[]);
+            rig.worker.on_create(Ok(gate_ws(2)));
+            assert_eq!(go(&rig, &run), GateStep::Running);
+            assert!(has_step(&rig, &run, &format!("{GATE_REQUESTED}1 2 {HEAD}")));
+            assert!(
+                !calls(&rig)
+                    .iter()
+                    .any(|call| matches!(call, Call::Send { .. })),
+                "nothing is sent to the session"
+            );
+        }
+
+        #[test]
         fn a_gate_whose_terminal_exited_with_no_exit_code_could_not_run_and_is_not_a_failure() {
             let (mut rig, run, _hub) = built();
             place(&mut rig, &run, 1, 1);
@@ -5732,6 +5922,7 @@ mod tests {
                         terminal: TerminalId(uuid::Uuid::from_u128(0x6e6)),
                         model: "opus".into(),
                         state: SessionState::Idle,
+                        name: None,
                     },
                 })
                 .turn(SessionTurn {

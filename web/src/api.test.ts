@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, createWorkspace, listMachines, sendFile, sessionBriefs, sessionTrail, thisMachine, workspaceChanges } from "./api";
+import { ApiError, createWorkspace, installUpdate, listMachines, sendFile, sessionBriefs, sessionTrail, thisMachine, workspaceChanges, workspaceShipping } from "./api";
 import { json } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -10,6 +10,7 @@ const reads = [
   ["briefs", () => sessionBriefs()],
   ["trail", () => sessionTrail("s1")],
   ["changes", () => workspaceChanges("w1")],
+  ["shipping", () => workspaceShipping("w1")],
   ["machines", () => listMachines()],
   ["machine", () => thisMachine()],
 ] as const;
@@ -43,6 +44,32 @@ describe("the reads", () => {
     expect(await workspaceChanges("w1")).toEqual({ base: "main", commits: [], files: [] });
     answer(json(200, { id: "m1" }));
     expect(await thisMachine()).toBe("m1");
+  });
+});
+
+describe("workspaceShipping", () => {
+  it("posts with no body, so another machine's workspace is carried to its owner, and gives back where the branch stands", async () => {
+    const shipping = { branch: "fix-login", pushed: true, unpushed: 0, pr: null, unreachable: false };
+    const sent: { url: string; method?: string; body?: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        sent.push({ url, method: init.method, body: init.body });
+        return json(200, shipping);
+      }),
+    );
+
+    expect(await workspaceShipping("w1")).toEqual(shipping);
+    expect(sent).toEqual([{ url: "/api/workspaces/w1/pr", method: "POST", body: undefined }]);
+  });
+
+  it("refuses any status but 200, as an owner on an older build answers 400", async () => {
+    for (const status of [201, 400, 503, 504]) {
+      answer(json(status, { error: "no such route" }));
+      const error = await workspaceShipping("w1").catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).status).toBe(status);
+    }
   });
 });
 
@@ -88,5 +115,38 @@ describe("createWorkspace", () => {
       { project: "p1", base: "main", name: "here" },
       { project: "p1", base: "main", name: "there", machine: "m2" },
     ]);
+  });
+});
+
+describe("installUpdate", () => {
+  it("posts the tag to the machine's update route and gives back the status and body as they came", async () => {
+    const fetch = vi.fn(async () => json(409, { error: "v0.9.1 is not ready", ready: "v0.9.2" }));
+    vi.stubGlobal("fetch", fetch);
+    expect(await installUpdate("machine-2", "v0.9.1")).toEqual({ status: 409, json: { error: "v0.9.1 is not ready", ready: "v0.9.2" } });
+    expect(fetch).toHaveBeenCalledWith("/api/machines/machine-2/update", expect.objectContaining({ method: "POST", body: JSON.stringify({ tag: "v0.9.1" }) }));
+  });
+
+  it("stops waiting after a minute with no answer, so the call reads as sent with no answer", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetch = vi.fn(
+        (_path: string, init: RequestInit) =>
+          new Promise<Response>((_answer, fail) => init.signal?.addEventListener("abort", () => fail(new DOMException("timed out", "AbortError")))),
+      );
+      vi.stubGlobal("fetch", fetch);
+      let failed: unknown;
+      void installUpdate("machine-2", "v0.9.1").catch((error: unknown) => (failed = error));
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(failed).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(failed).toBeInstanceOf(DOMException);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives back a 202's empty body as {}", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 202 })));
+    expect(await installUpdate("machine-2", "v0.9.1")).toEqual({ status: 202, json: {} });
   });
 });

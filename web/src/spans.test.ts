@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Mark } from "./api";
-import { bars, heading, placed, RANGES, sum, ticks, type Bar } from "./spans";
+import { bars, heading, layers, placed, RANGES, sum, ticks, waits, type Bar } from "./spans";
 
 const m = (kind: Mark["kind"], text: string, at: number): Mark => ({ kind, text, at });
 const MIN = 60_000;
@@ -74,7 +74,58 @@ describe("sum", () => {
       bar(20 * MIN, 22 * MIN, [m("tool", "$ ls", 21 * MIN), m("ask", "Proceed?", 21.5 * MIN)]),
       bar(30 * MIN, 30 * MIN, [m("ask", "Claude is waiting for your input", 30 * MIN)], true),
     ];
-    expect(sum([all, [bar(50 * MIN, 51 * MIN)]], -5 * MIN, 60 * MIN)).toEqual({ turns: 3, busy: 13 * MIN, tools: 2, asks: 1 });
+    expect(sum([all, [bar(50 * MIN, 51 * MIN)]], -5 * MIN, 60 * MIN)).toEqual({ turns: 3, busy: 13 * MIN, waited: 0, tools: 2, asks: 1 });
+  });
+
+  it("takes the time a turn stood waiting on you out of agent work, inside the window", () => {
+    const bar: Bar = { start: 0, end: 30 * MIN, open: true, nudge: false, steps: [] };
+    const waited = [{ start: 4 * MIN, end: 10 * MIN, open: false }, { start: 15 * MIN, end: 30 * MIN, open: true }];
+    // 23 minutes of the turn fall in the window; 6 + 10 of them it stood waiting.
+    expect(sum([[bar]], 2 * MIN, 25 * MIN, [waited])).toMatchObject({ busy: 7 * MIN, waited: 16 * MIN });
+  });
+});
+
+describe("waits", () => {
+  it("runs a question to the step that came after it: the time the turn stood waiting on you", () => {
+    const trail = [m("prompt", "fix it", 0), m("tool", "$ ls", 1 * MIN), m("ask", "Proceed?", 2 * MIN), m("tool", "$ rm", 9 * MIN), m("ask", "Push?", 10 * MIN), m("done", "", 12 * MIN)];
+    const [bar] = bars(trail, false, 20 * MIN);
+    expect(waits(bar, false, 20 * MIN)).toEqual([
+      { start: 2 * MIN, end: 9 * MIN, open: false },
+      { start: 10 * MIN, end: 12 * MIN, open: false },
+    ]);
+  });
+
+  it("runs a question still unanswered up to now while the session waits on you", () => {
+    const trail = [m("prompt", "fix it", 0), m("tool", "$ ls", 1 * MIN), m("ask", "Proceed?", 2 * MIN)];
+    const [bar] = bars(trail, true, 20 * MIN);
+    expect(waits(bar, true, 20 * MIN)).toEqual([{ start: 2 * MIN, end: 20 * MIN, open: true }]);
+    // Answered, with no step since: when it was answered is not known yet, so nothing is claimed.
+    expect(waits(bar, false, 20 * MIN)).toEqual([]);
+  });
+
+  it("dates a wait the trail holds no question for from the turn's last step", () => {
+    const [bar] = bars([m("prompt", "fix it", 0), m("tool", "$ ls", 3 * MIN)], true, 20 * MIN);
+    expect(waits(bar, true, 20 * MIN)).toEqual([{ start: 3 * MIN, end: 20 * MIN, open: true }]);
+  });
+
+  it("finds no wait in a reminder between turns", () => {
+    const [, nudge] = bars([m("prompt", "hi", 0), m("done", "", 1 * MIN), m("ask", "Claude is waiting for your input", 5 * MIN)], false, 20 * MIN);
+    expect(waits(nudge, false, 20 * MIN)).toEqual([]);
+  });
+});
+
+describe("layers", () => {
+  it("cuts the waits of every session into spans by how many stood waiting at once, inside the window", () => {
+    const w = (start: number, end: number) => ({ start: start * MIN, end: end * MIN, open: false });
+    expect(layers([[w(0, 10)], [w(5, 15), w(30, 40)], [w(8, 12)]], 2 * MIN, 35 * MIN)).toEqual([
+      { start: 2 * MIN, end: 5 * MIN, depth: 1 },
+      { start: 5 * MIN, end: 8 * MIN, depth: 2 },
+      { start: 8 * MIN, end: 10 * MIN, depth: 3 },
+      { start: 10 * MIN, end: 12 * MIN, depth: 2 },
+      { start: 12 * MIN, end: 15 * MIN, depth: 1 },
+      { start: 30 * MIN, end: 35 * MIN, depth: 1 },
+    ]);
+    expect(layers([], 0, 10 * MIN)).toEqual([]);
   });
 });
 

@@ -1,5 +1,5 @@
 import type { SessionState } from "./api";
-import { byUrgency, rows, type MachineView } from "./fleet";
+import { byUrgency, needingRows, needsYouIn, rows, tendedByFactory, type MachineView } from "./fleet";
 import { needsYou, sessionGlyph, type Glyph } from "./labels";
 import { shapes } from "./StateGlyph";
 
@@ -15,8 +15,8 @@ export interface Alert {
   body: string;
 }
 
-/** Each session's state, by id, as last seen. */
-export type Seen = Map<string, SessionState>;
+/** Each session's state, by id, as last seen, and whether a live factory run tended it then. */
+export type Seen = Map<string, { state: SessionState; tended: boolean }>;
 
 /** What entering a state says, for the states worth an alert. */
 const says: Partial<Record<SessionState, string>> = {
@@ -28,18 +28,27 @@ const says: Partial<Record<SessionState, string>> = {
 /**
  * The alerts for what changed since `before`: a session that went from working to idle finished
  * its turn, and one that entered waiting, stuck or failed needs you (also when it shows up that
- * way). The first look, with nothing before it, raises nothing.
+ * way). A live factory run's session never needs you, as on the board: the factory tends it. Once
+ * its run is held up, a session that already waits, is stuck or failed needs you, and is raised
+ * then. The first look, with nothing before it, raises nothing.
  */
 export function alertsFor(before: Seen | undefined, machines: MachineView[]): { alerts: Alert[]; seen: Seen } {
   const seen: Seen = new Map();
   const alerts: Alert[] = [];
   for (const workspace of machines.flatMap((m) => m.workspaces)) {
+    const tended = tendedByFactory(workspace.factory);
     for (const s of workspace.sessions) {
-      seen.set(s.id, s.state);
-      if (!before) continue;
-      const was = before.get(s.id);
-      if (was === s.state) continue;
-      const phrase = was === "working" && s.state === "idle" ? "finished its turn" : says[s.state];
+      const was = before?.get(s.id);
+      // A resend of the fleet drops every status until they follow it, so a tended session whose
+      // project's status is not here yet, with no change of its own, is no news: it stays tended
+      // until its project's status arrives, or its factory is turned off and none will. Held up,
+      // no longer named, or off, it is raised then. A factory left on whose holder goes quiet
+      // shows as factory_idle on the attention list instead.
+      const unmarked = was?.tended === true && was.state === s.state && workspace.statusUnknown === true;
+      seen.set(s.id, { state: s.state, tended: tended || unmarked });
+      if (!before || unmarked) continue;
+      if (was?.state === s.state && was.tended === tended) continue;
+      const phrase = was?.state === "working" && s.state === "idle" ? "finished its turn" : needsYouIn(sessionGlyph[s.state], workspace.factory) ? says[s.state] : undefined;
       if (phrase) alerts.push({ terminal: s.terminal, tag: s.id, glyph: sessionGlyph[s.state], title: workspace.name, body: `${s.name} ${phrase}` });
     }
   }
@@ -53,10 +62,14 @@ export interface Pulse {
   working: number;
 }
 
+/** The fleet's pulse. A live factory run's terminals that would need you are left out, as the board leaves its card under working. */
 export function pulse(machines: MachineView[]): Pulse {
-  const all = machines.flatMap((m) => m.workspaces.flatMap(rows));
+  const workspaces = machines.flatMap((m) => m.workspaces);
+  // What would need you but a live factory run tends is left out of the glyph; what needs you is
+  // counted as the board's needs-you lane holds it (`needingRows`), a held-up run's card included.
+  const all = workspaces.flatMap((w) => rows(w).filter((r) => needsYouIn(r.glyph, w.factory) || !needsYou.includes(r.glyph)));
   const count = (...glyphs: Glyph[]) => all.filter((r) => glyphs.includes(r.glyph)).length;
-  return { glyph: byUrgency(all)[0]?.glyph, needYou: count(...needsYou), working: count("working") };
+  return { glyph: byUrgency(all)[0]?.glyph, needYou: workspaces.reduce((n, w) => n + needingRows(w).length, 0), working: count("working") };
 }
 
 /** The tab's title: what needs you first, so a narrow tab still shows the count. */

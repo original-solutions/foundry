@@ -28,6 +28,8 @@
 //! - `POST /api/machines/{id}/limits` and `POST /api/machines/{id}/limits/clear`: set and clear a
 //!   machine's placement limits, see [`machine_limits`].
 //! - `POST /api/machines/{id}/remove`: removes a machine from the fleet, see [`machine_remove`].
+//! - `POST /api/machines/{id}/update` `{tag}`: installs the machine's ready release, from any
+//!   machine, see [`machine_update`].
 //! - `POST /api/workspaces` `{project, base, name, machine}`: makes a workspace, `201 {id}`, on
 //!   the machine `machine` names, or on this machine when it is absent. When the workspace is
 //!   made but its setup could not be started, it is still `201`, with an `error` beside the
@@ -42,16 +44,22 @@
 //!   {request, reasons}` and the request waits on this machine: see [`placement`](crate::placement)
 //!   for it and for `GET /api/placements` and `POST /api/placements/{id}/cancel`.
 //! - `POST /api/workspaces/{id}/archive` `{force}` (the body is optional): `204`, or `409` with
-//!   the uncommitted files, unpushed commits and submodules that hold it up.
+//!   the uncommitted files, unpushed commits and submodules that hold it up, and `detached`:
+//!   whether its folder is no longer a git worktree of its project, which holds it up too.
 //! - `POST /api/workspaces/{id}/sessions` `{model, prompt}` (`prompt` is optional): starts
 //!   Claude Code in the workspace, on `prompt` as its first prompt when one is given, `201 {id}`.
 //!   A blank prompt is none; one with a NUL or over 20,000 characters is `422`.
 //! - `POST /api/workspaces/{id}/shells`: starts the daemon's `$SHELL` in the workspace, `201
 //!   {id}`.
 //! - `POST /api/terminals/{id}/close`: `204`.
+//! - `POST /api/workspaces/{id}/pr`: what `GET` of it answers, through the same handler; the
+//!   body is not read.
+//! - `POST /api/sessions/{id}/rename` `{name}`: names the session, shown in place of its first
+//!   prompt, `204`; see [`Sessions::rename`] for how the name is cut and hidden. A name that is
+//!   blank clears it. A session that is not this machine's, or is gone, is `404`.
 //!
-//!   These five actions, on a workspace or terminal another machine owns or a create that
-//!   names another machine, are carried to that machine and answered as it answers: see
+//!   These seven actions, on a workspace, terminal or session another machine owns or a create
+//!   that names another machine, are carried to that machine and answered as it answers: see
 //!   [`carry`].
 //! - `POST /api/terminals/{id}/files?name=<name>`: keeps a file for the terminal and answers
 //!   its path, see [`files`].
@@ -60,7 +68,11 @@
 //! - `GET /api/workspaces/{id}/commits/{hash}`: what one commit on the workspace's branch
 //!   changed, see [`changes`]. Only a workspace of this machine.
 //! - `GET /api/workspaces/{id}/pr`: whether the workspace's branch is on `origin`, what is only
-//!   on this machine, and its pull request, see [`pr`]. Only a workspace of this machine.
+//!   on this machine, and its pull request, see [`pr`]. Only a workspace of this machine; a
+//!   `POST` of it is answered the same, and carried for another machine's.
+//!
+//!   These three reads of a workspace whose folder is no longer a git worktree of its project
+//!   are `404` too, saying so: archive it to remove the folder.
 //! - `GET /api/briefs`: what each session of this machine is for and doing, see [`briefs`].
 //! - `GET /api/sessions/{id}/trail`: every step a session of this machine took, see [`trail`].
 //!
@@ -132,6 +144,7 @@ pub mod machine_limits;
 pub mod machine_names;
 pub mod machine_priority;
 pub mod machine_remove;
+pub mod machine_update;
 mod pr;
 pub mod projects;
 pub mod terminals;
@@ -207,10 +220,14 @@ pub fn router(api: Api) -> Router {
         .route("/api/workspaces/{id}/shells", post(start_shell))
         .route("/api/workspaces/{id}/changes", get(changes::changes))
         .route("/api/workspaces/{id}/commits/{hash}", get(changes::commit))
-        .route("/api/workspaces/{id}/pr", get(pr::shipping))
+        .route(
+            "/api/workspaces/{id}/pr",
+            get(pr::shipping).post(pr::shipping),
+        )
         .route("/api/briefs", get(briefs::briefs))
         .route("/api/machine", get(machine::machine))
         .route("/api/sessions/{id}/trail", get(trail::trail))
+        .route("/api/sessions/{id}/rename", post(rename_session))
         .route("/api/placements", get(placement::list))
         .route("/api/placements/{id}/cancel", post(placement::cancel))
         .merge(factory::router())
@@ -443,14 +460,16 @@ impl IntoResponse for ApiError {
                     "uncommitted": redacted(&dirty.uncommitted),
                     "unpushed": redacted(&dirty.unpushed),
                     "submodules": redacted(&dirty.submodules),
+                    // The archive dialog's line for it is #323's, which #321 left it to.
+                    "detached": dirty.detached,
                 });
                 return (StatusCode::CONFLICT, Json(body)).into_response();
             }
             Self::Workspace(e) => (
                 match e {
-                    WorkspaceError::Unknown(_) | WorkspaceError::UnknownCommit(_) => {
-                        StatusCode::NOT_FOUND
-                    }
+                    WorkspaceError::Unknown(_)
+                    | WorkspaceError::UnknownCommit(_)
+                    | WorkspaceError::Detached(_) => StatusCode::NOT_FOUND,
                     WorkspaceError::UnknownProject(_)
                     | WorkspaceError::UnknownBase(_)
                     | WorkspaceError::BranchRefused(_)
@@ -1217,6 +1236,26 @@ async fn start_shell(State(api): State<Api>, Path(id): Path<String>) -> Result<R
         })
         .await?;
     Ok(created(terminal))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Rename {
+    name: String,
+}
+
+async fn rename_session(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    Body(rename): Body<Rename>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id, "session", SessionId)?;
+    if !api.sessions.rename(id, &rename.name).await? {
+        return Err(ApiError::NotFound(format!(
+            "no session {id} on this machine"
+        )));
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn close_terminal(

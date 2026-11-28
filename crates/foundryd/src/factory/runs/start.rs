@@ -43,7 +43,7 @@ use super::progress::{
     APPROVAL_RECHECKED, APPROVED, LAUNCH_BASE, LAUNCH_ENDING_SESSIONS, LAUNCH_MODEL,
     LAUNCH_PULL_REQUEST, LAUNCH_RESENDING, LAUNCH_RESUMING, LAUNCH_SENDING, LAUNCH_SENDING_RESUMED,
     Seen, TIME_LIMIT, UNCONFIRMED_CODE, WORKSPACE_CREATED, WORKSPACE_REQUESTED, build_name,
-    read_progress,
+    read_progress, step_text,
 };
 use super::{
     Closing, Progress, RunContext, RunError, Stop, abandon, as_posted, end_own_merge,
@@ -51,8 +51,8 @@ use super::{
     stop_session, workspace_id,
 };
 use crate::factory::github::read::{
-    APPROVAL_QUERY, ApprovalIssue, LabelChange, TimelineNode, gh_json, is_branch_path,
-    is_human_instructor, is_plain_ref_name, is_safe_branch_name, is_utc_second, issue_query_args,
+    gh_json, is_branch_path, is_plain_ref_name, is_safe_branch_name, is_utc_second,
+    issue_query_args,
 };
 use crate::factory::github::{
     Claim, IssueDetail, OpenPullRequest, OtherKind, Tracker, TrackerError, newest_claim,
@@ -78,6 +78,15 @@ pub const SETUP_FAILED: &str = "the build workspace's setup failed";
 
 /// The count of prompts a session has had before its launch is typed: none.
 pub const FIRST_PROMPT_COUNT: u64 = 0;
+
+/// The step written when the worker refuses the launch asked for again because the session's
+/// count of prompts rose: `launch-taken <count>`. The launch became a prompt, and the spec's
+/// step 3 sends a message again only when it never did, so it is not asked for again.
+pub const LAUNCH_TAKEN: &str = "launch-taken ";
+
+/// The step written once the worker took the launch asked for again: `launch-resent <count>`.
+/// A pass that asks again after it writes its own `launch-resending` line.
+pub const LAUNCH_RESENT: &str = "launch-resent ";
 
 /// Who holds claims back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,7 +264,8 @@ fn already_said(
     let labeled_at = match refusal {
         Refusal::LabeledByNonInstructor { labeled_at, .. }
         | Refusal::EditedAfterLabel { labeled_at }
-        | Refusal::EditHistoryIncomplete { labeled_at } => Some(labeled_at),
+        | Refusal::EditHistoryIncomplete { labeled_at }
+        | Refusal::TimelineShortOfLabel { labeled_at } => Some(labeled_at),
         Refusal::LabelNotFound | Refusal::LabelHistoryIncomplete => None,
     };
     Ok(match labeled_at {
@@ -730,7 +740,7 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StartStep, RunError>
         });
     }
     if seen.thread_id.is_some() {
-        return launched(ctx, run, &seen, &mut at);
+        return launched(ctx, run, &seen, &events, &mut at);
     }
     build(ctx, run, &seen, &detail, &mut at)
 }
@@ -840,7 +850,13 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
         }
         None => return skipped(format!("no claim comment names run {run}")),
     };
-    if let Some((labeled_at, labeled_by)) = claimed_on(ctx, issue)? {
+    if let Approval::Approved {
+        labeled_at,
+        labeled_by,
+    } = ctx
+        .tracker
+        .claimed_approval(repo, issue, &ctx.project.login, &ctx.config.instructors)?
+    {
         record_approval(ctx, run, &labeled_at, Some(&labeled_by), CauseStep::Start)?;
     }
     ctx.record(
@@ -852,87 +868,6 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
         &Cause::new(CauseStep::Start, "claim-found"),
     )?;
     Ok(None)
-}
-
-/// GitHub's answer to [`APPROVAL_QUERY`].
-#[derive(Deserialize)]
-struct LabelHistory {
-    data: LabelHistoryData,
-}
-
-#[derive(Deserialize)]
-struct LabelHistoryData {
-    repository: LabelHistoryRepository,
-}
-
-#[derive(Deserialize)]
-struct LabelHistoryRepository {
-    issue: ApprovalIssue,
-}
-
-/// The approval a claim was made on, read after the claim removed `factory:ready`: when and by
-/// whom the label the claim took off was applied, if an instructor applied it and the text is
-/// as an instructor left it since. Only the label's newest event is judged. A removal by the
-/// project's login is the claim's, and the label it took off is the event before it. A label
-/// still on is the approval, as when the claim's removal is not on the timeline. Any other
-/// newest event (a removal by anyone else, or none) approves nothing. These are
-/// `judge_approval`'s checks, made as of the claim rather than now. The text is judged by
-/// `text_check`, which reads the history again and checks its timestamps. `None` when the
-/// approval cannot be confirmed.
-fn claimed_on(ctx: &RunContext<'_>, issue: u64) -> Result<Option<(String, String)>, RunError> {
-    let repo = ctx.repo();
-    let instructors = &ctx.config.instructors;
-    let args = issue_query_args(repo, APPROVAL_QUERY, issue)?;
-    let history: LabelHistory = gh_json(ctx.tracker, &args, "a GraphQL response with the issue")?;
-    let ready = State::Ready.label();
-    // The label's events, newest first: `true` for applied, `false` for removed.
-    let mut events = history
-        .data
-        .repository
-        .issue
-        .timeline_items
-        .nodes
-        .into_iter()
-        .rev()
-        .filter_map(|node| match node {
-            TimelineNode::LabeledEvent(change) if change.label.name == ready => {
-                Some((true, change))
-            }
-            TimelineNode::UnlabeledEvent(change) if change.label.name == ready => {
-                Some((false, change))
-            }
-            _ => None,
-        });
-    let label = match events.next() {
-        Some((true, label)) => label,
-        Some((false, removal))
-            if removal
-                .actor
-                .as_ref()
-                .is_some_and(|actor| actor.login.eq_ignore_ascii_case(&ctx.project.login)) =>
-        {
-            match events.next() {
-                Some((true, label)) => label,
-                _ => return Ok(None),
-            }
-        }
-        _ => return Ok(None),
-    };
-    let LabelChange {
-        created_at,
-        actor: Some(actor),
-        ..
-    } = label
-    else {
-        return Ok(None);
-    };
-    if !is_human_instructor(Some(&actor), instructors) {
-        return Ok(None);
-    }
-    let text = ctx
-        .tracker
-        .text_check(repo, issue, &created_at, instructors)?;
-    Ok((text == TextCheck::Unchanged).then_some((created_at, actor.login)))
 }
 
 /// What a launch continues from.
@@ -1715,11 +1650,14 @@ fn record_launched(
 }
 
 /// A run whose session is launched: the label, and the launch asked for again by count when the
-/// session is idle a pass after it started.
-fn launched(
+/// session is idle a pass after it started, until the worker refuses it because the count rose
+/// ([`LAUNCH_TAKEN`]). `building` asks through this too, once the label has moved, with the
+/// ledger `events` its pass has read already.
+pub(super) fn launched(
     ctx: &RunContext<'_>,
     run: &RunId,
     seen: &Seen,
+    events: &[RunEvent],
     at: &mut Progress,
 ) -> Result<StartStep, RunError> {
     let Some(thread) = &seen.thread_id else {
@@ -1736,25 +1674,57 @@ fn launched(
         .view
         .session_turn(session)
         .is_none_or(|turn| turn.turn == 0 && turn.prompts == FIRST_PROMPT_COUNT);
-    if !(idle && untouched) {
+    // A launch the worker refused because the count rose was typed: it is not asked for again.
+    if !(idle && untouched) || launch_taken(events) {
         return Ok(StartStep::Started { session });
     }
     let (base, resumed) = recorded_decision(ctx, run, seen)?;
     let message = launch_message(ctx, run, &base, resumed.as_ref());
-    ctx.record_step(
-        run,
-        &format!("{LAUNCH_RESENDING}{FIRST_PROMPT_COUNT}"),
-        &Cause::new(CauseStep::Start, "launch-resend"),
-    )?;
+    // One line for asks in a row that typed nothing: when the ledger's newest step is this one,
+    // the ask before it was refused as busy or its send failed, and nothing has happened since,
+    // so a view that stays behind the worker's does not grow the ledger by a line a pass. A send
+    // the worker took is followed by `launch-resent`, so the next ask has its own line. The
+    // count guards each send either way.
+    let resending = format!("{LAUNCH_RESENDING}{FIRST_PROMPT_COUNT}");
+    if events.iter().rev().find_map(step_text) != Some(resending.as_str()) {
+        ctx.record_step(
+            run,
+            &resending,
+            &Cause::new(CauseStep::Start, "launch-resend"),
+        )?;
+    }
     match ctx.send(session, message, Some(FIRST_PROMPT_COUNT)) {
-        Ok(_) => Ok(StartStep::Resent { session }),
-        // The worker decides: its count rose, so the message was typed; or the session is not
-        // idle yet, and the next pass looks again.
-        Err(RunError::Send(SendRefused::CountRose { .. } | SendRefused::NotIdle)) => {
+        Ok(_) => {
+            ctx.record_step(
+                run,
+                &format!("{LAUNCH_RESENT}{FIRST_PROMPT_COUNT}"),
+                &Cause::new(CauseStep::Start, "launch-resent"),
+            )?;
+            Ok(StartStep::Resent { session })
+        }
+        // The worker decides: its count rose, so the message was typed, and the ledger says so
+        // that no later pass asks again while the session's turn record is late.
+        Err(RunError::Send(SendRefused::CountRose { now })) => {
+            ctx.record_step(
+                run,
+                &format!("{LAUNCH_TAKEN}{now}"),
+                &Cause::new(CauseStep::Start, "launch-taken"),
+            )?;
             Ok(StartStep::Started { session })
         }
+        // The session is not idle yet: the next pass looks again.
+        Err(RunError::Send(SendRefused::NotIdle)) => Ok(StartStep::Started { session }),
         Err(error) => Err(error),
     }
+}
+
+/// Whether the ledger shows the worker refused the launch asked for again because the
+/// session's count rose ([`LAUNCH_TAKEN`]): the launch was typed, and is not asked for again.
+fn launch_taken(events: &[RunEvent]) -> bool {
+    events
+        .iter()
+        .filter_map(step_text)
+        .any(|step| step.starts_with(LAUNCH_TAKEN))
 }
 
 #[cfg(test)]
@@ -2086,6 +2056,45 @@ mod tests {
                 .set_approval(approval_answer("2026-10-04T23:00:00Z", "mallory", &[]));
             claim_it(&rig).unwrap();
             assert_eq!(rig.sim.comments().len(), 2);
+        }
+
+        /// The same for a timeline page cut off at the label's second: its comment asks for the
+        /// label again, and the refusal after that newer label is explained again.
+        #[test]
+        fn a_short_timeline_after_a_newer_label_is_commented_again() {
+            let rig = Rig::new();
+            rig.sim
+                .set_approval(cut_off_at_label("2026-10-04T10:00:00Z"));
+            claim_it(&rig).unwrap();
+            rig.sim.set_labels(&["factory:ready"]);
+            rig.sim
+                .set_approval(cut_off_at_label("2026-10-04T23:00:00Z"));
+            claim_it(&rig).unwrap();
+            let comments = rig.sim.comments();
+            assert_eq!(comments.len(), 2);
+            for comment in comments {
+                assert!(comment.contains("apply `factory:ready` again"), "{comment}");
+                assert!(comment.contains("recent history"), "{comment}");
+            }
+        }
+
+        /// The approval answer for `tom`'s label at `labeled_at`, the oldest event on a full
+        /// timeline page of a longer history, with no body edits.
+        fn cut_off_at_label(labeled_at: &str) -> String {
+            let mut answer: serde_json::Value =
+                serde_json::from_str(&approval_answer(labeled_at, "tom", &[])).unwrap();
+            let timeline = &mut answer["data"]["repository"]["issue"]["timelineItems"];
+            let later = serde_json::json!({
+                "__typename": "LabeledEvent",
+                "createdAt": "2026-10-04T23:30:00Z",
+                "actor": {"__typename": "User", "login": "eve"},
+                "label": {"name": "bug"},
+            });
+            let nodes = timeline["nodes"].as_array_mut().unwrap();
+            nodes.extend((1..crate::factory::github::read::HISTORY_PAGE).map(|_| later.clone()));
+            timeline["totalCount"] =
+                serde_json::json!(crate::factory::github::read::HISTORY_PAGE + 5);
+            answer.to_string()
         }
 
         /// The runner's case "an issue that is assigned, closed or not ready is skipped with
@@ -2733,6 +2742,7 @@ mod tests {
                     terminal: TerminalId(uuid::Uuid::from_u128(0x5e6)),
                     model: "opus".into(),
                     state,
+                    name: None,
                 },
             }
         }
@@ -3159,6 +3169,58 @@ mod tests {
                     rig.steps(run)
                 );
                 assert!(calls(rig).is_empty());
+            }
+
+            /// The `gh api graphql` approval reads among the calls the rig's GitHub was asked.
+            fn approval_reads(rig: &Rig) -> usize {
+                let query = format!("query={}", crate::factory::github::read::APPROVAL_QUERY);
+                rig.sim
+                    .calls()
+                    .iter()
+                    .filter(|call| call[..2] == ["api", "graphql"] && call.contains(&query))
+                    .count()
+            }
+
+            /// A takeover reads the issue's approval history once, whether it approves or not.
+            #[test]
+            fn a_takeover_reads_the_approval_history_once() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                rig.sim.set_approval(removed_by_the_claim("tom", &[]));
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(approval_reads(&rig), 1);
+
+                let rig = Rig::new();
+                let run = taken_over(&rig, rig.machine);
+                rig.sim.set_approval(removed_by_the_claim("mallory", &[]));
+                goes_stuck_unapproved(&rig, &run);
+                assert_eq!(approval_reads(&rig), 1);
+            }
+
+            /// An approval history with a malformed timestamp fails the takeover before it
+            /// records or does anything, even where the label is a stranger's: the read checks
+            /// every timestamp, and a later pass reads it again.
+            #[test]
+            fn a_malformed_timestamp_in_the_history_fails_the_takeover_before_it_records_anything()
+            {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                let run = taken_over(&rig, elsewhere());
+                let mut nodes = vec![label_event(
+                    "LabeledEvent",
+                    "factory:ready",
+                    "2026-10-04 10:00:00Z",
+                    "User",
+                    "mallory",
+                )];
+                nodes.extend(claim_swap("2026-10-04T10:05:00Z"));
+                rig.sim.set_approval(timeline_of(nodes, &[]));
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert!(rig.ledger.read(&run).unwrap().is_empty());
+                assert_eq!(rig.sim.labels(), ["factory:triage"]);
+                assert!(calls(&rig).is_empty());
+                assert_eq!(approval_reads(&rig), 1);
             }
 
             /// The claim removed `factory:ready`: the run is approved on the newest label an
@@ -4186,13 +4248,31 @@ mod tests {
                 assert!(sends(&rig).is_empty());
             }
 
-            /// The worker decides: its count rose, so the message was typed. Nothing more.
+            /// The worker decides: its count rose, so the message was typed. Nothing more, and
+            /// the ledger says so, which `building` reads before it would ask again.
             #[test]
             fn a_refusal_because_the_count_rose_means_it_was_typed() {
                 let (mut rig, run) = started();
                 show_session(&mut rig, SessionState::Idle, None);
                 rig.worker.on_send(Err(SendRefused::CountRose { now: 1 }));
                 assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                let steps = rig.steps(&run);
+                assert_eq!(
+                    steps[steps.len() - 2..],
+                    ["launch-resending 0".to_owned(), "launch-taken 1".to_owned()]
+                );
+                assert!(launch_taken(&rig.events(&run)));
+            }
+
+            /// A refusal because the session is not idle says nothing of the launch: it was
+            /// not taken.
+            #[test]
+            fn a_refusal_because_the_session_is_not_idle_records_no_launch_taken() {
+                let (mut rig, run) = started();
+                show_session(&mut rig, SessionState::Idle, None);
+                rig.worker.on_send(Err(SendRefused::NotIdle));
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert!(!launch_taken(&rig.events(&run)));
             }
 
             #[test]

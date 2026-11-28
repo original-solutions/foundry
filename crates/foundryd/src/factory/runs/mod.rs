@@ -1065,6 +1065,24 @@ pub fn end_own_merge(
     )
 }
 
+/// How long a wait has lasted on the sleep-counting clock: from `since`, the lease generation
+/// and clock reading (ms) recorded at its start, to `now` under `generation`. `None` when the
+/// count starts again: no record, one of another generation (a takeover), or one above the
+/// clock now (a reboot that reset the clock). A takeover can lengthen a wait, never end it
+/// early. Every wait the runs count on that clock reads it here.
+pub fn time_waited(
+    since: Option<(u64, u64)>,
+    generation: u64,
+    now: u64,
+) -> Option<std::time::Duration> {
+    match since {
+        Some((from, at)) if from == generation && now >= at => {
+            Some(std::time::Duration::from_millis(now - at))
+        }
+        _ => None,
+    }
+}
+
 /// The id of `text` as a session, or why it is not one.
 pub fn session_id(text: &str) -> Result<SessionId, RunError> {
     uuid::Uuid::parse_str(text)
@@ -3546,6 +3564,40 @@ mod tests {
             let (closing, detail) = closed_issue(&rig.ctx(), &run, &seen).unwrap();
             assert_eq!(closing, Closing::PersonsMove);
             assert_eq!(detail.unwrap().number, ISSUE);
+        }
+    }
+
+    mod the_time_a_wait_has_lasted {
+        use std::time::Duration;
+
+        use super::*;
+
+        #[test]
+        fn is_the_clock_since_the_record_under_the_same_generation() {
+            assert_eq!(
+                time_waited(Some((3, 1_000)), 3, 4_500),
+                Some(Duration::from_millis(3_500))
+            );
+            assert_eq!(
+                time_waited(Some((3, 1_000)), 3, 1_000),
+                Some(Duration::ZERO)
+            );
+        }
+
+        #[test]
+        fn starts_again_under_another_generation() {
+            assert_eq!(time_waited(Some((3, 1_000)), 4, 9_000), None);
+            assert_eq!(time_waited(Some((4, 1_000)), 3, 9_000), None);
+        }
+
+        #[test]
+        fn starts_again_when_the_clock_reads_below_the_record() {
+            assert_eq!(time_waited(Some((3, 5_000)), 3, 4_999), None);
+        }
+
+        #[test]
+        fn starts_again_with_no_record() {
+            assert_eq!(time_waited(None, 3, 9_000), None);
         }
     }
 }

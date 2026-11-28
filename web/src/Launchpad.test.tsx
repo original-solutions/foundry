@@ -1,9 +1,11 @@
 import { onlineManager } from "@tanstack/react-query";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import type { ComponentProps } from "react";
+import { useState, type ComponentProps } from "react";
+import type { Project } from "./api";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { safeBranch } from "./branch";
 import { taskName, useCreateWorkspace } from "./Composer";
+import { repoName } from "./FirstRepo";
 import type { WorkspaceView } from "./fleet";
 import { Launchpad } from "./Launchpad";
 import { primaryButton } from "./Modal";
@@ -71,6 +73,22 @@ describe("taskName", () => {
     expect(taskName("Answer (https://github.com/o/r/pull/5) today")).toBe("answer pr 5 today");
     expect(taskName("Fix the docs (https://example.com/docs) today")).toBe("fix the docs today");
     expect(taskName("fix /api route")).toBe("fix /api route");
+  });
+});
+
+describe("repoName", () => {
+  it("names a project by the last part of its repo's address, without .git", () => {
+    expect(repoName("git@github.com:acme/storefront.git")).toBe("storefront");
+    expect(repoName("https://github.com/acme/billing-api")).toBe("billing-api");
+    expect(repoName("https://github.com/acme/docs-site.git/")).toBe("docs-site");
+    expect(repoName("ssh://git@git.example.com:2222/team/api.git")).toBe("api");
+    expect(repoName("/srv/git/widgets.git")).toBe("widgets");
+    expect(repoName("https://bot:hunter2@github.com/acme/shop.git")).toBe("shop");
+  });
+
+  it("gives nothing for an address with no name in it", () => {
+    expect(repoName("   ")).toBe("");
+    expect(repoName(".git")).toBe("");
   });
 });
 
@@ -299,12 +317,96 @@ describe("Launchpad", () => {
     expect(sentNames(calls)).toEqual(["fix it", ...Array.from({ length: 19 }, (_, i) => `fix it ${i + 3}`)]);
   });
 
-  it("says there is no project to work in when the fleet has none, and starts nothing", async () => {
+  it("asks for a repo first when the fleet has no project, with no task box to type into yet", async () => {
     await renderApp(<Harness projects={[]} />);
 
-    expect(screen.getByText(/No projects yet/)).toBeDefined();
-    fireEvent.change(promptBox(), { target: { value: "Fix it" } });
-    expect(start().disabled).toBe(true);
+    const steps = screen.getByRole("list", { name: "Getting started" });
+    expect(within(steps).getAllByRole("heading").map((h) => h.textContent)).toEqual(["Which repo should Claude work in?", "What should Claude work on?"]);
+    expect(within(steps).getAllByRole("listitem")[0].getAttribute("aria-current")).toBe("step");
+    expect(screen.getByLabelText("Repo URL")).toBe(document.activeElement);
+    expect(screen.queryByLabelText("What should Claude work on?")).toBeNull();
+    expect(screen.queryByText(/No projects yet/)).toBeNull();
+  });
+
+  it("names the project from its repo as the URL is typed, and adds it under that name", async () => {
+    const calls = mockFetch(json(201, { id: "p9" }));
+    await renderApp(<Harness projects={[]} />);
+
+    const add = screen.getByRole("button", { name: "Add" }) as HTMLButtonElement;
+    expect(add.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Repo URL"), { target: { value: " git@github.com:acme/storefront.git " } });
+    expect((screen.getByLabelText("Project name") as HTMLInputElement).placeholder).toBe("storefront");
+    fireEvent.click(add);
+
+    await waitFor(() => expect(calls).toEqual([{ url: "/api/projects", method: "POST", body: { name: "storefront", repo: "git@github.com:acme/storefront.git", id: expect.stringMatching(/^[0-9a-f-]{36}$/) } }]));
+  });
+
+  it("takes a typed project name over the one from the repo", async () => {
+    const calls = mockFetch(json(201, { id: "p9" }));
+    await renderApp(<Harness projects={[]} />);
+
+    fireEvent.change(screen.getByLabelText("Repo URL"), { target: { value: "https://github.com/acme/shop" } });
+    fireEvent.change(screen.getByLabelText("Project name"), { target: { value: "web" } });
+    fireEvent.submit(screen.getByLabelText("Repo URL"));
+
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0].body).toMatchObject({ name: "web", repo: "https://github.com/acme/shop" });
+  });
+
+  it("says why the daemon refused a repo and keeps what was typed, sending a retry under the same id", async () => {
+    const calls = mockFetch(json(504, { error: "no answer from studio, the acting coordinator, in time" }), json(201, { id: "p9" }));
+    await renderApp(<Harness projects={[]} />);
+
+    fireEvent.change(screen.getByLabelText("Repo URL"), { target: { value: "git@github.com:acme/storefront.git" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/no answer from studio/);
+    expect((screen.getByLabelText("Repo URL") as HTMLInputElement).value).toBe("git@github.com:acme/storefront.git");
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect((calls[1].body as { id: string }).id).toBe((calls[0].body as { id: string }).id);
+  });
+
+  it("ticks the repo off once the project arrives, then opens the task box on it", async () => {
+    mockFetch(json(201, { id: "p9" }));
+    const storefront: Project = { id: "p9", name: "storefront", repo: "git@github.com:acme/storefront.git" };
+    /** The launchpad over a project list that the test fills, as the shared settings would. */
+    function Growing() {
+      const [list, setList] = useState<Project[]>([]);
+      return (
+        <>
+          <Harness projects={list} />
+          <button type="button" onClick={() => setList([storefront])}>
+            settings arrive
+          </button>
+        </>
+      );
+    }
+    await renderApp(<Growing />);
+
+    fireEvent.change(screen.getByLabelText("Repo URL"), { target: { value: "git@github.com:acme/storefront.git" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    await screen.findByText(/Adding storefront/);
+    expect(screen.queryByLabelText("What should Claude work on?")).toBeNull();
+
+    // The new project arrives in the shared settings.
+    fireEvent.click(screen.getByRole("button", { name: "settings arrive" }));
+    const steps = await screen.findByRole("list", { name: "Getting started" });
+    const [repo, task] = within(steps).getAllByRole("listitem");
+    expect(repo.getAttribute("aria-current")).toBeNull();
+    expect(within(repo).getByText("storefront")).toBeDefined();
+    expect(task.getAttribute("aria-current")).toBe("step");
+    expect(promptBox()).toBe(document.activeElement);
+    expect((screen.getByRole("radio", { name: "storefront" }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.queryByLabelText("Repo URL")).toBeNull();
+  });
+
+  it("goes straight to the task when the fleet already has a project", async () => {
+    await renderApp(<Harness />);
+
+    expect(screen.queryByRole("list", { name: "Getting started" })).toBeNull();
+    expect(screen.queryByLabelText("Repo URL")).toBeNull();
+    expect(promptBox()).toBe(document.activeElement);
   });
 
   it("has every option on the page, with no second form behind it, and teaches the states a task shows", async () => {

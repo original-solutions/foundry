@@ -28,6 +28,12 @@ function Harness({ initial }: { initial: Project[] }) {
 }
 
 describe("Composer projects", () => {
+  it("shows each project with its face, the one its workspaces carry everywhere", async () => {
+    await renderApp(<Harness initial={[demo, api]} />);
+    const radio = screen.getByRole("radio", { name: "api" });
+    expect(radio.closest("label")?.querySelector("[title='api']")?.textContent).toBe("AP");
+  });
+
   it("offers to add a project when there are none, and that opens the Projects dialog", async () => {
     await renderApp(<Harness initial={[]} />);
 

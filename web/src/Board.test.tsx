@@ -5,9 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createContext, useContext, type ComponentProps } from "react";
 import type { AnyRecord, Changes, SessionState, Shipping } from "./api";
 import { archiveOf } from "./Archive";
+import { buttonShape, pressed } from "./Modal";
 import { Board, BOARD_BUSY_EVERY } from "./Board";
-import { fleet, type MachineView } from "./fleet";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { fleet, withFactory, type MachineView } from "./fleet";
+import { factoryStatus, factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { RETRY_EVERY } from "./poll";
 import { TerminalActions } from "./TerminalMenu";
 import { expectButtonShape, FakeSocket, json } from "./test-utils";
@@ -36,9 +37,11 @@ const records = (state: SessionState = "working"): AnyRecord[] => [
   session(ME, "s4", "w3", "t4", "idle"),
 ];
 
-const answers: Record<string, () => Response> = {};
+const answers: Record<string, () => Response | Promise<Response>> = {};
 let reads: string[] = [];
 const readsOf = (workspace: string) => reads.filter((u) => u.includes(`/${workspace}/`)).length;
+/** How many times `workspace`'s changes were read, leaving out where its branch stands. */
+const changesOf = (workspace: string) => reads.filter((u) => u === `/api/workspaces/${workspace}/changes`).length;
 
 /** The cards the board watches, and whether a card starts on screen. */
 let watched: { element: Element; seen: (entries: Partial<IntersectionObserverEntry>[]) => void }[] = [];
@@ -79,6 +82,11 @@ beforeEach(() => {
     } satisfies Changes);
   answers["/api/workspaces/w2/changes"] = () => json(200, { base: "main", commits: [], files: [] } satisfies Changes);
   answers["/api/workspaces/w3/changes"] = () => json(404, { error: "workspace not found" });
+  // A board served by this machine's daemon knows the machine, and reads where each of its workspaces' branches stand.
+  answers["/api/machine"] = () => json(200, { id: ME });
+  answers["/api/workspaces/w1/pr"] = () => json(200, { branch: "fix-login", pushed: false, unpushed: 0, pr: null, unreachable: false } satisfies Shipping);
+  answers["/api/workspaces/w2/pr"] = () => json(200, { branch: "tidy-readme", pushed: false, unpushed: 0, pr: null, unreachable: false } satisfies Shipping);
+  answers["/api/workspaces/w3/pr"] = () => json(404, { error: "workspace not found" });
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string) => {
@@ -143,6 +151,11 @@ async function show(machines: MachineView[], onChanges = vi.fn(), props: Partial
 const card = (name: string) => screen.getByRole("article", { name });
 
 describe("Board", () => {
+  it("marks each card with its project's face beside the project's name", async () => {
+    await show(fleet(records(), settings()));
+    expect(within(card("fix login")).getByTitle("demo").textContent).toBe("DE");
+  });
+
   it("shows every workspace as a card in a lane by what it needs: you, its agents, or nothing", async () => {
     await show(fleet(records(), settings()));
     const needs = screen.getByRole("region", { name: "Needs you" });
@@ -188,7 +201,7 @@ describe("Board", () => {
   });
 
   it("shows what each workspace changed: lines, files, commits, the biggest files and the newest commit", async () => {
-    await show(fleet(records(), settings()));
+    await show(fleet(records(), settings()), vi.fn(), {}, true);
     const login = card("fix login");
     await waitFor(() => expect(within(login).getByText("+34")).toBeDefined());
     expect(within(login).getByText("−5")).toBeDefined();
@@ -205,7 +218,7 @@ describe("Board", () => {
 
   it("opens a workspace's changes from its card", async () => {
     const onChanges = vi.fn();
-    await show(fleet(records(), settings()), onChanges);
+    await show(fleet(records(), settings()), onChanges, {}, true);
     const login = card("fix login");
     await waitFor(() => expect(within(login).getByText("+34")).toBeDefined());
     fireEvent.click(within(login).getByRole("button", { name: /changes/i }));
@@ -213,59 +226,91 @@ describe("Board", () => {
   });
 
   it("reads a workspace's changes again when a terminal's state changes, as when a turn ends", async () => {
-    const { update } = await show(fleet(records("waiting_for_you"), settings()));
+    const { update } = await show(fleet(records("waiting_for_you"), settings()), vi.fn(), {}, true);
     await waitFor(() => expect(within(card("fix login")).getByText("+34")).toBeDefined());
-    const before = reads.filter((u) => u.includes("/w1/")).length;
+    const before = changesOf("w1");
     update(fleet(records("failed"), settings()));
-    await waitFor(() => expect(reads.filter((u) => u.includes("/w1/")).length).toBe(before + 1));
+    await waitFor(() => expect(changesOf("w1")).toBe(before + 1));
+  });
+
+  it("reads nothing again for a workspace the daemon answered 404 when one of its terminals changes state", async () => {
+    // "far away" (w3) gets a shell that ends: its lane stays, its terminals' states change.
+    const shell = (state: "running" | "exited") => (state === "running" ? terminal(ME, "t9", "w3") : terminal(ME, "t9", "w3", "exited", { exit_code: 0 }));
+    const { update } = await show(fleet([...records("waiting_for_you"), shell("running")], settings()), vi.fn(), {}, true);
+    await waitFor(() => expect(within(card("far away")).getByText(/can.t be read from here/i)).toBeDefined());
+    await waitFor(() => expect(reads).toContain("/api/workspaces/w3/pr"));
+    const far = readsOf("w3");
+    expect(far).toBe(2);
+    const login = changesOf("w1");
+
+    update(fleet([...records("failed"), shell("exited")], settings()));
+    // The other card's change is read, so the change reached the board.
+    await waitFor(() => expect(changesOf("w1")).toBe(login + 1));
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(readsOf("w3")).toBe(far);
+  });
+
+  it("reads a workspace's changes again when a terminal changes state, but not where its branch stands once that answered 404", async () => {
+    answers["/api/workspaces/w1/pr"] = () => json(404, { error: "workspace not found" });
+    const prOf = (workspace: string) => reads.filter((u) => u === `/api/workspaces/${workspace}/pr`).length;
+    const { update } = await show(fleet(records("waiting_for_you"), settings()), vi.fn(), {}, true);
+    await waitFor(() => expect(within(card("fix login")).getByText("+34")).toBeDefined());
+    await waitFor(() => expect(prOf("w1")).toBeGreaterThan(0));
+    const changes = changesOf("w1");
+    const pr = prOf("w1");
+
+    update(fleet(records("failed"), settings()));
+    await waitFor(() => expect(changesOf("w1")).toBe(changes + 1));
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(prOf("w1")).toBe(pr);
   });
 
   it("reads a card's changes only once the card is on screen", async () => {
     startOnScreen = false;
-    await show(fleet(records(), settings()));
+    await show(fleet(records(), settings()), vi.fn(), {}, true);
+    expect(await within(card("fix login")).findByText(/reading changes/i)).toBeDefined();
     await act(async () => {});
-    expect(reads).toEqual([]);
-    expect(within(card("fix login")).getByText(/reading changes/i)).toBeDefined();
+    expect(reads.filter((u) => u.startsWith("/api/workspaces/"))).toEqual([]);
     scroll("fix login", true);
     await waitFor(() => expect(within(card("fix login")).getByText("+34")).toBeDefined());
-    expect(readsOf("w1")).toBe(1);
+    expect(changesOf("w1")).toBe(1);
     expect(readsOf("w2")).toBe(0);
   });
 
   it("reads a card again on a timer only while an agent in it works, and never a quiet one", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    await show(fleet(records("working"), settings()));
+    await show(fleet(records("working"), settings()), vi.fn(), {}, true);
     await waitFor(() => expect(within(card("tidy readme")).getByText("No changes yet")).toBeDefined());
-    const working = readsOf("w1");
-    const waiting = readsOf("w2");
+    const working = changesOf("w1");
+    const waiting = changesOf("w2");
     const twoMinutes = 120_000;
     await act(() => vi.advanceTimersByTimeAsync(twoMinutes + 100));
-    expect(readsOf("w1")).toBe(working + Math.floor(twoMinutes / BOARD_BUSY_EVERY));
-    expect(readsOf("w2")).toBe(waiting);
+    expect(changesOf("w1")).toBe(working + Math.floor(twoMinutes / BOARD_BUSY_EVERY));
+    expect(changesOf("w2")).toBe(waiting);
   });
 
   it("keeps reading a working card after a failed read, and stops for a workspace the daemon does not have", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     answers["/api/workspaces/w1/changes"] = () => json(500, { error: "git hiccup" });
     const allWorking = records().map((r) => (r.kind === "session" ? { ...r, body: { ...r.body, state: "working" as const } } : r));
-    await show(fleet(allWorking, settings()));
+    await show(fleet(allWorking, settings()), vi.fn(), {}, true);
     await waitFor(() => expect(within(card("far away")).getByText(/can.t be read from here/i)).toBeDefined());
     const twoMinutes = 120_000;
     await act(() => vi.advanceTimersByTimeAsync(twoMinutes + 100));
-    expect(readsOf("w1")).toBe(1 + Math.floor(twoMinutes / Math.max(BOARD_BUSY_EVERY, RETRY_EVERY)));
-    expect(readsOf("w3")).toBe(1);
+    expect(changesOf("w1")).toBe(1 + Math.floor(twoMinutes / Math.max(BOARD_BUSY_EVERY, RETRY_EVERY)));
+    expect(changesOf("w3")).toBe(1);
   });
 
   it("reads a card whose terminal changed state off screen when it comes back on screen, not before", async () => {
-    const { update } = await show(fleet(records("waiting_for_you"), settings()));
+    const { update } = await show(fleet(records("waiting_for_you"), settings()), vi.fn(), {}, true);
     await waitFor(() => expect(within(card("fix login")).getByText("+34")).toBeDefined());
-    const before = readsOf("w1");
+    const before = changesOf("w1");
     scroll("fix login", false);
     update(fleet(records("failed"), settings()));
     await act(async () => {});
-    expect(readsOf("w1")).toBe(before);
+    expect(changesOf("w1")).toBe(before);
     scroll("fix login", true);
-    await waitFor(() => expect(readsOf("w1")).toBe(before + 1));
+    await waitFor(() => expect(changesOf("w1")).toBe(before + 1));
   });
 
   it("stops reading a card's changes and shows none once its workspace is archiving or archived", async () => {
@@ -279,11 +324,11 @@ describe("Board", () => {
       }),
     );
     // Mid-archive, a read sees the worktree's files go: every file deleted.
-    const { client, update } = await show(fleet(records("waiting_for_you"), settings()));
+    const { client, update } = await show(fleet(records("waiting_for_you"), settings()), vi.fn(), {}, true);
     const login = card("fix login");
     await waitFor(() => expect(within(login).getByText("+34")).toBeDefined());
     answers["/api/workspaces/w1/changes"] = () => json(200, { base: "main", commits: [], files: [file("src/login.ts", 0, 24986)] } satisfies Changes);
-    const before = readsOf("w1");
+    const before = changesOf("w1");
 
     void client.getMutationCache().build(client, archiveOf("w1")).execute(true);
     await waitFor(() => expect(within(login).getByText(/archiving/i)).toBeDefined());
@@ -297,7 +342,8 @@ describe("Board", () => {
     await act(async () => {});
     update(fleet(records("failed"), settings()));
     await act(async () => {});
-    expect(readsOf("w1") - before).toBe(1); // the archive itself
+    expect(changesOf("w1") - before).toBe(0);
+    expect(reads.filter((u) => u === "/api/workspaces/w1/archive")).toHaveLength(1);
     expect(within(card("fix login")).queryByText(/24986/)).toBeNull();
     expect(within(card("fix login")).getByText(/archiving/i)).toBeDefined();
   });
@@ -313,6 +359,92 @@ describe("Board", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Board" }));
     expect(screen.getByRole("region", { name: "Working" })).toBeDefined();
     expect(localStorage.getItem("foundry.home")).toBe("board");
+  });
+});
+
+describe("As a list", () => {
+  const asList = () => fireEvent.click(within(screen.getByRole("group", { name: "Show workspaces as" })).getByRole("button", { name: "List" }));
+
+  it("shows each workspace as one line in the same lanes, and keeps the choice for next time", async () => {
+    await show(fleet(records(), settings()));
+    asList();
+    const needs = screen.getByRole("region", { name: "Needs you" });
+    const line = within(needs).getByRole("article", { name: "tidy readme" });
+    expect(within(line).getByRole("link", { name: "tidy readme" }).getAttribute("href")).toBe("/terminals/t3");
+    expect(within(line).getByText("Needs you")).toBeDefined();
+    expect(within(screen.getByRole("region", { name: "Working" })).getByRole("article", { name: "fix login" })).toBeDefined();
+    expect(within(screen.getByRole("group", { name: "Show workspaces as" })).getByRole("button", { name: "List" }).getAttribute("aria-pressed")).toBe("true");
+    expect(localStorage.getItem("foundry.layout")).toBe("list");
+    // The switch is drawn as Group by's is: the shared button with its pressed look.
+    for (const each of within(screen.getByRole("group", { name: "Show workspaces as" })).getAllByRole("button")) {
+      expect(`${buttonShape} ${pressed}`.split(" ").filter((c) => !each.classList.contains(c))).toEqual([]);
+    }
+    // A line is one row: no list of its terminals under it.
+    expect(within(card("fix login")).queryByRole("list")).toBeNull();
+  });
+
+  it("marks each line with its project's face, as a card is", async () => {
+    await show(fleet(records(), settings()));
+    asList();
+    expect(within(card("fix login")).getByTitle("demo").textContent).toBe("DE");
+  });
+
+  it("opens each terminal from its glyph and the changes from the line's count", async () => {
+    const onChanges = vi.fn();
+    const { router } = await show(fleet(records(), settings()), onChanges);
+    asList();
+    const login = card("fix login");
+    fireEvent.click(within(login).getByRole("link", { name: "shell Open" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    await waitFor(() => expect(within(login).getByText("+34")).toBeDefined());
+    expect(within(login).getByText("−5")).toBeDefined();
+    expect(within(login).getByText("1 uncommitted")).toBeDefined();
+    fireEvent.click(within(login).getByRole("button", { name: "Changes in fix login" }));
+    expect(onChanges).toHaveBeenCalledWith("w1");
+    await waitFor(() => expect(within(card("tidy readme")).getByText("No changes")).toBeDefined());
+  });
+
+  it("keeps a line's glyphs to three, and with more shows two and how many others", async () => {
+    await show(fleet([...records(), terminal(ME, "t5", "w1"), terminal(ME, "t6", "w1")], settings()));
+    asList();
+    const login = card("fix login");
+    expect(within(login).getAllByRole("link", { name: /Open|Working/ })).toHaveLength(2);
+    expect(within(login).getByText("+2")).toBeDefined();
+    expect(within(card("tidy readme")).queryByText(/^\+\d$/)).toBeNull();
+  });
+
+  it("says on the line what its first terminal is doing: the question, the tool, or the first line Claude said", async () => {
+    const briefs = {
+      s1: { title: null, now: { kind: "tool" as const, text: "Edit src/login.ts" }, said: undefined },
+      s3: { title: null, now: { kind: "ask" as const, text: "May I run the migration?" } },
+      s4: { title: null, now: null, said: "Fixed the login check.\nAll tests pass." },
+    };
+    await show(fleet(records(), settings(), briefs));
+    asList();
+    expect(within(card("fix login")).getByText("Edit src/login.ts")).toBeDefined();
+    expect(within(card("tidy readme")).getByText("May I run the migration?")).toBeDefined();
+    const said = within(card("far away")).getByText("Fixed the login check.");
+    expect(said.getAttribute("title")).toBe("Fixed the login check.\nAll tests pass.");
+  });
+
+  it("reads a line's changes only once it is on screen, as a card does", async () => {
+    startOnScreen = false;
+    localStorage.setItem("foundry.layout", "list");
+    await show(fleet(records(), settings()));
+    await act(async () => {});
+    expect(reads).toEqual([]);
+    scroll("fix login", true);
+    await waitFor(() => expect(within(card("fix login")).getByText("+34")).toBeDefined());
+    expect(readsOf("w2")).toBe(0);
+  });
+
+  it("opens as a list for a browser that kept it, and goes back to cards", async () => {
+    localStorage.setItem("foundry.layout", "list");
+    await show(fleet(records(), settings()));
+    expect(within(card("fix login")).queryByText("Open")).toBeNull();
+    fireEvent.click(within(screen.getByRole("group", { name: "Show workspaces as" })).getByRole("button", { name: "Cards" }));
+    expect(within(card("fix login")).getByText("Open")).toBeDefined();
+    expect(localStorage.getItem("foundry.layout")).toBe("cards");
   });
 });
 
@@ -422,13 +554,25 @@ describe("Grouped by shipping", () => {
     await show(fleet(fleetOf(), listed()), vi.fn(), {}, true);
     const far = card("far off");
     const button = await within(far).findByRole("button", { name: "Archive far off" });
-    // Its card asks this machine's daemon, which does not have it; the dialog asks nothing.
-    await waitFor(() => expect(readsOf("w6")).toBe(1));
+    // This machine's daemon does not have it: neither its card nor the dialog asks.
+    await waitFor(() => expect(within(card("draft login")).getByRole("button", { name: "Changes in draft login" })).toBeDefined());
+    expect(within(far).queryByRole("button", { name: "Changes in far off" })).toBeNull();
     fireEvent.click(button);
     const dialog = await screen.findByRole("dialog", { name: "Archive far off?" });
     expect(within(dialog).getByRole("region", { name: "Kept on far-off" }).textContent).toContain("laptop lists any work that would be lost");
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(readsOf("w6")).toBe(1);
+    expect(readsOf("w6")).toBe(0);
+  });
+
+  it("says on the card of a workspace on another machine that it is archiving while its archive runs", async () => {
+    answers["/api/workspaces/w6/archive"] = () => new Promise<Response>(() => {});
+    const { client } = await show(fleet(fleetOf(), listed()), vi.fn(), {}, true);
+    await waitFor(() => expect(within(card("draft login")).getByRole("button", { name: "Changes in draft login" })).toBeDefined());
+    expect(within(card("far off")).queryByText(/archiving/i)).toBeNull();
+
+    void client.getMutationCache().build(client, archiveOf("w6")).execute(false);
+    await waitFor(() => expect(within(card("far off")).getByText("Archiving…")).toBeDefined());
+    expect(readsOf("w6")).toBe(1); // the archive itself
   });
 
   it("moves a card to its new lane when one of its terminals changes state, and lights it up once there", async () => {
@@ -572,5 +716,61 @@ describe("The task bar", () => {
     fireEvent.keyDown(bar(), { key: "Enter", metaKey: true });
     await act(async () => {});
     expect(posts).toEqual([]);
+  });
+});
+
+/** Project p1's believed status: run 162 builds in w1, run 170 is held up in w2. */
+describe("Board and the factory", () => {
+  const factoryRecords = (): AnyRecord[] => [
+    sample(ME, 1),
+    workspace(ME, "w1", "fac 162"),
+    terminal(ME, "t1", "w1"),
+    session(ME, "s1", "w1", "t1", "stuck"),
+    workspace(ME, "w2", "fac 170"),
+    terminal(ME, "t2", "w2"),
+    session(ME, "s2", "w2", "t2", "finished"),
+    onCommit(ME, "w3", "far away"),
+  ];
+  beforeEach(() => {
+    answers["/api/workspaces/w1/changes"] = () => json(200, { base: "main", commits: [], files: [] } satisfies Changes);
+  });
+
+  it("marks a factory run's card and links it to its issue", async () => {
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses()));
+    const mark = within(card("fac 162")).getByRole("link", { name: "factory #162" });
+    expect(mark.getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");
+    expect(within(card("far away")).queryByRole("link", { name: /^factory/ })).toBeNull();
+  });
+
+  it("marks a run whose id names no issue as plain text, with no link", async () => {
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatus("p1", { "not-a-run": ["w1"] })));
+    const run = card("fac 162");
+    expect(within(run).getByText("factory").tagName).toBe("SPAN");
+    expect(within(run).queryByRole("link", { name: /^factory/ })).toBeNull();
+  });
+
+  it("keeps a factory session P1 marks stuck under working, quiet 10+ min, and a held-up run's card under needs you", async () => {
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses()));
+    const working = screen.getByRole("region", { name: "Working" });
+    expect(within(within(working).getByRole("article", { name: "fac 162" })).getByText("Quiet 10+ min")).toBeDefined();
+    expect(within(screen.getByRole("region", { name: "Needs you" })).getByRole("article", { name: "fac 170" })).toBeDefined();
+  });
+
+  it("moves a needs-info run's card under needs you too", async () => {
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses("needs_info")));
+    expect(within(screen.getByRole("region", { name: "Needs you" })).getByRole("article", { name: "fac 170" })).toBeDefined();
+  });
+
+  it("marks a factory run's line and shows a commit's line by its commit in the list too", async () => {
+    localStorage.setItem("foundry.layout", "list");
+    await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses()));
+    expect(within(card("fac 162")).getByRole("link", { name: "factory #162" }).getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");
+    expect(within(card("far away")).queryByRole("link", { name: /^factory/ })).toBeNull();
+    expect(within(card("far away")).getByText("demo · fedcba9")).toBeDefined();
+  });
+
+  it("shows a workspace with no branch by its commit", async () => {
+    await show(fleet(factoryRecords(), settings()));
+    expect(within(card("far away")).getByText("demo · fedcba9")).toBeDefined();
   });
 });

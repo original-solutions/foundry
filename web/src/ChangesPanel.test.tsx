@@ -2,7 +2,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Changes } from "./api";
-import { ChangesPanel } from "./ChangesPanel";
+import { CHANGES_EVERY, ChangesPanel } from "./ChangesPanel";
 import { loadViewed, saveViewed, seen } from "./review";
 import { expectFieldLook, FakeSocket, json, mockFetch, renderApp } from "./test-utils";
 
@@ -65,6 +65,18 @@ describe("ChangesPanel", () => {
     expect(within(panel).getByRole("region", { name: "docs/notes.md" }).textContent).toMatch(/new/i);
   });
 
+  it("colours a diff as code in the file's language, and marks the words a changed line changed", async () => {
+    const { panel } = await opened(json(200, changes));
+    const file = await within(panel).findByRole("region", { name: "src/login.ts" });
+    const removed = within(file).getByRole("row", { name: /^removed/ });
+    const added = within(file).getAllByRole("row", { name: /^added/ });
+    expect([...removed.querySelectorAll("[data-tone=keyword]")].map((e) => e.textContent)).toEqual(["const"]);
+    expect([...removed.querySelectorAll("mark")].map((e) => e.textContent)).toEqual(["2"]);
+    expect([...added[0].querySelectorAll("mark")].map((e) => e.textContent)).toEqual(["3"]);
+    expect(added[1].querySelector("mark")).toBeNull();
+    expect(added[1].querySelector("[data-tone=number]")?.textContent).toBe("4");
+  });
+
   it("folds a file away and back", async () => {
     const { panel } = await opened(json(200, changes));
     const file = await within(panel).findByRole("region", { name: "src/login.ts" });
@@ -84,6 +96,24 @@ describe("ChangesPanel", () => {
     const { panel } = await opened(json(404, { error: "workspace w1 is not a live workspace of this machine" }));
     const alert = await within(panel).findByRole("alert");
     expect(alert.textContent).toBe("Could not read the changes: workspace w1 is not a live workspace of this machine.");
+  });
+
+  it("reads the changes again every few seconds while open, and stops once the daemon answers 404", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const gone = await opened(json(200, changes), json(200, changes), json(404, { error: "workspace w1 not found" }));
+      const reads = () => gone.calls.filter((c) => c.url.endsWith("/changes")).length;
+      await waitFor(() => expect(gone.panel.textContent).toContain("+3"));
+      await act(() => vi.advanceTimersByTimeAsync(CHANGES_EVERY));
+      expect(reads()).toBe(2);
+      await act(() => vi.advanceTimersByTimeAsync(CHANGES_EVERY));
+      expect(reads()).toBe(3);
+      await within(gone.panel).findByRole("alert");
+      await act(() => vi.advanceTimersByTimeAsync(CHANGES_EVERY * 5));
+      expect(reads()).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("marks a file viewed: it folds, the count moves on, and this browser keeps it", async () => {
@@ -206,6 +236,13 @@ describe("ChangesPanel", () => {
     });
   });
 
+  it("names a workspace on a commit by its commit, as the board does", async () => {
+    mockFetch(json(200, changes));
+    await renderApp(<ChangesPanel workspace={{ ...target, branch: "", base: "fedcba9876543210fedcba9876543210fedcba98" }} onClose={() => {}} />);
+    const panel = await screen.findByRole("dialog", { name: /changes in fix login/i });
+    expect(within(panel).getByText("fedcba9")).toBeDefined();
+  });
+
   describe("comments for Claude", () => {
     const sessions = [
       { id: "s1", model: "opus", name: "opus 1", state: "idle" as const, terminal: "t1" },
@@ -307,6 +344,19 @@ describe("ChangesPanel", () => {
       act(() => FakeSocket.last().end(1011, "terminal gone"));
       await waitFor(() => expect(within(panel).getByRole("alert").textContent).toContain("Could not reach opus 1"));
       expect(within(file).getByRole("row", { name: "Comment on line 6" }).textContent).toContain("call it total");
+    });
+
+    it("says a live factory run's stuck session is quiet, as the board does", async () => {
+      FakeSocket.install();
+      mockFetch(json(200, changes), json(200, changes));
+      const quiet = [{ ...sessions[1], name: "opus", state: "stuck" as const }];
+      await renderApp(<ChangesPanel workspace={{ ...target, sessions: quiet, factory: { run: "o__r__162__1" } }} onClose={() => {}} />);
+      const panel = await screen.findByRole("dialog", { name: /changes in fix login/i });
+      const file = await within(panel).findByRole("region", { name: "src/login.ts" });
+      fireEvent.click(within(file).getByRole("button", { name: "Comment on line 6" }));
+      fireEvent.change(within(file).getByRole("textbox", { name: "Comment on line 6" }), { target: { value: "x" } });
+      fireEvent.keyDown(within(file).getByRole("textbox", { name: "Comment on line 6" }), { key: "Enter", metaKey: true });
+      expect(panel.textContent).toContain("opus is quiet 10+ min");
     });
 
     it("sends nothing while no session is idle, and says why", async () => {

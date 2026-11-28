@@ -2,9 +2,14 @@
 //! runs, so no handler knows about other machines.
 //!
 //! - `POST /api/workspaces` whose `machine` names another machine.
-//! - `POST /api/workspaces/{id}/sessions`, `/shells` and `/archive` for a workspace another
-//!   machine owns.
+//! - `POST /api/workspaces/{id}/sessions`, `/shells`, `/archive` and `/pr` for a workspace
+//!   another machine owns. An owner on a build from before `/pr` was carried answers it `400`,
+//!   as it answers any route it does not carry.
 //! - `POST /api/terminals/{id}/close` for a terminal another machine owns.
+//! - `POST /api/sessions/{id}/rename` for a session another machine owns.
+//! - `POST /api/machines/{id}/update` for another machine: it installs that machine's ready
+//!   release ([`super::machine_update`]), and goes only on a link that speaks
+//!   [`UPDATES_SINCE`](foundry_proto::messages::UPDATES_SINCE) or later.
 //!
 //! Each goes to its owner over [`Peers::call`](crate::sync::Peers::call), its body passed as
 //! bytes, and the owner's status and body come back unchanged. A call for a machine not in the
@@ -49,6 +54,9 @@ enum Target {
     Create,
     Workspace(WorkspaceId),
     Terminal(TerminalId),
+    Session(SessionId),
+    /// A machine's install, which runs on the machine it names.
+    Machine(MachineId),
     /// A factory worker route, which only a run carries.
     Worker(Worker),
     /// A Factory view route whose handler carries it: a stop, to the lease holder, and a
@@ -104,10 +112,12 @@ fn target(path: &str) -> Option<Target> {
     let parts: Vec<&str> = path.strip_prefix("/api/")?.split('/').collect();
     match parts.as_slice() {
         ["workspaces"] => Some(Target::Create),
-        ["workspaces", id, "sessions" | "shells" | "archive"] => {
+        ["workspaces", id, "sessions" | "shells" | "archive" | "pr"] => {
             Some(Target::Workspace(WorkspaceId(id.parse().ok()?)))
         }
         ["terminals", id, "close"] => Some(Target::Terminal(TerminalId(id.parse().ok()?))),
+        ["sessions", id, "rename"] => Some(Target::Session(SessionId(id.parse().ok()?))),
+        ["machines", id, "update"] => Some(Target::Machine(MachineId(id.parse().ok()?))),
         ["factory", "workspaces"] => Some(Target::Worker(Worker::Create)),
         ["workspaces", id, "factory", "session"] => {
             Some(Target::Worker(Worker::Start(WorkspaceId(id.parse().ok()?))))
@@ -275,6 +285,11 @@ async fn owner(api: &Api, target: Target, body: &Bytes) -> Result<Option<Machine
             .filter(|record| !record.deleted && record.owner != me)
             .map(|record| record.owner)),
         Target::Terminal(id) => Ok(api.peers.owner_of(id).await?),
+        Target::Session(id) => Ok(on_store(&api.store, move |store| store.session(id))
+            .await?
+            .filter(|record| !record.deleted && record.owner != me)
+            .map(|record| record.owner)),
+        Target::Machine(id) => Ok(Some(id).filter(|id| *id != me)),
         // Never carried by this layer: a run's call finds its owner with `worker_owner`, and
         // a Factory view route's handler carries it itself.
         Target::Worker(_) | Target::View => Ok(None),
@@ -343,12 +358,14 @@ mod tests {
     fn only_the_carried_routes_have_a_target() {
         let id = uuid::Uuid::new_v4();
         assert!(matches!(target("/api/workspaces"), Some(Target::Create)));
-        for action in ["sessions", "shells", "archive"] {
+        for action in ["sessions", "shells", "archive", "pr"] {
             let path = format!("/api/workspaces/{id}/{action}");
             assert!(matches!(target(&path), Some(Target::Workspace(w)) if w.0 == id));
         }
         let path = format!("/api/terminals/{id}/close");
         assert!(matches!(target(&path), Some(Target::Terminal(t)) if t.0 == id));
+        let path = format!("/api/sessions/{id}/rename");
+        assert!(matches!(target(&path), Some(Target::Session(s)) if s.0 == id));
         let at = |path: String| worker(&path);
         assert_eq!(worker("/api/factory/workspaces"), Some(Worker::Create));
         let (w, s, t) = (WorkspaceId(id), SessionId(id), TerminalId(id));
@@ -378,9 +395,29 @@ mod tests {
             format!("/api/sessions/{id}/trail"),
             format!("/api/sessions/{id}/factory"),
             "/api/sessions/not-an-id/factory/turn".to_owned(),
+            "/api/sessions/not-an-id/rename".to_owned(),
+            format!("/api/sessions/{id}/rename/more"),
             format!("/api/terminals/{id}/tail/more"),
         ] {
             assert!(target(&other).is_none(), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_machines_install_is_carried_to_the_machine_it_names() {
+        let id = uuid::Uuid::new_v4();
+        let path = format!("/api/machines/{id}/update");
+        assert!(carries(&path));
+        assert!(matches!(target(&path), Some(Target::Machine(m)) if m.0 == id));
+        assert!(worker(&path).is_none());
+        for other in [
+            "/api/machines/not-an-id/update".to_owned(),
+            format!("/api/machines/{id}/remove"),
+            format!("/api/machines/{id}/limits"),
+            format!("/api/machines/{id}/update/more"),
+            "/api/machines/update".to_owned(),
+        ] {
+            assert!(!carries(&other), "{other}");
         }
     }
 
@@ -400,7 +437,9 @@ mod tests {
             format!("/api/workspaces/{id}/sessions"),
             format!("/api/workspaces/{id}/shells"),
             format!("/api/workspaces/{id}/archive"),
+            format!("/api/workspaces/{id}/pr"),
             format!("/api/terminals/{id}/close"),
+            format!("/api/sessions/{id}/rename"),
         ] {
             assert!(carries(&path), "{path}");
             assert!(worker(&path).is_none(), "{path}");

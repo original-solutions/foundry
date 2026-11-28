@@ -894,12 +894,9 @@ impl ReadLog {
     /// Whether the feedback is to be read now. A read of another generation (a takeover), or of
     /// a clock reading above this one (a clock that was reset), leaves it due, never later.
     fn due(&self, generation: u64, now: u64, seconds: u64) -> bool {
-        match self.last {
-            Some((from, at)) if from == generation && now >= at => {
-                now - at >= seconds.saturating_mul(1000)
-            }
-            _ => true,
-        }
+        super::time_waited(self.last, generation, now).is_none_or(|waited| {
+            waited >= std::time::Duration::from_millis(seconds.saturating_mul(1000))
+        })
     }
 }
 
@@ -4069,6 +4066,7 @@ mod tests {
                 terminal: TerminalId(uuid::Uuid::from_u128(0x5e6)),
                 model: "opus".into(),
                 state,
+                name: None,
             },
         }
     }
@@ -5239,6 +5237,7 @@ mod tests {
                     terminal: TerminalId(uuid::Uuid::from_u128(0x5e6)),
                     model: "opus".into(),
                     state,
+                    name: None,
                 },
             });
         if let Some((turn, prompts)) = turn {
@@ -6164,6 +6163,7 @@ mod tests {
                         terminal: TerminalId(uuid::Uuid::from_u128(0x5e6)),
                         model: "opus".into(),
                         state: SessionState::Idle,
+                        name: None,
                     },
                 })
                 .turn(foundry_proto::factory::SessionTurn {

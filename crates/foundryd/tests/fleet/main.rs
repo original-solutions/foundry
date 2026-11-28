@@ -10,10 +10,13 @@ mod factory;
 mod join;
 mod relay;
 mod sync;
+mod update;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -331,6 +334,120 @@ async fn forward(
     }
 }
 
+/// Names the one test a child process of this test binary runs ([`run_child`]).
+const CHILD: &str = "FOUNDRY_FLEET_CHILD_TEST";
+
+/// How long a whole test may run in its child process.
+const CHILD_WAIT: Duration = Duration::from_secs(300);
+
+/// The test `name` of the module whose `module_path!()` is `module`, as this binary names it.
+fn test_path(module: &str, name: &str) -> String {
+    let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+    format!("{module}::{name}")
+}
+
+/// Whether this process is a child of this test binary started to run one test
+/// ([`run_child`]).
+pub fn in_child() -> bool {
+    std::env::var_os(CHILD).is_some()
+}
+
+/// Runs `test` on the runtime `runtime` builds, when this process is the child process started
+/// for the test `name` of `module` (its `module_path!()`), and answers whether it ran it.
+pub fn ran_in_child<F, Fut>(
+    module: &str,
+    name: &str,
+    mut runtime: tokio::runtime::Builder,
+    test: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    if std::env::var(CHILD).ok() != Some(test_path(module, name)) {
+        return false;
+    }
+    let runtime = runtime.enable_all().build().unwrap();
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(test());
+    }));
+    // A pass on a blocking thread may wait on the runtime: dropping it would wait for ever.
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    if let Err(panic) = ran {
+        std::panic::resume_unwind(panic);
+    }
+    true
+}
+
+/// Runs the test `name` of `module` (its `module_path!()`) in a child process of this test
+/// binary, which must pass within [`CHILD_WAIT`]. The child's `HOME` is `home` and its global git
+/// config is `gitconfig`; it inherits no `GIT_CONFIG_SYSTEM`, `XDG_CONFIG_HOME` or GitHub token,
+/// and `configure` sets what else it needs. This process's own environment is left as it is.
+pub fn run_child(
+    module: &str,
+    name: &str,
+    home: &Path,
+    gitconfig: &Path,
+    configure: impl FnOnce(&mut Command),
+) {
+    let full = test_path(module, name);
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args([full.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, &full)
+        .env("HOME", home)
+        .env("GIT_CONFIG_GLOBAL", gitconfig)
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure(&mut child);
+    let out = wait_child(child.spawn().unwrap(), CHILD_WAIT);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "{full} failed in its child process ({:?})\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+        out.status
+    );
+}
+
+/// The output of `child`, which is killed once `limit` passes.
+fn wait_child(mut child: std::process::Child, limit: Duration) -> std::process::Output {
+    use std::io::Read as _;
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = stdout.read_to_end(&mut text);
+        text
+    });
+    let err = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = stderr.read_to_end(&mut text);
+        text
+    });
+    let end = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > end {
+            let _ = child.kill();
+            break child.wait().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    std::process::Output {
+        status,
+        stdout: out.join().unwrap(),
+        stderr: err.join().unwrap(),
+    }
+}
+
 pub fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -405,6 +522,7 @@ pub fn session(
                 terminal,
                 model: "claude-opus-5-5".into(),
                 state,
+                name: None,
             },
         })
     }

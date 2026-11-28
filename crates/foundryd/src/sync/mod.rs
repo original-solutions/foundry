@@ -163,6 +163,9 @@ struct Inner {
     /// The loopback address of the API a carried call is made to; none until
     /// [`Peers::serve_calls`].
     calls: Mutex<Option<SocketAddr>>,
+    /// What a carried call's answer that asks for a stop fires once it has left; none until
+    /// [`Peers::stop_after_calls`].
+    stop: Mutex<Option<call::Stop>>,
     /// The coordinator a record link hands settings and edits to; none until
     /// [`Peers::coordinate`]. Held weakly, as the coordinator holds these peers.
     coordinator: Mutex<Option<Weak<Coordinator>>>,
@@ -187,6 +190,7 @@ impl Peers {
                 listed_cache: Mutex::new(None),
                 terminals: Mutex::new(None),
                 calls: Mutex::new(None),
+                stop: Mutex::new(None),
                 coordinator: Mutex::new(None),
                 freshness: Mutex::new(None),
                 links: Mutex::new(BTreeMap::new()),

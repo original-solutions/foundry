@@ -1,21 +1,27 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
-import { Named, Now } from "./Now";
+import { Named } from "./Now";
 import { startShell } from "./api";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
-import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
+import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
+import { FactoryMark } from "./FactoryMark";
 import { MachineName } from "./Machines";
-import { glyphText, StateGlyph } from "./StateGlyph";
+import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
+import { SessionNameField, useRenaming } from "./SessionName";
 import { SparkIcon } from "./FirstPrompt";
 import { Mark } from "./Mark";
+import { ProjectFace } from "./ProjectFace";
 import { ThemeButton } from "./ThemeButton";
 import { railKey } from "./collapsed";
+import { pollEvery } from "./poll";
+import { CHECKS_EVERY, checksPending, SHIPPING_STALE, shippingQuery, standing, toneText, useReadOnChange } from "./Shipping";
+import { useOnScreen } from "./cardChanges";
 import type { MachineSample } from "./api";
 
 const statusColour = { online: "text-neutral-400", offline: "text-red-400", unknown: "text-neutral-400" };
@@ -134,16 +140,18 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
   };
   const tab = (id: string) => ({ tabIndex: id === stop ? 0 : -1, onFocus: () => setFocused(id) });
 
+  // The header sits above the list that scrolls, so a scrollbar takes its width from the list
+  // and the header always has the sidebar's full width for its buttons.
   return (
-    <nav id="sidebar" aria-label="Workspaces" onKeyDown={keys} className="flex h-full w-full shrink-0 flex-col gap-4 overflow-y-auto bg-neutral-900 p-3 text-sm text-neutral-100 md:w-80">
-      <div className="flex items-center justify-between gap-2">
-        <h1 className="text-lg font-semibold">
-          <Link to="/" onClick={onNavigate} title="The board" className="flex items-center gap-1.5 rounded">
-            <Mark className="size-3.5 text-emerald-400" />
-            Foundry
+    <nav id="sidebar" aria-label="Workspaces" onKeyDown={keys} className="flex h-full w-full shrink-0 flex-col bg-neutral-900 text-sm text-neutral-100 md:w-80">
+      <div className="flex shrink-0 items-center justify-between gap-2 px-3 pt-3">
+        <h1 className="min-w-0 text-lg font-semibold">
+          <Link to="/" onClick={onNavigate} title="The board" className="flex min-w-0 items-center gap-1.5 rounded">
+            <Mark className="size-3.5 shrink-0 text-emerald-400" />
+            <span className="truncate">Foundry</span>
           </Link>
         </h1>
-        <div className="flex items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-0.5">
           {onRail && (
             <button
               type="button"
@@ -175,86 +183,89 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
           )}
         </div>
       </div>
-      {machines.map((machine) => {
-        const ids = machine.workspaces.map((w) => w.id);
-        const allFolded = ids.length > 0 && ids.every((id) => !unfolded.has(id));
-        return (
-          <section key={machine.id} aria-label={machine.name} className="space-y-2">
-            <div className="px-1">
-              <div className="group/machine flex items-center gap-2">
-                <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${statusDot[machine.status]}`} />
-                <MachineName machine={machine} className="text-sm font-semibold">
-                  {(rename) => (
-                    <>
-                      <h2 className="min-w-0 truncate font-semibold">
-                        <Link
-                          to="/machines"
-                          onClick={onNavigate}
-                          title={`${machine.id}: its load, memory, disk and workspaces`}
-                          className="rounded hover:underline hover:decoration-neutral-600 hover:underline-offset-4"
-                        >
-                          {machine.name}
-                        </Link>
-                      </h2>
-                      {rename && (
-                        <Action
-                          label={`Rename ${machine.name}`}
-                          title="Rename"
-                          onClick={rename}
-                          className="shrink-0 pointer-fine:opacity-0 pointer-fine:group-hover/machine:opacity-100 pointer-fine:focus-visible:opacity-100"
-                        >
-                          <path d="M10.5 2.5l3 3L6 13H3v-3z" />
-                        </Action>
-                      )}
-                    </>
+      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-3 pt-4">
+        {machines.map((machine) => {
+          const ids = machine.workspaces.map((w) => w.id);
+          const allFolded = ids.length > 0 && ids.every((id) => !unfolded.has(id));
+          return (
+            <section key={machine.id} aria-label={machine.name} className="space-y-2">
+              <div className="px-1">
+                <div className="group/machine flex items-center gap-2">
+                  <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${statusDot[machine.status]}`} />
+                  <MachineName machine={machine} className="text-sm font-semibold">
+                    {(rename) => (
+                      <>
+                        <h2 className="min-w-0 truncate font-semibold">
+                          <Link
+                            to="/machines"
+                            onClick={onNavigate}
+                            title={`${machine.id}: its load, memory, disk and workspaces`}
+                            className="rounded hover:underline hover:decoration-neutral-600 hover:underline-offset-4"
+                          >
+                            {machine.name}
+                          </Link>
+                        </h2>
+                        {rename && (
+                          <Action
+                            label={`Rename ${machine.name}`}
+                            title="Rename"
+                            onClick={rename}
+                            className="shrink-0 pointer-fine:opacity-0 pointer-fine:group-hover/machine:opacity-100 pointer-fine:focus-visible:opacity-100"
+                          >
+                            <path d="M10.5 2.5l3 3L6 13H3v-3z" />
+                          </Action>
+                        )}
+                      </>
+                    )}
+                  </MachineName>
+                  <span className={`text-xs ${statusColour[machine.status]}`}>{machine.status}</span>
+                  {ids.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => fold(ids, !allFolded)}
+                      className="ml-auto shrink-0 rounded px-1 text-[11px] text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+                    >
+                      {allFolded ? "Unfold all" : "Fold all"}
+                    </button>
                   )}
-                </MachineName>
-                <span className={`text-xs ${statusColour[machine.status]}`}>{machine.status}</span>
-                {ids.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => fold(ids, !allFolded)}
-                    className="ml-auto shrink-0 rounded px-1 text-[11px] text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
-                  >
-                    {allFolded ? "Unfold all" : "Fold all"}
-                  </button>
-                )}
+                </div>
+                <div className="mt-1 flex items-start gap-2 text-xs text-neutral-400">
+                  {machine.sample && <LoadMeter sample={machine.sample} />}
+                  <span className="min-w-0" title={machineNumbers(machine.sample)}>
+                    {machineStats(machine.sample)}
+                  </span>
+                </div>
               </div>
-              <div className="mt-1 flex items-start gap-2 text-xs text-neutral-400">
-                {machine.sample && <LoadMeter sample={machine.sample} />}
-                <span className="min-w-0" title={machineNumbers(machine.sample)}>
-                  {machineStats(machine.sample)}
-                </span>
+              <div className="space-y-3">
+                {machine.workspaces.map((workspace) => (
+                  <Workspace
+                    key={workspace.id}
+                    workspace={workspace}
+                    folded={!unfolded.has(workspace.id)}
+                    readable={machine.status !== "offline"}
+                    onFold={(on) => fold([workspace.id], on)}
+                    selected={selected}
+                    onNavigate={onNavigate}
+                    onChanges={onChanges}
+                    tab={tab}
+                  />
+                ))}
               </div>
-            </div>
-            <div className="space-y-1">
-              {machine.workspaces.map((workspace) => (
-                <Workspace
-                  key={workspace.id}
-                  workspace={workspace}
-                  folded={!unfolded.has(workspace.id)}
-                  onFold={(on) => fold([workspace.id], on)}
-                  selected={selected}
-                  onNavigate={onNavigate}
-                  onChanges={onChanges}
-                  tab={tab}
-                />
-              ))}
-            </div>
-          </section>
-        );
-      })}
-      {onKeys && (
-        <button
-          type="button"
-          onClick={onKeys}
-          title="Every key Foundry answers"
-          className="mt-auto flex items-center gap-1.5 self-start rounded px-1 text-xs text-neutral-500 hover:text-neutral-200 pointer-coarse:hidden"
-        >
-          Keyboard
-          <kbd className="rounded border border-neutral-700 px-1 font-sans text-[11px] leading-4">?</kbd>
-        </button>
-      )}
+            </section>
+          );
+        })}
+        {onKeys && (
+          <button
+            type="button"
+            onClick={onKeys}
+            title="Every key Foundry answers"
+            className="mt-auto flex items-center gap-1.5 self-start rounded px-1 text-xs text-neutral-500 hover:text-neutral-200 pointer-coarse:hidden"
+          >
+            Keyboard
+            <kbd className="rounded border border-neutral-700 px-1 font-sans text-[11px] leading-4">?</kbd>
+          </button>
+        )}
+      </div>
     </nav>
   );
 }
@@ -280,6 +291,8 @@ function LoadMeter({ sample }: { sample: MachineSample }) {
 interface WorkspaceProps {
   workspace: WorkspaceView;
   folded: boolean;
+  /** Whether its machine may be asked where its work stands: any but an offline one. */
+  readable: boolean;
   onFold: (on: boolean) => void;
   selected?: string;
   onNavigate?: () => void;
@@ -288,38 +301,41 @@ interface WorkspaceProps {
   tab: (id: string) => { tabIndex: number; onFocus: () => void };
 }
 
-function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
+/**
+ * A workspace in two columns: its project's face, with a spine hanging from it in its most urgent
+ * terminal's fill (the board's card edge, so the two always match), and beside it everything else.
+ * The face sits in the fold button with the name, drawn over its own column, so they are one stop.
+ * Unfolded, it is two lines above its sessions: the name with its actions and factory mark, then
+ * the standing line ending in the branch.
+ */
+function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
   const terminals = useTerminalActions();
   const list = rows(workspace);
   const over = ended(workspace);
+  const lead = byUrgency(list)[0];
+  const branch = branchOf(workspace);
   return (
-    <div role="group" aria-label={workspace.name} className="group/ws">
-      <div className="flex items-center gap-2 rounded-md px-1 py-1 hover:bg-neutral-800/60">
-        <button
-          type="button"
-          aria-expanded={!folded}
-          onClick={() => onFold(!folded)}
-          data-stop={workspace.id}
-          data-workspace={workspace.id}
-          data-name={workspace.name}
-          {...tab(workspace.id)}
-          title={folded ? "Unfold" : "Fold"}
-          className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
-        >
-          <svg viewBox="0 0 16 16" aria-hidden="true" className={`size-3 shrink-0 text-neutral-500 transition-transform motion-reduce:transition-none ${folded ? "" : "rotate-90"}`} fill="currentColor">
-            <path d="M6 3.5l5 4.5-5 4.5z" />
-          </svg>
-          <span className="truncate font-medium">{workspace.name}</span>
-        </button>
-        {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
-      </div>
-      {!folded && (
-        <>
-          <div className="flex items-center gap-2 pl-6 pr-1">
-            <span className="min-w-0 flex-1 truncate text-xs text-neutral-500">
-              {workspace.branch} · {workspace.project}
-            </span>
+    <div role="group" aria-label={workspace.name} className="group/ws relative grid grid-cols-[1.25rem_minmax(0,1fr)] gap-x-2">
+      <span aria-hidden="true" data-spine="" className={`mx-auto mt-7 mb-[3px] w-0.5 rounded-full ${lead ? glyphFill[lead.glyph] : "bg-neutral-800"}`} />
+      <div className="min-w-0">
+        {/* At least a 24px action tall, so the actions showing on hover do not move the list. */}
+        <div className="flex min-h-7 items-center gap-2 rounded-md py-0.5 pr-1 pl-2 hover:bg-neutral-800/60">
+          <button
+            type="button"
+            aria-expanded={!folded}
+            onClick={() => onFold(!folded)}
+            data-stop={workspace.id}
+            data-workspace={workspace.id}
+            data-name={workspace.name}
+            {...tab(workspace.id)}
+            title={folded ? "Unfold" : "Fold"}
+            className="flex min-w-0 flex-1 items-center text-left"
+          >
+            <ProjectFace project={workspace.project} className="absolute top-1 left-0 size-5 text-[10px]" />
+            <span className="truncate font-medium">{workspace.name}</span>
+          </button>
+          {!folded && (
             <div className="flex shrink-0 items-center gap-0.5 pointer-fine:hidden pointer-fine:group-focus-within/ws:flex pointer-fine:group-hover/ws:flex">
               {onChanges && (
                 <Action label="Changes" title={words.changes} onClick={() => onChanges(workspace.id)}>
@@ -345,22 +361,88 @@ function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges,
                 </Action>
               )}
             </div>
-          </div>
-          {shell.error && (
-            <p role="alert" className="pl-6 text-xs text-red-400">
-              {couldNot("start a shell", shell.error)}
-            </p>
           )}
-          {list.length > 0 && (
-            <ul className="ml-[11px] mt-0.5 border-l border-neutral-800 pl-1.5">
-              {list.map((row) => (
-                <Item key={row.terminal} row={row} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />
-              ))}
-            </ul>
+          {workspace.factory && <FactoryMark run={workspace.factory} compact />}
+          {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
+        </div>
+        <StandingLine workspace={workspace} list={list} readable={readable} branch={folded || branch === workspace.name ? undefined : branch} />
+        {!folded && (
+          <>
+            {shell.error && (
+              <p role="alert" className="pl-2 text-xs text-red-400">
+                {couldNot("start a shell", shell.error)}
+              </p>
+            )}
+            {list.length > 0 && (
+              <ul className="mt-0.5">
+                {list.map((row) => (
+                  <Item key={row.terminal} row={row} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The line under a workspace's name: its project, then where its work stands (`standing`) in its
+ * tone, the pull request linked to GitHub. Read through the cache entry the board shares, once the
+ * row is on screen, again when one of its terminals changes glyph (a turn that ends may have pushed
+ * or opened a pull request), and every `CHECKS_EVERY` only while its pull request's checks run;
+ * never on window focus or reconnect, since each read runs git and asks GitHub on the owner. Not
+ * read while `readable` is off (its machine is offline). A read that fails or has not answered
+ * leaves the project alone, and says nothing of why. `branch`, when given, ends the line.
+ */
+function StandingLine({ workspace, list, readable, branch }: { workspace: WorkspaceView; list: Row[]; readable: boolean; branch?: string }) {
+  const [ref, onScreen] = useOnScreen<HTMLParagraphElement>();
+  const enabled = readable && onScreen;
+  const { data, isError } = useQuery({
+    ...shippingQuery(workspace.id),
+    enabled,
+    staleTime: SHIPPING_STALE,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    refetchInterval: (query) => pollEvery(CHECKS_EVERY, enabled && checksPending(query.state.data))(query),
+  });
+  // The row reads on a glyph change as a board card does (#311); the hook reads once when both do.
+  useReadOnChange(workspace.id, list.map((r) => `${r.terminal}:${r.glyph}`).join(" "));
+
+  const working = list.some((r) => r.glyph === "starting" || r.glyph === "working");
+  const stands = readable && data && !isError ? standing(data, working) : undefined;
+  const title = [workspace.project, stands?.text, branch].filter((part) => part !== undefined).join(" · ");
+  return (
+    <p ref={ref} title={title} className="truncate pr-1 pl-2 text-xs text-neutral-500">
+      <span>{workspace.project}</span>
+      {stands && (
+        <>
+          <span className="text-neutral-600"> · </span>
+          {stands.pr ? (
+            <a
+              href={stands.pr.url}
+              target="_blank"
+              rel="noreferrer"
+              title={`${stands.pr.title} (open on GitHub)`}
+              tabIndex={-1}
+              className={`rounded hover:underline hover:underline-offset-4 ${toneText[stands.tone]}`}
+            >
+              {stands.text}
+            </a>
+          ) : (
+            <span className={toneText[stands.tone]}>{stands.text}</span>
           )}
         </>
       )}
-    </div>
+      {branch !== undefined && (
+        <>
+          <span className="text-neutral-600"> · </span>
+          <span className="font-mono text-[11px]">{branch}</span>
+        </>
+      )}
+    </p>
   );
 }
 
@@ -418,9 +500,18 @@ function Action({ label, title, onClick, disabled, className = "", children }: {
 function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspace: string; selected?: string; onNavigate?: () => void; tab: WorkspaceProps["tab"] }) {
   const current = row.terminal === selected;
   const ended = row.glyph === "done" || row.glyph === "away";
+  const naming = useRenaming(row.terminal, "row");
+  if (naming?.editing && row.session) {
+    return (
+      <li className="flex items-center gap-2 rounded bg-neutral-800 px-2 py-1 md:py-0.5">
+        <StateGlyph glyph={row.glyph} />
+        <SessionNameField session={row.session} name={row.title ?? ""} onClose={naming.stop} className="text-sm" />
+      </li>
+    );
+  }
   return (
     <li>
-      <TerminalMenu id={row.terminal}>
+      <TerminalMenu id={row.terminal} place="row">
         <Link
           to="/terminals/$terminalId"
           params={{ terminalId: row.terminal }}
@@ -430,17 +521,15 @@ function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspa
           data-workspace={workspace}
           data-name={row.title ? `${row.name} ${row.title}` : row.name}
           {...tab(row.terminal)}
+          onDoubleClick={row.session ? naming?.start : undefined}
           title={row.title ? `${row.name}: ${row.title}` : undefined}
-          className={`flex items-start gap-2 rounded px-2 py-1.5 hover:bg-neutral-800 md:py-1 ${current ? "bg-neutral-800 text-neutral-50" : ended ? "text-neutral-500" : ""}`}
+          className={`flex items-center gap-2 rounded px-2 py-1.5 hover:bg-neutral-800 md:py-1 ${current ? "bg-neutral-800 text-neutral-50" : ended ? "text-neutral-500" : ""}`}
         >
-          <span className="flex h-5 shrink-0 items-center">
-            <StateGlyph glyph={row.glyph} />
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="flex items-baseline gap-2 leading-5">
-              <Named name={row.name} title={row.title} /> <span className={`shrink-0 text-xs ${ended ? "" : glyphText[row.glyph]}`}>{row.label}</span>
-            </span>
-            {row.now && <Now step={row.now} />}
+          <StateGlyph glyph={row.glyph} />
+          <span className="flex min-w-0 flex-1 items-baseline gap-2 leading-5">
+            {/* Busy: the step takes the title's place on the line; the title stays for screen readers and the tooltip. */}
+            <Named name={row.name} title={row.title} step={row.now} />{" "}
+            <span className={`shrink-0 text-xs ${ended ? "" : glyphText[row.glyph]}`}>{row.label}</span>
           </span>
         </Link>
       </TerminalMenu>

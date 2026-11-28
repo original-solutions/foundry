@@ -30,8 +30,8 @@ pub use fake::FakeTracker;
 pub use gh::{Answer, Gh};
 pub use read::{
     Activity, Blocker, BodyEdit, CheckState, CheckStatus, Comment, DropReason, Dropped, Feedback,
-    FeedbackKind, InlineComment, IssueDetail, IssueSummary, Listing, Mergeable, OpenPullRequest,
-    PullRequest,
+    FeedbackKind, InlineComment, IssueDetail, IssueLabels, IssueSummary, Listing, Mergeable,
+    OpenPullRequest, PullRequest,
 };
 pub use write::{
     Claim, IssueComment, MARKER, STATUS_MARKER, claim_comment, claim_marker, newest_claim,
@@ -136,6 +136,16 @@ pub trait Tracker: Send + Sync {
         read::issue(self, repo, number)
     }
 
+    /// The labels and open or closed state of each issue numbered, read 100 to a call; a number
+    /// GitHub has no issue for is not in the answer.
+    fn issue_labels(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+    ) -> Result<std::collections::BTreeMap<u64, IssueLabels>, TrackerError> {
+        read::issue_labels(self, repo, numbers)
+    }
+
     /// Whether an instructor applied the `factory:ready` label in force and every edit since
     /// was an instructor's.
     fn approval(
@@ -145,6 +155,19 @@ pub trait Tracker: Send + Sync {
         instructors: &[String],
     ) -> Result<Approval, TrackerError> {
         read::approval(self, repo, issue, instructors)
+    }
+
+    /// The approval a takeover's claim was made on: who applied the `factory:ready` label the
+    /// claim of `project_login` took off (or the label still on), if an instructor did and every
+    /// edit since was an instructor's. One read of the history.
+    fn claimed_approval(
+        &self,
+        repo: &str,
+        issue: u64,
+        project_login: &str,
+        instructors: &[String],
+    ) -> Result<Approval, TrackerError> {
+        read::claimed_approval(self, repo, issue, project_login, instructors)
     }
 
     /// Whether the issue text is as an instructor left it at `since`.

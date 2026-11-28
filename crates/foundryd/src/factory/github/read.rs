@@ -4,7 +4,7 @@
 //! fake are read alike. Ported from the reading half of the runner's `src/tracker/github.ts`,
 //! and from `src/tracker/approvalHistory.ts`, the pure half of the approval rule.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::de::DeserializeOwned;
 
@@ -180,6 +180,16 @@ pub struct IssueDetail {
     pub closed: bool,
 }
 
+/// One issue as [`issue_labels`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueLabels {
+    pub number: u64,
+    /// The label names.
+    pub labels: Vec<String>,
+    /// GitHub has the issue closed.
+    pub closed: bool,
+}
+
 /// An open issue that blocks another one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Blocker {
@@ -283,6 +293,29 @@ struct RawIssueSummary {
 enum IssueState {
     Open,
     Closed,
+}
+
+/// The answer to [`issue_labels`]'s query: each alias with the issue it found, or null.
+#[derive(serde::Deserialize)]
+struct RawLabelledAnswer {
+    data: HashMap<String, Option<RawLabelled>>,
+}
+
+/// An issue the batched read found. GitHub answers an empty object for a number it has as
+/// something other than an issue, so every field may be missing.
+#[derive(serde::Deserialize)]
+struct RawLabelled {
+    #[serde(default)]
+    number: Option<u64>,
+    #[serde(default)]
+    state: Option<IssueState>,
+    #[serde(default)]
+    labels: Option<RawLabelNodes>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawLabelNodes {
+    nodes: Vec<RawLabel>,
 }
 
 #[derive(serde::Deserialize)]
@@ -557,6 +590,107 @@ pub fn issue<G: Tracker + ?Sized>(
         closed: raw.state == IssueState::Closed,
         labels,
     })
+}
+
+/// The fragment [`issue_labels`] reads each issue by. GitHub puts at most 100 labels on an
+/// issue, so one page holds them all.
+const LABELLED_FRAGMENT: &str =
+    "fragment Labelled on Issue { number state labels(first: 100) { nodes { name } } }";
+
+/// How many issues one [`issue_labels`] call reads, so a query stays well inside the argument
+/// size and GitHub's limits however many numbers are asked for.
+const LABELLED_PER_CALL: usize = 100;
+
+/// The labels and open or closed state of each issue numbered, read 100 to a GraphQL call
+/// (one call up to 100 numbers, none for no number); any failed call fails the read. A number
+/// GitHub has no issue for is not in the answer: each is looked up by its URL, which GitHub
+/// answers with null, where `issue(number:)` would fail the whole call.
+pub fn issue_labels<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    numbers: &[u64],
+) -> Result<BTreeMap<u64, IssueLabels>, TrackerError> {
+    let numbers: Vec<u64> = numbers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<u64>>()
+        .into_iter()
+        .collect();
+    if numbers.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    // Each URL names the repo, so one not written as a plain `owner/name` would send every
+    // lookup elsewhere and let every run go: refuse it before any call.
+    let plain = repo
+        .split_once('/')
+        .is_some_and(|(owner, name)| is_plain_segment(owner) && is_plain_segment(name));
+    if !plain {
+        return Err(invalid_argument(repo, "a repo written as owner/name"));
+    }
+    let mut found = BTreeMap::new();
+    for chunk in numbers.chunks(LABELLED_PER_CALL) {
+        found.extend(issue_labels_of(gh, repo, chunk)?);
+    }
+    Ok(found)
+}
+
+/// One call of [`issue_labels`]: `numbers`, at most [`LABELLED_PER_CALL`] of them. Each URL is
+/// passed as a variable, so the query text holds nothing read from outside.
+fn issue_labels_of<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    numbers: &[u64],
+) -> Result<BTreeMap<u64, IssueLabels>, TrackerError> {
+    let declared: Vec<String> = numbers.iter().map(|n| format!("$u{n}: URI!")).collect();
+    let asked: Vec<String> = numbers
+        .iter()
+        .map(|n| format!("i{n}: resource(url: $u{n}) {{ ...Labelled }}"))
+        .collect();
+    let mut args = vec![
+        "api".to_string(),
+        "graphql".into(),
+        "-f".into(),
+        format!(
+            "query=query({}) {{ {} }} {LABELLED_FRAGMENT}",
+            declared.join(", "),
+            asked.join(" ")
+        ),
+    ];
+    for n in numbers {
+        args.push("-f".into());
+        args.push(format!("u{n}=https://github.com/{repo}/issues/{n}"));
+    }
+    let answer: RawLabelledAnswer =
+        gh_json(gh, &args, "a GraphQL response with each issue asked for")?;
+    let mut found = BTreeMap::new();
+    for &number in numbers {
+        let Some(read) = answer.data.get(&format!("i{number}")) else {
+            return Err(parse_error(
+                &args,
+                &format!("a GraphQL response naming issue {number}"),
+            ));
+        };
+        // Null for no such issue, an object without a number for something other than an issue,
+        // and another number for an issue the URL led elsewhere: none is the issue asked for.
+        let Some(read) = read.as_ref().filter(|read| read.number == Some(number)) else {
+            continue;
+        };
+        let (Some(state), Some(labels)) = (&read.state, &read.labels) else {
+            return Err(parse_error(
+                &args,
+                &format!("issue {number} with its state and labels"),
+            ));
+        };
+        found.insert(
+            number,
+            IssueLabels {
+                number,
+                labels: labels.nodes.iter().map(|l| l.name.clone()).collect(),
+                closed: *state == IssueState::Closed,
+            },
+        );
+    }
+    Ok(found)
 }
 
 /// The open issues GitHub's dependency links say block `issue`.
@@ -1184,6 +1318,15 @@ fn edits_whole_since(issue: &ApprovalIssue, since: &str) -> bool {
         )
 }
 
+/// [`TextCheck`] with `Unjudged` split by the history that is short, so a refusal can name it.
+/// A cut-off edit history wins when the timeline is short too.
+enum TextVerdict {
+    Unchanged,
+    Changed,
+    EditsCut,
+    TimelineShort,
+}
+
 /// Judges every body edit and title rename with time at or after `since`. A moment in the same
 /// second counts as after, because timestamps have no finer order. `reaches` says the renames
 /// on the timeline page cover everything at or after `since`.
@@ -1193,6 +1336,20 @@ pub fn text_changes_since(
     instructors: &[String],
     reaches: bool,
 ) -> TextCheck {
+    match judge_text(issue, since, instructors, reaches) {
+        TextVerdict::Unchanged => TextCheck::Unchanged,
+        TextVerdict::Changed => TextCheck::Changed,
+        TextVerdict::EditsCut | TextVerdict::TimelineShort => TextCheck::Unjudged,
+    }
+}
+
+/// [`text_changes_since`], saying which history left the text unjudged.
+fn judge_text(
+    issue: &ApprovalIssue,
+    since: &str,
+    instructors: &[String],
+    reaches: bool,
+) -> TextVerdict {
     let edit_by_stranger = issue.user_content_edits.nodes.iter().any(|edit| {
         edit.edited_at.as_str() >= since && !is_human_instructor(edit.editor.as_ref(), instructors)
     });
@@ -1204,19 +1361,22 @@ pub fn text_changes_since(
         _ => false,
     });
     if edit_by_stranger || rename_by_stranger {
-        TextCheck::Changed
-    } else if edits_whole_since(issue, since) && reaches {
-        TextCheck::Unchanged
+        TextVerdict::Changed
+    } else if !edits_whole_since(issue, since) {
+        TextVerdict::EditsCut
+    } else if !reaches {
+        TextVerdict::TimelineShort
     } else {
-        TextCheck::Unjudged
+        TextVerdict::Unchanged
     }
 }
 
 /// Whether the factory may build the issue: an instructor (only ever a `User`) applied the
 /// `ready` label in force now, and every body edit and title rename from that second on was an
 /// instructor's. Only the newest timeline page is read: it holds the label in force and all
-/// after it, and a full page without it is `label-history-incomplete`. Label names match
-/// exactly; times compare as text.
+/// after it, a full page without it is `label-history-incomplete`, and a page that may hide a
+/// rename in the label's second leaves the text unjudged. Label names match exactly; times
+/// compare as text.
 pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]) -> Approval {
     let mut in_force: Option<&LabelChange> = None;
     for event in &issue.timeline_items.nodes {
@@ -1230,7 +1390,68 @@ pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]
             _ => {}
         }
     }
-    let Some(label) = in_force else {
+    judge_chosen_label(issue, in_force, instructors)
+}
+
+/// The approval a claim was made on, judged after the claim removed `ready`: [`judge_approval`]'s
+/// checks, made as of the claim rather than now. Only the label's newest event is judged. A
+/// removal by `project_login` (in any letter case) is the claim's, and the label it took off is
+/// the event before it; a label still on is the approval, as when the claim's removal is not on
+/// the timeline. Any other newest event (a removal by anyone else, a removal after a removal, or
+/// none) approves nothing, refused as [`judge_approval`] refuses a label it does not find. The
+/// text is judged from the label's second on, and a timeline page that may hide a rename in that
+/// second leaves it unjudged.
+pub fn judge_claimed_approval(
+    issue: &ApprovalIssue,
+    ready: &str,
+    project_login: &str,
+    instructors: &[String],
+) -> Approval {
+    // The label's events, newest first: `true` for applied, `false` for removed.
+    let mut events = issue
+        .timeline_items
+        .nodes
+        .iter()
+        .rev()
+        .filter_map(|node| match node {
+            TimelineNode::LabeledEvent(change) if change.label.name == ready => {
+                Some((true, change))
+            }
+            TimelineNode::UnlabeledEvent(change) if change.label.name == ready => {
+                Some((false, change))
+            }
+            _ => None,
+        });
+    let label = match events.next() {
+        Some((true, label)) => Some(label),
+        Some((false, removal))
+            if removal
+                .actor
+                .as_ref()
+                .is_some_and(|actor| actor.login.eq_ignore_ascii_case(project_login)) =>
+        {
+            match events.next() {
+                Some((true, label)) => Some(label),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    judge_chosen_label(issue, label, instructors)
+}
+
+/// What both judges decide once they have chosen the label (or found none): a missing label is
+/// `label-history-incomplete` on a full page of a longer history and `label-not-found`
+/// otherwise; a label applied by anyone but a human instructor is refused; and every body edit
+/// and title rename from the label's second on must be an instructor's, with a timeline page
+/// that may hide a rename in that second refused as `timeline-short-of-label` (when the body's
+/// edit history is whole) and a cut-off edit history as `edit-history-incomplete`.
+fn judge_chosen_label(
+    issue: &ApprovalIssue,
+    label: Option<&LabelChange>,
+    instructors: &[String],
+) -> Approval {
+    let Some(label) = label else {
         let timeline = &issue.timeline_items;
         let cut_off =
             timeline.nodes.len() >= HISTORY_PAGE && timeline.total_count > HISTORY_PAGE as u64;
@@ -1249,11 +1470,15 @@ pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]
             labeled_at,
         });
     };
-    // The label is on the page, so the renames at or after it are too.
-    match text_changes_since(issue, &labeled_at, instructors, true) {
-        TextCheck::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
-        TextCheck::Unjudged => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
-        TextCheck::Unchanged => Approval::Approved {
+    // The page may be cut off just after the label, hiding a rename in its second.
+    let reaches = timeline_reaches(issue, &labeled_at);
+    match judge_text(issue, &labeled_at, instructors, reaches) {
+        TextVerdict::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
+        TextVerdict::EditsCut => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
+        TextVerdict::TimelineShort => {
+            Approval::Refused(Refusal::TimelineShortOfLabel { labeled_at })
+        }
+        TextVerdict::Unchanged => Approval::Approved {
             labeled_at,
             labeled_by: applied_by.login.clone(),
         },
@@ -1719,6 +1944,24 @@ pub fn approval<G: Tracker + ?Sized>(
 ) -> Result<Approval, TrackerError> {
     let found = read_history(gh, repo, issue)?;
     Ok(judge_approval(&found, State::Ready.label(), instructors))
+}
+
+/// The approval a takeover's claim was made on: [`judge_claimed_approval`] over one read of
+/// the issue's history, its timestamps checked.
+pub fn claimed_approval<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    issue: u64,
+    project_login: &str,
+    instructors: &[String],
+) -> Result<Approval, TrackerError> {
+    let found = read_history(gh, repo, issue)?;
+    Ok(judge_claimed_approval(
+        &found,
+        State::Ready.label(),
+        project_login,
+        instructors,
+    ))
 }
 
 /// Whether the issue text is as an instructor left it at `since`.
@@ -2875,6 +3118,213 @@ mod tests {
         assert_eq!(fake.calls()[0][..3], args(&["issue", "view", "7"])[..]);
     }
 
+    // Several issues' labels in one read.
+
+    /// The one call that reads the labels of `numbers`, as `issue_labels` makes it: each URL is
+    /// a variable, so the query text holds nothing read from outside.
+    fn issue_labels_call(numbers: &[u64]) -> Vec<String> {
+        let declared: Vec<String> = numbers.iter().map(|n| format!("$u{n}: URI!")).collect();
+        let asked: Vec<String> = numbers
+            .iter()
+            .map(|n| format!("i{n}: resource(url: $u{n}) {{ ...Labelled }}"))
+            .collect();
+        let mut call = args(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!(
+                "query=query({}) {{ {} }} fragment Labelled on Issue {{ number state labels(first: 100) {{ nodes {{ name }} }} }}",
+                declared.join(", "),
+                asked.join(" ")
+            ),
+        ]);
+        for n in numbers {
+            call.push("-f".into());
+            call.push(format!("u{n}=https://github.com/{REPO}/issues/{n}"));
+        }
+        call
+    }
+
+    /// GitHub's answer for each of `numbers`, found open with `factory:stuck`.
+    fn all_stuck(numbers: &[u64]) -> String {
+        let data: serde_json::Map<String, Value> = numbers
+            .iter()
+            .map(|n| (format!("i{n}"), labelled(*n, "OPEN", &["factory:stuck"])))
+            .collect();
+        json!({ "data": data }).to_string()
+    }
+
+    /// GitHub's answer for an issue the read found.
+    fn labelled(number: u64, state: &str, labels: &[&str]) -> Value {
+        json!({
+            "number": number,
+            "state": state,
+            "labels": {"nodes": labels.iter().map(|name| json!({"name": name})).collect::<Vec<_>>()},
+        })
+    }
+
+    #[test]
+    fn issue_labels_reads_the_labels_and_state_of_each_number_in_one_call() {
+        let fake = FakeTracker::new();
+        fake.on(
+            issue_labels_call(&[5, 7]),
+            Answer::ok(
+                json!({"data": {
+                    "i5": labelled(5, "OPEN", &["factory:stuck", "type:fix"]),
+                    "i7": labelled(7, "CLOSED", &["factory:stuck"]),
+                }})
+                .to_string(),
+            ),
+        );
+        // Asked out of order and twice: each number is read once, in one call.
+        let read = issue_labels(&fake, REPO, &[7, 5, 7]).unwrap();
+        assert_eq!(fake.calls().len(), 1, "{:?}", fake.calls());
+        assert_eq!(
+            read.into_iter().collect::<Vec<_>>(),
+            vec![
+                (
+                    5,
+                    IssueLabels {
+                        number: 5,
+                        labels: vec!["factory:stuck".into(), "type:fix".into()],
+                        closed: false,
+                    }
+                ),
+                (
+                    7,
+                    IssueLabels {
+                        number: 7,
+                        labels: vec!["factory:stuck".into()],
+                        closed: true,
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// A number GitHub has no issue for answers null, and one it has as something other than an
+    /// issue answers an empty object: neither is in the answer, and neither fails the read.
+    #[test]
+    fn issue_labels_leaves_out_a_number_github_does_not_return() {
+        let fake = FakeTracker::new();
+        fake.on(
+            issue_labels_call(&[5, 8, 9]),
+            Answer::ok(
+                json!({"data": {
+                    "i5": labelled(5, "OPEN", &[]),
+                    "i8": {},
+                    "i9": null,
+                }})
+                .to_string(),
+            ),
+        );
+        let read = issue_labels(&fake, REPO, &[5, 8, 9]).unwrap();
+        assert_eq!(read.keys().copied().collect::<Vec<_>>(), vec![5]);
+        assert_eq!(read[&5].labels, Vec::<String>::new());
+    }
+
+    /// A URL GitHub resolves to an issue with another number, such as one moved elsewhere, is
+    /// not the issue asked for: it is left out, not read as that number's labels.
+    #[test]
+    fn issue_labels_leaves_out_an_issue_github_answers_with_another_number() {
+        let fake = FakeTracker::new();
+        fake.on(
+            issue_labels_call(&[5, 6]),
+            Answer::ok(
+                json!({"data": {
+                    "i5": labelled(12, "OPEN", &["factory:stuck"]),
+                    "i6": labelled(6, "OPEN", &["factory:stuck"]),
+                }})
+                .to_string(),
+            ),
+        );
+        let read = issue_labels(&fake, REPO, &[5, 6]).unwrap();
+        assert_eq!(read.keys().copied().collect::<Vec<_>>(), vec![6]);
+    }
+
+    #[test]
+    fn issue_labels_of_no_number_makes_no_call() {
+        let fake = FakeTracker::new();
+        assert!(issue_labels(&fake, REPO, &[]).unwrap().is_empty());
+        assert!(fake.calls().is_empty());
+    }
+
+    /// More numbers than one call reads are read 100 to a call, lowest first, so no query
+    /// outgrows the argument size or GitHub's limits however many issues are asked for.
+    #[test]
+    fn issue_labels_reads_more_than_100_numbers_100_to_a_call() {
+        let fake = FakeTracker::new();
+        let first: Vec<u64> = (1..=100).collect();
+        fake.on(issue_labels_call(&first), Answer::ok(all_stuck(&first)));
+        fake.on(
+            issue_labels_call(&[101]),
+            Answer::ok(json!({"data": {"i101": labelled(101, "CLOSED", &[])}}).to_string()),
+        );
+        let asked: Vec<u64> = (1..=101).rev().collect();
+        let read = issue_labels(&fake, REPO, &asked).unwrap();
+        assert_eq!(fake.calls().len(), 2, "{:?}", fake.calls());
+        assert_eq!(
+            read.keys().copied().collect::<Vec<_>>(),
+            (1..=101).collect::<Vec<_>>()
+        );
+        assert!(read[&101].closed);
+        assert!(!read[&100].closed);
+    }
+
+    /// A failed call fails the whole read, whichever hundred it was reading.
+    #[test]
+    fn issue_labels_fails_when_any_of_its_calls_fails() {
+        let first: Vec<u64> = (1..=100).collect();
+        let fake = FakeTracker::answering([Answer::ok(all_stuck(&first)), Answer::fail(1, "boom")]);
+        let asked: Vec<u64> = (1..=101).collect();
+        let error = issue_labels(&fake, REPO, &asked).unwrap_err();
+        assert!(is_failed(&error), "{error}");
+        assert_eq!(fake.calls().len(), 2, "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn issue_labels_errors_are_typed() {
+        let failing = FakeTracker::answering([Answer::fail(1, "boom")]);
+        let failed = issue_labels(&failing, REPO, &[5]).unwrap_err();
+        assert!(is_failed(&failed), "{failed}");
+        assert!(failed.to_string().contains("status 1"), "{failed}");
+
+        for wrong in [
+            // Not an answer at all.
+            "[]".to_string(),
+            // No data.
+            json!({"data": null}).to_string(),
+            // A number asked for that the answer does not name.
+            json!({"data": {}}).to_string(),
+            // An issue without its labels.
+            json!({"data": {"i5": {"number": 5, "state": "OPEN"}}}).to_string(),
+            // An issue in a state GitHub does not have.
+            json!({"data": {"i5": labelled(5, "GONE", &[])}}).to_string(),
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(wrong.clone())]);
+            let error = issue_labels(&fake, REPO, &[5]).unwrap_err();
+            assert!(is_parse(&error), "{wrong}: {error}");
+        }
+    }
+
+    /// The repo is written into the query, so one that is not a plain `owner/name` is refused
+    /// before any call.
+    #[test]
+    fn issue_labels_refuses_a_repo_not_written_as_owner_name_before_any_call() {
+        for repo in [
+            "rawphp",
+            "rawphp/soft\"fac",
+            "rawphp/softfac/x",
+            "../softfac",
+            "/softfac",
+        ] {
+            let fake = FakeTracker::new();
+            let error = issue_labels(&fake, repo, &[5]).unwrap_err();
+            assert!(is_refused(&error), "{repo}: {error}");
+            assert!(fake.calls().is_empty(), "{repo}");
+        }
+    }
+
     // Pull requests.
 
     const PR_VIEW: &str = "{\"createdAt\":\"2026-10-29T05:50:00Z\",\"baseRefName\":\"main\",\"headRefName\":\"t3code/2bb65018\",\"headRefOid\":\"4f1c2d3e4a5b60718293a4b5c6d7e8f901234567\",\"isCrossRepository\":false,\"isDraft\":true,\"mergeable\":\"MERGEABLE\",\"number\":2,\"state\":\"OPEN\"}";
@@ -3956,6 +4406,12 @@ mod tests {
         }
     }
 
+    fn timeline_short(labeled_at: &str) -> Refusal {
+        Refusal::TimelineShortOfLabel {
+            labeled_at: labeled_at.into(),
+        }
+    }
+
     fn by_non_instructor(by: Option<&str>, labeled_at: &str) -> Refusal {
         Refusal::LabeledByNonInstructor {
             by: by.map(String::from),
@@ -4196,6 +4652,57 @@ mod tests {
     }
 
     #[test]
+    fn judge_approval_refuses_a_cut_off_timeline_whose_oldest_event_is_the_label() {
+        // A rename in the label's second could sit on the page before this one. Applying the
+        // label again puts a newer label on the newest page, so the refusal says so.
+        let mut page = vec![labeled(LABELED, "tom", READY)];
+        page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        assert_eq!(
+            judge_approval(
+                &issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None),
+                READY,
+                &names(&["tom"])
+            ),
+            refused(timeline_short(LABELED))
+        );
+    }
+
+    #[test]
+    fn judge_approval_says_the_edit_history_is_cut_when_the_timeline_is_cut_short_too() {
+        // A cut-off edit history keeps its own refusal, even when the timeline is cut short too.
+        let mut page = vec![labeled(LABELED, "tom", READY)];
+        page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        assert_eq!(
+            judge_approval(
+                &issue_of(
+                    page,
+                    &[(AFTER, "tom")],
+                    Some(HISTORY_PAGE as u64 + 5),
+                    Some(150)
+                ),
+                READY,
+                &names(&["tom"])
+            ),
+            refused(history_cut(LABELED))
+        );
+    }
+
+    #[test]
+    fn both_judges_say_the_edit_history_is_cut_when_its_newest_entry_is_not_the_last_edit() {
+        // Every edit is on the page by count, but the newest entry is not the issue's last edit,
+        // so the edit history is not whole, and its refusal wins over the short timeline.
+        let mut page = vec![labeled(LABELED, "tom", READY)];
+        page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        let mut issue = issue_of(page, &[(AFTER, "tom")], Some(HISTORY_PAGE as u64 + 5), None);
+        issue.last_edited_at = Some(LATER.into());
+        assert_eq!(
+            judge_approval(&issue, READY, &names(&["tom"])),
+            refused(history_cut(LABELED))
+        );
+        assert_eq!(claimed(&issue), refused(history_cut(LABELED)));
+    }
+
+    #[test]
     fn edited_since_counts_anyones_edit_or_rename_at_or_after_the_moment() {
         assert!(!edited_since(
             &issue_of(vec![renamed(BEFORE, "tom")], &[(BEFORE, "tom")], None, None),
@@ -4226,6 +4733,472 @@ mod tests {
             &issue_of(reaches_back, &[], None, None),
             LABELED
         ));
+    }
+
+    // ---- judge_claimed_approval: the approval a takeover's claim was made on ----
+
+    /// The project's login in these tests: the claim's removal of the label is by it.
+    const PROJECT: &str = "softfac-bot";
+
+    fn unlabeled_by(at: &str, actor: Option<Actor>) -> TimelineNode {
+        TimelineNode::UnlabeledEvent(LabelChange {
+            created_at: at.into(),
+            actor,
+            label: LabelName { name: READY.into() },
+        })
+    }
+
+    fn labeled_by(at: &str, actor: Option<Actor>) -> TimelineNode {
+        TimelineNode::LabeledEvent(LabelChange {
+            created_at: at.into(),
+            actor,
+            label: LabelName { name: READY.into() },
+        })
+    }
+
+    /// The claim's swap of `factory:ready` for `factory:triage` at `at`, by `login`.
+    fn swap_by(at: &str, login: &str) -> [TimelineNode; 2] {
+        [unlabeled(at, login), labeled(at, login, "factory:triage")]
+    }
+
+    fn claimed(issue: &ApprovalIssue) -> Approval {
+        judge_claimed_approval(issue, READY, PROJECT, &names(&["tom"]))
+    }
+
+    #[test]
+    fn judge_claimed_approval_approves_the_newest_label_in_force() {
+        let issue = issue_of(vec![labeled(LABELED, "Tom", READY)], &[], None, None);
+        assert_eq!(claimed(&issue), approved(LABELED, "Tom"));
+        // Taken off by an instructor and applied again: the newest is in force.
+        let again = issue_of(
+            vec![
+                labeled(BEFORE, "tom", READY),
+                unlabeled(LABELED, "tom"),
+                labeled(AFTER, "tom", READY),
+            ],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(claimed(&again), approved(AFTER, "tom"));
+    }
+
+    #[test]
+    fn judge_claimed_approval_approves_the_label_the_projects_removal_took_off_in_any_case() {
+        for login in [PROJECT, "Softfac-Bot", "SOFTFAC-BOT"] {
+            let mut events = vec![labeled(LABELED, "tom", READY)];
+            events.extend(swap_by(AFTER, login));
+            let issue = issue_of(events, &[], None, None);
+            assert_eq!(claimed(&issue), approved(LABELED, "tom"), "{login}");
+        }
+        // Other labels around the claim change nothing.
+        let mut events = vec![
+            labeled(LABELED, "tom", READY),
+            labeled(LABELED, "eve", "bug"),
+        ];
+        events.extend(swap_by(AFTER, PROJECT));
+        events.push(labeled(LATER, PROJECT, "factory:building"));
+        assert_eq!(
+            claimed(&issue_of(events, &[], None, None)),
+            approved(LABELED, "tom")
+        );
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_the_projects_removal_with_no_label_before_it() {
+        let not_found = refused(Refusal::LabelNotFound);
+        let alone = issue_of(swap_by(AFTER, PROJECT).into(), &[], None, None);
+        assert_eq!(claimed(&alone), not_found);
+        // A removal before it, not a label, is no approval either.
+        let removals = issue_of(
+            vec![unlabeled(LABELED, "tom"), unlabeled(AFTER, PROJECT)],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(claimed(&removals), not_found);
+        // The event just before the claim's removal is an instructor's withdrawal: the label
+        // further back is no approval.
+        let withdrawn = issue_of(
+            vec![
+                labeled(BEFORE, "tom", READY),
+                unlabeled(LABELED, "tom"),
+                unlabeled(AFTER, PROJECT),
+            ],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(claimed(&withdrawn), not_found);
+        // A label applied and taken off again after the claim hides it.
+        let mut events = vec![labeled(BEFORE, "tom", READY)];
+        events.extend(swap_by(LABELED, PROJECT));
+        events.push(labeled(AFTER, "tom", READY));
+        events.push(unlabeled(LATER, "tom"));
+        assert_eq!(claimed(&issue_of(events, &[], None, None)), not_found);
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_a_removal_by_anyone_else() {
+        let not_found = refused(Refusal::LabelNotFound);
+        for actor in [Some(user("tom")), Some(user("eve")), None] {
+            let issue = issue_of(
+                vec![
+                    labeled(LABELED, "tom", READY),
+                    unlabeled_by(AFTER, actor.clone()),
+                ],
+                &[],
+                None,
+                None,
+            );
+            assert_eq!(claimed(&issue), not_found, "{actor:?}");
+        }
+        // A login that only contains the project's is someone else.
+        let issue = issue_of(
+            vec![
+                labeled(LABELED, "tom", READY),
+                unlabeled(AFTER, "softfac-bot-2"),
+            ],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(claimed(&issue), not_found);
+    }
+
+    #[test]
+    fn judge_claimed_approval_with_no_label_event_is_refused_as_judge_approval_refuses_it() {
+        assert_eq!(
+            claimed(&issue_of(vec![], &[], None, None)),
+            refused(Refusal::LabelNotFound)
+        );
+        let page: Vec<TimelineNode> = (0..HISTORY_PAGE).map(|_| renamed(BEFORE, "tom")).collect();
+        assert_eq!(
+            claimed(&issue_of(page, &[], Some(HISTORY_PAGE as u64 + 1), None)),
+            refused(Refusal::LabelHistoryIncomplete)
+        );
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_a_label_with_no_actor() {
+        let in_force = issue_of(vec![labeled_by(LABELED, None)], &[], None, None);
+        assert_eq!(
+            claimed(&in_force),
+            refused(by_non_instructor(None, LABELED))
+        );
+        let mut events = vec![labeled_by(LABELED, None)];
+        events.extend(swap_by(AFTER, PROJECT));
+        assert_eq!(
+            claimed(&issue_of(events, &[], None, None)),
+            refused(by_non_instructor(None, LABELED))
+        );
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_a_label_by_a_non_instructor_or_a_bot() {
+        let app = Actor {
+            typename: Some("Bot".into()),
+            login: "tom".into(),
+        };
+        for (actor, by) in [(user("eve"), "eve"), (app, "tom")] {
+            let in_force = issue_of(
+                vec![labeled_by(LABELED, Some(actor.clone()))],
+                &[],
+                None,
+                None,
+            );
+            assert_eq!(
+                claimed(&in_force),
+                refused(by_non_instructor(Some(by), LABELED)),
+                "{actor:?}"
+            );
+            let mut events = vec![labeled_by(LABELED, Some(actor.clone()))];
+            events.extend(swap_by(AFTER, PROJECT));
+            assert_eq!(
+                claimed(&issue_of(events, &[], None, None)),
+                refused(by_non_instructor(Some(by), LABELED)),
+                "{actor:?}"
+            );
+        }
+        // The project's login is no instructor: its own label approves nothing.
+        let own = issue_of(vec![labeled(LABELED, PROJECT, READY)], &[], None, None);
+        assert_eq!(
+            claimed(&own),
+            refused(by_non_instructor(Some(PROJECT), LABELED))
+        );
+        // A stranger's label in force at the claim, though an instructor's came before it.
+        let mut events = vec![
+            labeled(BEFORE, "tom", READY),
+            unlabeled(BEFORE, "tom"),
+            labeled(LABELED, "eve", READY),
+        ];
+        events.extend(swap_by(AFTER, PROJECT));
+        assert_eq!(
+            claimed(&issue_of(events, &[], None, None)),
+            refused(by_non_instructor(Some("eve"), LABELED))
+        );
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_a_strangers_edit_or_rename_at_or_after_the_label() {
+        let edited = refused(edited_after(LABELED));
+        for at in [LABELED, AFTER] {
+            let mut events = vec![labeled(LABELED, "tom", READY)];
+            events.extend(swap_by(LATER, PROJECT));
+            let edit = issue_of(events.clone(), &[(at, "eve")], None, None);
+            assert_eq!(claimed(&edit), edited, "edit at {at}");
+            let mut renamed_after = events.clone();
+            renamed_after.insert(1, renamed(at, "eve"));
+            let rename = issue_of(renamed_after, &[], None, None);
+            assert_eq!(claimed(&rename), edited, "rename at {at}");
+        }
+        // Before the label, or by an instructor, it approves.
+        let mut events = vec![renamed(BEFORE, "eve"), labeled(LABELED, "tom", READY)];
+        events.push(renamed(AFTER, "tom"));
+        events.extend(swap_by(LATER, PROJECT));
+        let issue = issue_of(events, &[(AFTER, "tom"), (BEFORE, "eve")], None, None);
+        assert_eq!(claimed(&issue), approved(LABELED, "tom"));
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_an_edit_history_it_cannot_judge() {
+        let cut = refused(history_cut(LABELED));
+        let edits: Vec<(&str, &str)> = (0..HISTORY_PAGE).map(|_| (AFTER, "tom")).collect();
+        let mut events = vec![labeled(LABELED, "tom", READY)];
+        events.extend(swap_by(LATER, PROJECT));
+        assert_eq!(claimed(&issue_of(events.clone(), &edits, None, None)), cut);
+        // A total larger than the page shows.
+        assert_eq!(
+            claimed(&issue_of(
+                events.clone(),
+                &[(AFTER, "tom")],
+                None,
+                Some(150)
+            )),
+            cut
+        );
+    }
+
+    #[test]
+    fn judge_claimed_approval_refuses_a_cut_off_timeline_whose_oldest_event_is_the_label() {
+        // A timeline cut off with the label its oldest event shown: a rename in the same
+        // second could be hidden, and applying the label again lets the next claim judge it.
+        let mut page = vec![labeled(LABELED, "tom", READY)];
+        page.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        assert_eq!(
+            claimed(&issue_of(
+                page.clone(),
+                &[],
+                Some(HISTORY_PAGE as u64 + 5),
+                None
+            )),
+            refused(timeline_short(LABELED))
+        );
+        // With the edit history cut off as well, that refusal wins.
+        assert_eq!(
+            claimed(&issue_of(
+                page,
+                &[(AFTER, "tom")],
+                Some(HISTORY_PAGE as u64 + 5),
+                Some(150)
+            )),
+            refused(history_cut(LABELED))
+        );
+    }
+
+    /// The two judges agree wherever the label in force decides: the same label, actor, edit
+    /// and rename rules, and the same refusals, a cut-off page whose oldest event is the label
+    /// included.
+    #[test]
+    fn judge_claimed_approval_agrees_with_judge_approval_on_a_label_in_force() {
+        /// A timeline, the body edits, and the edit history's total when it is not their count.
+        type Shape<'a> = (Vec<TimelineNode>, &'a [(&'a str, &'a str)], Option<u64>);
+        let app = Actor {
+            typename: Some("Bot".into()),
+            login: "tom".into(),
+        };
+        let actors = [
+            Some(user("tom")),
+            Some(user("eve")),
+            Some(user(PROJECT)),
+            Some(app),
+            None,
+        ];
+        let full: Vec<(&str, &str)> = (0..HISTORY_PAGE).map(|_| (AFTER, "tom")).collect();
+        let mut cases = Vec::new();
+        for actor in &actors {
+            let label = || labeled_by(LABELED, actor.clone());
+            let shapes: Vec<Shape> = vec![
+                (vec![label()], &[], None),
+                (
+                    vec![renamed(BEFORE, "eve"), label()],
+                    &[(BEFORE, "eve")],
+                    None,
+                ),
+                (vec![label()], &[(LABELED, "eve")], None),
+                (vec![label()], &[(AFTER, "eve")], None),
+                (vec![label()], &[(AFTER, "tom")], None),
+                (vec![label(), renamed(AFTER, "eve")], &[], None),
+                (vec![label(), renamed(LABELED, "tom")], &[], None),
+                (vec![label()], &full, None),
+                (vec![label()], &[(AFTER, "tom")], Some(150)),
+                (
+                    vec![
+                        labeled(BEFORE, "tom", READY),
+                        unlabeled(BEFORE, "tom"),
+                        label(),
+                    ],
+                    &[],
+                    None,
+                ),
+            ];
+            for (events, edits, edits_total) in shapes {
+                cases.push(issue_of(events, edits, None, edits_total));
+            }
+        }
+        // No label at all, on a whole page and on a cut-off one.
+        cases.push(issue_of(vec![renamed(AFTER, "tom")], &[], None, None));
+        let page: Vec<TimelineNode> = (0..HISTORY_PAGE)
+            .map(|_| labeled(LATER, "eve", "bug"))
+            .collect();
+        cases.push(issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None));
+        // A cut-off page that reaches back past the label: it shows every rename after it.
+        for after in [None, Some(renamed(AFTER, "eve"))] {
+            let mut page = vec![
+                labeled(BEFORE, "eve", "bug"),
+                labeled(LABELED, "tom", READY),
+            ];
+            page.extend(after);
+            page.extend((page.len()..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+            cases.push(issue_of(page, &[], Some(HISTORY_PAGE as u64 + 5), None));
+        }
+        // A cut-off page whose oldest event is another one in the label's second: a rename in
+        // that second could still be on the page before it.
+        let mut same_second = vec![
+            labeled(LABELED, "eve", "bug"),
+            labeled(LABELED, "tom", READY),
+        ];
+        same_second.extend((2..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        let same_second = issue_of(same_second, &[], Some(HISTORY_PAGE as u64 + 5), None);
+        assert_eq!(
+            judge_approval(&same_second, READY, &names(&["tom"])),
+            refused(timeline_short(LABELED))
+        );
+        cases.push(same_second);
+
+        let instructors = names(&["tom"]);
+        let mut seen = Vec::new();
+        for issue in &cases {
+            let fresh = judge_approval(issue, READY, &instructors);
+            assert_eq!(
+                judge_claimed_approval(issue, READY, PROJECT, &instructors),
+                fresh,
+                "{issue:?}"
+            );
+            if !seen.contains(&fresh) {
+                seen.push(fresh);
+            }
+        }
+        // The cases reach every outcome, so agreement is not agreement on one answer.
+        for outcome in [
+            approved(LABELED, "tom"),
+            refused(by_non_instructor(Some("eve"), LABELED)),
+            refused(by_non_instructor(None, LABELED)),
+            refused(edited_after(LABELED)),
+            refused(history_cut(LABELED)),
+            refused(timeline_short(LABELED)),
+            Approval::Refused(Refusal::LabelNotFound),
+            Approval::Refused(Refusal::LabelHistoryIncomplete),
+        ] {
+            assert!(seen.contains(&outcome), "{outcome:?} in {seen:?}");
+        }
+
+        // Both judges hand the label they chose to one tail, which judges the cut-off page
+        // itself: a refusal added to a single judge beside the tail shows wherever a case
+        // triggers it. On a cut-off page whose oldest event is the label, a rename in its second
+        // could be hidden, so both refuse it.
+        let mut oldest = vec![labeled(LABELED, "tom", READY)];
+        oldest.extend((1..HISTORY_PAGE).map(|_| labeled(LATER, "eve", "bug")));
+        let oldest = issue_of(oldest, &[], Some(HISTORY_PAGE as u64 + 5), None);
+        assert_eq!(
+            judge_approval(&oldest, READY, &instructors),
+            refused(timeline_short(LABELED))
+        );
+        assert_eq!(
+            judge_claimed_approval(&oldest, READY, PROJECT, &instructors),
+            refused(timeline_short(LABELED))
+        );
+        cases.push(oldest);
+        for issue in &cases {
+            // No case ends in a removal of `ready`, so its label in force is its newest one.
+            let label = issue
+                .timeline_items
+                .nodes
+                .iter()
+                .rev()
+                .find_map(|node| match node {
+                    TimelineNode::LabeledEvent(change) if change.label.name == READY => {
+                        Some(change)
+                    }
+                    _ => None,
+                });
+            assert_eq!(
+                judge_approval(issue, READY, &instructors),
+                judge_chosen_label(issue, label, &instructors),
+                "{issue:?}"
+            );
+            assert_eq!(
+                judge_claimed_approval(issue, READY, PROJECT, &instructors),
+                judge_chosen_label(issue, label, &instructors),
+                "{issue:?}"
+            );
+        }
+    }
+
+    // ---- claimed_approval ----
+
+    #[test]
+    fn claimed_approval_reads_the_history_once_and_judges_it_as_of_the_claim() {
+        let answer = events_reply(
+            &[
+                ready_on(LABELED, "tom"),
+                ready_off(AFTER, "Softfac-Bot"),
+                label_event("LabeledEvent", AFTER, "Softfac-Bot", "factory:triage"),
+            ],
+            None,
+            &creation_only("eve"),
+        );
+        let fake = FakeTracker::answering([Answer::ok(answer)]);
+        let found = fake
+            .claimed_approval(REPO, 6, PROJECT, &names(&["tom"]))
+            .unwrap();
+        assert_eq!(found, approved(LABELED, "tom"));
+        assert_eq!(fake.calls(), vec![approval_call()]);
+    }
+
+    #[test]
+    fn claimed_approval_with_a_malformed_timestamp_is_a_parse_error() {
+        for at in ["2026-10-04 10:00:00Z", "", "yesterday"] {
+            for answer in [
+                events_reply(
+                    &[ready_on(LABELED, "tom"), ready_off(at, PROJECT)],
+                    None,
+                    &creation_only("tom"),
+                ),
+                events_reply(
+                    &[ready_on(LABELED, "tom")],
+                    Some(e(at, "tom")),
+                    &[e(CREATED, "tom"), e(AFTER, "tom")],
+                ),
+            ] {
+                let fake = FakeTracker::answering([Answer::ok(answer)]);
+                let error = fake
+                    .claimed_approval(REPO, 6, PROJECT, &names(&["tom"]))
+                    .unwrap_err();
+                assert!(is_parse_error_of(Some(error), &approval_call()), "{at:?}");
+                assert_eq!(fake.calls(), vec![approval_call()]);
+            }
+        }
     }
 
     // ---- approval ----
@@ -4902,13 +5875,26 @@ mod tests {
 
     #[test]
     fn labels_and_renames_share_the_page_and_the_label_in_force_is_enough() {
-        // The label is the oldest event shown, so every later event, the renames included, is
-        // on the page: events come oldest first and the page is the newest 100. Nothing before
-        // the label matters, whatever the total.
-        let mut events = vec![ready_on(LABELED, "tom")];
-        events.extend(renames_after_label(99));
+        // The oldest event shown is before the label, so every event in or after the label's
+        // second, the renames included, is on the page: events come oldest first and the page
+        // is the newest 100. Nothing before the label matters, whatever the total.
+        let mut events = vec![
+            rename_event("2026-10-04T09:59:59Z", "eve"),
+            ready_on(LABELED, "tom"),
+        ];
+        events.extend(renames_after_label(98));
         let answer = approval_reply(&events, 400, None, &creation_only("eve"));
         assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+
+        // With the label the oldest event shown, a rename in its second could be on the page
+        // before this one.
+        let mut oldest = vec![ready_on(LABELED, "tom")];
+        oldest.extend(renames_after_label(99));
+        let cut = approval_reply(&oldest, 400, None, &creation_only("eve"));
+        assert_eq!(
+            approval_of(&cut, &["tom"]),
+            refused(timeline_short(LABELED))
+        );
 
         // A stranger's rename on that page is seen.
         let mut with_stranger = events.clone();

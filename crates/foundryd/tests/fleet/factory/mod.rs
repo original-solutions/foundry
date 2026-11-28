@@ -27,7 +27,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -61,7 +61,7 @@ use tokio::task::JoinHandle;
 
 pub use github::FakeTracker;
 
-use crate::{Daemon, Fleet, lock, sample, until};
+use crate::{Daemon, Fleet, lock, ran_in_child, run_child, sample, until};
 
 /// The project's repo on GitHub.
 pub const REPO: &str = "acme/widgets";
@@ -76,9 +76,6 @@ pub const HELPER_SECRET: &str = "MachineHelperPassword0123456789qrstuv";
 
 /// How long a test waits for a step of the factory, on the wall clock.
 pub const WAIT: Duration = Duration::from_secs(120);
-
-/// How long a whole test may run in its child process.
-const CHILD_WAIT: Duration = Duration::from_secs(300);
 
 /// How many child processes run at once. Each runs three daemons, and the factory's limits are
 /// on a clock ten times as fast as the wall clock, so a child slowed by the others sees its
@@ -111,8 +108,6 @@ impl Drop for Place {
     }
 }
 
-/// Names the test a child process runs.
-const CHILD: &str = "FOUNDRY_FLEET_FACTORY_TEST";
 /// The folder of bare repos `https://github.com/` stands for, in a child process.
 const ORIGINS: &str = "FOUNDRY_FLEET_FACTORY_ORIGINS";
 
@@ -135,27 +130,18 @@ pub fn config(provision: &[&str], gate: &[&str], gate_retries: u32) -> String {
 
 /// Runs the test `name` of this module path: in this process when it is the child started for
 /// it, else in a child process of this test binary whose `PATH`, `HOME` and git config are the
-/// harness's, which must pass. `name` is the test function's name.
+/// harness's, which must pass ([`run_child`]). `name` is the test function's name.
 pub fn isolated<F, Fut>(module: &str, name: &str, test: F)
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = ()>,
 {
-    let module = module.split_once("::").map_or(module, |(_, rest)| rest);
-    let full = format!("{module}::{name}");
-    if std::env::var(CHILD).ok().as_deref() == Some(full.as_str()) {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.block_on(test());
-        }));
-        // A pass on a blocking thread may wait on the runtime: dropping it would wait for ever.
-        runtime.shutdown_timeout(Duration::from_secs(5));
-        if let Err(panic) = ran {
-            std::panic::resume_unwind(panic);
-        }
+    if ran_in_child(
+        module,
+        name,
+        tokio::runtime::Builder::new_multi_thread(),
+        test,
+    ) {
         return;
     }
     let dir = tempfile::Builder::new()
@@ -188,63 +174,9 @@ where
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let child = Command::new(std::env::current_exe().unwrap())
-        .args([full.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD, &full)
-        .env(ORIGINS, &origins)
-        .env("PATH", path)
-        .env("HOME", &home)
-        .env("GIT_CONFIG_GLOBAL", &gitconfig)
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let out = wait_child(child, CHILD_WAIT);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success() && stdout.contains("1 passed"),
-        "{full} failed in its child process ({:?})\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
-        out.status
-    );
-}
-
-/// The output of `child`, which is killed once `limit` passes.
-fn wait_child(mut child: std::process::Child, limit: Duration) -> std::process::Output {
-    use std::io::Read as _;
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut text = Vec::new();
-        let _ = stdout.read_to_end(&mut text);
-        text
+    run_child(module, name, &home, &gitconfig, |child| {
+        child.env(ORIGINS, &origins).env("PATH", path);
     });
-    let err = std::thread::spawn(move || {
-        let mut text = Vec::new();
-        let _ = stderr.read_to_end(&mut text);
-        text
-    });
-    let end = std::time::Instant::now() + limit;
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if std::time::Instant::now() > end {
-            let _ = child.kill();
-            break child.wait().unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    std::process::Output {
-        status,
-        stdout: out.join().unwrap(),
-        stderr: err.join().unwrap(),
-    }
 }
 
 /// `name` on `PATH`.
@@ -760,6 +692,7 @@ impl Harness {
                 github.clone(),
                 clock.clone(),
                 sent.clone(),
+                None,
             )
             .await;
             write_held(daemon, i == 0 || builds, builds);
@@ -983,7 +916,11 @@ fn write_held(daemon: &Daemon, token: bool, builds: bool) {
 }
 
 impl Machine {
-    /// The API, sessions and factory service of `daemon`, holding `secrets`.
+    /// The API, sessions and factory service of `daemon`, holding `secrets`, beside the cut-off,
+    /// as `foundryd` runs them. `earlier` is the data folder and home a daemon before it used,
+    /// for a restart: its terminals are reattached, its workspaces swept and its sessions
+    /// adopted before anything is served, in `foundryd`'s order.
+    #[allow(clippy::too_many_arguments)]
     async fn start(
         daemon: &Daemon,
         secrets: Arc<Held>,
@@ -992,14 +929,18 @@ impl Machine {
         github: Arc<FakeTracker>,
         clock: Arc<FakeClock>,
         sent: Arc<Mutex<Vec<Sent>>>,
+        earlier: Option<(TempDir, TempDir)>,
     ) -> Machine {
         let (me, store, peers) = (daemon.id, daemon.store.clone(), daemon.peers.clone());
-        // A Unix socket path is at most about 100 bytes.
-        let data = tempfile::Builder::new()
-            .prefix("fm")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let restarted = earlier.is_some();
+        let (data, home) = earlier.unwrap_or_else(|| {
+            // A Unix socket path is at most about 100 bytes.
+            let data = tempfile::Builder::new()
+                .prefix("fm")
+                .tempdir_in("/tmp")
+                .unwrap();
+            (data, tempfile::tempdir().unwrap())
+        });
         let agent = built("foundry-fake-agent");
         let claude: Vec<String> = [
             "sh".into(),
@@ -1017,11 +958,17 @@ impl Machine {
             data.path(),
             built("foundry-holder"),
         ));
+        if restarted {
+            terminals.reattach_all().await.unwrap();
+        }
         let held: Arc<dyn Secrets> = secrets.clone();
         let workspaces = Arc::new(
             Workspaces::new(me, store.clone(), data.path(), terminals.clone())
                 .with_secrets(held.clone()),
         );
+        if restarted {
+            workspaces.sweep().await.unwrap();
+        }
         let hooks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sessions = Arc::new(
             Sessions::new(
@@ -1041,6 +988,9 @@ impl Machine {
             )
             .with_secrets(held),
         );
+        if restarted {
+            sessions.adopt().await;
+        }
         let hook_router = sessions.router();
         let api = Api::new(
             store,
@@ -1066,12 +1016,13 @@ impl Machine {
             runtime: tokio::runtime::Handle::current(),
             sent,
         });
+        let clock = clock as Arc<dyn Clock>;
         let factory = Factory::new(
             daemon.store.clone(),
             me,
             host,
             freshness.clone(),
-            clock as Arc<dyn Clock>,
+            clock.clone(),
         );
         let (placing, served) = (api.clone(), api.clone());
         let servers = vec![
@@ -1088,6 +1039,13 @@ impl Machine {
                 axum::serve(listener, api::router(served)).await.unwrap();
             }),
             tokio::spawn(factory.serve()),
+            tokio::spawn(foundryd::factory::cutoff::run(
+                daemon.store.clone(),
+                me,
+                api.sessions.clone(),
+                freshness,
+                clock,
+            )),
         ];
         Machine {
             data,

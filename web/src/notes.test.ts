@@ -79,6 +79,12 @@ describe("takers", () => {
     ]);
   });
 
+  it("says a live factory run's stuck session is quiet, and a held-up run's stuck", () => {
+    expect(takers([session({ state: "stuck" })], { run: "o__r__162__1" })[0].label).toBe("Quiet 10+ min");
+    expect(takers([session({ state: "stuck" })], { run: "o__r__162__1", held: "stuck" })[0].label).toBe("Stuck");
+    expect(takers([session({ state: "stuck" })])[0].label).toBe("Stuck");
+  });
+
   it("keeps a lone model's name plain and says what a busy session is doing", () => {
     const [only] = takers([session({ state: "working" })]);
     expect(only.name).toBe("opus");

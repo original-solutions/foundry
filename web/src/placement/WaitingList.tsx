@@ -45,7 +45,8 @@ function Requests({ requests, folded }: { requests: Placement[]; folded: boolean
   return (
     <section
       aria-label="Waiting for a machine"
-      className="pointer-events-auto rounded-lg border border-sky-800/60 bg-neutral-900 text-sm shadow-lg shadow-black/50"
+      // As the attention card: beside the strip folded, a row of its own open.
+      className={`${open ? "basis-full" : "flex-[1_1_auto]"} pointer-events-auto rounded-lg border border-sky-800/60 bg-neutral-900 text-sm shadow-lg shadow-black/50`}
     >
       <button
         type="button"
