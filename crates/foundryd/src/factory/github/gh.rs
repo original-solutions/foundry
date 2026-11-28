@@ -415,10 +415,12 @@ impl Tracker for Gh {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -442,7 +444,253 @@ mod tests {
     }
 
     fn gh_at(program: &Path, clock: Arc<dyn Clock>) -> Gh {
-        Gh::new("rawphp", TOKEN, clock).with_program(program)
+        Gh::new("rawphp", TOKEN, clock, Budgets::default().of("rawphp")).with_program(program)
+    }
+
+    fn counts_of(budget: &Arc<Mutex<LoginBudget>>) -> BTreeMap<(Budget, String), u64> {
+        budget.lock().unwrap().counts.clone()
+    }
+
+    fn count(budget: &Arc<Mutex<LoginBudget>>, kind: Budget, key: &str) -> u64 {
+        counts_of(budget)
+            .get(&(kind, key.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn each_command_has_a_budget_and_a_key() {
+        let long_since = "api repos/o/r/issues/5/comments?since=2026-01-01T00:00:00Z&per_page=100";
+        for (call, budget, key) in [
+            ("issue list --repo o/r", Budget::Graphql, "issue list"),
+            ("issue view 5", Budget::Graphql, "issue view"),
+            ("issue edit 5 --add-label x", Budget::Graphql, "issue edit"),
+            ("pr view 7", Budget::Graphql, "pr view"),
+            ("release list", Budget::Graphql, "release list"),
+            ("api graphql -f query=x", Budget::Graphql, "api graphql"),
+            (
+                "api repos/o/r/issues/5/dependencies/blocked_by",
+                Budget::Rest,
+                "api repos/o/r/issues/N/dependencies/blocked_by",
+            ),
+            (long_since, Budget::Rest, "api repos/o/r/issues/N/comments"),
+            (
+                "api -X PATCH repos/o/r/issues/comments/123 -f body=secret",
+                Budget::Rest,
+                "api repos/o/r/issues/comments/N",
+            ),
+            (
+                "api --method=PATCH -H Accept:x repos/o/r/issues/comments/123 -f body=secret",
+                Budget::Rest,
+                "api repos/o/r/issues/comments/N",
+            ),
+            ("auth status", Budget::Graphql, "auth status"),
+        ] {
+            let call: Vec<String> = call.split(' ').map(String::from).collect();
+            assert_eq!(budget_of(&call), budget, "{call:?}");
+            assert_eq!(command_key(&call), key, "{call:?}");
+            assert!(!command_key(&call).contains("secret"));
+        }
+        assert_eq!(command_key(&args(&["version"])), "version");
+    }
+
+    #[test]
+    fn one_login_has_one_budget_and_each_login_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fake_gh(dir.path(), "echo ok");
+        let budgets = Budgets::default();
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        let make = |login: &str| {
+            Gh::new(login, TOKEN, clock.clone(), budgets.of(login)).with_program(&program)
+        };
+        make("tomkaczocha")
+            .gh(&args(&["issue", "view", "1"]))
+            .unwrap();
+        make("tomkaczocha")
+            .gh(&args(&["issue", "view", "2"]))
+            .unwrap();
+        make("rawphp").gh(&args(&["issue", "view", "3"])).unwrap();
+        assert!(Arc::ptr_eq(
+            &budgets.of("tomkaczocha"),
+            &budgets.of("tomkaczocha")
+        ));
+        assert_eq!(
+            count(&budgets.of("tomkaczocha"), Budget::Graphql, "issue view"),
+            2
+        );
+        assert_eq!(
+            count(&budgets.of("rawphp"), Budget::Graphql, "issue view"),
+            1
+        );
+    }
+
+    #[test]
+    fn a_failing_call_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fake_gh(dir.path(), "echo boom >&2; exit 1");
+        let budget = Budgets::default().of("rawphp");
+        let gh = Gh::new("rawphp", TOKEN, Arc::new(FakeClock::new()), budget.clone())
+            .with_program(&program);
+        gh.gh(&args(&["api", "repos/o/r/issues/5"])).unwrap_err();
+        assert_eq!(count(&budget, Budget::Rest, "api repos/o/r/issues/N"), 1);
+    }
+
+    #[test]
+    fn graphql_points_and_quota_come_from_rate_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer = dir.path().join("answer");
+        let program = fake_gh(dir.path(), &format!("cat '{}'", answer.display()));
+        let budget = Budgets::default().of("rawphp");
+        let gh = Gh::new("rawphp", TOKEN, Arc::new(FakeClock::new()), budget.clone())
+            .with_program(&program);
+        let call = args(&["api", "graphql", "-f", "query=x"]);
+        let limited = |cost: u64, remaining: u64| {
+            format!(
+                r#"{{"data":{{"rateLimit":{{"cost":{cost},"remaining":{remaining},"limit":5000,"resetAt":"2026-11-28T12:00:00Z"}}}}}}"#
+            )
+        };
+        fs::write(&answer, limited(2, 4990)).unwrap();
+        gh.gh(&call).unwrap();
+        {
+            let held = budget.lock().unwrap();
+            assert_eq!(held.points, 2);
+            let quota = held.quota.as_ref().unwrap();
+            assert_eq!(
+                (quota.remaining, quota.limit, quota.reset_at.as_str()),
+                (4990, 5000, "2026-11-28T12:00:00Z")
+            );
+        }
+        fs::write(&answer, limited(3, 4987)).unwrap();
+        gh.gh(&call).unwrap();
+        assert_eq!(budget.lock().unwrap().points, 5);
+        assert_eq!(
+            budget.lock().unwrap().quota.as_ref().unwrap().remaining,
+            4987
+        );
+        for other in [r#"{"data":{"viewer":{"login":"x"}}}"#, "not json at all"] {
+            fs::write(&answer, other).unwrap();
+            gh.gh(&call).unwrap();
+            let held = budget.lock().unwrap();
+            assert_eq!(held.points, 5, "{other}");
+            assert_eq!(held.quota.as_ref().unwrap().remaining, 4987, "{other}");
+        }
+    }
+
+    fn quota_budget() -> LoginBudget {
+        let mut budget = LoginBudget::default();
+        budget
+            .counts
+            .insert((Budget::Graphql, "issue view".into()), 40);
+        budget
+            .counts
+            .insert((Budget::Graphql, "api graphql".into()), 3);
+        budget
+            .counts
+            .insert((Budget::Rest, "api repos/o/r/issues/N".into()), 7);
+        budget.points = 12;
+        budget
+    }
+
+    #[test]
+    fn the_hourly_line_reads_exactly() {
+        let mut budget = quota_budget();
+        assert_eq!(
+            hourly_line("rawphp", &budget),
+            "factory: GitHub use by rawphp in the last hour: graphql 43 calls, 12 points; \
+             rest 7 calls; remaining unknown; \
+             most: issue view 40, api repos/o/r/issues/N 7, api graphql 3"
+        );
+        budget.quota = Some(Quota {
+            remaining: 4900,
+            limit: 5000,
+            reset_at: "2026-11-28T12:00:00Z".into(),
+        });
+        assert_eq!(
+            hourly_line("rawphp", &budget),
+            "factory: GitHub use by rawphp in the last hour: graphql 43 calls, 12 points; \
+             rest 7 calls; remaining 4900 of 5000, resets 2026-11-28T12:00:00Z; \
+             most: issue view 40, api repos/o/r/issues/N 7, api graphql 3"
+        );
+    }
+
+    #[test]
+    fn the_hourly_line_names_five_keys_at_most_and_breaks_ties_by_key() {
+        let mut budget = LoginBudget::default();
+        for (key, n) in [
+            ("pr d", 1),
+            ("pr a", 1),
+            ("pr c", 1),
+            ("pr b", 1),
+            ("pr f", 1),
+            ("pr e", 1),
+            ("pr z", 9),
+        ] {
+            budget.counts.insert((Budget::Graphql, key.into()), n);
+        }
+        let line = hourly_line("rawphp", &budget);
+        assert!(
+            line.ends_with("most: pr z 9, pr a 1, pr b 1, pr c 1, pr d 1"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_line_comes_with_the_first_call_after_an_hour_and_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fake_gh(dir.path(), "echo ok");
+        let clock = Arc::new(FakeClock::new());
+        let budget = Budgets::default().of("rawphp");
+        let gh = Gh::new("rawphp", TOKEN, clock.clone(), budget.clone()).with_program(&program);
+        let logged = crate::test_log::Logged::default();
+        let _capture = logged.capture();
+        let call = args(&["issue", "view", "1"]);
+        gh.gh(&call).unwrap();
+        clock.advance(Duration::from_secs(59 * 60));
+        gh.gh(&call).unwrap();
+        assert!(
+            !logged.text().contains("GitHub use by"),
+            "{}",
+            logged.text()
+        );
+        clock.advance(Duration::from_secs(60));
+        gh.gh(&call).unwrap();
+        let text = logged.text();
+        assert_eq!(text.matches("GitHub use by").count(), 1, "{text}");
+        assert!(text.contains("INFO"), "{text}");
+        assert!(text.contains("graphql 2 calls"), "{text}");
+        assert_eq!(count(&budget, Budget::Graphql, "issue view"), 1);
+        gh.gh(&call).unwrap();
+        assert_eq!(logged.text().matches("GitHub use by").count(), 1);
+    }
+
+    #[test]
+    fn the_line_holds_no_token_title_or_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fake_gh(
+            dir.path(),
+            r#"echo '{"title":"Secret plan ghp_titleLeak","body":"Body text xyzzy"}'"#,
+        );
+        let clock = Arc::new(FakeClock::new());
+        let budget = Budgets::default().of("rawphp");
+        let gh = Gh::new("rawphp", TOKEN, clock.clone(), budget).with_program(&program);
+        let logged = crate::test_log::Logged::default();
+        let _capture = logged.capture();
+        let call = args(&[
+            "api",
+            "-X",
+            "PATCH",
+            "repos/o/r/issues/comments/9",
+            "-f",
+            "body=Body text xyzzy",
+        ]);
+        gh.gh(&call).unwrap();
+        clock.advance(Duration::from_secs(3600));
+        gh.gh(&call).unwrap();
+        let text = logged.text();
+        assert!(text.contains("GitHub use by rawphp"), "{text}");
+        for secret in [TOKEN, "Secret plan", "ghp_titleLeak", "Body text", "xyzzy"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
     }
 
     #[test]
@@ -841,7 +1089,12 @@ mod tests {
 
     #[test]
     fn the_command_sets_the_token_and_clears_every_other_credential_variable() {
-        let gh = Gh::new("rawphp", TOKEN, Arc::new(FakeClock::new()));
+        let gh = Gh::new(
+            "rawphp",
+            TOKEN,
+            Arc::new(FakeClock::new()),
+            Budgets::default().of("rawphp"),
+        );
         let command = gh.command(&args(&["api", "user"]));
         let envs: std::collections::HashMap<_, _> = command
             .get_envs()
@@ -867,7 +1120,13 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let ran = dir.path().join("ran");
             let program = fake_gh(dir.path(), &format!("touch '{}'", ran.display()));
-            let gh = Gh::new("rawphp", token, Arc::new(FakeClock::new())).with_program(&program);
+            let gh = Gh::new(
+                "rawphp",
+                token,
+                Arc::new(FakeClock::new()),
+                Budgets::default().of("rawphp"),
+            )
+            .with_program(&program);
             let error = gh.gh(&args(&["api", "user"])).unwrap_err();
             let TrackerError::Other {
                 kind: OtherKind::NotStarted,
