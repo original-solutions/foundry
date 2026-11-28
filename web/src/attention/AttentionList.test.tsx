@@ -47,7 +47,7 @@ const setupFailed: AttentionItem = {
 type Request = { url: string; method: string };
 
 let lists: AttentionItem[][];
-let dismissAnswer: () => Response;
+let dismissAnswer: (url: string) => Response;
 let closeAnswer: () => Response;
 let requests: Request[];
 
@@ -61,7 +61,7 @@ beforeEach(() => {
     vi.fn(async (url: string, init: RequestInit = {}) => {
       requests.push({ url, method: init.method ?? "GET" });
       if (url === "/api/attention") return json(200, { items: lists.length > 1 ? lists.shift() : lists[0] });
-      if (url.endsWith("/dismiss")) return dismissAnswer();
+      if (url.endsWith("/dismiss")) return dismissAnswer(url);
       if (url.endsWith("/close")) return closeAnswer();
       throw new Error(`unexpected request ${url}`);
     }),
@@ -284,6 +284,37 @@ describe("AttentionList", () => {
     ]);
     fireEvent.click(within(card).getAllByRole("button", { name: "Close terminal" })[0]);
     await waitFor(() => expect(requests).toContainEqual({ url: "/api/terminals/t9/close", method: "POST" }));
+  });
+
+  it("says why a grouped item's dismissal failed on that item's line, and keeps both lines", async () => {
+    const other = { ...overwritten, id: "setting_overwritten:project:p2", what: "Two sides of a split both edited the project docs; the edit made on this-mac was replaced" };
+    lists = [[overwritten, other]];
+    dismissAnswer = (url) =>
+      url.includes("p2") ? json(503, { error: "no link to m3, the acting coordinator, is open, so the edit was not sent" }) : new Response(null, { status: 204 });
+    await renderApp(<AttentionList />);
+    const card = await screen.findByRole("listitem", { name: "2 settings overwritten" });
+    const line = (what: string) => within(card).getByRole("button", { name: what }).closest("li")!;
+    fireEvent.click(within(line(other.what)).getByRole("button", { name: "Dismiss" }));
+    const alert = await within(card).findByRole("alert");
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(alert.textContent).toContain("no link to m3");
+    expect(line(other.what).contains(alert)).toBe(true);
+    expect(line(overwritten.what).contains(alert)).toBe(false);
+  });
+
+  it("keeps a what's line breaks, alone or opened in a group", async () => {
+    const claim = (issue: number): AttentionItem => ({
+      ...stuck(issue),
+      id: `foreign_claim:p__${issue}`,
+      kind: "foreign_claim",
+      what: `Issue #${issue} is claimed\nby another-factory`,
+    });
+    lists = [[stuck(1), claim(1), claim(2)]];
+    await renderApp(<AttentionList />);
+    const alone = await screen.findByText(/ReportingEdgeTest > totals 1/);
+    expect(alone.className).toContain("whitespace-pre-line");
+    fireEvent.click(screen.getByRole("button", { name: "Issue #2 is claimed" }));
+    expect(screen.getByText(/Issue #2 is claimed\s+by another-factory/).className).toContain("whitespace-pre-line");
   });
 
   it("names a run stuck item", async () => {

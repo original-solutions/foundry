@@ -75,7 +75,11 @@ export interface AttentionGroup {
  */
 export function byKind(items: AttentionItem[]): AttentionGroup[] {
   const groups = new Map<string, AttentionItem[]>();
-  for (const item of items) groups.set(item.kind, [...(groups.get(item.kind) ?? []), item]);
+  for (const item of items) {
+    const group = groups.get(item.kind);
+    if (group) group.push(item);
+    else groups.set(item.kind, [item]);
+  }
   return [...groups].map(([kind, items]) => ({
     kind,
     items,

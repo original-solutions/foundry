@@ -81,7 +81,7 @@ function Single({ item, settling }: { item: AttentionItem; settling: Settling })
         <span className="font-medium text-neutral-100">{heading(item.kind, 1)}</span>
         <span className="truncate text-xs text-neutral-500">{item.machine_name}</span>
       </p>
-      <p className="text-neutral-200">{item.what}</p>
+      <p className="whitespace-pre-line text-neutral-200">{item.what}</p>
       <p className="text-neutral-400">{item.todo}</p>
       {acts(item) && (
         <p className="flex gap-3 pt-1">
