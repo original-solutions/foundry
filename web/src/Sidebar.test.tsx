@@ -1,7 +1,8 @@
 import { focusManager, useQueryClient } from "@tanstack/react-query";
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { FactoryMark } from "./FactoryMark";
 import { fleet, withFactory } from "./fleet";
 import { Sidebar } from "./Sidebar";
 import { CHECKS_EVERY } from "./Shipping";
@@ -563,6 +564,13 @@ describe("Sidebar and the factory", () => {
     expect(header.children[2]).toBe(within(run).getByRole("link", { name: "factory #162" }));
     expect(within(run).getByText("Quiet 10+ min")).toBeDefined();
     expect(within(screen.getByRole("group", { name: "on a commit" })).queryByRole("link", { name: /^factory/ })).toBeNull();
+  });
+
+  it("leaves the mark in full where it is not compact, as the board and its list show it", () => {
+    render(<FactoryMark run={{ run: "original-solutions__foundry__162__1", issue: 162, url: "https://github.com/original-solutions/foundry/issues/162" }} />);
+    const mark = screen.getByRole("link", { name: "factory #162" });
+    expect(mark.textContent).toBe("factory #162");
+    expect(mark.hasAttribute("aria-label")).toBe(false);
   });
 
   it("says factory alone on the mark of a run whose id names no issue", async () => {
