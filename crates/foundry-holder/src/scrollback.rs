@@ -1,8 +1,9 @@
 //! The current screen and the last 10,000 lines of scrollback.
 //!
 //! The holder is not a terminal emulator. It keeps the tail of the raw bytes the PTY produced, cut
-//! at a line, and a client replays them into its own emulator (xterm.js) to rebuild the screen and
-//! history. Terminal modes set before the kept tail began are not replayed.
+//! at a line unless the rest of the cut line is longer than half the byte cap (see
+//! [`Scrollback::push`]), and a client replays them into its own emulator (xterm.js) to rebuild the
+//! screen and history. Terminal modes set before the kept tail began are not replayed.
 
 use std::collections::VecDeque;
 
@@ -21,7 +22,8 @@ pub struct Scrollback {
     start: u64,
     /// Stream offset of every newline in `bytes`, oldest first.
     newlines: VecDeque<u64>,
-    /// False when a byte cap cut the oldest line, so `bytes` starts part way through it.
+    /// False while a byte cap's cut has left `bytes` part way through its oldest line, until
+    /// [`Self::push`] drops the rest of that line or keeps it.
     on_line: bool,
     max_lines: usize,
     max_bytes: usize,
@@ -51,6 +53,12 @@ impl Scrollback {
     }
 
     /// Appends output, then drops the oldest lines over either limit.
+    ///
+    /// A byte cap that cuts a line drops the rest of that line too, so what is kept starts on a
+    /// line, when that rest is at most half the cap. A longer rest is kept from the cut on, and
+    /// so is a line whose end has not come yet: a terminal that writes megabytes with no newline,
+    /// such as a progress display drawn with cursor moves, would otherwise lose all it kept at
+    /// that line's end.
     pub fn push(&mut self, mut data: &[u8]) {
         if data.len() > self.max_bytes {
             let skipped = data.len() - self.max_bytes;
@@ -118,11 +126,16 @@ impl Scrollback {
         }
     }
 
-    /// Drops through the oldest newline kept, so what is left starts on a line.
+    /// Drops through the oldest newline kept, so what is left starts on a line, when that drops
+    /// at most half the cap. Else the cut line is kept from the cut on.
     fn drop_to_next_line(&mut self) {
-        if let Some(&at) = self.newlines.front() {
-            let n = usize::try_from(at + 1 - self.start).unwrap_or(self.bytes.len());
-            self.drop_front(n);
+        let rest = self
+            .newlines
+            .front()
+            .map(|&at| usize::try_from(at + 1 - self.start).unwrap_or(self.bytes.len()));
+        match rest {
+            Some(n) if n <= self.max_bytes / 2 => self.drop_front(n),
+            _ => self.on_line = true,
         }
     }
 }
@@ -203,9 +216,56 @@ mod tests {
         assert_eq!(scrollback.snapshot(), b"6789");
         // The 4 bytes held and the 6 skipped are behind the snapshot now.
         assert_eq!(scrollback.start(), 10);
+        // The rest of the cut line, `89\n`, is more than half the cap, so it stays.
         scrollback.push(b"\nx");
-        assert_eq!(scrollback.snapshot(), b"x");
-        assert_eq!(scrollback.start(), 15);
+        assert_eq!(scrollback.snapshot(), b"89\nx");
+        assert_eq!(scrollback.start(), 12);
+    }
+
+    /// A line longer than what is kept is kept from the cut on: the newline that ends it does
+    /// not take it away. A test runner that draws its progress with cursor moves writes
+    /// megabytes with no newline, and the end of that line is what a failed setup's tail shows.
+    #[test]
+    fn a_line_longer_than_the_cap_keeps_its_end_when_a_newline_ends_it() {
+        let mut scrollback = Scrollback::with_limits(100, 32);
+        scrollback.push(b"first\n");
+        for _ in 0..10 {
+            scrollback.push(b"....");
+        }
+        scrollback.push(b"FAILED");
+        scrollback.push(b"\ndone\n");
+        let mut kept = b".".repeat(20);
+        kept.extend_from_slice(b"FAILED\ndone\n");
+        assert_eq!(scrollback.snapshot(), kept);
+        assert_eq!(scrollback.start(), 6 + 40 + 6 + 6 - 32);
+        // A later cut into the same line keeps it too: its rest is still more than half the cap.
+        scrollback.push(b"x\n");
+        assert!(scrollback.snapshot().ends_with(b"FAILED\ndone\nx\n"));
+        assert_eq!(scrollback.len(), 32);
+    }
+
+    /// A cut whose line ends within what is kept still drops the rest of that line, so the
+    /// snapshot starts on a line.
+    #[test]
+    fn a_cut_line_that_ends_within_what_is_kept_is_dropped_whole() {
+        let mut scrollback = Scrollback::with_limits(100, 12);
+        scrollback.push(b"aaaaaa\nbbbb\n");
+        scrollback.push(b"cc\n");
+        assert_eq!(scrollback.snapshot(), b"bbbb\ncc\n");
+    }
+
+    /// The rest of a cut line is dropped when it is half the cap, and kept when it is more.
+    #[test]
+    fn the_rest_of_a_cut_line_is_dropped_up_to_half_the_cap() {
+        let mut scrollback = Scrollback::with_limits(100, 8);
+        scrollback.push(b"aaaa\nbbb");
+        scrollback.push(b"c");
+        assert_eq!(scrollback.snapshot(), b"bbbc");
+
+        let mut scrollback = Scrollback::with_limits(100, 8);
+        scrollback.push(b"aaaaa\nbb");
+        scrollback.push(b"c");
+        assert_eq!(scrollback.snapshot(), b"aaaa\nbbc");
     }
 
     #[test]

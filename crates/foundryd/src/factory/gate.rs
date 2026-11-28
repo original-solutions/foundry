@@ -872,8 +872,13 @@ mod tests {
         /// are, with its error output folded in as in a terminal, and the code it exits with.
         /// `stub` is shell code run before the script, in the script's own shell.
         fn run_setup(stub: &str, commands: &[&str]) -> (String, i32) {
+            run_setup_in("/bin/sh", stub, commands).unwrap()
+        }
+
+        /// [`run_setup`] under `shell`, or `None` when the machine has no such shell.
+        fn run_setup_in(shell: &str, stub: &str, commands: &[&str]) -> Option<(String, i32)> {
             let script = format!("exec 2>&1\n{stub}\n{}", crate::workspaces::setup_limited());
-            let ran = std::process::Command::new("/bin/sh")
+            let ran = match std::process::Command::new(shell)
                 .arg("-c")
                 .arg(script)
                 .arg("setup")
@@ -881,10 +886,101 @@ mod tests {
                 .args(commands)
                 .stdin(std::process::Stdio::null())
                 .output()
-                .unwrap();
+            {
+                Ok(ran) => ran,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(error) => panic!("{shell}: {error}"),
+            };
             let tail = String::from_utf8(ran.stdout).unwrap();
             let code = ran.status.code().unwrap();
-            (tail, code)
+            Some((tail, code))
+        }
+
+        /// The shells a test runs the setup under: `/bin/sh`, and `bash` where there is one,
+        /// which stands in for macOS's `/bin/sh`.
+        const SHELLS: [&str; 2] = ["/bin/sh", "bash"];
+
+        #[test]
+        fn the_real_setup_prints_only_the_commands_own_lines_and_its_own_for_a_failure() {
+            let command = "echo one; echo 'test tests::example ... FAILED'; echo to-stderr >&2; echo three; exit 100";
+            let commands = [command];
+            for shell in SHELLS {
+                let Some((tail, code)) = run_setup_in(shell, "", &commands) else {
+                    continue;
+                };
+                assert_eq!(code, 100, "{shell}: {tail:?}");
+                assert_eq!(
+                    tail,
+                    format!(
+                        "$ {command}\none\ntest tests::example ... FAILED\nto-stderr\nthree\nsetup failed: {command} exited 100\n"
+                    ),
+                    "{shell}"
+                );
+                let GateResult::Failed {
+                    command: named,
+                    how,
+                    output,
+                } = result(TerminalState::Exited, Some(code), &tail, &strs(&commands))
+                else {
+                    panic!("{shell}: not a failure: {tail:?}");
+                };
+                assert_eq!(
+                    (named.as_deref(), how.as_str()),
+                    (Some(command), "exit code 100"),
+                    "{shell}: {tail:?}"
+                );
+                assert!(
+                    output.contains("test tests::example ... FAILED"),
+                    "{shell}: {output:?}"
+                );
+                assert!(output.contains("to-stderr"), "{shell}: {output:?}");
+            }
+        }
+
+        #[test]
+        fn the_real_setup_prints_no_notice_of_its_own_for_a_command_past_its_limit() {
+            let commands = ["echo before; sleep 3187"];
+            for shell in SHELLS {
+                let Some((tail, code)) = run_setup_in(shell, "sleep() { :; }", &commands) else {
+                    continue;
+                };
+                assert_eq!(code, TIMED_OUT, "{shell}: {tail:?}");
+                assert_eq!(
+                    tail,
+                    format!(
+                        "$ {0}\nbefore\nsetup failed: {0} ran past {1} s and was stopped\n",
+                        commands[0],
+                        COMMAND_LIMIT.as_secs()
+                    ),
+                    "{shell}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_real_setup_keeps_its_error_stream_out_of_the_command() {
+            // The marker is split so the echoed `$ <command>` line does not hold it.
+            let command = "if ( : >&3 ) 2>/dev/null; then echo fd3-lea\"\"ked; fi; echo after";
+            for shell in SHELLS {
+                let Some((tail, code)) = run_setup_in(shell, "", &[command]) else {
+                    continue;
+                };
+                assert_eq!(code, 0, "{shell}: {tail:?}");
+                assert!(!tail.contains("fd3-leaked"), "{shell}: {tail:?}");
+                assert!(tail.contains("after\n"), "{shell}: {tail:?}");
+            }
+        }
+
+        #[test]
+        fn the_real_setup_explains_a_mktemp_that_fails() {
+            for shell in SHELLS {
+                let stub = "mktemp() { echo mktemp-broke >&2; return 1; }";
+                let Some((tail, code)) = run_setup_in(shell, stub, &["echo hi"]) else {
+                    continue;
+                };
+                assert_eq!(code, 1, "{shell}: {tail:?}");
+                assert!(tail.contains("mktemp-broke"), "{shell}: {tail:?}");
+            }
         }
 
         #[test]
@@ -905,8 +1001,7 @@ mod tests {
                 (Some("echo boom; exit 3"), "exit code 3"),
                 "{tail:?}"
             );
-            // The command's own output comes first. Some shells, such as macOS's `/bin/sh`, add
-            // a line of their own when the stopped watcher is reaped, so the rest is not asserted.
+            // The command's own output comes first.
             assert!(output.starts_with("boom\n"), "{tail:?}");
         }
 
@@ -918,7 +1013,6 @@ mod tests {
             let commands = ["sleep 3187"];
             let (tail, code) = run_setup("sleep() { :; }", &commands);
             assert_eq!(code, TIMED_OUT, "{tail:?}");
-            // Its output is not asserted: some shells print a line of their own for the kill.
             let GateResult::Failed { command, how, .. } =
                 result(TerminalState::Exited, Some(code), &tail, &strs(&commands))
             else {

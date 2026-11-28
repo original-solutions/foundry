@@ -158,6 +158,17 @@ printf 'setup passed\n'"#;
 /// Linux. A command runs in the background with a watcher beside it; the watcher waits out the
 /// limit and then stops the command's whole tree: it freezes every process of the tree, lists it
 /// again until no new one appears so nothing forks away, and kills them all.
+///
+/// Killing the watcher or a command makes some shells (macOS's `/bin/sh` is bash, and dash does
+/// it for a command) print a job notice such as `Killed ( sleep "$limit"; ... )` on their own
+/// stderr, which would land in the failure's output. So the script's own stderr goes to
+/// `/dev/null` for good, after fd 3 keeps the terminal's, which `mktemp` and each command get
+/// back; fd 3 is closed in the command so it does not leak into it.
+///
+/// That drops every message of the setup shell's own, not only the job notices: the notice that a
+/// command died of a signal (`Segmentation fault`, an OOM kill) goes too, and so do errors from
+/// `ps` and `awk` in `tree`. A command's signal death is still seen in its exit code, on the
+/// `setup failed: <command> exited <code>` line the gate parses.
 const SETUP_LIMITED: &str = r#"limit=$1
 shift
 tree() {
@@ -182,13 +193,14 @@ stop_tree() {
   done
   for p in $known; do kill -KILL "$p" 2>/dev/null; done
 }
+exec 3>&2 2>/dev/null
 dir=
 trap 'rm -rf "$dir"' EXIT
 trap 'exit 1' HUP INT TERM
 for command do
   printf '$ %s\n' "$command"
-  dir=$(mktemp -d) || exit 1
-  /bin/sh -c "$command" &
+  dir=$(mktemp -d 2>&3) || exit 1
+  /bin/sh -c "$command" 2>&3 3>&- &
   pid=$!
   ( sleep "$limit"; : > "$dir/killed"; stop_tree "$pid" ) &
   watcher=$!
