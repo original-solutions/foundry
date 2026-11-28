@@ -6673,4 +6673,194 @@ mod tests {
             assert_eq!(rig.worker.calls(), vec![probe(1), probe(2)]);
         }
     }
+
+    // #367: a session that may be at work on a machine cut off for 15 minutes, with its pull
+    // request reported, is an interruption as one with none reported is.
+    mod a_reported_pull_request_cut_off_at_work {
+        use super::*;
+        use crate::factory::gate::{self, MACHINE_GONE_AFTER};
+        use crate::factory::runs::gating::gate_running;
+        use crate::factory::runs::progress::GATE_REQUESTED;
+
+        const HEAD: &str = "1111111111111111111111111111111111111111";
+        const BASE_TIP: &str = "2222222222222222222222222222222222222222";
+
+        /// The gate's workspace on the build machine.
+        fn gate_workspace() -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(0x6a7))
+        }
+
+        /// A building run whose session read turn 1 and reported its pull request, which is
+        /// open on its own branch.
+        fn reported() -> (Rig, RunId) {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.step(&run, "turn-read 1");
+            pr_opened(&rig, &run);
+            rig.sim.set_pull(12, pr_on(PR_BRANCH, false));
+            (rig, run)
+        }
+
+        /// The build machine unreachable for `span`, its session shown unreachable with its
+        /// newest turn 1 and `prompts` prompts typed: 2 is a prompt after that turn, so the
+        /// session may be at work; 1 is at rest.
+        fn away(span: Duration, prompts: u64) -> FleetView {
+            FleetView::builder()
+                .online(m2())
+                .workspace(workspace_record(m1(), old(), BRANCH, None))
+                .session(session_record(session(), old(), SessionState::Unreachable))
+                .turn(turn_of(session(), old(), 1, prompts))
+                .unreachable(m1(), span)
+                .build()
+        }
+
+        fn at_work(span: Duration) -> FleetView {
+            away(span, 2)
+        }
+
+        /// A gate placed on the build machine and created, in flight.
+        fn gate_in_flight(rig: &Rig, run: &RunId) {
+            rig.step(
+                run,
+                &format!("{GATE_REQUESTED}1 1 {HEAD} {BASE_TIP} {}", m1()),
+            );
+            rig.step(run, &format!("gate-created 1 {}", gate_workspace()));
+            assert!(gate_running(&rig.events(run)));
+        }
+
+        #[test]
+        fn is_interrupted_at_15_minutes_and_resumed_on_the_pull_requests_branch() {
+            let (mut rig, run) = reported();
+            rig.view = at_work(UNREACHABLE_FOR);
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Archiving {
+                    resumes: 1,
+                    workspace: Some(old()),
+                }
+            );
+            let lines = interruptions(&rig, &run);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0]["branch"], PR_BRANCH);
+            assert_eq!(
+                resume_steps(&rig, &run),
+                [
+                    format!("resume-archiving 1 {}", old()),
+                    "resume-archive-asked 1".to_string(),
+                ]
+            );
+            // It goes on as a run with no pull request reported does.
+            rig.view = archived();
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::NeedsMachine(Placing::Resume { resumes: 1 })
+            );
+            resume_workspace_made(&mut rig, &run);
+            assert_eq!(
+                resumed(&mut rig, &run),
+                ResumeStep::Started {
+                    resumes: 1,
+                    session: resumed_session(),
+                }
+            );
+            let Some(Call::Create { request, .. }) = create_calls(&rig).pop() else {
+                panic!("no create");
+            };
+            assert_eq!(request.name, "fac/8-1-r1");
+            assert_eq!(
+                request.checkout,
+                Checkout::Branch {
+                    name: PR_BRANCH.into()
+                }
+            );
+        }
+
+        #[test]
+        fn records_nothing_and_stays_building_short_of_15_minutes() {
+            let (mut rig, run) = reported();
+            rig.view = at_work(UNREACHABLE_FOR - Duration::from_secs(1));
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+            assert!(rig.worker.calls().is_empty());
+            assert_eq!(rig.ctx().seen(&run).unwrap().state, Some(State::Building));
+        }
+
+        /// #294's rule stands: a session at rest when last seen is not at work, and its
+        /// reported pull request is the gate's.
+        #[test]
+        fn a_session_at_rest_when_last_seen_is_left_to_the_gate() {
+            let (mut rig, run) = reported();
+            rig.view = away(UNREACHABLE_FOR * 2, 1);
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+            assert!(interruptions(&rig, &run).is_empty());
+            assert!(rig.worker.calls().is_empty());
+        }
+
+        /// A recorded pass is the gate's to finish: no session is needed for it.
+        #[test]
+        fn a_run_with_a_recorded_pass_is_left_to_the_gate() {
+            let (mut rig, run) = reported();
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::StepChanged {
+                        step: format!("gate-passed {HEAD} 1"),
+                    },
+                    &Cause::new(CauseStep::Gate, "gate-passed").attempt(1),
+                )
+                .unwrap();
+            rig.view = at_work(UNREACHABLE_FOR);
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+        }
+
+        /// The gate in flight is not read while the session may be at work, so it does not
+        /// hide the interruption: it is marked could not run, with the gate's own words for a
+        /// machine that is gone, before the interruption is recorded, and its slot is free.
+        #[test]
+        fn a_gate_in_flight_is_marked_could_not_run_before_the_interruption() {
+            let (mut rig, run) = reported();
+            gate_in_flight(&rig, &run);
+            rig.view = at_work(UNREACHABLE_FOR);
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Archiving {
+                    resumes: 1,
+                    workspace: Some(old()),
+                }
+            );
+            let events = rig.events(&run);
+            assert!(!gate_running(&events));
+            let reason = gate::could_not_run(None, MACHINE_GONE_AFTER, None).unwrap();
+            let expected = format!("gate-could-not-run 1 1 1 1 {reason}");
+            let could_not_run = events
+                .iter()
+                .position(|e| step_text(e) == Some(expected.as_str()))
+                .expect("the gate could not run");
+            let interrupted = events
+                .iter()
+                .position(|e| e.event == "session_interrupted")
+                .expect("the interruption");
+            assert!(could_not_run < interrupted);
+            // Nothing is asked of the gate's machine, which is gone.
+            assert_eq!(rig.worker.calls(), vec![archived_call()]);
+        }
+
+        /// Short of 15 minutes the gate in flight is left to the gate's own rules.
+        #[test]
+        fn a_gate_in_flight_short_of_15_minutes_is_left_running() {
+            let (mut rig, run) = reported();
+            gate_in_flight(&rig, &run);
+            rig.view = at_work(UNREACHABLE_FOR - Duration::from_secs(1));
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+            assert!(gate_running(&rig.events(&run)));
+        }
+    }
 }
