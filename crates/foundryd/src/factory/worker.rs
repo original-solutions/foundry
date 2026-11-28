@@ -792,7 +792,7 @@ mod tests {
         fake.archive(ws).unwrap();
         fake.tail(term).unwrap();
         let req = request("a", "r1");
-        fake.create(m, req.clone()).unwrap();
+        fake.create(Target::Machine(m), req.clone()).unwrap();
         fake.turn(asked, 3).unwrap();
         let sess = fake.start_session(ws, start(), msg("go")).unwrap();
         fake.end_sessions(ws).unwrap();
@@ -804,7 +804,7 @@ mod tests {
                 Call::Archive { workspace: ws },
                 Call::Tail { terminal: term },
                 Call::Create {
-                    machine: m,
+                    target: Target::Machine(m),
                     request: req
                 },
                 Call::Turn {
@@ -884,10 +884,19 @@ mod tests {
     fn a_second_default_create_with_the_same_tag_and_name_answers_the_first() {
         let fake = FakeWorker::new();
         let m = machine(1);
-        let first = fake.create(m, request("a", "r1")).unwrap();
-        assert_eq!(fake.create(m, request("a", "r1")).unwrap(), first);
-        assert_ne!(fake.create(m, request("b", "r1")).unwrap(), first);
-        assert_ne!(fake.create(m, request("a", "r2")).unwrap(), first);
+        let first = fake.create(Target::Machine(m), request("a", "r1")).unwrap();
+        assert_eq!(
+            fake.create(Target::Machine(m), request("a", "r1")).unwrap(),
+            first
+        );
+        assert_ne!(
+            fake.create(Target::Machine(m), request("b", "r1")).unwrap(),
+            first
+        );
+        assert_ne!(
+            fake.create(Target::Machine(m), request("a", "r2")).unwrap(),
+            first
+        );
     }
 
     #[test]
@@ -896,34 +905,49 @@ mod tests {
         let m = machine(1);
         let scripted = WorkspaceId(id(9));
         fake.on_create(Ok(scripted));
-        assert_eq!(fake.create(m, request("a", "r1")).unwrap(), scripted);
-        let fresh = fake.create(m, request("a", "r1")).unwrap();
+        assert_eq!(
+            fake.create(Target::Machine(m), request("a", "r1")).unwrap(),
+            scripted
+        );
+        let fresh = fake.create(Target::Machine(m), request("a", "r1")).unwrap();
         assert_ne!(fresh, scripted, "the scripted answer answered one call");
-        assert_eq!(fake.create(m, request("a", "r1")).unwrap(), fresh);
+        assert_eq!(
+            fake.create(Target::Machine(m), request("a", "r1")).unwrap(),
+            fresh
+        );
     }
 
     #[test]
     fn a_default_create_is_per_machine_and_forgets_an_archived_workspace() {
         let fake = FakeWorker::new();
         let (a, b) = (machine(1), machine(2));
-        let first = fake.create(a, request("a", "r1")).unwrap();
-        let elsewhere = fake.create(b, request("a", "r1")).unwrap();
+        let first = fake.create(Target::Machine(a), request("a", "r1")).unwrap();
+        let elsewhere = fake.create(Target::Machine(b), request("a", "r1")).unwrap();
         assert_ne!(elsewhere, first);
-        assert_eq!(fake.create(a, request("a", "r1")).unwrap(), first);
+        assert_eq!(
+            fake.create(Target::Machine(a), request("a", "r1")).unwrap(),
+            first
+        );
         fake.archive(first).unwrap();
-        let again = fake.create(a, request("a", "r1")).unwrap();
+        let again = fake.create(Target::Machine(a), request("a", "r1")).unwrap();
         assert_ne!(again, first);
-        assert_eq!(fake.create(b, request("a", "r1")).unwrap(), elsewhere);
+        assert_eq!(
+            fake.create(Target::Machine(b), request("a", "r1")).unwrap(),
+            elsewhere
+        );
     }
 
     #[test]
     fn a_failed_archive_does_not_forget_the_workspace() {
         let fake = FakeWorker::new();
         let m = machine(1);
-        let first = fake.create(m, request("a", "r1")).unwrap();
+        let first = fake.create(Target::Machine(m), request("a", "r1")).unwrap();
         fake.on_archive(Err(WorkerError::Failed("no".into())));
         assert!(fake.archive(first).is_err());
-        assert_eq!(fake.create(m, request("a", "r1")).unwrap(), first);
+        assert_eq!(
+            fake.create(Target::Machine(m), request("a", "r1")).unwrap(),
+            first
+        );
     }
 
     #[test]
@@ -942,6 +966,90 @@ mod tests {
         assert_eq!(fake.send(sess, msg("a"), Some(1)), Ok(1));
         assert_eq!(
             fake.send(sess, msg("a"), Some(1)),
+    #[test]
+    fn a_target_is_written_as_its_machine_or_its_kind_and_read_back() {
+        let m = machine(1);
+        let id = m.to_string();
+        assert_eq!(Target::Machine(m).to_string(), id);
+        assert_eq!(id.parse::<Target>(), Ok(Target::Machine(m)));
+        assert_eq!(Target::Host(HostKind::Vims).to_string(), "vims");
+        assert_eq!("vims".parse::<Target>(), Ok(Target::Host(HostKind::Vims)));
+        assert_eq!(Target::Machine(m).machine(), Some(m));
+        assert_eq!(Target::Host(HostKind::Vims).machine(), None);
+    }
+
+    #[test]
+    fn a_target_is_read_only_in_the_form_foundry_writes_it() {
+        let id = machine(0xabcdef).to_string();
+        assert!("kubernetes".parse::<Target>().is_err());
+        assert!("Vims".parse::<Target>().is_err());
+        assert!("".parse::<Target>().is_err());
+        assert!(id.to_uppercase().parse::<Target>().is_err());
+        assert!(id.replace('-', "").parse::<Target>().is_err());
+        assert!(format!("{{{id}}}").parse::<Target>().is_err());
+    }
+
+    #[test]
+    fn the_fake_refuses_a_host_create_naming_the_kind_and_records_it() {
+        let fake = FakeWorker::new();
+        let host = Target::Host(HostKind::Vims);
+        let req = request("a", "r1");
+        let Err(WorkerError::Failed(said)) = fake.create(host, req.clone()) else {
+            panic!("a host create is refused");
+        };
+        assert!(said.contains("vims"), "{said}");
+        assert_eq!(
+            fake.calls(),
+            vec![Call::Create {
+                target: host,
+                request: req
+            }]
+        );
+        // A scripted answer still comes first.
+        let scripted = WorkspaceId(id(9));
+        fake.on_create(Ok(scripted));
+        assert_eq!(fake.create(host, request("a", "r1")), Ok(scripted));
+    }
+
+    #[test]
+    fn the_fleet_machine_of_a_host_is_a_refusal_naming_the_kind() {
+        let m = machine(1);
+        assert_eq!(fleet_machine(Target::Machine(m)), Ok(m));
+        let Err(WorkerError::Failed(said)) = fleet_machine(Target::Host(HostKind::Vims)) else {
+            panic!("a host is refused");
+        };
+        assert!(said.contains("vims"), "{said}");
+    }
+
+    #[test]
+    fn the_fake_records_the_four_host_calls_apart_from_its_calls() {
+        let fake = FakeWorker::new();
+        let ws = WorkspaceId(id(5));
+        let other = WorkspaceId(id(6));
+        fake.archive(ws).unwrap();
+        fake.advance(ws).unwrap();
+        fake.rest(ws).unwrap();
+        fake.archive(other).unwrap();
+        fake.wake(other).unwrap();
+        fake.keep(ws).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::Archive { workspace: ws },
+                Call::Archive { workspace: other }
+            ]
+        );
+        assert_eq!(
+            fake.host_calls(),
+            vec![
+                (1, HostCall::Advance { workspace: ws }),
+                (1, HostCall::Rest { workspace: ws }),
+                (2, HostCall::Wake { workspace: other }),
+                (2, HostCall::Keep { workspace: ws }),
+            ]
+        );
+    }
+
             Err(SendRefused::CountRose { now: 2 })
         );
         assert_eq!(fake.send(sess, msg("a"), None), Ok(2));
@@ -1040,7 +1148,9 @@ mod tests {
         let (_dir, mut store) = open();
         let m = machine(1);
         let fake = FakeWorker::new();
-        let made = fake.create(m, request("run", "r1")).unwrap();
+        let made = fake
+            .create(Target::Machine(m), request("run", "r1"))
+            .unwrap();
         let view = FleetView::read(&store, BTreeSet::from([m]), BTreeMap::new()).unwrap();
         assert!(view.workspace_named(project(1), "run").is_none());
 

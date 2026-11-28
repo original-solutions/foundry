@@ -2034,7 +2034,7 @@ mod tests {
     use crate::factory::lifecycle::State;
     use crate::factory::messages::{self, LAUNCH_FAILED, ResumeFrom, SESSION_GONE};
     use crate::factory::worker::{
-        Call, CreateWorkspace, FleetView, FleetViewBuilder, Lost, WorkerError,
+        Call, CreateWorkspace, FleetView, FleetViewBuilder, HostCall, Lost, Target, WorkerError,
     };
     use crate::sessions::factory::BODY_PATH;
     use crate::sessions::turns::TurnText;
@@ -2242,7 +2242,7 @@ mod tests {
     }
 
     fn placed_on(rig: &Rig, run: &RunId, machine: MachineId) -> ResumeStep {
-        placed(&rig.ctx(), run, machine).unwrap()
+        placed(&rig.ctx(), run, Target::Machine(machine)).unwrap()
     }
 
     fn is_skipped(step: &ResumeStep) -> bool {
@@ -3204,7 +3204,7 @@ mod tests {
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
             assert!(advance(&rig.ctx(), &run).is_ok());
-            let error = placed(&rig.ctx(), &run, m2()).unwrap_err();
+            let error = placed(&rig.ctx(), &run, Target::Machine(m2())).unwrap_err();
             assert!(matches!(
                 error,
                 RunError::Worker(WorkerError::Unreachable(_))
@@ -3575,10 +3575,10 @@ mod tests {
             );
             let calls = create_calls(&rig);
             assert_eq!(calls.len(), 1);
-            let Call::Create { machine, request } = &calls[0] else {
+            let Call::Create { target, request } = &calls[0] else {
                 panic!("a create");
             };
-            assert_eq!(*machine, m1());
+            assert_eq!(*target, Target::Machine(m1()));
             assert_eq!(
                 request.checkout,
                 Checkout::Branch {
@@ -3714,7 +3714,7 @@ mod tests {
             let (rig, run) = archived_and_waiting_for_a_machine();
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("x".into())));
-            let _ = placed(&rig.ctx(), &run, m2());
+            let _ = placed(&rig.ctx(), &run, Target::Machine(m2()));
             let steps = resume_steps(&rig, &run);
             assert!(
                 steps.contains(&format!("resume-machine 1 {}", m2())),
@@ -3729,7 +3729,7 @@ mod tests {
             assert!(
                 calls
                     .iter()
-                    .all(|call| matches!(call, Call::Create { machine, .. } if *machine == m2()))
+                    .all(|call| matches!(call, Call::Create { target, .. } if *target == Target::Machine(m2())))
             );
         }
 
@@ -3820,6 +3820,30 @@ mod tests {
         fn the_resumed_session_is_started_recorded_and_named_in_the_status() {
             let mut rig = Rig::new();
             let run = run_id(1);
+        /// A setup that is running is advanced each pass with its workspace; one that exited
+        /// cleanly is not.
+        #[test]
+        fn a_setup_that_is_running_is_advanced_and_one_that_exited_is_not() {
+            let (mut rig, run) = archived_and_waiting_for_a_machine();
+            resume_workspace_made(&mut rig, &run);
+            rig.view = with_resume_workspace("fac/8-1-r1", Some(setup_terminal()))
+                .terminal(terminal_record(TerminalState::Running, None))
+                .build();
+            assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Setup));
+            let advanced: Vec<_> = rig
+                .worker
+                .host_calls()
+                .into_iter()
+                .map(|(_, c)| c)
+                .collect();
+            assert_eq!(advanced, [HostCall::Advance { workspace: fresh() }]);
+            rig.view = with_resume_workspace("fac/8-1-r1", Some(setup_terminal()))
+                .terminal(terminal_record(TerminalState::Exited, Some(0)))
+                .build();
+            assert!(matches!(pass(&rig, &run), ResumeStep::Started { .. }));
+            assert_eq!(rig.worker.host_calls().len(), 1);
+        }
+
             building(&rig, &run);
             rig.view = failed();
             never_written(&rig);
@@ -4007,10 +4031,10 @@ mod tests {
                 .unwrap();
             assert!(moved_at < created_at);
             let calls = create_calls(&rig);
-            let Call::Create { machine, request } = &calls[0] else {
+            let Call::Create { target, request } = &calls[0] else {
                 panic!("a create");
             };
-            assert_eq!(*machine, m2());
+            assert_eq!(*target, Target::Machine(m2()));
             assert_eq!(request.name, "fac/8-1");
             assert_eq!(
                 request.checkout,
@@ -4081,7 +4105,7 @@ mod tests {
                 pass(&rig, &run),
                 ResumeStep::NeedsMachine(Placing::MovedClaim { .. })
             ));
-            assert!(placed(&rig.ctx(), &run, m1()).is_err());
+            assert!(placed(&rig.ctx(), &run, Target::Machine(m1())).is_err());
             assert!(create_calls(&rig).is_empty());
             // Online again, the machine is start's to ask.
             rig.view = FleetView::builder().online(m1()).online(m2()).build();
@@ -4772,7 +4796,7 @@ mod tests {
             );
             // Nothing ran: the same resume, no second decision.
             assert_eq!(interruptions(&rig, &run).len(), 1);
-            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             rig.worker.on_create(Ok(fresh3()));
             assert_eq!(
                 placed_on(&rig, &run, m3()),
@@ -4780,8 +4804,8 @@ mod tests {
             );
             let calls = create_calls(&rig);
             assert_eq!(calls.len(), 2);
-            assert!(matches!(&calls[1], Call::Create { machine, request }
-                if *machine == m3() && request.name == "fac/8-1-r1"));
+            assert!(matches!(&calls[1], Call::Create { target, request }
+                if *target == Target::Machine(m3()) && request.name == "fac/8-1-r1"));
             // When the given-up machine is heard from again its workspace is an orphan.
             let view = FleetView::builder()
                 .online(m1())
@@ -4807,7 +4831,7 @@ mod tests {
                 .build();
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
-            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             assert!(resume_steps(&rig, &run).contains(&format!("claim-moved {}", m2())));
             rig.view = FleetView::builder()
                 .online(m3())
@@ -4819,7 +4843,7 @@ mod tests {
                 ResumeStep::NeedsMachine(Placing::MovedClaim { .. })
             ));
             assert!(resume_steps(&rig, &run).contains(&format!("claim-moved-given-up {}", m2())));
-            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             rig.worker.on_create(Ok(fresh3()));
             assert_eq!(
                 placed_on(&rig, &run, m3()),
@@ -5047,7 +5071,7 @@ mod tests {
                 .build();
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
-            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             assert_eq!(
                 resume_steps(&rig, &run),
                 vec![format!("claim-moved {}", m2())]
@@ -5066,7 +5090,7 @@ mod tests {
             assert!(
                 calls
                     .iter()
-                    .all(|call| matches!(call, Call::Create { machine, .. } if *machine == m2()))
+                    .all(|call| matches!(call, Call::Create { target, .. } if *target == Target::Machine(m2())))
             );
             assert_eq!(
                 resume_steps(&rig, &run),
@@ -5605,7 +5629,7 @@ mod tests {
                 .unreachable(m2(), secs(15 * 60))
                 .build();
             assert!(matches!(pass(&rig, &run), ResumeStep::NeedsMachine(_)));
-            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             // Heard from again: placement may pick it, and its earlier workspace of the name is
             // found and used.
             rig.view = with_resume_workspace("fac/8-1-r1", Some(setup_terminal()))
@@ -5637,7 +5661,7 @@ mod tests {
                 .build();
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
-            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             rig.view = FleetView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
@@ -5647,7 +5671,7 @@ mod tests {
                 pass(&rig, &run),
                 ResumeStep::NeedsMachine(Placing::MovedClaim { .. })
             ));
-            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             // The target is back: placement may pick it again.
             rig.view = FleetView::builder()
                 .online(m2())
@@ -5675,7 +5699,7 @@ mod tests {
                 .build();
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
-            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             rig.view = FleetView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
@@ -5860,7 +5884,7 @@ mod tests {
                 .build();
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
-            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             rig.view = FleetView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
@@ -5985,7 +6009,7 @@ mod tests {
                 .build();
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
-            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             rig.view = FleetView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
@@ -6074,7 +6098,9 @@ mod tests {
             assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Workspace));
             let calls = create_calls(&rig);
             assert_eq!(calls.len(), 1);
-            assert!(matches!(&calls[0], Call::Create { machine, .. } if *machine == m2()));
+            assert!(
+                matches!(&calls[0], Call::Create { target, .. } if *target == Target::Machine(m2()))
+            );
             assert!(resume_steps(&rig, &run).contains(&format!("resume-workspace 1 {}", fresh3())));
         }
 

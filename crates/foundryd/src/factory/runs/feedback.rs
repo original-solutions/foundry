@@ -1989,7 +1989,9 @@ mod tests {
     use crate::factory::lifecycle::State;
     use crate::factory::messages::{self, LAUNCH_FAILED};
     use crate::factory::runs::resume::BRANCH_REFUSED;
-    use crate::factory::worker::{Call, CreateWorkspace, FleetView, FleetViewBuilder, WorkerError};
+    use crate::factory::worker::{
+        Call, CreateWorkspace, FleetView, FleetViewBuilder, HostCall, Target, WorkerError,
+    };
     use crate::sessions::factory::BODY_PATH;
     use crate::workspaces::{Checkout, FactoryTag, Setup};
 
@@ -3063,10 +3065,10 @@ mod tests {
             // setup, named for the round.
             world.rig.worker.on_create(Ok(fresh()));
             assert_eq!(world.go(), FeedbackStep::Preparing(Wait::Workspace));
-            let Call::Create { machine, request } = world.creates().remove(0) else {
+            let Call::Create { target, request } = world.creates().remove(0) else {
                 unreachable!()
             };
-            assert_eq!(machine, m1());
+            assert_eq!(target, Target::Machine(m1()));
             assert_eq!(
                 request,
                 CreateWorkspace {
@@ -4472,17 +4474,20 @@ mod tests {
             let ours = WorkspaceId(uuid::Uuid::from_u128(0xb23));
             world.rig.worker.on_create(Ok(ours));
             assert_eq!(pass(&world), FeedbackStep::Preparing(Wait::Workspace));
-            let creates: Vec<(MachineId, String)> = world
+            let creates: Vec<(Target, String)> = world
                 .creates()
                 .into_iter()
                 .map(|call| match call {
-                    Call::Create { machine, request } => (machine, request.name),
+                    Call::Create { target, request } => (target, request.name),
                     _ => unreachable!(),
                 })
                 .collect();
             assert_eq!(
                 creates,
-                [(m1(), "fac/8-1-f1".into()), (m2, "fac/8-1-f1".into())]
+                [
+                    (Target::Machine(m1()), "fac/8-1-f1".into()),
+                    (Target::Machine(m2), "fac/8-1-f1".into())
+                ]
             );
             // Its record shows on m2 with the setup done: the session starts there, once.
             let mut record = workspace_record(ours, "fac/8-1-f1", Some(setup_terminal()));
@@ -4808,6 +4813,37 @@ mod tests {
             let mut world = World::reviewed();
             world.rig.worker.on_create(Ok(fresh()));
             assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+        #[test]
+        fn a_setup_that_runs_is_advanced_each_pass_and_one_that_exited_is_not() {
+            let mut world = World::reviewed();
+            world.rig.worker.on_create(Ok(fresh()));
+            assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+            assert_eq!(world.go(), FeedbackStep::Preparing(Wait::Workspace));
+            let with_setup = |state, code| {
+                fleet()
+                    .workspace(workspace_record(
+                        fresh(),
+                        "fac/8-1-f1",
+                        Some(setup_terminal()),
+                    ))
+                    .terminal(terminal_record(state, code))
+                    .build()
+            };
+            world.rig.view = with_setup(TerminalState::Running, None);
+            assert_eq!(world.go(), FeedbackStep::Preparing(Wait::Setup));
+            let advanced: Vec<_> = world
+                .rig
+                .worker
+                .host_calls()
+                .into_iter()
+                .map(|(_, call)| call)
+                .collect();
+            assert_eq!(advanced, [HostCall::Advance { workspace: fresh() }]);
+            world.rig.view = with_setup(TerminalState::Exited, Some(0));
+            assert!(matches!(world.go(), FeedbackStep::Started { .. }));
+            assert_eq!(world.rig.worker.host_calls().len(), 1);
+        }
+
             assert_eq!(world.go(), FeedbackStep::Preparing(Wait::Workspace));
             world.rig.view = round_view();
             world.rig.sim.set_approval(approval_answer(

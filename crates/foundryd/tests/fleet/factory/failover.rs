@@ -18,7 +18,7 @@ use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
-use foundry_proto::factory::{FactoryKey, FactoryRecord, NotHolding, RunEvent, RunId};
+use foundry_proto::factory::{FactoryKey, FactoryRecord, HostKind, NotHolding, RunEvent, RunId};
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, WorkspaceId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::{Record, Session};
@@ -32,7 +32,7 @@ use foundryd::factory::github::{
 };
 use foundryd::factory::ledger::Hide;
 use foundryd::factory::status::Freshness;
-use foundryd::factory::worker::{CreateWorkspace, Worker};
+use foundryd::factory::worker::{CreateWorkspace, Target, Worker};
 use foundryd::factory::{Answering, Factory, Host, Leases, Leasing, Watched};
 use foundryd::secrets::Secrets;
 use foundryd::sessions::{self, Gateway, Sessions};
@@ -552,7 +552,7 @@ impl Rig {
         };
         let worker = FleetWorker::new(self.parts[i].api.clone(), tokio::runtime::Handle::current());
         let on = self.id(on);
-        tokio::task::spawn_blocking(move || worker.create(on, request))
+        tokio::task::spawn_blocking(move || worker.create(Target::Machine(on), request))
             .await
             .unwrap()
             .expect("the build workspace is made")
@@ -1735,4 +1735,51 @@ fn the_traps_rules_match_the_claims_calls() {
     ])));
     assert!(!is_write(&call(&["issue", "view", "12"])));
     assert!(!is_write(&call(&["api", "graphql", "-f", "query=x"])));
+}
+
+#[test]
+fn the_fleet_worker_refuses_a_host_and_does_nothing_for_the_four_host_calls() {
+    isolated(
+        module_path!(),
+        "the_fleet_worker_refuses_a_host_and_does_nothing_for_the_four_host_calls",
+        || async {
+            let rig = Rig::start(RigOptions::default()).await;
+            let worker =
+                FleetWorker::new(rig.parts[0].api.clone(), tokio::runtime::Handle::current());
+            let request = CreateWorkspace {
+                project: rig.project,
+                name: "fac/12-1".into(),
+                checkout: Checkout::NewBranch {
+                    base: "main".into(),
+                    branch: Some("fac/12-1".into()),
+                },
+                setup: Setup::Own,
+                tag: FactoryTag {
+                    project: rig.project,
+                    run: "rawphp__softfac__12__1".into(),
+                },
+            };
+            let workspace = WorkspaceId::random();
+            let (created, advanced, rested, woke, kept) = tokio::task::spawn_blocking(move || {
+                (
+                    worker.create(Target::Host(HostKind::Vims), request),
+                    worker.advance(workspace),
+                    worker.rest(workspace),
+                    worker.wake(workspace),
+                    worker.keep(workspace),
+                )
+            })
+            .await
+            .unwrap();
+            let Err(foundryd::factory::worker::WorkerError::Failed(said)) = created else {
+                panic!("a host create is refused: {created:?}");
+            };
+            assert!(said.contains("vims"), "{said}");
+            assert_eq!(
+                (advanced, rested, woke, kept),
+                (Ok(()), Ok(()), Ok(()), Ok(()))
+            );
+            rig.h.no_unknown_calls();
+        },
+    );
 }

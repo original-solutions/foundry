@@ -1729,7 +1729,7 @@ fn launch_taken(events: &[RunEvent]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use foundry_proto::factory::{FactorySettings, ProjectFactory};
+    use foundry_proto::factory::{FactorySettings, HostKind, ProjectFactory};
 
     use super::super::testing::HeldFor;
     use super::super::testing::*;
@@ -1755,7 +1755,7 @@ mod tests {
     }
 
     fn claim_it(rig: &Rig) -> Result<ClaimOutcome, RunError> {
-        claim(&rig.ctx(), ISSUE, rig.machine)
+        claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine))
     }
 
     fn claimed(rig: &Rig) -> RunId {
@@ -1948,9 +1948,35 @@ mod tests {
                 newest(&rig),
                 Some(Claim::Foundry {
                     run: run.clone(),
-                    machine: rig.machine
+                    target: Target::Machine(rig.machine)
                 })
             );
+        /// A claim at a host names the host's kind in its marker and in the `claimed` line.
+        #[test]
+        fn a_claim_at_a_host_names_its_kind_in_the_marker_and_the_claimed_line() {
+            let rig = Rig::new();
+            let host = Target::Host(HostKind::Vims);
+            let ClaimOutcome::Claimed { run } = claim(&rig.ctx(), ISSUE, host).unwrap() else {
+                panic!("a claim");
+            };
+            let marker = format!("<!-- foundry:claim {run} vims -->");
+            let comments = rig.sim.comments();
+            assert!(
+                comments
+                    .iter()
+                    .any(|body| body.trim_end().lines().last() == Some(marker.as_str())),
+                "{comments:?}"
+            );
+            assert_eq!(
+                newest(&rig),
+                Some(Claim::Foundry {
+                    run: run.clone(),
+                    target: host
+                })
+            );
+            assert_eq!(rig.events(&run)[1].data["machine"], "vims");
+        }
+
             let events = rig.events(&run);
             assert_eq!(events[0].cause.as_ref().unwrap()["actor"], "tom");
             assert_eq!(events[1].data["machine"], rig.machine.to_string());
@@ -2149,7 +2175,7 @@ mod tests {
             let mut rig = Rig::new();
             rig.guard = Box::new(Lost);
             assert!(matches!(
-                claim(&rig.ctx(), ISSUE, rig.machine),
+                claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)),
                 Err(RunError::LeaseLost(_))
             ));
             assert!(rig.sim.writes().is_empty());
@@ -2165,13 +2191,13 @@ mod tests {
             let run = claimed(&rig);
             rig.sim.comment_as(
                 "mallory",
-                &crate::factory::github::claim_comment(&run_id(7), &rig.machine),
+                &crate::factory::github::claim_comment(&run_id(7), &Target::Machine(rig.machine)),
             );
             assert_eq!(
                 newest(&rig),
                 Some(Claim::Foundry {
                     run,
-                    machine: rig.machine
+                    target: Target::Machine(rig.machine)
                 })
             );
         }
@@ -2195,7 +2221,7 @@ mod tests {
                 newest(&rig),
                 Some(Claim::Foundry {
                     run: run_id(1),
-                    machine: rig.machine
+                    target: Target::Machine(rig.machine)
                 })
             );
             // The cut-short run is ended, so it holds no slot.
@@ -2207,7 +2233,7 @@ mod tests {
                 newest(&rig),
                 Some(Claim::Foundry {
                     run: run_id(2),
-                    machine: rig.machine
+                    target: Target::Machine(rig.machine)
                 })
             );
             assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
@@ -2342,7 +2368,7 @@ mod tests {
             rig.guard = Box::new(HeldFor::new(2));
             // The comment landed; the lease is lost before the label.
             assert!(matches!(
-                claim(&rig.ctx(), ISSUE, rig.machine),
+                claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)),
                 Err(RunError::LeaseLost(_))
             ));
             assert_eq!(rig.sim.writes().len(), 1);
@@ -2661,7 +2687,7 @@ mod tests {
 
     /// What one pass of `advance` shows, with the fleet as the test lays it out.
     mod the_launch {
-        use foundry_proto::ids::{SessionId, TerminalId, WorkspaceId};
+        use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
         use foundry_proto::record::{Record, Session, Terminal, Workspace};
         use foundry_proto::state::{SessionState, TerminalState};
 
@@ -2672,7 +2698,7 @@ mod tests {
         use crate::factory::messages::{
             CANNOT_CONFIRM, LAUNCH_FAILED, Message, ResumeFrom, TEXT_CHANGED,
         };
-        use crate::factory::worker::{Call, FleetView, Lost, WorkerError};
+        use crate::factory::worker::{Call, FleetView, HostCall, Lost, WorkerError};
         use crate::sessions::factory::{BODY_PATH, SendRefused};
         use crate::workspaces::{Checkout, FactoryTag, Setup};
 
@@ -2778,7 +2804,7 @@ mod tests {
             let rig = Rig::new();
             rig.worker.on_create(Ok(ws_id()));
             rig.worker.on_start_session(Ok(session()));
-            let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+            let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                 ClaimOutcome::Claimed { run } => run,
                 other => panic!("{other:?}"),
             };
@@ -2787,7 +2813,7 @@ mod tests {
 
         /// The run a claim made.
         fn claim_run(rig: &Rig) -> RunId {
-            match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+            match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                 ClaimOutcome::Claimed { run } => run,
                 other => panic!("{other:?}"),
             }
@@ -2884,7 +2910,7 @@ mod tests {
                 assert_eq!(
                     calls(&rig),
                     vec![Call::Create {
-                        machine: rig.machine,
+                        target: Target::Machine(rig.machine),
                         request: crate::factory::worker::CreateWorkspace {
                             project: project_id(),
                             name: "fac/8-1".into(),
@@ -2909,7 +2935,7 @@ mod tests {
                 rig.worker
                     .on_create(Err(WorkerError::Unreachable("down".into())));
                 rig.worker.on_create(Ok(ws_id()));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -2944,7 +2970,7 @@ mod tests {
                 let rig = Rig::new();
                 rig.worker
                     .on_create(Err(WorkerError::Unreachable("down".into())));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -2992,8 +3018,8 @@ mod tests {
                 let run = taken_over(&rig, elsewhere());
                 assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
                 match &creates(&rig)[..] {
-                    [Call::Create { machine, request }] => {
-                        assert_eq!(*machine, elsewhere());
+                    [Call::Create { target, request }] => {
+                        assert_eq!(*target, Target::Machine(elsewhere()));
                         assert_eq!(request.name, "fac/8-1");
                     }
                     other => panic!("{other:?}"),
@@ -3038,7 +3064,10 @@ mod tests {
                 rig.sim.set_assignees(&[LOGIN]);
                 rig.sim.comment_as(
                     "mallory",
-                    &crate::factory::github::claim_comment(&run_id(1), &elsewhere()),
+                    &crate::factory::github::claim_comment(
+                        &run_id(1),
+                        &Target::Machine(elsewhere()),
+                    ),
                 );
                 let step = pass(&rig, &run_id(1));
                 assert!(matches!(step, StartStep::Skipped { .. }));
@@ -3574,6 +3603,48 @@ mod tests {
                 assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Setup));
                 assert!(start_sessions(&rig).is_empty());
                 assert!(
+            #[test]
+            fn still_running_is_advanced_once_a_pass_with_its_workspace() {
+                let (mut rig, run) = claimed_rig();
+                pass(&rig, &run);
+                show_setup(&mut rig, TerminalState::Running, None);
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Setup));
+                let advanced: Vec<_> = rig
+                    .worker
+                    .host_calls()
+                    .into_iter()
+                    .map(|(_, c)| c)
+                    .collect();
+                assert_eq!(advanced, [HostCall::Advance { workspace: ws_id() }]);
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Setup));
+                assert_eq!(rig.worker.host_calls().len(), 2);
+            }
+
+            #[test]
+            fn that_exited_cleanly_is_not_advanced() {
+                let (mut rig, run) = claimed_rig();
+                pass(&rig, &run);
+                show_setup(&mut rig, TerminalState::Exited, Some(0));
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert!(rig.worker.host_calls().is_empty());
+            }
+
+            #[test]
+            fn that_failed_keeps_the_workspace() {
+                let (mut rig, run) = claimed_rig();
+                pass(&rig, &run);
+                show_setup(&mut rig, TerminalState::Exited, Some(2));
+                rig.worker.on_tail(Ok("setup failed".into()));
+                assert!(matches!(pass(&rig, &run), StartStep::Stuck { .. }));
+                let kept: Vec<_> = rig
+                    .worker
+                    .host_calls()
+                    .into_iter()
+                    .map(|(_, c)| c)
+                    .collect();
+                assert_eq!(kept, [HostCall::Keep { workspace: ws_id() }]);
+            }
+
                     !calls(&rig)
                         .iter()
                         .any(|call| matches!(call, Call::Tail { .. }))
@@ -3932,7 +4003,7 @@ mod tests {
                 rig.worker.on_start_session(Err(WorkerError::Failed(
                     "no such skill factory-build".into(),
                 )));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -3968,7 +4039,7 @@ mod tests {
                 rig.worker.on_start_session(Err(WorkerError::Failed(
                     "no such skill factory-build".into(),
                 )));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -3997,7 +4068,7 @@ mod tests {
                 rig.worker.on_create(Ok(ws_id()));
                 rig.worker
                     .on_start_session(Err(WorkerError::Failed("refused".into())));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -4026,7 +4097,7 @@ mod tests {
                     .on_start_session(Err(WorkerError::Unreachable("did not answer".into())));
                 rig.worker
                     .on_start_session(Err(WorkerError::Failed("refused".into())));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -4055,7 +4126,7 @@ mod tests {
                 rig.worker
                     .on_start_session(Err(WorkerError::Unreachable("down".into())));
                 rig.worker.on_start_session(Ok(session()));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -4089,7 +4160,7 @@ mod tests {
                 rig.worker
                     .on_start_session(Err(WorkerError::Unreachable("down".into())));
                 rig.worker.on_start_session(Ok(session()));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -4331,7 +4402,7 @@ mod tests {
                     &Cause::new(CauseStep::Start, "test"),
                     None,
                 );
-                match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 }
@@ -4704,7 +4775,7 @@ mod tests {
                 let rig = rig_for_second_attempt();
                 time_limited_first_attempt(&rig, "fac/8-1");
                 rig.sim.add_branch("fac/8-1");
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -4742,7 +4813,7 @@ mod tests {
             fn starts_from_base_when_the_branch_is_not_on_origin() {
                 let rig = rig_for_second_attempt();
                 time_limited_first_attempt(&rig, "fac/8-1");
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -4760,7 +4831,7 @@ mod tests {
                 let rig = rig_for_second_attempt();
                 time_limited_first_attempt(&rig, "-x");
                 rig.sim.add_branch("-x");
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -4783,7 +4854,7 @@ mod tests {
                     "tom",
                     &[("2026-10-04T11:00:00Z", "tom")],
                 ));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -4800,7 +4871,7 @@ mod tests {
             fn is_an_error_that_leaves_the_issue_in_triage_when_the_branch_cannot_be_looked_up() {
                 let rig = rig_for_second_attempt();
                 time_limited_first_attempt(&rig, "fac/8-1");
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -4842,7 +4913,7 @@ mod tests {
                 rig.worker.on_create(Ok(ws_id()));
                 rig.worker.on_start_session(Ok(session()));
                 rig.sim.set_body(body);
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -5047,7 +5118,7 @@ mod tests {
                 let rig = Rig::new();
                 rig.worker.on_create(Ok(ws_id()));
                 rig.worker.on_start_session(Ok(session()));
-                let run = match claim(&rig.ctx(), ISSUE, elsewhere()).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(elsewhere())).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -5356,7 +5427,7 @@ mod tests {
             }
 
             fn claim_it_for_the_launch(rig: &Rig) -> ClaimOutcome {
-                claim(&rig.ctx(), ISSUE, rig.machine).unwrap()
+                claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap()
             }
 
             /// The runner's case "a second attempt gets the next number and its own command id":
@@ -6536,7 +6607,7 @@ mod tests {
                 let mut rig = Rig::new();
                 rig.guard = Box::new(Lost);
                 assert!(matches!(
-                    claim(&rig.ctx(), ISSUE, rig.machine),
+                    claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)),
                     Err(RunError::LeaseLost(_))
                 ));
                 assert!(rig.sim.writes().is_empty());
@@ -6571,7 +6642,9 @@ mod tests {
                 rig.foundry_claim(&run_id(1), rig.machine);
                 assert_eq!(pass(&rig, &run_id(1)), StartStep::Waiting(Wait::Workspace));
                 match &creates(&rig)[..] {
-                    [Call::Create { machine, .. }] => assert_eq!(*machine, rig.machine),
+                    [Call::Create { target, .. }] => {
+                        assert_eq!(*target, Target::Machine(rig.machine))
+                    }
                     other => panic!("{other:?}"),
                 }
             }
@@ -6686,7 +6759,7 @@ mod tests {
             fn a_failed_claim_whose_claim_comments_cannot_be_read_fails_with_the_claim_s_error() {
                 let rig = Rig::new();
                 rig.sim.fail("--add-label", usize::MAX);
-                match claim(&rig.ctx(), ISSUE, rig.machine) {
+                match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)) {
                     Err(RunError::Tracker(error)) => {
                         assert!(error.to_string().contains("--add-label"), "{error}")
                     }
@@ -6858,7 +6931,7 @@ mod tests {
                 rig.worker.on_create(Ok(ws_id()));
                 rig.guard = Box::new(HeldFor::new(3));
                 assert!(matches!(
-                    claim(&rig.ctx(), ISSUE, rig.machine),
+                    claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)),
                     Err(RunError::LeaseLost(_))
                 ));
                 assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
@@ -7003,7 +7076,7 @@ mod tests {
                 rig.worker
                     .on_start_session(Err(WorkerError::Failed("refused".into())));
                 rig.worker.on_start_session(Ok(session()));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -7040,7 +7113,7 @@ mod tests {
                 rig.worker
                     .on_start_session(Err(WorkerError::Unreachable("did not answer".into())));
                 rig.worker.on_start_session(Ok(session()));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };
@@ -7115,7 +7188,7 @@ mod tests {
                 rig.worker
                     .on_start_session(Err(WorkerError::Unreachable("down".into())));
                 rig.worker.on_start_session(Ok(session()));
-                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                let run = match claim(&rig.ctx(), ISSUE, Target::Machine(rig.machine)).unwrap() {
                     ClaimOutcome::Claimed { run } => run,
                     other => panic!("{other:?}"),
                 };

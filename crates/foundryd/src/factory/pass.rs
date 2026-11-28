@@ -2210,8 +2210,8 @@ mod tests {
     use crate::factory::messages::Message;
     use crate::factory::runs::RunProject;
     use crate::factory::worker::{
-        AlwaysHeld, Call, CreateWorkspace, FakeWorker, FleetView, Guard, LeaseLost, Lost, Worker,
-        WorkerError,
+        AlwaysHeld, Call, CreateWorkspace, FakeWorker, FleetView, Guard, LeaseLost, Lost, Target,
+        Worker, WorkerError,
     };
     use crate::sessions::factory::{FactoryStart, SendRefused};
     use crate::sessions::turns::TurnText;
@@ -2285,7 +2285,7 @@ mod tests {
     }
 
     impl Worker for Watched {
-        fn create(&self, m: MachineId, r: CreateWorkspace) -> Result<WorkspaceId, WorkerError> {
+        fn create(&self, m: Target, r: CreateWorkspace) -> Result<WorkspaceId, WorkerError> {
             self.note("create");
             self.inner.create(m, r)
         }
@@ -2322,6 +2322,22 @@ mod tests {
         }
     }
 
+        fn advance(&self, w: WorkspaceId) -> Result<(), WorkerError> {
+            self.note("advance");
+            self.inner.advance(w)
+        }
+        fn rest(&self, w: WorkspaceId) -> Result<(), WorkerError> {
+            self.note("rest");
+            self.inner.rest(w)
+        }
+        fn wake(&self, w: WorkspaceId) -> Result<(), WorkerError> {
+            self.note("wake");
+            self.inner.wake(w)
+        }
+        fn keep(&self, w: WorkspaceId) -> Result<(), WorkerError> {
+            self.note("keep");
+            self.inner.keep(w)
+        }
     // ----- the rig -----
 
     struct Rig {
@@ -2995,7 +3011,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             let report = rig.pass();
             assert!(rig.claimed_issues().is_empty());
@@ -3022,7 +3038,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             // The claim's build workspace, with its setup terminal, is on the machine the comment
             // names: a record with no setup would have the create asked again.
@@ -3104,7 +3120,10 @@ mod tests {
                 rig.hub.comment_as(
                     5,
                     LOGIN,
-                    &crate::factory::github::claim_comment(&named, &builder_machine()),
+                    &crate::factory::github::claim_comment(
+                        &named,
+                        &Target::Machine(builder_machine()),
+                    ),
                 );
                 let report = rig.pass();
                 assert_eq!(report.failed, None, "{named}: {report:?}");
@@ -3138,7 +3157,7 @@ mod tests {
             rig.hub.comment_as(
                 4,
                 "mallory",
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             let report = rig.pass();
             // No claim of the login is on the issue, so it is neither ours nor foreign.
@@ -3734,7 +3753,7 @@ mod tests {
             rig.hub.comment_as(
                 issue,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             run
         }
@@ -4030,7 +4049,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.pass();
             assert_eq!(
@@ -4137,7 +4156,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.hub.ready(6);
             rig.worker
@@ -5596,7 +5615,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.hub.ready(6);
             let report = rig.pass();
@@ -5616,7 +5635,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.hub.ready(6);
             let report = rig.pass();
@@ -5833,7 +5852,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.tracker = Hiding::new(
                 Arc::new(PanicsOnceClaimed {
@@ -6155,7 +6174,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&run, &builder_machine()),
+                &crate::factory::github::claim_comment(&run, &Target::Machine(builder_machine())),
             );
             rig.tracker = Hiding::new(
                 Arc::new(FailsOnceClaimed {
@@ -6200,7 +6219,7 @@ mod tests {
             rig.hub.comment_as(
                 5,
                 LOGIN,
-                &crate::factory::github::claim_comment(&carried, &me()),
+                &crate::factory::github::claim_comment(&carried, &Target::Machine(me())),
             );
             rig.hub.ready(6);
             let report = rig.pass();

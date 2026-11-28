@@ -1113,7 +1113,7 @@ pub(crate) mod testing {
     use crate::factory::config::Limits;
     use crate::factory::github::{Hiding, OtherKind, Tracker};
     use crate::factory::ledger::testing::{T0, open_store, ticking};
-    use crate::factory::worker::{AlwaysHeld, FakeWorker};
+    use crate::factory::worker::{AlwaysHeld, FakeWorker, Target};
 
     pub const REPO: &str = "rawphp/softfac";
     pub const LOGIN: &str = "softfac-bot";
@@ -1681,8 +1681,10 @@ pub(crate) mod testing {
 
         /// The claim comment as Foundry posts it, as the project's login.
         pub fn foundry_claim(&self, run: &RunId, machine: MachineId) -> u64 {
-            self.sim
-                .comment_as(LOGIN, &crate::factory::github::claim_comment(run, &machine))
+            self.sim.comment_as(
+                LOGIN,
+                &crate::factory::github::claim_comment(run, &Target::Machine(machine)),
+            )
         }
     }
 }
@@ -1695,7 +1697,7 @@ mod tests {
     use super::*;
     use crate::factory::github::STATUS_MARKER;
     use crate::factory::ledger::events::ResumedFrom;
-    use crate::factory::worker::{Call, Lost};
+    use crate::factory::worker::{Call, HostCall, Lost, Target};
 
     const SESSION: &str = "00000000-0000-0000-0000-0000000005e5";
     const WORKSPACE: &str = "00000000-0000-0000-0000-000000000a11";
@@ -2784,7 +2786,10 @@ mod tests {
             ("comment_on_pr", ctx.comment_on_pr(1, "x")),
             ("mark_pr_ready", ctx.mark_pr_ready(1)),
             ("mark_pr_draft", ctx.mark_pr_draft(1)),
-            ("create", ctx.create(machine(), request).map(|_| ())),
+            (
+                "create",
+                ctx.create(Target::Machine(machine()), request).map(|_| ()),
+            ),
             (
                 "start_session",
                 ctx.start_session(workspace, start, message.clone())
@@ -3239,6 +3244,48 @@ mod tests {
             );
             rig.moved(&run, State::Building, State::PrOpen);
             let mut at = progress(&rig, &run, State::Building);
+        #[test]
+        fn a_run_going_stuck_keeps_its_build_workspace_once_its_session_is_stopped() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            let workspace = workspace_id(WORKSPACE).unwrap();
+            let kept = rig.worker.host_calls();
+            assert_eq!(kept.len(), 1, "{kept:?}");
+            let (before, call) = kept[0];
+            assert_eq!(call, HostCall::Keep { workspace });
+            assert!(
+                rig.worker.calls()[..before]
+                    .iter()
+                    .any(|call| matches!(call, Call::EndSessions { .. })),
+                "the session is stopped before the workspace is kept"
+            );
+        }
+
+        #[test]
+        fn a_run_with_no_workspace_keeps_nothing_when_it_goes_stuck() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            rig.step(&run, "approved x");
+            let mut at = progress(&rig, &run, State::Triage);
+            assert_eq!(at.worktree, None);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            assert!(rig.worker.host_calls().is_empty());
+        }
+
+        #[test]
+        fn a_run_already_stuck_is_not_kept_again() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.moved(&run, State::Building, State::Stuck);
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            assert!(rig.worker.host_calls().is_empty());
+        }
+
             go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
             let writes = rig.sim.writes();
             assert!(writes[0].starts_with("pr ready 12"));

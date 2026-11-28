@@ -516,6 +516,17 @@ pub(crate) mod tests {
 
     #[test]
     fn run_id_new_rejects_bad_repos() {
+    #[test]
+    fn a_host_kind_is_written_in_lower_case_and_read_back() {
+        assert_eq!(serde_json::to_string(&HostKind::Vims).unwrap(), "\"vims\"");
+        let back: HostKind = serde_json::from_str("\"vims\"").unwrap();
+        assert_eq!(back, HostKind::Vims);
+        assert_eq!(HostKind::Vims.to_string(), "vims");
+        assert_eq!("vims".parse::<HostKind>(), Ok(HostKind::Vims));
+        assert!("Vims".parse::<HostKind>().is_err());
+        assert!("kubernetes".parse::<HostKind>().is_err());
+    }
+
         for repo in [
             "",
             "softfac",

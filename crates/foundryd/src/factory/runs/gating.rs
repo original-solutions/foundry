@@ -2628,7 +2628,7 @@ mod tests {
         self, CommandFailure, FailedCheck, GateFailure, SESSION_GONE, STOPPED_BY_HAND,
     };
     use crate::factory::worker::{
-        AlwaysHeld, Call, FleetView, FleetViewBuilder, Lost, WorkerError,
+        AlwaysHeld, Call, FleetView, FleetViewBuilder, HostCall, Lost, Target, WorkerError,
     };
     use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
     use crate::workspaces::{Checkout, Setup};
@@ -3299,6 +3299,43 @@ mod tests {
         }
     }
 
+    /// The host calls of the worker, without how many calls came before each.
+    fn host_calls(rig: &Rig) -> Vec<HostCall> {
+        rig.worker
+            .host_calls()
+            .into_iter()
+            .map(|(_, call)| call)
+            .collect()
+    }
+
+    /// The build workspace was woken exactly once, and before the first send.
+    fn woke_before_the_send(rig: &Rig) {
+        let woken: Vec<usize> = rig
+            .worker
+            .host_calls()
+            .into_iter()
+            .filter(|(_, call)| {
+                *call
+                    == HostCall::Wake {
+                        workspace: workspace(),
+                    }
+            })
+            .map(|(before, _)| before)
+            .collect();
+        let send = rig
+            .worker
+            .calls()
+            .iter()
+            .position(|call| matches!(call, Call::Send { .. }))
+            .expect("a send");
+        assert_eq!(woken.len(), 1, "{:?}", rig.worker.host_calls());
+        assert!(
+            woken[0] <= send,
+            "woke after call {} but sent at {send}",
+            woken[0]
+        );
+    }
+
     fn no_writes(rig: &Rig) {
         assert_eq!(rig.sim.writes(), Vec::<String>::new());
     }
@@ -3406,7 +3443,7 @@ mod tests {
 
         fn the_gate_request(rig: &Rig, run: &RunId) -> Call {
             Call::Create {
-                machine: machine(),
+                target: Target::Machine(machine()),
                 request: gate::request(&rig.config, project_id(), HEAD, run, 1),
             }
         }
@@ -3421,6 +3458,67 @@ mod tests {
             );
             let writes = rig.sim.writes();
             assert!(
+        #[test]
+        fn the_build_workspace_is_put_at_rest_before_the_gate_is_placed() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            let rested = rig.worker.host_calls();
+            let create = rig
+                .worker
+                .calls()
+                .iter()
+                .position(|call| matches!(call, Call::Create { .. }))
+                .expect("a create");
+            assert_eq!(
+                rested,
+                [(
+                    create,
+                    HostCall::Rest {
+                        workspace: workspace()
+                    }
+                )]
+            );
+            assert_eq!(creates(&rig), 1);
+        }
+
+        #[test]
+        fn a_session_that_is_not_ready_for_a_gate_is_not_put_at_rest() {
+            let (mut rig, run, _hub) = built();
+            show(&mut rig, &run, SessionState::Working, 1, &[]);
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert!(rig.worker.host_calls().is_empty());
+        }
+
+        #[test]
+        fn a_gate_whose_terminal_runs_is_advanced_with_the_gates_workspace() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            assert!(
+                !host_calls(&rig)
+                    .iter()
+                    .any(|call| matches!(call, HostCall::Advance { .. }))
+            );
+            assert_eq!(go(&rig, &run), GateStep::Running);
+            assert!(host_calls(&rig).contains(&HostCall::Advance {
+                workspace: gate_ws(1)
+            }));
+        }
+
+        #[test]
+        fn a_gate_whose_terminal_exited_is_not_advanced() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            assert_eq!(
+                ends(&mut rig, &run, 1, 1, 0, PASS_TAIL),
+                GateStep::Passed { pr: 12 }
+            );
+            assert!(
+                !host_calls(&rig)
+                    .iter()
+                    .any(|call| matches!(call, HostCall::Advance { .. }))
+            );
+        }
+
                 written_at(&writes, "pr ready 12") < written_at(&writes, "pr comment 12"),
                 "{writes:?}"
             );
@@ -4058,6 +4156,16 @@ mod tests {
             assert_eq!(sends(&rig), vec![sent(1, failed_message(FAIL_OUTPUT))]);
             assert_eq!(gate_sent_back_lines(&rig, &run), [(1, 1)]);
             assert!(has_step(&rig, &run, "gate-sending 1 1"));
+        #[test]
+        fn a_failed_attempt_wakes_the_build_workspace_before_it_is_sent_into_the_session() {
+            let (mut rig, run, _hub) = built();
+            assert_eq!(
+                gated(&mut rig, &run, 101, FAIL_TAIL),
+                GateStep::SentBack { attempt: 1 }
+            );
+            woke_before_the_send(&rig);
+        }
+
             // The gate's workspace is archived; the build session is not ended.
             assert!(calls(&rig).contains(&archive_of(gate_ws(1))));
             assert!(!calls(&rig).contains(&end_of_build()));
@@ -4653,6 +4761,17 @@ mod tests {
             );
             assert_eq!(creates(&rig), 0);
             assert_eq!(sends(&rig), vec![sent(1, conflict_message())]);
+        #[test]
+        fn a_conflict_wakes_the_build_workspace_before_it_is_sent() {
+            let (rig, run, hub) = built();
+            hub.set_mergeable("CONFLICTING");
+            assert_eq!(
+                go_without_a_slot(&rig, &run),
+                GateStep::SentBack { attempt: 1 }
+            );
+            woke_before_the_send(&rig);
+        }
+
             let lines: Vec<_> = rig
                 .events(&run)
                 .into_iter()
@@ -4841,6 +4960,16 @@ mod tests {
             assert_eq!(
                 sends(&rig),
                 vec![sent(
+        #[test]
+        fn a_failed_check_wakes_the_build_workspace_before_it_is_sent() {
+            let (mut rig, run, hub) = built();
+            assert_eq!(
+                gated_with(&mut rig, &run, &hub, RED),
+                GateStep::SentBack { attempt: 1 }
+            );
+            woke_before_the_send(&rig);
+        }
+
                     1,
                     messages::check_failed(HEAD, &[red("ci")], BODY_PATH)
                 )]

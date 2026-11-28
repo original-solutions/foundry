@@ -451,7 +451,7 @@ pub fn mark_pr_draft<G: Tracker + ?Sized>(gh: &G, repo: &str, pr: u64) -> Result
 mod tests {
     use std::sync::Arc;
 
-    use foundry_proto::factory::RunId;
+    use foundry_proto::factory::{HostKind, RunId};
     use foundry_proto::ids::MachineId;
     use serde_json::json;
 
@@ -1523,6 +1523,14 @@ mod tests {
     }
 
     fn comment(id: u64, author: Option<&str>, body: &str) -> IssueComment {
+    fn target() -> Target {
+        Target::Machine(machine())
+    }
+
+    fn vims() -> Target {
+        Target::Host(HostKind::Vims)
+    }
+
         IssueComment {
             id,
             author: author.map(str::to_string),
@@ -1531,7 +1539,7 @@ mod tests {
     }
 
     fn foundry_claim(id: u64, author: &str) -> IssueComment {
-        comment(id, Some(author), &claim_comment(&run(), &machine()))
+        comment(id, Some(author), &claim_comment(&run(), &target()))
     }
 
     fn runner_claim(id: u64, author: &str) -> IssueComment {
@@ -1545,13 +1553,13 @@ mod tests {
     fn ours() -> Option<Claim> {
         Some(Claim::Foundry {
             run: run(),
-            machine: machine(),
+            target: target(),
         })
     }
 
     #[test]
     fn a_claim_comment_has_foundrys_marker_as_its_last_line() {
-        let body = claim_comment(&run(), &machine());
+        let body = claim_comment(&run(), &target());
         assert_eq!(
             body.lines().last().unwrap(),
             format!("<!-- foundry:claim rawphp__softfac__6__1 {MACHINE} -->")
@@ -1565,13 +1573,51 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn a_host_claim_comment_names_the_kind_and_is_foundrys_claim() {
+        let body = claim_comment(&run(), &vims());
+        assert_eq!(
+            body.lines().last().unwrap(),
+            "<!-- foundry:claim rawphp__softfac__6__1 vims -->"
+        );
+        let comments = [comment(5, Some("rawphp"), &body)];
+        assert_eq!(
+            newest_claim(&comments, "rawphp"),
+            Some(Claim::Foundry {
+                run: run(),
+                target: vims()
+            })
+        );
+        // The machine form still names a machine.
+        assert_eq!(
+            newest_claim(&[foundry_claim(6, "rawphp")], "rawphp"),
+            Some(Claim::Foundry {
+                run: run(),
+                target: Target::Machine(machine())
+            })
+        );
+    }
+
+    #[test]
+    fn a_foundry_marker_naming_a_kind_this_build_does_not_know_is_foreign() {
+        let body = format!(
+            "Claimed by Foundry.\n\n<!-- foundry:claim {} kubernetes -->",
+            run()
+        );
+        let comments = [comment(8, Some("rawphp"), &body)];
+        assert_eq!(
+            newest_claim(&comments, "rawphp"),
+            Some(Claim::Foreign { comment_id: 8 })
+        );
+    }
+
     fn a_posted_claim_is_the_claim_comment_with_its_marker_whole_after_hiding() {
         let fake = Arc::new(FakeTracker::answering([Answer::ok("")]));
         let tracker = Hiding::new(fake.clone(), hider());
-        tracker.post_claim(REPO, 6, &run(), &machine()).unwrap();
+        tracker.post_claim(REPO, 6, &run(), &target()).unwrap();
         assert_eq!(
             fake.calls(),
-            vec![comment_call("6", &claim_comment(&run(), &machine()))]
+            vec![comment_call("6", &claim_comment(&run(), &target()))]
         );
         // `for_comment` alone would hide the machine id, a long word of letters and digits.
         assert!(!for_comment(MACHINE).contains(MACHINE));
@@ -1598,7 +1644,7 @@ mod tests {
         let after = [foundry_claim(5, "rawphp"), foundry_claim(6, "mallory")];
         assert_eq!(newest_claim(&after, "rawphp"), ours());
         // Nor does a deleted account's.
-        let ghost = [comment(7, None, &claim_comment(&run(), &machine()))];
+        let ghost = [comment(7, None, &claim_comment(&run(), &target()))];
         assert_eq!(newest_claim(&ghost, "rawphp"), None);
     }
 
@@ -1628,20 +1674,20 @@ mod tests {
 
         // Newest is the higher comment id, whatever order the list is in.
         let later_run = RunId::new(REPO, 6, 2).unwrap();
-        let newer = comment(30, Some("rawphp"), &claim_comment(&later_run, &machine()));
+        let newer = comment(30, Some("rawphp"), &claim_comment(&later_run, &target()));
         let comments = [newer, foundry_claim(20, "rawphp")];
         assert_eq!(
             newest_claim(&comments, "rawphp"),
             Some(Claim::Foundry {
                 run: later_run,
-                machine: machine()
+                target: target()
             })
         );
     }
 
     #[test]
     fn a_marker_that_is_not_the_last_line_is_no_claim() {
-        let quoted = format!("{}\n\nquoted above", claim_comment(&run(), &machine()));
+        let quoted = format!("{}\n\nquoted above", claim_comment(&run(), &target()));
         let comments = [
             comment(5, Some("rawphp"), &quoted),
             comment(
@@ -1656,7 +1702,7 @@ mod tests {
         let trailing = [comment(
             8,
             Some("rawphp"),
-            &format!("{}\n\n", claim_comment(&run(), &machine())),
+            &format!("{}\n\n", claim_comment(&run(), &target())),
         )];
         assert_eq!(newest_claim(&trailing, "rawphp"), ours());
     }
