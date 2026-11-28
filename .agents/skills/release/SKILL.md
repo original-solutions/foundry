@@ -61,9 +61,11 @@ The gate in `AGENTS.md`, every command, on the bumped tree:
 
 ```sh
 npm --prefix web ci && npm --prefix web run build
+cargo install cargo-nextest --version 0.9.151 --locked
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+cargo nextest run --workspace --locked
+cargo test --workspace --doc --locked
 npm --prefix web run check
 ```
 
