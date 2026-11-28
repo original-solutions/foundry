@@ -1,10 +1,11 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named } from "./Now";
-import { archiveWorkspace, startShell } from "./api";
+import { startShell } from "./api";
+import { archiveOf } from "./Archive";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
 import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
@@ -247,7 +248,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                     {machineStats(machine.sample)}
                   </span>
                 </div>
-                {terminals && <Tidy over={over} empty={machine.workspaces.filter((w) => rows(w).length === 0).map((w) => w.id)} clear={terminals.clear} />}
+                {terminals && <Tidy over={over} empty={sweepable(machine)} clear={terminals.clear} />}
               </div>
               <div className="space-y-3">
                 {machine.workspaces.map((workspace) => (
@@ -284,17 +285,37 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
 }
 
 /**
+ * The workspaces of `machine` its sweep archives: those with no terminals left that no factory run
+ * holds. A run's workspace can be empty between its sessions, and the factory still builds in it.
+ */
+function sweepable(machine: MachineView): string[] {
+  return machine.workspaces.filter((w) => rows(w).length === 0 && !w.factory).map((w) => w.id);
+}
+
+/**
  * A machine's sweep, under its numbers: clear every terminal that ended (`over`), and archive every
  * workspace left with no terminals (`empty`). Archiving is not forced, so the daemon keeps any
- * workspace with work it would lose, and the line says how many it kept.
+ * workspace with work it would lose, and the line says how many it kept. Each archive is the same
+ * mutation a single one is (`archiveOf`), so every view sees it under way; one that fails leaves
+ * the others to finish, and the line says how many could not be archived and why.
  */
 function Tidy({ over, empty, clear }: { over: string[]; empty: string[]; clear: (ids: string[]) => void }) {
+  const client = useQueryClient();
   const archive = useMutation({
-    mutationFn: async (ids: string[]) => (await Promise.all(ids.map((id) => archiveWorkspace(id, false)))).filter((held) => held !== null).length,
+    mutationFn: async (ids: string[]) => {
+      const results = await Promise.allSettled(ids.map((id) => client.getMutationCache().build(client, archiveOf(id)).execute(false)));
+      const failed = results.flatMap((r) => (r.status === "rejected" ? [r.reason as unknown] : []));
+      return { of: ids.length, kept: results.filter((r) => r.status === "fulfilled" && r.value !== null).length, failed: failed.length, why: failed[0] };
+    },
   });
-  const kept = archive.data ?? 0;
-  if (over.length === 0 && empty.length === 0 && !archive.error) return null;
+  if (over.length === 0 && empty.length === 0) return null;
   const action = "rounded px-1 text-[11px] text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-50";
+  // What was kept or could not be archived is still empty, so the line stays until those go too.
+  const { kept = 0, failed = 0, of = 0, why = undefined } = archive.data ?? {};
+  const said = [
+    kept > 0 && `${kept} kept: ${kept === 1 ? "it has" : "they have"} work archiving would lose. Archive ${kept === 1 ? "it from its row" : "them from their rows"}.`,
+    failed > 0 && couldNot(`archive ${failed} of the ${of} empty workspaces`, why),
+  ].filter((line) => line !== false);
   return (
     <div className="mt-1 flex flex-wrap items-center gap-x-1">
       {over.length > 0 && (
@@ -303,6 +324,7 @@ function Tidy({ over, empty, clear }: { over: string[]; empty: string[]; clear: 
         </button>
       )}
       {empty.length > 0 && (
+        // One click and no confirm: the archive is never forced, so the daemon keeps any workspace with work to lose, and branches stay.
         <button
           type="button"
           onClick={() => archive.mutate(empty)}
@@ -313,9 +335,9 @@ function Tidy({ over, empty, clear }: { over: string[]; empty: string[]; clear: 
           {archive.isPending ? `Archiving ${archive.variables.length}…` : `Archive ${empty.length} empty`}
         </button>
       )}
-      {((kept > 0 && empty.length > 0) || archive.error) && (
+      {empty.length > 0 && said.length > 0 && (
         <p role="status" className="basis-full px-1 text-xs text-amber-400">
-          {archive.error ? couldNot("archive the empty workspaces", archive.error) : `${kept} kept: ${kept === 1 ? "it has" : "they have"} work archiving would lose. Archive ${kept === 1 ? "it from its row" : "them from their rows"}.`}
+          {said.join(" ")}
         </p>
       )}
     </div>

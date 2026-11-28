@@ -8,7 +8,7 @@ To get back to the board from anywhere, click **Foundry** at the top of the side
 
 ## Project faces
 
-Every project has a face: two letters from its name on a small coloured tile, such as **ST** for storefront and **BA** for billing-api. Its workspaces carry it wherever they show: on a board card and a list line, in the sidebar, at the head of each column on the rail, and beside the workspace name in a terminal's bar. The task box shows it on each project button. So in a long list you can tell which project a workspace belongs to without reading it. Point at a face to see the project's name.
+Every project has a face: two letters from its name on a small coloured tile, such as **ST** for storefront and **BA** for billing-api. Its workspaces carry it wherever they show: on a board card and a list line, in the sidebar, and beside the workspace name in a terminal's bar. The task box shows it on each project button. So in a long list you can tell which project a workspace belongs to without reading it. Point at a face to see the project's name.
 
 The colours keep clear of the state colours, so a face never reads as a state. Each project keeps its colour when another is added, and every machine shows the same one. With more than six projects, colours repeat, and the letters tell them apart.
 
@@ -111,8 +111,9 @@ The timeline only has turns from after this machine's daemon started.
 The sidebar is the same fleet as a list. It sits at the left on a wide screen. From the top:
 
 - **Foundry** goes to the board.
-- The buttons in the header are, in order, **Collapse sidebar**, a theme switch, **Settings** (a gear), the bell for notifications, **Jump to** and **New task**. **Collapse sidebar** shows only on a wide screen. `Cmd+,` (`Ctrl+,` on Windows and Linux) opens Settings too, except in a text field or a terminal.
+- The buttons in the header are, in order, the factory icon (opens the Factory view), **Collapse sidebar**, a theme switch, **Settings** (a gear), the bell for notifications, **Jump to** and **New task**. **Collapse sidebar** shows only on a wide screen. `Cmd+,` (`Ctrl+,` on Windows and Linux) opens Settings too, except in a text field or a terminal.
 - Each machine has a status dot, its name, and its status. Click the name to open the Machines view. Under it, a load bar and one line of numbers, such as "2.88/core · 8.1 GB mem · 59.8 GB disk · 4 sessions". Point at the line for fuller numbers. The bar turns amber at 0.7 load per core and red at 1.
+- Under the numbers, when there is something to sweep, the machine's sweep line. **Clear N ended** clears every terminal that ended in any of its workspaces, as each workspace's own **Clear N ended** does. **Archive N empty** archives every workspace with no terminals left, except one a factory run still holds. It does not ask first, and it never forces: a workspace with uncommitted or unpushed work is kept, and the line says how many were kept. The button reads **Archiving N…** while it runs, and each card being archived says so too. Branches stay.
 - Under a machine, its workspaces. **Fold all** at the right of the machine line folds every workspace, and then reads **Unfold all**.
 - **Keyboard** at the bottom lists every key the app answers. `?` opens it too.
 
@@ -140,7 +141,7 @@ Point at an unfolded workspace and a row of buttons shows on its name's line, af
 
 [End, clear and archive](sessions.md#end-clear-and-archive) says what the last two do.
 
-Right-click a terminal anywhere it is listed, or press and hold it on a touch screen, for its menu. That is in the sidebar, on a board card, in the rail, or in a tab. [The terminal's menu](sessions.md#the-terminals-menu) lists what it offers.
+Right-click a terminal anywhere it is listed, or press and hold it on a touch screen, for its menu. That is in the sidebar, on a board card, in the rail's Sessions list, or in a tab. [The terminal's menu](sessions.md#the-terminals-menu) lists what it offers.
 
 ### Using the keyboard
 
@@ -154,21 +155,24 @@ The workspace list is one Tab stop. Once inside:
 
 ## The rail
 
-The rail is the sidebar squeezed to a strip as narrow as a button. It gives a terminal more room and still shows every state.
+The rail is the sidebar squeezed to a strip as narrow as a button. It gives a terminal more room. It holds only buttons; **Sessions** lists every terminal when you want them.
 
-![The rail: a strip of buttons, then a column of state glyphs for each workspace](images/board-rail.png)
+![The rail with its Sessions list open beside it, grouped Needs you, Working, Ready and Ended](images/board-rail.png)
 
 Press the **Collapse sidebar** button in the sidebar header, or `Cmd+B` (`Ctrl+B` on Windows and Linux, outside a terminal). **Expand sidebar** on the rail, or the same key, brings the list back.
 
 On the rail, from the top:
 
 - The Foundry mark goes to the board, and the factory icon goes to the Factory view. See [The factory](factory.md).
-- **Expand sidebar**, **Jump to** and **New task**.
-- A dot per machine for its status. Click it to open the Machines view.
-- A column for each workspace, headed by its project's face, then its glyphs. Point at the face for the workspace and project names. The workspace you are in is outlined. A glyph is a link to its terminal, and pointing at it names the workspace, terminal and state. A column shows six at most, then "+N".
-- The bell, the theme switch and **Settings** at the bottom.
+- **Sessions**, with a badge counting the terminals that need you, when any do.
+- **Jump to** and **New task**.
+- At the bottom, **Expand sidebar**, the bell, the theme switch and **Settings**.
 
-`Up`, `Down`, `Home` and `End` move along the rail's glyphs.
+**Sessions** opens every session and shell of the fleet as one list, grouped **Needs you**, **Working**, **Ready**, **Ended** and **Unreachable**, with empty groups left out. **Needs you** holds exactly what the board's Needs you lane holds. Each row shows its state, its workspace, the factory issue when it is a factory run's, the terminal's name with what it is doing or its title, and its machine when there is more than one. A row is a link to its terminal, and right-clicking it opens the terminal's menu. **Ended** has a **Clear N** button that clears the terminals in it.
+
+The list floats over the terminal. Picking a session, `Esc` or a click in the main pane closes it. **Dock beside the rail** keeps it open as a column instead, and picking a session leaves it open; **Undock** floats it again. Whether it is docked is kept in this browser.
+
+Opened from its button, the list starts on the terminal you are in, or on its first row. `Up`, `Down`, `Home` and `End` move through it.
 
 The choice of rail or list is kept in this browser. With none kept, a window narrower than 1024 pixels starts on the rail.
 

@@ -101,6 +101,19 @@ describe("Rail", () => {
     expect(list()).toBeNull();
   });
 
+  it("leaves the focus where it is when a docked list shows by itself, and takes it when opened from its button", async () => {
+    localStorage.setItem("foundry.sessions", "docked");
+    await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
+
+    expect(list()).not.toBeNull();
+    expect(document.activeElement).toBe(document.body);
+
+    fireEvent.click(sessions());
+    expect(list()).toBeNull();
+    fireEvent.click(sessions());
+    expect(document.activeElement).toBe(within(list()!).getByRole("link", { name: "fix login / shell: Open" }));
+  });
+
   it("walks the list with the arrows from the session that is open", async () => {
     await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
     fireEvent.click(sessions());

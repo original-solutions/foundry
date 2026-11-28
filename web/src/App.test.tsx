@@ -8,7 +8,7 @@ import { router, routeTree } from "./App";
 import { button, dangerButton, pressed, viewLook } from "./Modal";
 import { keep, KEEP_AFTER, recall } from "./memory";
 import { nextSteps } from "./next";
-import { ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { FakeSocket, json, mockFetch, type Call } from "./test-utils";
 
 // What the stand-in terminals show on every row, and the link finder the last one opened registered.
@@ -1698,6 +1698,95 @@ describe("App", () => {
       ]),
     );
     expect((await within(sidebar).findByRole("status")).textContent).toBe("1 kept: it has work archiving would lose. Archive it from its row.");
+  });
+
+  it("says on the board that each workspace the machine's sweep archives is archiving, as a single archive does", async () => {
+    const calls = mockActions(new Promise<Response>(() => {}), new Promise<Response>(() => {}));
+    await open("/", { ...live, records: [...live.records, workspace(ME, "w2", "fix logout"), workspace(ME, "w3", "fix signup")] });
+    const card = (name: string) => screen.getByRole("article", { name });
+    expect(within(card("fix logout")).queryByText("Archiving…")).toBeNull();
+
+    fireEvent.click(within(screen.getByRole("navigation", { name: "Workspaces" })).getByRole("button", { name: "Archive 2 empty" }));
+
+    await waitFor(() => expect(within(card("fix logout")).getByText("Archiving…")).toBeDefined());
+    expect(within(card("fix signup")).getByText("Archiving…")).toBeDefined();
+    expect(within(card("fix login")).queryByText("Archiving…")).toBeNull();
+    expect(calls.map((c) => c.url).sort()).toEqual(["/api/workspaces/w2/archive", "/api/workspaces/w3/archive"]);
+  });
+
+  it("says what the sweep archived, kept and could not archive when one archive of several fails", async () => {
+    mockActions(new Response(null, { status: 204 }), json(409, { uncommitted: ["a.txt"], unpushed: [], submodules: [], detached: false }), json(500, { error: "disk full" }));
+    await open("/terminals/t1", {
+      ...live,
+      records: [...live.records, workspace(ME, "w2", "fix logout"), workspace(ME, "w3", "fix signup"), workspace(ME, "w4", "fix search")],
+    });
+    const sidebar = screen.getByRole("navigation");
+
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Archive 3 empty" }));
+
+    expect((await within(sidebar).findByRole("status")).textContent).toBe(
+      "1 kept: it has work archiving would lose. Archive it from its row. Could not archive 1 of the 3 empty workspaces: disk full.",
+    );
+  });
+
+  it("leaves a factory run's workspace with no terminals out of the machine's sweep, live or held up", async () => {
+    const calls = mockActions(new Response(null, { status: 204 }));
+    await open("/terminals/t1", {
+      ...live,
+      records: [...live.records, workspace(ME, "w2", "fac 162"), workspace(ME, "w3", "fac 170"), workspace(ME, "w4", "fix signup")],
+    });
+    const status = factoryStatus("p1", { "original-solutions__foundry__162__1": ["w2"] }, { "original-solutions__foundry__170__1": { kind: "stuck", workspaces: ["w3"] } }).p1;
+    act(() => sockets("/api/events").at(-1)!.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status })));
+    const sidebar = screen.getByRole("navigation");
+
+    fireEvent.click(await within(sidebar).findByRole("button", { name: "Archive 1 empty" }));
+
+    await waitFor(() => expect(calls.map((c) => c.url)).toEqual(["/api/workspaces/w4/archive"]));
+  });
+
+  it("sweeps only its own machine: another machine's ended terminals and empty workspaces stay", async () => {
+    const calls = mockActions(...Array.from({ length: 4 }, () => new Response(null, { status: 204 })));
+    await open("/terminals/t1", {
+      ...ended,
+      records: [
+        ...ended.records,
+        workspace(ME, "w2", "fix logout"),
+        workspace(ME, "w7", "fix search"),
+        terminal(ME, "t8", "w7", "exited", { exit_code: 0 }),
+        sample(OTHER, 1),
+        workspace(OTHER, "w5", "far off"),
+        terminal(OTHER, "t9", "w5", "exited", { exit_code: 0 }),
+        workspace(OTHER, "w6", "far empty"),
+      ],
+      settings: settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "laptop", address: "10.0.0.2" }], priority: [ME, OTHER] }),
+    });
+    const studio = screen.getByRole("region", { name: "studio" });
+    // The laptop has its own sweep, for its own terminal and workspace.
+    expect(within(screen.getByRole("region", { name: "laptop" })).getByRole("button", { name: "Archive 1 empty" })).toBeDefined();
+
+    fireEvent.click(within(studio).getByRole("button", { name: "Clear 3 ended" }));
+    fireEvent.click(within(studio).getByRole("button", { name: "Archive 1 empty" }));
+
+    await waitFor(() =>
+      expect(calls.map((c) => c.url).sort()).toEqual(["/api/terminals/t3/close", "/api/terminals/t4/close", "/api/terminals/t8/close", "/api/workspaces/w2/archive"]),
+    );
+  });
+
+  it("closes the floating sessions list on a press in the main pane, and keeps a docked one open", async () => {
+    mockActions();
+    await open("/terminals/t1", live);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    const main = document.querySelector("main")!;
+
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+    expect(screen.getByRole("region", { name: "Sessions" })).toBeDefined();
+    fireEvent.pointerDown(main);
+    expect(screen.queryByRole("region", { name: "Sessions" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Dock beside the rail" }));
+    fireEvent.pointerDown(main);
+    expect(screen.getByRole("region", { name: "Sessions" })).toBeDefined();
   });
 
   it("ends a running session from the header's menu only after asking, then moves to the next tab once it is gone", async () => {

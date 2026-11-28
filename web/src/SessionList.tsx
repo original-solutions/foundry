@@ -2,6 +2,7 @@ import { Link } from "@tanstack/react-router";
 import { useEffect, useRef, type KeyboardEvent } from "react";
 import { byUrgency, needingRows, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import type { Glyph } from "./labels";
+import { factoryBadge } from "./FactoryMark";
 import { Named } from "./Now";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { TerminalMenu, useTerminalActions } from "./TerminalMenu";
@@ -56,6 +57,8 @@ interface Props {
   machines: MachineView[];
   selected?: string;
   docked: boolean;
+  /** Whether the list takes the focus when it shows: when a person opened it, not when a docked list shows by itself. */
+  focus: boolean;
   onDock: (on: boolean) => void;
   /** Called when a session is picked. */
   onPick: () => void;
@@ -63,10 +66,10 @@ interface Props {
 
 /**
  * The fleet's sessions and shells as one list beside the rail: grouped by state, each row its
- * workspace, its factory issue, what it is doing and, with more than one machine, where. It opens
- * with the open terminal focused, and the arrows walk it. Ended terminals clear from their group.
+ * workspace, its factory issue, what it is doing and, with more than one machine, where. Opened by
+ * a person, it focuses the open terminal's row, and the arrows walk it. Ended terminals clear from their group.
  */
-export function SessionList({ machines, selected, docked, onDock, onPick }: Props) {
+export function SessionList({ machines, selected, docked, focus, onDock, onPick }: Props) {
   const groups = sessionGroups(machines);
   const many = machines.length > 1;
   const terminals = useTerminalActions();
@@ -74,6 +77,7 @@ export function SessionList({ machines, selected, docked, onDock, onPick }: Prop
   const count = groups.reduce((n, g) => n + g.items.length, 0);
 
   useEffect(() => {
+    if (!focus) return;
     const links = [...(ref.current?.querySelectorAll<HTMLElement>("[data-session]") ?? [])];
     (links.find((l) => l.dataset.session === selected) ?? links[0])?.focus();
     // Only when the list opens: a fleet update must not move the focus.
@@ -167,7 +171,7 @@ function SessionRow({ row, workspace, machine, current, onPick }: { row: Row; wo
         <span className={`truncate font-medium ${quiet ? "text-neutral-400" : ""}`}>{workspace.name}</span>
         {/* The issue as text: the row is already a link, and FactoryMark is one too. */}
         {workspace.factory?.issue !== undefined ? (
-          <span className="rounded border border-violet-500/40 px-1 text-[10px] leading-4 font-medium text-violet-300">#{workspace.factory.issue}</span>
+          <span className={factoryBadge}>#{workspace.factory.issue}</span>
         ) : (
           <span />
         )}

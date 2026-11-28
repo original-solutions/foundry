@@ -2,7 +2,7 @@
 
 The machines view shows every machine in your fleet as a card: whether it is online, how busy it is, and what runs on it. It is also where you add a machine, set its limits and take it out of the fleet.
 
-Open it from the **Machines** switch at the top right of the board, beside **Board** and **Timeline**. A machine's name in the sidebar, or its dot on the rail, opens it too.
+Open it from the **Machines** switch at the top right of the board, beside **Board** and **Timeline**. A machine's name in the sidebar opens it too.
 
 ![The machines view with one machine: load graph, free memory and disk, and its workspaces](images/machines-overview.png)
 

@@ -34,6 +34,8 @@ interface Props {
 export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }: Props) {
   const [docked, setDocked] = useState(loadDocked);
   const [open, setOpen] = useState(docked);
+  // A docked list that shows by itself leaves the focus where it is; opened from its button, it takes it.
+  const [asked, setAsked] = useState(false);
   const button = useRef<HTMLButtonElement>(null);
   const need = needing(machines).length;
   const flying = open && !docked;
@@ -78,7 +80,10 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
           aria-label={need > 0 ? `Sessions: ${need} need${need === 1 ? "s" : ""} you` : "Sessions"}
           aria-expanded={open}
           title="Every session and shell, by state"
-          onClick={() => setOpen(!open)}
+          onClick={() => {
+            setAsked(true);
+            setOpen(!open);
+          }}
           className={`relative grid size-8 place-items-center rounded-md hover:bg-neutral-800 hover:text-neutral-200 ${open ? "bg-neutral-800 text-neutral-200" : ""}`}
         >
           <SessionsIcon className="size-4" />
@@ -103,7 +108,7 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
           <SettingsLink />
         </div>
       </nav>
-      {open && <SessionList machines={machines} selected={selected} docked={docked} onDock={dock} onPick={() => !docked && setOpen(false)} />}
+      {open && <SessionList machines={machines} selected={selected} docked={docked} focus={asked} onDock={dock} onPick={() => !docked && setOpen(false)} />}
     </>
   );
 }

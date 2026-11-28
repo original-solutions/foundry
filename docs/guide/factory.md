@@ -2,7 +2,7 @@
 
 The factory builds GitHub issues for you. For each project that has its factory on, Foundry claims the issues labelled `factory:ready`, builds each one in a workspace on a machine of the fleet, and opens a pull request. The Factory view shows what it is doing, turns each project's factory on or off, and holds the settings for the whole fleet.
 
-Open it from the factory icon near the top of the rail. To get the rail, collapse the sidebar with `Cmd+B`, or `Ctrl+B` outside a terminal. On any screen, a phone too, the jump palette goes there: open it and pick **Factory**. The view's **Board** and **Machines** links take you back.
+Open it from the factory icon in the sidebar header, or near the top of the rail when the sidebar is collapsed. On any screen, a phone too, the jump palette goes there: open it and pick **Factory**. The view's **Board** and **Machines** links take you back.
 
 ![The Factory view with the settings form and two projects whose factory is off](images/factory-overview.png)
 
