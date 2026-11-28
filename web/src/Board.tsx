@@ -397,7 +397,9 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
                 <span className="min-w-0 flex-1">
                   <span className="flex items-baseline gap-2 leading-5">
                     <Named name={row.name} title={row.title} />
-                    <span className={`shrink-0 text-xs ${glyphText[row.glyph]}`}>{row.label}</span>
+                    <span title={row.fullLabel} className={`shrink-0 text-xs ${glyphText[row.glyph]}`}>
+                      {row.label}
+                    </span>
                   </span>
                   {row.now && <Now step={row.now} />}
                 </span>

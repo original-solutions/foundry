@@ -286,12 +286,19 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
   }));
 }
 
-/** The factory run a workspace belongs to: its id, its issue where the id names one, and whether it waits on a person. */
+/**
+ * The factory run a workspace belongs to: its id, its issue where the id names one, and where it
+ * stands: held up for a person (`held`, with the daemon's `reason`), else live at `step` with the
+ * gate's failed tries so far (`gateRetries`, when there are any).
+ */
 export interface FactoryRun {
   run: string;
   issue?: number;
   url?: string;
   held?: HeldUp["kind"];
+  reason?: string;
+  step?: string;
+  gateRetries?: number;
 }
 
 /**
@@ -307,13 +314,13 @@ export const QUIET = "Quiet 10+ min";
 export function factoryRuns(statuses: Record<string, FactoryStatus> | undefined): (workspace: WorkspaceView) => FactoryRun | undefined {
   const named = new Map<string, FactoryRun>();
   for (const status of Object.values(statuses ?? {})) {
-    const runs: { run: string; workspaces: string[]; held?: HeldUp["kind"] }[] = [
-      ...status.runs.map((r) => ({ run: r.run, workspaces: r.workspaces })),
-      ...status.held_up.map((h) => ({ run: h.run, workspaces: h.workspaces ?? [], held: h.kind })),
+    const runs: { workspaces: string[]; stands: Omit<FactoryRun, "issue" | "url"> }[] = [
+      ...status.runs.map((r) => ({ workspaces: r.workspaces, stands: { run: r.run, step: r.step, ...(r.gate_retries_used > 0 && { gateRetries: r.gate_retries_used }) } })),
+      ...status.held_up.map((h) => ({ workspaces: h.workspaces ?? [], stands: { run: h.run, held: h.kind, reason: h.reason } })),
     ];
-    for (const { run, workspaces, held } of runs) {
-      const parts = parseRun(run);
-      const mark: FactoryRun = { run, ...(parts && { issue: parts.issue, url: issueUrl(parts) }), ...(held && { held }) };
+    for (const { workspaces, stands } of runs) {
+      const parts = parseRun(stands.run);
+      const mark: FactoryRun = { ...stands, ...(parts && { issue: parts.issue, url: issueUrl(parts) }) };
       for (const workspace of workspaces) named.set(`${status.project}/${workspace}`, mark);
     }
   }
@@ -400,21 +407,75 @@ export interface Row {
   /** What Claude said when its last turn ended, only once the session rests: idle or finished. */
   said?: string;
   label: string;
+  /** The label uncut, when it cuts its factory run's reason short: for a tooltip. */
+  fullLabel?: string;
   glyph: Glyph;
 }
 
 /** A session that has stopped for now or for good, so what it last said is its news. */
 const rests: Glyph[] = ["ready", "done"];
 
+/**
+ * A terminal with nothing of its own to say in factory run `run`'s workspace, so it says the run's
+ * stage instead: one that has ended, and in a held-up run one that waits for its next prompt too,
+ * since none comes until you act. So "Ended" never stands for a run that is stuck. A terminal that
+ * works, asks or is quiet keeps its own state, as does a live run's ready one: the factory moves it.
+ */
+const atRest = (glyph: Glyph, run: FactoryRun): boolean => glyph === "done" || glyph === "failed" || (glyph === "ready" && run.held !== undefined);
+
 /** A workspace's terminals in sidebar order: its sessions, then its shells. */
 export function rows(workspace: WorkspaceView): Row[] {
+  const run = workspace.factory;
+  const stage = run && runStage(run);
+  const told = (label: string, glyph: Glyph): Pick<Row, "label" | "fullLabel"> =>
+    run && stage && atRest(glyph, run) ? { label: stage.label, ...(stage.full !== stage.label && { fullLabel: stage.full }) } : { label };
   return [
     ...workspace.sessions.map((s) => {
       const glyph = sessionGlyph[s.state];
-      return { terminal: s.terminal, session: s.id, name: s.name, title: s.title, now: busy.includes(glyph) ? s.now : undefined, said: rests.includes(glyph) ? s.said : undefined, label: sessionLabelIn(s.state, workspace.factory), glyph };
+      return { terminal: s.terminal, session: s.id, name: s.name, title: s.title, now: busy.includes(glyph) ? s.now : undefined, said: rests.includes(glyph) ? s.said : undefined, ...told(sessionLabelIn(s.state, workspace.factory), glyph), glyph };
     }),
-    ...workspace.shells.map((t) => ({ terminal: t.id, name: t.name, label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
+    ...workspace.shells.map((t) => {
+      const glyph = terminalGlyph(t.state, t.exitCode);
+      return { terminal: t.id, name: t.name, ...told(terminalLabel(t.state, t.exitCode), glyph), glyph };
+    }),
   ];
+}
+
+/**
+ * The longest a factory run's label gets, its reason cut at a word to fit: beside a terminal's
+ * name on a sidebar row, the narrowest place a label shows. The rest shows on hover.
+ */
+const LABEL_ROOM = 32;
+
+/** `text` cut to `room` characters, at a word where one ends in its second half, ending in "…". */
+function cut(text: string, room: number): string {
+  if (text.length <= room) return text;
+  const head = text.slice(0, room - 1);
+  const space = head.lastIndexOf(" ");
+  return `${(space > room / 2 ? head.slice(0, space) : head).trimEnd()}…`;
+}
+
+/** A live run's steps as the daemon names them (its issue's `factory:` label, or `claimed`), in words. */
+const stepWords: Record<string, string> = { "pr-open": "PR open" };
+
+/**
+ * Where factory run `run` stands, in the words every view shows on its workspace's terminals at
+ * rest (`rows`): "Stuck · gate red: make check fails on main", "Needs info · …", "Building",
+ * "Building · gate retry 1", "PR open". A held-up run's label carries its reason's first line, cut
+ * to fit `LABEL_ROOM`; `full` has all of it. Nothing for a run whose stage is not known.
+ */
+export function runStage(run: FactoryRun): { label: string; full: string } | undefined {
+  if (run.held) {
+    const kind = run.held === "stuck" ? "Stuck" : "Needs info";
+    const why = run.reason?.trim() ?? "";
+    if (!why) return { label: kind, full: kind };
+    const head = `${kind} · `;
+    return { label: head + cut(why.split("\n")[0].trim(), LABEL_ROOM - head.length), full: head + why };
+  }
+  if (!run.step) return undefined;
+  const step = stepWords[run.step] ?? `${run.step.charAt(0).toUpperCase()}${run.step.slice(1).replaceAll("-", " ")}`;
+  const label = run.gateRetries ? `${step} · gate retry ${run.gateRetries}` : step;
+  return { label, full: label };
 }
 
 /**

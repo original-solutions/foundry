@@ -37,6 +37,14 @@ describe("NextUp", () => {
     const link = await screen.findByRole("link", { name: "Next that needs you: tidy cart styles / opus, 1 needs you" });
     expect(link.textContent).toContain("Stuck");
   });
+
+  it("says what a held-up factory run is stuck on, its whole reason, since the strip has the room and cuts it itself", async () => {
+    const held = { ...next, glyph: "done" as const, label: "Stuck · gate red: make check…", fullLabel: "Stuck · gate red: make check fails on main, see the gate log", now: undefined };
+    await renderApp(<NextUp next={held} others={1} />);
+    const link = await screen.findByRole("link", { name: "Next that needs you: tidy cart styles / opus, 1 needs you" });
+    expect(link.textContent).toContain("Stuck · gate red: make check fails on main, see the gate log");
+    expect(link.title).toContain("Stuck · gate red: make check fails on main, see the gate log ·");
+  });
 });
 
 describe("useOpenStanding", () => {

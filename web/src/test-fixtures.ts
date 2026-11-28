@@ -83,7 +83,7 @@ export function onCommit(owner: string, id: string, name: string): AnyRecord {
 export function factoryStatus(
   project: string,
   live: Record<string, string[]>,
-  held: Record<string, { kind: HeldUp["kind"]; workspaces?: string[] }> = {},
+  held: Record<string, { kind: HeldUp["kind"]; workspaces?: string[]; reason?: string }> = {},
 ): Record<string, FactoryStatus> {
   return {
     [project]: {
@@ -97,7 +97,7 @@ export function factoryStatus(
       ready: [],
       feedback_waiting: [],
       runs: Object.entries(live).map(([run, workspaces]) => ({ run, title: "t", step: "building", machine: ME, gate_retries_used: 0, minutes_used: 3, workspaces, sessions: [] })),
-      held_up: Object.entries(held).map(([run, h]) => ({ run, kind: h.kind, reason: "why", ...(h.workspaces && { workspaces: h.workspaces }) })),
+      held_up: Object.entries(held).map(([run, h]) => ({ run, kind: h.kind, reason: h.reason ?? "why", ...(h.workspaces && { workspaces: h.workspaces }) })),
       gate_infra: [],
       finished: [],
       foreign: [],

@@ -756,6 +756,26 @@ describe("Board and the factory", () => {
     expect(within(screen.getByRole("region", { name: "Needs you" })).getByRole("article", { name: "fac 170" })).toBeDefined();
   });
 
+  describe("a held-up run's stage", () => {
+    const reason = "gate red: make check fails on main, see the gate log";
+    const stuck = () => factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1"] }, { "original-solutions__foundry__170__1": { kind: "stuck", workspaces: ["w2"], reason } });
+
+    it("says what the run is stuck on where its card names its ended session's state, with the whole reason on hover", async () => {
+      await show(withFactory(fleet(factoryRecords(), settings()), stuck()));
+      const label = within(card("fac 170")).getByText("Stuck · gate red: make check…");
+      expect(label.getAttribute("title")).toBe(`Stuck · ${reason}`);
+      expect(within(card("fac 170")).queryByText("Ended")).toBeNull();
+    });
+
+    it("says it on the line's lead terminal and its glyph in the list too", async () => {
+      localStorage.setItem("foundry.layout", "list");
+      await show(withFactory(fleet(factoryRecords(), settings()), stuck()));
+      const label = within(card("fac 170")).getByText("Stuck · gate red: make check…");
+      expect(label.getAttribute("title")).toBe(`Stuck · ${reason}`);
+      expect(within(card("fac 170")).getByRole("link", { name: `opus Stuck · ${reason}` })).toBeDefined();
+    });
+  });
+
   it("moves a needs-info run's card under needs you too", async () => {
     await show(withFactory(fleet(factoryRecords(), settings()), factoryStatuses("needs_info")));
     expect(within(screen.getByRole("region", { name: "Needs you" })).getByRole("article", { name: "fac 170" })).toBeDefined();

@@ -11,6 +11,8 @@ export interface Needing {
   name: string;
   glyph: Glyph;
   label: string;
+  /** The label uncut, when it cuts its factory run's reason short. */
+  fullLabel?: string;
   /** What its session asks, when it asks something. */
   now?: Step;
 }
@@ -23,7 +25,7 @@ export interface Needing {
 export function needing(machines: MachineView[]): Needing[] {
   const needs = lanes(machines).find((l) => l.lane === "needs")?.cards ?? [];
   return needs.flatMap((card) =>
-    needingRows(card.workspace).map((row) => ({ terminal: row.terminal, workspace: card.workspace.name, name: row.name, glyph: row.glyph, label: row.label, now: row.now })),
+    needingRows(card.workspace).map((row) => ({ terminal: row.terminal, workspace: card.workspace.name, name: row.name, glyph: row.glyph, label: row.label, ...(row.fullLabel && { fullLabel: row.fullLabel }), now: row.now })),
   );
 }
 

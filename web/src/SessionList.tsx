@@ -146,7 +146,7 @@ export function SessionList({ machines, selected, docked, onDock, onPick }: Prop
 }
 
 function SessionRow({ row, workspace, machine, current, onPick }: { row: Row; workspace: WorkspaceView; machine?: string; current: boolean; onPick: () => void }) {
-  const name = `${workspace.name} / ${row.name}: ${row.label}`;
+  const name = `${workspace.name} / ${row.name}: ${row.fullLabel ?? row.label}`;
   const quiet = row.glyph === "done" || row.glyph === "away";
   return (
     <TerminalMenu id={row.terminal} place="row">
@@ -172,7 +172,9 @@ function SessionRow({ row, workspace, machine, current, onPick }: { row: Row; wo
           <span />
         )}
         <span className="col-start-2 col-end-4 flex min-w-0 items-baseline gap-1.5 text-xs text-neutral-400">
-          <span className={`shrink-0 ${quiet ? "" : glyphText[row.glyph]}`}>{row.label}</span>
+          <span title={row.fullLabel} className={`shrink-0 ${quiet ? "" : glyphText[row.glyph]}`}>
+            {row.label}
+          </span>
           <span className="text-neutral-600">·</span>
           <Named name={row.name} title={row.title} step={row.now} />
           {machine && <span className="shrink-0 text-neutral-500">{machine}</span>}
