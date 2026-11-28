@@ -3,9 +3,12 @@
 //! - `GET /api/state`: the full synced state, as a [`UiMessage::State`].
 //! - `GET /api/events`, a WebSocket: a [`UiMessage::State`] first, then a
 //!   [`UiMessage::Record`] for each record that changes, deleted ones included, and a
-//!   [`UiMessage::Settings`] when the shared settings change. When a machine goes offline or
-//!   comes back, the whole state is sent again, so its sessions and terminals show as
-//!   unreachable or as they are. The store is read every [`EVENTS_EVERY`], so a record written
+//!   [`UiMessage::Settings`] when the shared settings change. The state carries what each
+//!   machine holds and the protocol each linked machine speaks; a [`UiMessage::Held`] follows a
+//!   change to a machine's held record. When a machine goes offline or comes back, or the
+//!   protocols change, the whole state is sent again, so its sessions and terminals show as
+//!   unreachable or as they are. A held record this build cannot read is left out, with one
+//!   warning while it stays unreadable. The store is read every [`EVENTS_EVERY`], so a record written
 //!   several times between two reads is sent once, at its newest version. A record this build
 //!   cannot read, one a newer build wrote before a rollback, leaves out its owner's changes up
 //!   to it, with a warning, and the socket goes on.
@@ -568,13 +571,49 @@ async fn on_store<T: Send + 'static>(
 
 // --- state and events ---
 
-/// The full state as [`UiMessage::State`], and the highest version it holds per owner.
+/// The held records as one read left them: the factory versions the rows were read at, and the
+/// rows, or the error of a row this build cannot read.
+type HeldRead = (
+    BTreeMap<MachineId, u64>,
+    Result<BTreeMap<MachineId, MachineHeld>, StoreError>,
+);
+
+/// The factory versions, then the held records, in one lock, so a write between the two reads
+/// shows as a newer version at the next read. A row this build cannot read, one a newer build
+/// wrote before a rollback, is no reason to fail what the UI is sent: it is left in the result.
+/// Any other error is returned.
+fn read_helds(store: &mut Store) -> Result<HeldRead, StoreError> {
+    let versions = store.factory_versions()?;
+    match store.helds() {
+        Ok(helds) => Ok((versions, Ok(helds))),
+        Err(error @ StoreError::Json(_)) => Ok((versions, Err(error))),
+        Err(error) => Err(error),
+    }
+}
+
+/// What the state read of the held records: the factory versions they were read at, and whether
+/// a row could not be read.
+struct HeldSeen {
+    at: BTreeMap<MachineId, u64>,
+    unreadable: bool,
+}
+
+/// The full state as [`UiMessage::State`], the highest version it holds per owner, and what it
+/// read of the held records. Held records this build cannot read are left out, with a warning.
 async fn full_state_for(
     api: &Api,
     online: &BTreeSet<MachineId>,
-) -> Result<(UiMessage, BTreeMap<MachineId, u64>), StoreError> {
+) -> Result<(UiMessage, BTreeMap<MachineId, u64>, HeldSeen), StoreError> {
     let (versions, records, settings) = api.peers.state_snapshot_for(online).await?;
-    let held = on_store(&api.store, |store| store.helds()).await?;
+    let (at, held) = on_store(&api.store, read_helds).await?;
+    let unreadable = held.is_err();
+    let held = held.unwrap_or_else(|error| {
+        tracing::warn!(
+            "api: what machines hold is not sent: {}",
+            redact(&error.to_string())
+        );
+        BTreeMap::new()
+    });
     let state = UiMessage::State {
         protocol: PROTOCOL,
         records,
@@ -583,7 +622,7 @@ async fn full_state_for(
         held,
         protocols: api.peers.protocols(),
     };
-    Ok((state, versions))
+    Ok((state, versions, HeldSeen { at, unreadable }))
 }
 
 async fn state(State(api): State<Api>) -> Result<Json<UiMessage>, ApiError> {
@@ -625,6 +664,11 @@ struct Sent {
     online: BTreeSet<MachineId>,
     protocols: BTreeMap<MachineId, u16>,
     held: BTreeMap<MachineId, MachineHeld>,
+    /// The factory versions the held records were last read at: they are read again when the
+    /// versions differ.
+    held_at: BTreeMap<MachineId, u64>,
+    /// A held record cannot be read, and has been warned of: not warned of again until it can.
+    held_unreadable: bool,
     factory: Believed,
 }
 
@@ -790,12 +834,17 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
             continue;
         }
         let seen = sent.seq;
+        let held_at = sent.held_at.clone();
         let (versions, settings, helds) = on_store(&api.store, move |store| {
-            Ok((
-                store.versions()?,
-                store.settings_since(Some(seen))?,
-                store.helds()?,
-            ))
+            let versions = store.versions()?;
+            let settings = store.settings_since(Some(seen))?;
+            // The held records are read only when a factory record has been written since.
+            let helds = if store.factory_versions()? == held_at {
+                None
+            } else {
+                Some(read_helds(store)?)
+            };
+            Ok((versions, settings, helds))
         })
         .await?;
         for (owner, version) in versions {
@@ -837,19 +886,39 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
                 return Ok(());
             }
         }
-        for (machine, held) in helds {
-            if sent.held.get(&machine) == Some(&held) {
-                continue;
-            }
-            let message = UiMessage::Held {
-                protocol: PROTOCOL,
-                machine,
-                held: held.clone(),
+        if let Some((at, helds)) = helds {
+            sent.held_at = at;
+            let helds = match helds {
+                Ok(helds) => {
+                    if std::mem::take(&mut sent.held_unreadable) {
+                        tracing::info!("api: what machines hold can be read again");
+                    }
+                    helds
+                }
+                Err(error) => {
+                    if !std::mem::replace(&mut sent.held_unreadable, true) {
+                        tracing::warn!(
+                            "api: what machines hold is not sent: {}",
+                            redact(&error.to_string())
+                        );
+                    }
+                    BTreeMap::new()
+                }
             };
-            if !send(&mut socket, &message).await {
-                return Ok(());
+            for (machine, held) in helds {
+                if sent.held.get(&machine) == Some(&held) {
+                    continue;
+                }
+                let message = UiMessage::Held {
+                    protocol: PROTOCOL,
+                    machine,
+                    held: held.clone(),
+                };
+                if !send(&mut socket, &message).await {
+                    return Ok(());
+                }
+                sent.held.insert(machine, held);
             }
-            sent.held.insert(machine, held);
         }
         match send_factory(api, &mut socket, &mut sent.factory, sent.seq, &sent.online).await? {
             Factory::Sent => {}
@@ -866,7 +935,7 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
 /// covered, or `None` when the UI has gone.
 async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, StoreError> {
     let online = api.peers.online();
-    let (state, versions) = full_state_for(api, &online).await?;
+    let (state, versions, held_seen) = full_state_for(api, &online).await?;
     let (seq, protocols, held) = match &state {
         UiMessage::State {
             settings,
@@ -890,6 +959,8 @@ async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, S
         online,
         protocols,
         held,
+        held_at: held_seen.at,
+        held_unreadable: held_seen.unreadable,
         factory,
     }))
 }

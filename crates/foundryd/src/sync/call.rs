@@ -175,6 +175,11 @@ pub enum CallError {
     Refused(String),
 }
 
+/// The newest protocol among one machine's open record links.
+fn newest(open: &BTreeMap<u64, super::Link>) -> Option<u16> {
+    open.values().map(|link| link.speak).max()
+}
+
 impl Peers {
     /// This machine's id.
     pub fn me(&self) -> MachineId {
@@ -259,9 +264,7 @@ impl Peers {
 
     /// The newest protocol an open record link to `machine` speaks, or `None` with no link open.
     fn speaks(&self, machine: MachineId) -> Option<u16> {
-        lock(&self.inner.links)
-            .get(&machine)
-            .and_then(|open| open.values().map(|link| link.speak).max())
+        lock(&self.inner.links).get(&machine).and_then(newest)
     }
 
     /// The protocol each machine with an open record link speaks (the newest, as [`speaks`]
@@ -271,9 +274,7 @@ impl Peers {
     pub fn protocols(&self) -> BTreeMap<MachineId, u16> {
         let mut protocols: BTreeMap<MachineId, u16> = lock(&self.inner.links)
             .iter()
-            .filter_map(|(machine, open)| {
-                Some((*machine, open.values().map(|link| link.speak).max()?))
-            })
+            .filter_map(|(machine, open)| Some((*machine, newest(open)?)))
             .collect();
         protocols.insert(self.inner.me, PROTOCOL);
         protocols

@@ -3,9 +3,14 @@
 //! Every [`CHECK_EVERY`] this machine reads the logins it holds a token for, its default login,
 //! which gateway keys are set, and whether the `factory-build` skill is installed for the
 //! service user, and writes a [`MachineHeld`] record when any differs from what it last wrote,
-//! the first check at once. The age between checks is read on the sleep-counting clock of
-//! [`crate::clock`]. Only the names of the secrets are listed, and the default login (which is no
-//! secret) is read: no token or key is read, and none is ever logged.
+//! the first check at once, and again every [`REWRITE_EVERY`] when nothing differs. The age
+//! between checks and between writes is read on the sleep-counting clock of [`crate::clock`].
+//! Only the names of the secrets are listed, and the default login (which is no secret) is read:
+//! no token or key is read, and none is ever logged.
+//!
+//! A list of names that cannot be read at all fails the check: nothing is written and the old
+//! record stays. `gateway` is `None` only when the list for the gateway keys alone cannot be
+//! read.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -33,6 +38,11 @@ enum HeldError {
 
 /// How often the logins and the skill are checked.
 pub const CHECK_EVERY: Duration = Duration::from_secs(5);
+
+/// How long a record that has not changed stands before it is written again, at a new version.
+/// A copy of it that an older build stored on a peer, re-serialised without the fields this build
+/// adds, is replaced by the next write, which nothing else would make while nothing changes.
+pub const REWRITE_EVERY: Duration = Duration::from_secs(10 * 60);
 
 /// How often the clock is read while waiting. It only paces the reads: the wait is measured on
 /// the clock.
@@ -71,20 +81,27 @@ pub(crate) async fn run_with(
     clock: Arc<dyn Clock>,
 ) {
     let mut written: Option<MachineHeld> = None;
+    // When the record was last written (or found to need no write), on the clock.
+    let mut written_at = Duration::ZERO;
     // What the last failed check said, while checks keep failing.
     let mut failing: Option<String> = None;
     loop {
         let checked = clock.now();
+        let rewrite = checked.saturating_sub(written_at) >= REWRITE_EVERY;
+        // No `last` makes the check write whatever it finds.
         let (store, secrets, skill, last) = (
             store.clone(),
             secrets.clone(),
             skill.clone(),
-            written.clone(),
+            written.clone().filter(|_| !rewrite),
         );
         match tokio::task::spawn_blocking(move || check(&store, me, &*secrets, skill, last)).await {
             Ok(Ok(held)) => {
                 if failing.take().is_some() {
                     tracing::info!("what this machine holds can be read and written again");
+                }
+                if rewrite || written.as_ref() != Some(&held) {
+                    written_at = checked;
                 }
                 written = Some(held);
             }
@@ -130,7 +147,7 @@ fn check(
         logins,
         skill: skill.is_some_and(|path| path.exists()),
         default: secrets::github_default(secrets),
-        // A list that cannot be read says nothing of the keys.
+        // The list read again for the keys: when only this read fails, the keys are unknown.
         gateway: secrets.names().ok().map(|names| GatewayKeys {
             key: names.iter().any(|name| name == secrets::GATEWAY),
             management: names.iter().any(|name| name == secrets::GATEWAY_MANAGEMENT),
