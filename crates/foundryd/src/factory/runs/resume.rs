@@ -64,12 +64,14 @@
 //!   recorded pass, shown unreachable and not at rest (`gating::at_rest`) on a machine
 //!   unreachable for 15 minutes, may be at work there and is an interruption as any other.
 //!   The pass calls [`advance`] for it before it polls a gate in flight. The resume that
-//!   interruption owes, the resumed session until it reports again (its first message asked
-//!   again, its end an interruption of its own), and a stuck path it began stay this step's.
-//!   A gate in flight on a machine gone for `gate::MACHINE_GONE_AFTER` is marked could not run
-//!   (`gate-could-not-run`) before the interruption is recorded, as the gate would mark it if
-//!   it read it while the session may be at work; one on a machine that is not gone is left to
-//!   the gate's own rules. A session at rest when last seen stays the gate's (#294).
+//!   interruption owes, the resumed session until a turn of it is read (its first message
+//!   asked again, its end an interruption of its own), and a stuck path it began stay this
+//!   step's.
+//!   A gate in flight is marked could not run (`gate-could-not-run`) before the interruption
+//!   is recorded, since the gate reads no gate while the run is this step's: on a machine gone
+//!   for `gate::MACHINE_GONE_AFTER` in the gate's own words, and on one that is not gone with
+//!   [`GATE_CUT_OFF`], its workspace archived by force. A session at rest when last seen stays
+//!   the gate's (#294).
 //!
 //! Where it differs from the runner:
 //!
@@ -274,11 +276,11 @@ use foundry_proto::record::{Record, Workspace};
 use foundry_proto::state::{SessionState, TerminalState};
 use serde_json::Value;
 
-use super::gating::{self, GATE_COULD_NOT_RUN};
+use super::gating::{self, GATE_COULD_NOT_RUN, GATE_CREATED};
 use super::progress::{
-    GATE_REQUESTED, STUCK_DETAIL, STUCK_STOP, Seen, TEXT_CODE, UNREACHABLE_FOR, UNVERIFIED_CODE,
-    WORKSPACE_CREATED, WORKSPACE_REQUESTED, build_name, feedback_name, highest, numbered,
-    pending_relaunch, read_progress, resume_name, step_text,
+    GATE_REQUESTED, STUCK_DETAIL, STUCK_STOP, Seen, TEXT_CODE, TURN_READ, UNREACHABLE_FOR,
+    UNVERIFIED_CODE, WORKSPACE_CREATED, WORKSPACE_REQUESTED, build_name, feedback_name, highest,
+    numbered, pending_relaunch, read_progress, resume_name, step_text,
 };
 use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
 use super::{
@@ -343,6 +345,10 @@ pub const CLAIM_MOVED: &str = "claim-moved ";
 /// The step written when the machine a claim moved to was unreachable for 15 minutes before its
 /// workspace was answered: `claim-moved-given-up <id>`.
 pub const CLAIM_GIVEN_UP: &str = "claim-moved-given-up ";
+
+/// Why a gate in flight on a machine that is not gone could not run when the interruption of
+/// its run's session stopped it: the words of its `gate-could-not-run` step.
+pub const GATE_CUT_OFF: &str = "the build session was interrupted";
 
 /// The step written before a turn probe's first `Failed` answer is acted on:
 /// `resume-turn-failing <session> <turn> <generation> <ms>`, with the lease generation and the
@@ -873,8 +879,8 @@ fn pass(ctx: &RunContext<'_>, run: &RunId, placed: Option<Target>) -> Result<Res
     }
     // The gate has the pull request the session reported, unless the session may be at work
     // on a machine cut off for 15 minutes: that is an interruption all the same (#367). A
-    // session resumed since the report has reported nothing yet, so it is this step's too.
-    let with_the_gate = (seen.pr_reported && !interrupted_since_report(&events))
+    // session resumed since the report with no turn read yet is this step's too.
+    let with_the_gate = (seen.pr_reported && !resumed_unread(&events))
         || (seen.pass.is_some() && seen.last_pr.is_some());
     let ended = if !with_the_gate || cut_off_at_work(ctx, &seen) {
         ended(ctx, run, &events, &seen)?
@@ -894,9 +900,9 @@ fn pass(ctx: &RunContext<'_>, run: &RunId, placed: Option<Target>) -> Result<Res
 
 /// Whether this step has a run whose pull request is reported, which the gate holds otherwise
 /// (#367): its session may be at work on a machine unreachable for 15 minutes, it was
-/// interrupted since the report (the resume is owed, or the resumed session has not reported
-/// again, so its first message and its end are this step's, as for a run with no pull request
-/// reported), or a stuck path this step began is to be finished. The pass calls [`advance`]
+/// interrupted since the report (the resume is owed, or no turn of the resumed session has
+/// been read, so its first message and its end are this step's, as for a run with no pull
+/// request reported), or a stuck path this step began is to be finished. The pass calls [`advance`]
 /// for it, and polls no gate in flight first, since one is not read while the session may be
 /// at work. It reads no worker and writes nothing.
 pub fn takes_from_the_gate(ctx: &RunContext<'_>, events: &[RunEvent]) -> bool {
@@ -905,22 +911,28 @@ pub fn takes_from_the_gate(ctx: &RunContext<'_>, events: &[RunEvent]) -> bool {
         serde_json::from_str::<StuckStop>(raw)
             .is_ok_and(|decision| OWN_STUCK_CODES.contains(&decision.code.as_str()))
     });
-    let resumed = seen.pr_reported && seen.pass.is_none() && interrupted_since_report(events);
+    let resumed = seen.pr_reported && seen.pass.is_none() && resumed_unread(events);
     resumed || own_stuck || cut_off_at_work(ctx, &seen)
 }
 
-/// Whether a resume's `session_interrupted` line follows the newest `pr_opened`: the session
-/// that reported the pull request was interrupted, and none has reported it since. The run's
-/// `pr_reported` stays set through it, as `progress` reads the ledger.
-fn interrupted_since_report(events: &[RunEvent]) -> bool {
+/// Whether a resume's `session_interrupted` line follows the newest `pr_opened` with no turn
+/// read after it: the session that reported the pull request was interrupted, and no turn of
+/// the session resumed since has been read. The run's `pr_reported` stays set through the
+/// interruption, as `progress` reads the ledger, and `building` writes no second `pr_opened`
+/// when the resumed session reports the same pull request, only the turn read: from then on the
+/// run is the gate's again, as any run whose session reported its pull request.
+fn resumed_unread(events: &[RunEvent]) -> bool {
     let newest = |found: &dyn Fn(&RunEvent) -> bool| events.iter().rposition(found);
     let interrupted = newest(&|event| {
         event.event == names::SESSION_INTERRUPTED
             && event.data.get("relaunch") != Some(&Value::Bool(true))
     });
     let reported = newest(&|event| event.event == names::PR_OPENED);
+    let read = newest(&|event| step_text(event).is_some_and(|step| step.starts_with(TURN_READ)));
     match (interrupted, reported) {
-        (Some(interrupted), Some(reported)) => interrupted > reported,
+        (Some(interrupted), Some(reported)) => {
+            interrupted > reported && read.is_none_or(|read| read < interrupted)
+        }
         _ => false,
     }
 }
@@ -956,22 +968,23 @@ fn session_owner(ctx: &RunContext<'_>, seen: &Seen) -> Option<MachineId> {
         .or_else(|| seen.machine.as_deref().and_then(parse_machine))
 }
 
-/// A gate in flight when the session of a run whose pull request is reported is interrupted,
-/// on a machine gone for `gate::MACHINE_GONE_AFTER`, is marked could not run before the
-/// interruption is recorded: the gate's own rule for such a gate, with its words and its count
-/// of failures to run for the attempt, which the gate does not apply itself while the session
-/// may be at work, since it reads no gate then. Its slot is freed, its workspace is the gate's
-/// to archive or leave before another is placed, and a fifth failure to run is the gate's
-/// stuck. A gate on a machine that is not gone may still be running its commands there: it is
-/// left to the gate's own rules and keeps its slot. A pass cut short after the step decides
-/// the interruption again.
+/// A gate in flight when the session of a run whose pull request is reported is interrupted
+/// is marked could not run before the interruption is recorded, with the gate's count of
+/// failures to run for its attempt. The gate reads no gate while the session may be at work,
+/// nor while the run is this step's after it, so one left in flight would hold its slot
+/// unread. On a machine gone for `gate::MACHINE_GONE_AFTER` that is the gate's own rule, with
+/// its words. On a machine that is not gone the gate may still be running its commands: it is
+/// marked with [`GATE_CUT_OFF`] and its workspace (the one recorded, else the one the fleet
+/// shows under the gate's name) is archived by force, which stops them. An archive that fails
+/// is no error: the gate archives a gate that could not run, by its own rules, before it
+/// places another. A fifth failure to run is the gate's stuck. A pass cut short after the step
+/// decides the interruption again, and finds no gate in flight.
 fn gate_cut_off(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent]) -> Result<(), RunError> {
     if !gating::gate_running(events) {
         return Ok(());
     }
-    let Some(placed) = events
-        .iter()
-        .filter_map(step_text)
+    let steps = || events.iter().filter_map(step_text);
+    let Some(placed) = steps()
         .filter_map(|step| step.strip_prefix(GATE_REQUESTED))
         .next_back()
     else {
@@ -984,16 +997,11 @@ fn gate_cut_off(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent]) -> Resul
     ) else {
         return Err(RunError::Invalid(format!("the gate step {placed:?}")));
     };
-    let Some(reason) = part
+    let gone = part
         .nth(2)
         .and_then(parse_machine)
-        .and_then(|machine| gate::could_not_run(None, ctx.view.unreachable_for(machine), None))
-    else {
-        return Ok(());
-    };
-    let failures = events
-        .iter()
-        .filter_map(step_text)
+        .and_then(|machine| gate::could_not_run(None, ctx.view.unreachable_for(machine), None));
+    let failures = steps()
         .filter_map(|step| step.strip_prefix(GATE_COULD_NOT_RUN))
         .filter(|rest| rest.split(' ').next() == Some(attempt.to_string().as_str()))
         .count();
@@ -1001,12 +1009,35 @@ fn gate_cut_off(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent]) -> Resul
         .unwrap_or(u32::MAX)
         .saturating_add(1);
     let wait = gate::backoff(failures).map_or_else(|| "-".to_owned(), |wait| wait.to_string());
+    let reason = gone.as_deref().unwrap_or(GATE_CUT_OFF);
     ctx.held()?;
     ctx.record_step(
         run,
         &format!("{GATE_COULD_NOT_RUN}{attempt} {k} {failures} {wait} {reason}"),
         &Cause::new(CauseStep::Gate, "gate-could-not-run").attempt(attempt),
-    )
+    )?;
+    if gone.is_some() {
+        return Ok(());
+    }
+    let created = steps()
+        .filter_map(|step| step.strip_prefix(GATE_CREATED))
+        .filter_map(|rest| rest.split_once(' '))
+        .filter(|(n, _)| n.parse::<u32>().ok() == Some(k))
+        .filter_map(|(_, id)| workspace_id(id).ok())
+        .next_back()
+        .or_else(|| {
+            ctx.view
+                .workspace_named(ctx.project.id, &gate::name(run, k))
+                .map(|record| record.body.id)
+        });
+    if let Some(workspace) = created {
+        match ctx.archive(workspace) {
+            Ok(()) => {}
+            Err(error @ RunError::LeaseLost(_)) => return Err(error),
+            Err(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// The codes of the stuck paths this step begins. None is one `start` or `building` writes:
