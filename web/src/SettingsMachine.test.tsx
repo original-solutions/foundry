@@ -321,6 +321,41 @@ describe("SettingsMachine", () => {
     expect(screen.getByRole("button", { name: "Save 1 change" })).toBeDefined();
   });
 
+  /** Stubs `fetch` so each call waits until the test answers it. */
+  function held() {
+    const out: { url: string; answer: (r: Response) => void }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => new Promise<Response>((answer) => out.push({ url, answer }))),
+    );
+    return out;
+  }
+
+  it("does not mark a field typed into while a save was out as changed elsewhere, whatever was sent", async () => {
+    const out = held();
+    await show(OTHER);
+    type("Name", "desk ");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(out).toHaveLength(1));
+    type("Name", "desk2");
+    await act(async () => out[0].answer(new Response(null, { status: 204 })));
+    expect(bar()?.textContent).not.toContain("changed elsewhere");
+    expect(screen.getByRole("button", { name: "Save 1 change" })).toBeDefined();
+  });
+
+  it("does not mark a limit typed into while another limit's save was out as changed elsewhere", async () => {
+    const out = held();
+    await show(OTHER);
+    type("Max sessions", "5");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(out).toHaveLength(1));
+    type("Max load per core", "2");
+    await act(async () => out[0].answer(new Response(null, { status: 204 })));
+    expect(row("Max load per core").textContent).not.toContain("changed elsewhere");
+    expect(bar()?.textContent).not.toContain("changed elsewhere");
+    expect(screen.getByRole("button", { name: "Save 1 change" })).toBeDefined();
+  });
+
   describe("the update", () => {
     const ready = (id: string) => [at(ME, 1, id === ME ? { version: "0.9.0", update_ready: "v0.9.1" } : {}), at(OTHER, 1, id === OTHER ? { version: "0.9.0", update_ready: "v0.9.1" } : {})];
 
