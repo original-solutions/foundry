@@ -5,7 +5,7 @@ import type { MachineView } from "./fleet";
 import { MachineKept } from "./MachineKept";
 import { limitsText, removeMachine, renameMachine, sendLimits } from "./machineApi";
 import { button, dangerButton, field, Modal, primaryButton } from "./Modal";
-import { diff, type Field, type Refusal } from "./reviewDiff";
+import { diff, type Change, type Field, type Refusal } from "./reviewDiff";
 import { ReviewBar, useLeaveGuard } from "./ReviewBar";
 import { Page, Row, type PageProps } from "./SettingsPage";
 import { install, rowSays, useInstalls } from "./UpdateChecklist";
@@ -109,6 +109,15 @@ const defs: (Field<Texts> & { help: string; attrs?: { min: number | string; step
   { key: "min_free_disk_gb", label: "Min free disk (GB)", help: "Placement skips it with less free disk than this.", show: blankIsNone, attrs: { min: 0, step: "any" } },
 ];
 
+/**
+ * The fields of `draft` that differ from `saved`, as the review bar lists them. The name is compared
+ * as text: `diff` reads text of digits as a number, so a machine named "1" renamed "01" would be no change.
+ */
+function changed(saved: Texts, draft: Texts): Change[] {
+  const renamed = saved.name === draft.name ? [] : [{ key: "name", label: "Name", before: saved.name.trim(), after: draft.name.trim() }];
+  return [...renamed, ...diff(saved, draft, defs.filter((def) => def.key !== "name"))];
+}
+
 const asNumber = (text: string) => (text.trim() === "" ? null : Number(text));
 
 /** The first limit outside the range the daemon takes, with the daemon's own sentence for it, or nothing. */
@@ -155,11 +164,11 @@ function Shared({ machine }: { machine: MachineView }) {
   const values: Texts = { ...now, ...edits };
   const blank = (t: Texts) => limitKeys.every((k) => t[k].trim() === "");
   const clearing = blank(values) && !blank(now);
-  const fieldChanges = diff(now, { ...values, name: values.name.trim() }, defs);
+  const fieldChanges = changed(now, { ...values, name: values.name.trim() });
   const changes = clearing
     ? [...fieldChanges.filter((c) => c.key === "name"), { key: "limits", label: "Limits", before: machine.limits ? limitsText(machine.limits) : "", after: "none" }]
     : fieldChanges;
-  const moved = new Set(diff({ ...now, ...from }, now, defs).map((c) => c.key));
+  const moved = new Set(changed({ ...now, ...from }, now).map((c) => c.key));
   const staleFields = fieldChanges.map((c) => c.key).filter((key) => moved.has(key));
   const stale = clearing ? [...staleFields.filter((k) => k === "name"), ...(limitKeys.some((k) => moved.has(k)) ? ["limits"] : [])] : staleFields;
   useLeaveGuard(changes.length > 0);

@@ -1,6 +1,6 @@
 import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useRef, useState, type FC } from "react";
+import { useId, useRef, useState, type FC } from "react";
 import type { MachineView } from "./fleet";
 import { addMachine, movePriority } from "./machineApi";
 import { button, field, Modal, primaryButton } from "./Modal";
@@ -53,9 +53,10 @@ function CoordinatorOrder({ machines }: { machines: MachineView[] }) {
     },
   });
   const moving = move.isPending || posted?.from === shown;
+  const heading = useId();
   return (
-    <section aria-labelledby="coordinator-order">
-      <h3 id="coordinator-order" className="text-sm font-semibold text-neutral-100">
+    <section aria-labelledby={heading}>
+      <h3 id={heading} className="text-sm font-semibold text-neutral-100">
         Coordinator order
       </h3>
       <p className="mt-0.5 text-xs text-neutral-500">The first machine online in this order coordinates the fleet.</p>

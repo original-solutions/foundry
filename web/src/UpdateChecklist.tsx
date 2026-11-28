@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useId, useState, useSyncExternalStore } from "react";
 import { installUpdate, refused } from "./api";
 import type { MachineView } from "./fleet";
 import { button, primaryButton } from "./Modal";
@@ -169,6 +169,7 @@ export function useInstalls(machines: MachineView[], here: string | undefined) {
 export function UpdateChecklist({ machines, here }: { machines: MachineView[]; here: string | undefined }) {
   // Machines unticked by hand; every other waiting machine is ticked, one made ready later too.
   const [unticked, setUnticked] = useState<Set<string>>(new Set());
+  const heading = useId();
   const { calls, batch, held } = useInstalls(machines, here);
   const rows = batch?.map((id) => calls[id]);
 
@@ -188,8 +189,8 @@ export function UpdateChecklist({ machines, here }: { machines: MachineView[]; h
     );
 
   return (
-    <section aria-labelledby="update-checklist">
-      <h3 id="update-checklist" className="text-sm font-semibold text-neutral-100">
+    <section aria-labelledby={heading}>
+      <h3 id={heading} className="text-sm font-semibold text-neutral-100">
         Install the waiting release
       </h3>
       <p className="mt-0.5 text-xs text-neutral-500">Each machine picked installs the release shown for it and restarts. Its terminals keep running.</p>

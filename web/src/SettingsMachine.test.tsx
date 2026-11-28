@@ -1,10 +1,11 @@
+import { Link, useRouterState } from "@tanstack/react-router";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnyRecord, MachineSample, SharedSettings } from "./api";
 import { emptyState, fleet } from "./fleet";
 import { SettingsMachine } from "./SettingsMachine";
-import { forgetInstalls } from "./UpdateChecklist";
+import { forgetInstalls, UpdateChecklist } from "./UpdateChecklist";
 import { ME, OTHER, sample, settings } from "./test-fixtures";
 import { json, mockFetch, pageProps, renderApp } from "./test-utils";
 
@@ -172,6 +173,68 @@ describe("SettingsMachine", () => {
     await show(OTHER);
     type("Name", " laptop ");
     expect(bar()).toBeNull();
+  });
+
+  it("compares the name as text, so a name of digits typed another way is a change", async () => {
+    const calls = mockFetch(new Response(null, { status: 204 }));
+    const given = settings({ ...limited, machines: [limited.machines[0], { id: OTHER, name: "1", address: "" }] });
+    await show(OTHER, { given });
+    type("Name", "01");
+    expect(bar()?.textContent).toContain("Name 1 → 01");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(bar()).toBeNull());
+    expect(calls).toEqual([{ url: `/api/machines/${OTHER}/rename`, method: "POST", body: { name: "01" } }]);
+  });
+
+  describe("leaving with unsaved edits", () => {
+    /**
+     * Shows laptop's page beside a link away and the path the router is at, opened at its own path:
+     * the router asks no blocker about leaving a path it has no route for.
+     */
+    async function withWayOut() {
+      function Path() {
+        return <output aria-label="Path">{useRouterState({ select: (s) => s.location.pathname })}</output>;
+      }
+      const machines = fleet([at(ME, 1), at(OTHER, 1)], limited, {}, [ME, OTHER]);
+      await renderApp(
+        <>
+          <Link to="/settings/machines/$machine" params={{ machine: OTHER }}>
+            In
+          </Link>
+          <Link to="/settings">Away</Link>
+          <Path />
+          <SettingsMachine {...pageProps({ state: { ...emptyState, synced: true, settings: limited }, machines, here: ME })} machineId={OTHER} />
+        </>,
+      );
+      fireEvent.click(screen.getByRole("link", { name: "In" }));
+      await waitFor(() => expect(path()).toBe(`/settings/machines/${OTHER}`));
+    }
+    const path = () => screen.getByRole("status", { name: "Path" }).textContent;
+
+    it("asks before leaving with an unsaved name, and Cancel stays with the edit", async () => {
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      await withWayOut();
+      type("Name", "desk");
+
+      fireEvent.click(screen.getByRole("link", { name: "Away" }));
+      await waitFor(() => expect(confirm).toHaveBeenCalledTimes(1));
+      expect(path()).toBe(`/settings/machines/${OTHER}`);
+      expect(field("Name").value).toBe("desk");
+
+      confirm.mockReturnValue(true);
+      fireEvent.click(screen.getByRole("link", { name: "Away" }));
+      await waitFor(() => expect(path()).toBe("/settings"));
+      confirm.mockRestore();
+    });
+
+    it("leaves without asking when nothing is unsaved", async () => {
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      await withWayOut();
+      fireEvent.click(screen.getByRole("link", { name: "Away" }));
+      await waitFor(() => expect(path()).toBe("/settings"));
+      expect(confirm).not.toHaveBeenCalled();
+      confirm.mockRestore();
+    });
   });
 
   it("locks the name, limits and Clear limits, and offers no Remove, for a machine the machine list does not hold", async () => {
@@ -517,6 +580,42 @@ describe("SettingsMachine", () => {
       expect(screen.getByText(/the machine serving this page is restarting/i)).toBeDefined();
       expect(screen.queryByText(/^this machine is restarting/i)).toBeNull();
       expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
+    });
+
+    /** Shows laptop's page and the checklist on one screen, over a fleet where both machines have v0.9.1 ready. */
+    async function pageAndChecklist() {
+      const machines = fleet([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })], limited, {}, [ME, OTHER]);
+      await renderApp(
+        <>
+          <SettingsMachine {...pageProps({ state: { ...emptyState, synced: true, settings: limited }, machines, here: ME })} machineId={OTHER} />
+          <UpdateChecklist machines={machines} here={ME} />
+        </>,
+      );
+      return within(screen.getByRole("region", { name: "Install the waiting release" }));
+    }
+
+    it("holds the checklist, and keeps its picks, while an Install from a machine's page is out", async () => {
+      const out = pending();
+      const checklist = await pageAndChecklist();
+      fireEvent.click(within(screen.getByRole("region", { name: "Update" })).getByRole("button", { name: "Install" }));
+
+      expect(checklist.getByRole("list", { name: "Machines with a release waiting" })).toBeDefined();
+      expect(checklist.queryByRole("list", { name: "Installs" })).toBeNull();
+      expect(checklist.getByText(/still out/i)).toBeDefined();
+      expect(checklist.getByRole<HTMLButtonElement>("button", { name: "Install" }).disabled).toBe(true);
+      await act(async () => out[0].answer(json(202, {})));
+      expect(checklist.getByRole<HTMLButtonElement>("button", { name: "Install" }).disabled).toBe(false);
+    });
+
+    it("shows on a machine's page what became of the install the checklist sent it", async () => {
+      mockFetch(json(202, {}));
+      const checklist = await pageAndChecklist();
+      fireEvent.click(checklist.getByRole("checkbox", { name: "studio v0.9.1" }));
+      fireEvent.click(checklist.getByRole("button", { name: "Install" }));
+
+      const page = within(screen.getByRole("region", { name: "Update" }));
+      expect(await page.findByText(/^Restarting/)).toBeDefined();
+      expect(page.queryByRole("button", { name: "Install" })).toBeNull();
     });
 
     it("offers no Install on the serving machine's page while an install to another machine is still out", async () => {

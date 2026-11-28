@@ -52,6 +52,20 @@ const entry = (name: string) => within(order()).getByRole("listitem", { name });
 const moveButton = (name: string, way: "up" | "down") => screen.getByRole<HTMLButtonElement>("button", { name: `Move ${name} ${way} in the coordinator order` });
 
 describe("SettingsMachines", () => {
+  it("names each coordinator order by its own heading when two are shown", async () => {
+    const machines = fleet(records, laptopFirst);
+    const props = pageProps({ state: { ...emptyState, synced: true, settings: laptopFirst }, machines, here: ME });
+    await renderApp(
+      <>
+        <SettingsMachines {...props} />
+        <SettingsMachines {...props} />
+      </>,
+    );
+    const regions = screen.getAllByRole("region", { name: "Coordinator order" });
+    expect(regions).toHaveLength(2);
+    for (const region of regions) expect(region.contains(document.getElementById(region.getAttribute("aria-labelledby")!))).toBe(true);
+  });
+
   it("holds the update checklist", async () => {
     await show(laptopFirst, undefined, [at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1)]);
     const checklist = screen.getByRole("region", { name: "Install the waiting release" });

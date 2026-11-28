@@ -60,6 +60,19 @@ afterEach(() => {
 });
 
 describe("UpdateChecklist", () => {
+  it("names each checklist by its own heading when two are shown", () => {
+    const machines = machinesOf([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+    render(
+      <>
+        <UpdateChecklist machines={machines} here={ME} />
+        <UpdateChecklist machines={machines} here={ME} />
+      </>,
+    );
+    const regions = screen.getAllByRole("region", { name: "Install the waiting release" });
+    expect(regions).toHaveLength(2);
+    for (const region of regions) expect(region.contains(document.getElementById(region.getAttribute("aria-labelledby")!))).toBe(true);
+  });
+
   it("says no machine has a release waiting, and offers no Install, while none has one", () => {
     show([at(ME, 1, { version: "0.9.0" }), at(OTHER, 1, { version: "0.9.0" })]);
     expect(within(dialog()).getByText("No machine has a release waiting.")).toBeDefined();
