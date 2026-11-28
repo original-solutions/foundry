@@ -314,6 +314,8 @@ describe("SettingsMachine", () => {
     await act(async () => out[0].answer(new Response(null, { status: 204 })));
     expect(field("Name").value).toBe("desk2");
     expect(bar()?.textContent).toContain("1 change");
+    expect(bar()?.textContent).not.toContain("changed elsewhere");
+    expect(screen.getByRole("button", { name: "Save 1 change" })).toBeDefined();
   });
 
   describe("the update", () => {
