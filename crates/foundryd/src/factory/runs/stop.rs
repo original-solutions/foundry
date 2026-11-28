@@ -954,7 +954,7 @@ mod tests {
     use crate::factory::lifecycle::State;
     use crate::factory::messages::STOPPED_BY_HAND;
     use crate::factory::runs::testing::*;
-    use crate::factory::worker::{Call, FleetView, Lost};
+    use crate::factory::worker::{Call, Lost, StoreView};
 
     const SESSION: &str = "00000000-0000-0000-0000-0000000005e5";
     const WS: &str = "00000000-0000-0000-0000-000000000a11";
@@ -981,16 +981,16 @@ mod tests {
     }
 
     /// The fleet with the build machine online and the build workspace on it.
-    fn fleet(rig: &Rig) -> FleetView {
-        FleetView::builder()
+    fn fleet(rig: &Rig) -> StoreView {
+        StoreView::builder()
             .online(rig.machine)
             .workspace(workspace_record(rig.machine, ws(), BRANCH))
             .build()
     }
 
     /// The build machine has been unreachable for `span`, its workspace as it left it.
-    fn cut_off(rig: &Rig, span: Duration) -> FleetView {
-        FleetView::builder()
+    fn cut_off(rig: &Rig, span: Duration) -> StoreView {
+        StoreView::builder()
             .workspace(workspace_record(rig.machine, ws(), BRANCH))
             .unreachable(rig.machine, span)
             .build()
@@ -1430,7 +1430,7 @@ mod tests {
             rig.sim.set_labels(&["factory:building"]);
             rig.sim.set_assignees(&[LOGIN]);
             // The build's workspace is archived; the round's shows once it was made.
-            let mut view = FleetView::builder().online(rig.machine);
+            let mut view = StoreView::builder().online(rig.machine);
             if steps
                 .iter()
                 .any(|step| step.starts_with("feedback-workspace"))
@@ -1507,7 +1507,7 @@ mod tests {
                 .iter()
                 .any(|step| step.starts_with("resume-workspace"))
             {
-                rig.view = FleetView::builder()
+                rig.view = StoreView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, resume_ws(), "fac/8-1-r1"))
                     .build();
@@ -1921,7 +1921,7 @@ mod tests {
             rig.sim.set_labels(&["factory:pr-open"]);
             rig.sim.set_assignees(&[]);
             rig.sim.set_pull(12, pull("OPEN"));
-            rig.view = FleetView::builder().online(rig.machine).build();
+            rig.view = StoreView::builder().online(rig.machine).build();
             (rig, run)
         }
 
@@ -1933,14 +1933,14 @@ mod tests {
             rig.moved(&run, State::Building, State::PrOpen);
             rig.sim.set_labels(&["factory:pr-open"]);
             rig.sim.set_assignees(&[]);
-            rig.view = FleetView::builder().online(rig.machine).build();
+            rig.view = StoreView::builder().online(rig.machine).build();
             (rig, run)
         }
 
         /// The fleet shows a feedback round's workspace, which that round's session is in.
         fn with_feedback_workspace(rig: &mut Rig, span: Option<Duration>) {
             let builder =
-                FleetView::builder().workspace(workspace_record(rig.machine, fws(), "fac/8-1-f1"));
+                StoreView::builder().workspace(workspace_record(rig.machine, fws(), "fac/8-1-f1"));
             rig.view = match span {
                 Some(span) => builder.unreachable(rig.machine, span).build(),
                 None => builder.online(rig.machine).build(),
@@ -2268,7 +2268,7 @@ mod tests {
                 let (mut rig, run) = building_run();
                 rig.sim.set_approval(stranger_edited());
                 finish(&rig, &run);
-                rig.view = FleetView::builder().online(rig.machine).build();
+                rig.view = StoreView::builder().online(rig.machine).build();
                 assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
                 assert!(rig.sim.calls().is_empty());
                 assert!(calls(&rig).is_empty());
@@ -2455,7 +2455,7 @@ mod tests {
                 let (mut rig, run) = pr_open_run();
                 rig.write(&run, round_decision());
                 // The build's workspace still shows, as its archive may not have gone through.
-                rig.view = FleetView::builder()
+                rig.view = StoreView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, ws(), BRANCH))
                     .build();
@@ -2496,7 +2496,7 @@ mod tests {
                 // Nothing is posted: the pull request's merge is the end.
                 assert!(rig.sim.writes().is_empty());
                 // The fleet no longer shows it: nothing more is asked.
-                rig.view = FleetView::builder().online(rig.machine).build();
+                rig.view = StoreView::builder().online(rig.machine).build();
                 assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
                 assert_eq!(archive_calls(&rig), vec![fws()]);
             }
@@ -2538,7 +2538,7 @@ mod tests {
                     &run,
                     &format!("gate-requested 1 1 {SHA} {SHA} {}", rig.machine),
                 );
-                rig.view = FleetView::builder()
+                rig.view = StoreView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, ws(), BRANCH))
                     .workspace(workspace_record(rig.machine, gate, "fac/8-1-g1"))
@@ -2680,7 +2680,7 @@ mod tests {
             fn an_archive_that_fails_in_the_middle_is_carried_on_and_each_is_asked_once() {
                 let (mut rig, run) = pr_open_run();
                 let resume = WorkspaceId(uuid::Uuid::from_u128(0x5a1));
-                rig.view = FleetView::builder()
+                rig.view = StoreView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, resume, "fac/8-1-r1"))
                     .workspace(workspace_record(rig.machine, fws(), "fac/8-1-f1"))
@@ -3091,7 +3091,7 @@ mod tests {
                 // The ledger of a finished run takes no line.
                 assert_eq!(rig.events(&run).len(), events);
                 // The fleet no longer shows it: nothing is asked and the issue is not read.
-                rig.view = FleetView::builder().online(rig.machine).build();
+                rig.view = StoreView::builder().online(rig.machine).build();
                 let reads = issue_reads(&rig);
                 assert_eq!(pass(&rig, &run), ReconcileStep::Unchanged);
                 assert_eq!(archives(&rig), 1);

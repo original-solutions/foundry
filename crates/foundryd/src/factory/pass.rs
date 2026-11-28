@@ -207,7 +207,7 @@ pub struct World<'a> {
     pub tracker: &'a dyn Commenting,
     pub worker: &'a dyn Worker,
     /// What the fleet shows this pass.
-    pub view: &'a FleetView,
+    pub view: &'a dyn FleetView,
     /// The ledger; the pass writes under the generation the guard answers.
     pub ledger: &'a Ledger,
     /// Where the status is written.
@@ -635,7 +635,7 @@ impl World<'_> {
             .machines
             .iter()
             .map(|machine| machine.id)
-            .filter(|machine| self.view.online(*machine))
+            .filter(|machine| self.view.online(Target::Machine(*machine)))
             .collect();
         online.insert(self.me);
         online
@@ -2254,7 +2254,7 @@ mod tests {
     use crate::factory::messages::Message;
     use crate::factory::runs::RunProject;
     use crate::factory::worker::{
-        AlwaysHeld, Call, CreateWorkspace, FakeWorker, FleetView, Guard, LeaseLost, Lost, Target,
+        AlwaysHeld, Call, CreateWorkspace, FakeWorker, Guard, LeaseLost, Lost, StoreView, Target,
         Worker, WorkerError,
     };
     use crate::sessions::factory::{FactoryStart, SendRefused};
@@ -2391,7 +2391,7 @@ mod tests {
         hub: Arc<Hub>,
         tracker: Hiding,
         worker: Watched,
-        view: FleetView,
+        view: StoreView,
         guard: Box<dyn Guard>,
         lease: LeaseState,
         clock: FakeClock,
@@ -2427,8 +2427,8 @@ mod tests {
     }
 
     /// A fleet of this machine and one builder that holds the login and the skill.
-    fn fleet() -> FleetView {
-        FleetView::builder()
+    fn fleet() -> StoreView {
+        StoreView::builder()
             .online(me())
             .online(builder_machine())
             .sample(sample(builder_machine(), 0))
@@ -2718,7 +2718,7 @@ mod tests {
                         &Cause::new(CauseStep::Start, "test"),
                     )
                     .unwrap();
-                rig.view = FleetView::builder()
+                rig.view = StoreView::builder()
                     .online(me())
                     .online(builder_machine())
                     .sample(sample(builder_machine(), 0))
@@ -2895,7 +2895,7 @@ mod tests {
         fn a_claim_refused_for_no_room_says_it_waits_counts_no_error_and_claims_nothing_more_from_that_repo()
          {
             let mut rig = Rig::new();
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(me())
                 .online(builder_machine())
                 .sample(sample(builder_machine(), 8))
@@ -3086,7 +3086,7 @@ mod tests {
             );
             // The claim's build workspace, with its setup terminal, is on the machine the comment
             // names: a record with no setup would have the create asked again.
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(me())
                 .online(builder_machine())
                 .workspace(Record {
@@ -3519,7 +3519,7 @@ mod tests {
                     &cause,
                 )
                 .unwrap();
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(me())
                 .online(builder_machine())
                 .sample(sample(builder_machine(), 1))
@@ -3647,7 +3647,7 @@ mod tests {
                     setup: None,
                 },
             };
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(me())
                 .workspace(record(workspace, "fac/5-1"))
                 .workspace(record(gate_workspace(), "fac/5-1-g1"))
@@ -3890,7 +3890,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}"));
             let orphan = WorkspaceId(uuid::Uuid::from_u128(0x99));
             let with = |online: bool| {
-                let mut view = FleetView::builder().online(me());
+                let mut view = StoreView::builder().online(me());
                 if online {
                     view = view.online(builder_machine());
                 }
@@ -4115,7 +4115,7 @@ mod tests {
             rig.hub.issue(5, &["factory:triage"]);
             let run = RunId::new(REPO, 5, 1).unwrap();
             // A workspace names the run and no claim comment does: start leaves it alone.
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(me())
                 .workspace(Record {
                     owner: builder_machine(),
@@ -4710,7 +4710,7 @@ mod tests {
                 )
                 .unwrap();
             let orphan = WorkspaceId(uuid::Uuid::from_u128(0x44));
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(me())
                 .online(builder_machine())
                 .workspace(Record {
@@ -6294,7 +6294,7 @@ mod tests {
             // The fleet shows the workspace of 5 ready, so its session starts in the claim's own
             // advance: the run holds no machine reservation in the ledger from then on.
             let terminal = TerminalId(uuid::Uuid::from_u128(0x78));
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(me())
                 .online(builder_machine())
                 .sample(sample(builder_machine(), 0))
@@ -6570,8 +6570,8 @@ mod tests {
         }
 
         /// The fleet with the build workspace of each of `issues` live on the builder.
-        pub(super) fn fleet_with(issues: &[u64]) -> FleetView {
-            let mut view = FleetView::builder().online(me()).online(builder_machine());
+        pub(super) fn fleet_with(issues: &[u64]) -> StoreView {
+            let mut view = StoreView::builder().online(me()).online(builder_machine());
             for issue in issues {
                 view = view.workspace(Record {
                     owner: builder_machine(),

@@ -112,7 +112,7 @@ pub struct RunContext<'a> {
     /// What the fleet is asked to do.
     pub worker: &'a dyn Worker,
     /// What the fleet shows this pass.
-    pub view: &'a FleetView,
+    pub view: &'a dyn FleetView,
     pub ledger: &'a Ledger,
     /// Whether the lease is still held: checked before every change and every call to a worker.
     pub guard: &'a dyn Guard,
@@ -1175,7 +1175,7 @@ pub(crate) mod testing {
     use crate::factory::config::Limits;
     use crate::factory::github::{Hiding, OtherKind, Tracker};
     use crate::factory::ledger::testing::{T0, open_store, ticking};
-    use crate::factory::worker::{AlwaysHeld, FakeWorker, Target};
+    use crate::factory::worker::{AlwaysHeld, FakeWorker, StoreView, Target};
 
     pub const REPO: &str = "rawphp/softfac";
     pub const LOGIN: &str = "softfac-bot";
@@ -1620,7 +1620,7 @@ pub(crate) mod testing {
         pub sim: Arc<Sim>,
         pub tracker: Hiding,
         pub worker: FakeWorker,
-        pub view: FleetView,
+        pub view: StoreView,
         pub guard: Box<dyn Guard>,
         pub clock: FakeClock,
         pub project: RunProject,
@@ -1668,7 +1668,7 @@ pub(crate) mod testing {
                 sim,
                 tracker,
                 worker: FakeWorker::new(),
-                view: FleetView::default(),
+                view: StoreView::default(),
                 guard: Box::new(AlwaysHeld(1)),
                 clock: FakeClock::new(),
                 project: RunProject {
@@ -1759,7 +1759,7 @@ mod tests {
     use super::*;
     use crate::factory::github::STATUS_MARKER;
     use crate::factory::ledger::events::ResumedFrom;
-    use crate::factory::worker::{Call, HostCall, Lost, Target};
+    use crate::factory::worker::{Call, HostCall, Lost, StoreView, Target};
 
     const SESSION: &str = "00000000-0000-0000-0000-0000000005e5";
     const WORKSPACE: &str = "00000000-0000-0000-0000-000000000a11";
@@ -1969,7 +1969,7 @@ mod tests {
             let actions = [Action::ForwardComment {
                 comment_id: "c1".into(),
             }];
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .turn(foundry_proto::factory::SessionTurn {
                     session: session_id(SESSION).unwrap(),
                     workspace: workspace_id(WORKSPACE).unwrap(),
@@ -2011,7 +2011,7 @@ mod tests {
             let actions = [Action::ForwardComment {
                 comment_id: "c1".into(),
             }];
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .turn(foundry_proto::factory::SessionTurn {
                     session: session_id(SESSION).unwrap(),
                     workspace: workspace_id(WORKSPACE).unwrap(),
@@ -2263,7 +2263,7 @@ mod tests {
             let actions = [Action::ForwardComment {
                 comment_id: "c1".into(),
             }];
-            rig.view = FleetView::builder().turn(turn(3)).build();
+            rig.view = StoreView::builder().turn(turn(3)).build();
             rig.worker.on_send(Err(SendRefused::Failed {
                 reason: "timed out".into(),
                 prompts: Some(3),
@@ -2277,7 +2277,7 @@ mod tests {
                     .contains(&"send-intent forward-comment c1 3".to_string())
             );
             // The worker typed it and its answer was lost: the count has risen.
-            rig.view = FleetView::builder().turn(turn(4)).build();
+            rig.view = StoreView::builder().turn(turn(4)).build();
             rig.worker.on_send(Err(SendRefused::CountRose { now: 4 }));
             let mut at = progress(&rig, &run, State::Building);
             apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
@@ -2319,7 +2319,7 @@ mod tests {
         }
 
         fn set_prompts(rig: &mut Rig, prompts: u64) {
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .turn(foundry_proto::factory::SessionTurn {
                     session: session_id(SESSION).unwrap(),
                     workspace: workspace_id(WORKSPACE).unwrap(),
@@ -2607,7 +2607,7 @@ mod tests {
         #[test]
         fn a_send_to_a_session_that_shows_no_turn_waits_for_one() {
             let (mut rig, run, payload, actions) = forward_rig(3);
-            rig.view = FleetView::builder().build();
+            rig.view = StoreView::builder().build();
             assert!(matches!(
                 forward(&rig, &run, &payload, &actions),
                 Err(RunError::NoPromptCount { .. })

@@ -2698,7 +2698,7 @@ mod tests {
         use crate::factory::messages::{
             CANNOT_CONFIRM, LAUNCH_FAILED, Message, ResumeFrom, TEXT_CHANGED,
         };
-        use crate::factory::worker::{Call, FleetView, HostCall, Lost, WorkerError};
+        use crate::factory::worker::{Call, HostCall, Lost, StoreView, WorkerError};
         use crate::sessions::factory::{BODY_PATH, SendRefused};
         use crate::workspaces::{Checkout, FactoryTag, Setup};
 
@@ -2775,7 +2775,7 @@ mod tests {
 
         /// The fleet shows the build workspace, with no setup.
         fn show_workspace(rig: &mut Rig) {
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(rig.machine)
                 .workspace(workspace_record(rig.machine, "fac/8-1", None))
                 .build();
@@ -2783,7 +2783,7 @@ mod tests {
 
         /// The fleet shows the build workspace with a setup terminal in `state`.
         fn show_setup(rig: &mut Rig, state: TerminalState, code: Option<i32>) {
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(rig.machine)
                 .workspace(workspace_record(
                     rig.machine,
@@ -4212,7 +4212,7 @@ mod tests {
                 // The step was written, the call went out, the ledger line was lost.
                 rig.step(&run, "approval-rechecked");
                 rig.step(&run, "launch-sending");
-                rig.view = FleetView::builder()
+                rig.view = StoreView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, "fac/8-1", None))
                     .session(session_record(rig.machine, SessionState::Working))
@@ -4264,7 +4264,7 @@ mod tests {
                 state: SessionState,
                 turn: Option<(u64, u64)>,
             ) {
-                let mut view = FleetView::builder()
+                let mut view = StoreView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, "fac/8-1", None))
                     .session(session_record(rig.machine, state));
@@ -4449,7 +4449,7 @@ mod tests {
             }
 
             pub(super) fn show_second(rig: &mut Rig, name: &str) {
-                rig.view = FleetView::builder()
+                rig.view = StoreView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, name, None))
                     .build();
@@ -4488,7 +4488,7 @@ mod tests {
                     .unwrap();
                 assert!(pr < resuming && resuming < requested);
                 // The workspace is shown, and the session starts from the pull request.
-                rig.view = FleetView::builder()
+                rig.view = StoreView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, "fac/8-2", None))
                     .build();
@@ -5150,7 +5150,7 @@ mod tests {
                 };
                 let mut rig = rig;
                 assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
-                rig.view = FleetView::builder()
+                rig.view = StoreView::builder()
                     .online(elsewhere())
                     .workspace(workspace_record(elsewhere(), "fac/8-1", None))
                     .build();
@@ -5720,7 +5720,7 @@ mod tests {
             #[test]
             fn a_thread_t3_no_longer_knows_is_stopped_at_the_worktree_the_ledger_records() {
                 let (mut rig, run) = started();
-                rig.view = FleetView::builder().online(rig.machine).build();
+                rig.view = StoreView::builder().online(rig.machine).build();
                 rig.write(
                     &run,
                     Event::Stuck {
@@ -7171,7 +7171,7 @@ mod tests {
             fn a_start_whose_answer_was_lost_adopts_the_factory_session_the_fleet_shows() {
                 let (mut rig, run) = workspace_shown();
                 rig.step(&run, "launch-sending");
-                rig.view = FleetView::builder()
+                rig.view = StoreView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, "fac/8-1", None))
                     .session(session_record(rig.machine, SessionState::Working))
@@ -7195,7 +7195,7 @@ mod tests {
             fn a_session_with_no_turn_record_is_not_adopted_as_the_runs_own() {
                 let (mut rig, run) = workspace_shown();
                 rig.step(&run, "launch-sending");
-                rig.view = FleetView::builder()
+                rig.view = StoreView::builder()
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, "fac/8-1", None))
                     .session(session_record(rig.machine, SessionState::Working))

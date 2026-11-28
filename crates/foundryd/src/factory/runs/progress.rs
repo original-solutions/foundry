@@ -1556,7 +1556,9 @@ impl Live {
         } else {
             UNREACHABLE_FOR
         };
-        ctx.view.unreachable_for(self.machine) >= after
+        ctx.view
+            .unreachable_for(crate::factory::worker::Target::Machine(self.machine))
+            >= after
     }
 }
 
