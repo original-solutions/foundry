@@ -313,6 +313,17 @@ describe("SettingsMachine", () => {
       expect(screen.queryByRole("heading", { name: "Update" })).toBeNull();
     });
 
+    it("offers no Install while the page does not know which machine serves it", async () => {
+      const calls = mockFetch(json(202, {}));
+      const machines = fleet(ready(OTHER), limited, {}, [ME, OTHER]);
+      await renderApp(<SettingsMachine {...pageProps({ state: { ...emptyState, synced: true, settings: limited }, machines, here: undefined })} machineId={OTHER} />);
+      expect(screen.getByText("v0.9.1 is ready")).toBeDefined();
+      const install = screen.queryByRole<HTMLButtonElement>("button", { name: "Install" });
+      if (install) fireEvent.click(install);
+      expect(install === null || install.disabled).toBe(true);
+      expect(calls).toEqual([]);
+    });
+
     it("says, before anything is sent, that the machine serving the page restarts", async () => {
       const calls = mockFetch();
       await show(ME, { records: ready(ME) });
