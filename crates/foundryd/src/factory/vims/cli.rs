@@ -88,13 +88,14 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
             // its last line, is read for a code there; stderr is read for any JSON line, and for
             // a code in plain text when it holds none. A code is no refusal when any JSON on
             // either stream names something Vims took (an operation, a workspace, an id, or a
-            // state other than failed), or when an `exec` waits, since it can print its
+            // state other than failed), when either stream holds a `{` the reader cannot read,
+            // which may name such work, or when an `exec` waits, since it can print its
             // command's output on either: the command ran.
             let out = json_answer(&stdout, false);
             let err = json_answer(&stderr, true);
             let took = [&stdout, &stderr]
                 .into_iter()
-                .any(|text| json_objects(text).any(|value| names_work(&value)));
+                .any(|text| !all_read(text) || json_objects(text).any(|value| names_work(&value)));
             let coded = out.as_ref().and_then(json_code).or_else(|| match &err {
                 Some(err) => json_code(err),
                 None => plain_code(&stderr),
@@ -152,6 +153,15 @@ fn json_answer(text: &str, any_line: bool) -> Option<Value> {
             }
         })
         .filter(Value::is_object)
+}
+
+/// Whether the reader sees all the JSON in `text`: it is all one JSON value, or each of its
+/// lines that holds a `{` is a JSON object (so a text with no `{` is read in full).
+fn all_read(text: &str) -> bool {
+    let object =
+        |text: &str| serde_json::from_str::<Value>(text.trim()).is_ok_and(|v| v.is_object());
+    serde_json::from_str::<Value>(text.trim()).is_ok()
+        || text.lines().filter(|line| line.contains('{')).all(object)
 }
 
 /// Every JSON object in `text`: all of it, and each of its lines.
@@ -853,6 +863,10 @@ mod tests {
             "echo '{\"id\":\"op_7\",\"status\":\"queued\"}' >&2\necho '{\"error\":{\"code\":\"QUOTA_EXCEEDED\"}}' >&2\nexit 1",
             "echo '{\"id\":\"op_7\",\"status\":\"queued\"}'\necho 'hint: try again'\necho 'Error: PRECONDITION_FAILED: paused' >&2\nexit 1",
             "printf '{\\n  \"id\": \"op_7\"\\n}\\n'\necho 'Error: PRECONDITION_FAILED: paused' >&2\nexit 1",
+            // Output with a `{` the reader cannot read may name work it cannot see.
+            "printf '{\\n  \"id\": \"op_7\",\\n  \"status\": \"queued\"\\n}\\nError: QUOTA_EXCEEDED: vCPU\\n' >&2\nexit 1",
+            "printf '{\\n  \"id\": \"op_7\"\\n}\\nhint: try again\\n'\necho 'Error: QUOTA_EXCEEDED: vCPU' >&2\nexit 1",
+            "echo '{\"op\": 7' >&2\necho 'Error: PRECONDITION_FAILED: paused' >&2\nexit 1",
         ] {
             let program = fake_vims(dir.path(), script);
             let error = vims_at(&program, Arc::new(SystemClock))
@@ -872,6 +886,15 @@ mod tests {
             .call(&exec_call())
             .unwrap_err();
         assert_eq!(error.code(), Some("PRECONDITION_FAILED"));
+        assert!(error.refusal().is_some(), "{error:?}");
+        // So does a refusal pretty-printed on its own, which the reader reads whole.
+        let program = fake_vims(
+            dir.path(),
+            "printf '{\\n  \"error\": {\"code\": \"PRECONDITION_FAILED\"}\\n}\\n'\nexit 1",
+        );
+        let error = vims_at(&program, Arc::new(SystemClock))
+            .call(&exec_call())
+            .unwrap_err();
         assert!(error.refusal().is_some(), "{error:?}");
     }
 
