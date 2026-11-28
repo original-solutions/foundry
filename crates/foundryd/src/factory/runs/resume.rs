@@ -7172,6 +7172,93 @@ mod tests {
             ));
         }
 
+        /// The reminder's answer, a turn read of its own, reports the pull request again: the
+        /// run is the gate's.
+        #[test]
+        fn a_resumed_session_read_after_its_reminder_is_the_gates() {
+            let (mut rig, run) = resumed_after_cut_off();
+            rig.step(&run, "result-line-reminding 1");
+            rig.step(&run, "turn-read 1");
+            rig.step(&run, "result-line-reminded");
+            rig.step(&run, "turn-read 2");
+            rig.view = resumed_in(SessionState::Failed);
+            assert!(!takes_from_the_gate(&rig.ctx(), &rig.events(&run)));
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+        }
+
+        /// A reminder of the session before the interruption is not the resumed session's: its
+        /// turn read is a report.
+        #[test]
+        fn a_reminder_before_the_interruption_does_not_hide_the_resumed_report() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.step(&run, "result-line-reminding 1");
+            rig.step(&run, "turn-read 1");
+            rig.step(&run, "result-line-reminded");
+            rig.step(&run, "turn-read 2");
+            pr_opened(&rig, &run);
+            rig.sim.set_pull(12, pr_on(PR_BRANCH, false));
+            let mut rig = rig;
+            rig.view = FleetView::builder()
+                .online(m2())
+                .workspace(workspace_record(m1(), old(), BRANCH, None))
+                .session(session_record(session(), old(), SessionState::Unreachable))
+                .turn(turn_of(session(), old(), 2, 3))
+                .unreachable(m1(), UNREACHABLE_FOR)
+                .build();
+            pass_one(&rig, &run);
+            rig.view = archived();
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::NeedsMachine(Placing::Resume { resumes: 1 })
+            );
+            resume_workspace_made(&mut rig, &run);
+            assert!(matches!(
+                resumed(&mut rig, &run),
+                ResumeStep::Started { resumes: 1, .. }
+            ));
+            assert!(takes_from_the_gate(&rig.ctx(), &rig.events(&run)));
+            rig.step(&run, "turn-read 1");
+            assert!(!takes_from_the_gate(&rig.ctx(), &rig.events(&run)));
+        }
+
+        /// A gate placed for a resumed session read only for its reminder is in flight when
+        /// that session is interrupted: it is marked could not run before the interruption.
+        #[test]
+        fn a_gate_in_flight_when_a_resumed_session_is_interrupted_could_not_run() {
+            let (mut rig, run) = resumed_after_cut_off();
+            rig.step(&run, "result-line-reminding 1");
+            rig.step(&run, "turn-read 1");
+            rig.step(&run, "result-line-reminded");
+            rig.step(
+                &run,
+                &format!("{GATE_REQUESTED}1 1 {HEAD} {BASE_TIP} {}", m2()),
+            );
+            rig.step(&run, &format!("gate-created 1 {}", gate_workspace()));
+            assert!(gate_running(&rig.events(&run)));
+            rig.view = resumed_in(SessionState::Failed);
+            never_written(&rig);
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::Archiving { resumes: 2, .. }
+            ));
+            let events = rig.events(&run);
+            assert!(!gate_running(&events));
+            let expected = format!("{GATE_COULD_NOT_RUN}1 1 1 1 {GATE_CUT_OFF}");
+            let could_not_run = events
+                .iter()
+                .position(|e| step_text(e) == Some(expected.as_str()))
+                .expect("the gate could not run");
+            let interrupted = events
+                .iter()
+                .rposition(|e| e.event == "session_interrupted")
+                .expect("the interruption");
+            assert!(could_not_run < interrupted);
+        }
+
         /// A gate on a machine that is not gone whose create was not answered is found in the
         /// fleet by the gate's name, and an earlier gate's workspace is not the one archived.
         #[test]
