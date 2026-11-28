@@ -77,6 +77,8 @@ let attention: unknown[] = [];
 let placements: unknown[] = [];
 const quiet: Shipping = { branch: "b", pushed: false, unpushed: 0, pr: null, unreachable: false };
 let shipping: Shipping = quiet;
+/** What a plain read of /api/factory answers, when a test sets one; left out of the calls, as the other reads are. */
+let factoryNow: unknown;
 
 function mockActions(...answers: Response[]): Call[] {
   const calls: Call[] = [];
@@ -89,6 +91,7 @@ function mockActions(...answers: Response[]): Call[] {
       if (url.endsWith("/api/attention")) return json(200, { items: attention });
       if (url.endsWith("/api/placements")) return json(200, { requests: placements });
       if (url.endsWith("/api/machines")) return json(200, { me: ME, machines: [] });
+      if (url.endsWith("/api/factory") && factoryNow !== undefined && init.method === undefined) return json(200, factoryNow);
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       const next = answers.shift();
       if (!next) throw new Error("unexpected request");
@@ -105,6 +108,7 @@ beforeEach(() => {
   shipping = quiet;
   attention = [];
   placements = [];
+  factoryNow = undefined;
   localStorage.clear();
   FakeSocket.install();
   vi.stubGlobal(
@@ -464,9 +468,7 @@ describe("App", () => {
     mockActions();
     const fresh = await open("/", live);
     expect(document.title).toBe("Foundry · 1 working");
-    fireEvent.click(screen.getByRole("button", { name: "Notifications" }));
-    expect(screen.getByRole("switch", { name: "Desktop alerts" }).getAttribute("aria-checked")).toBe("true");
-    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    expect(screen.getByRole("link", { name: "Notifications" }).getAttribute("href")).toBe("/settings/notifications");
 
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
     const events = sockets("/api/events").at(-1)!;
@@ -1146,7 +1148,7 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "k", metaKey: true });
     let palette = await screen.findByRole("dialog", { name: "Jump to" });
     const views = within(palette).getByRole("navigation", { name: "Views" });
-    expect(within(views).getAllByRole("button").map((b) => b.textContent)).toEqual(["Board", "Timeline", "Machines", "Factory"]);
+    expect(within(views).getAllByRole("button").map((b) => b.textContent)).toEqual(["Board", "Timeline", "Machines", "Factory", "Settings"]);
     expect(within(views).getByRole("button", { name: "Board" }).getAttribute("aria-current")).toBe("page");
     // The view you are on looks as it does in the board's own View switch.
     const lacks = (el: Element, look: string) => look.split(" ").filter((c) => !el.classList.contains(c));
@@ -1175,6 +1177,167 @@ describe("App", () => {
     fireEvent.keyDown(within(palette).getByRole("combobox"), { key: "Enter" });
     await waitFor(() => expect(router.state.location.pathname).toBe("/"));
     expect(screen.getByRole("radio", { name: "Board" }).getAttribute("aria-checked")).toBe("true");
+  });
+
+  describe("Settings", () => {
+    const fleetFactory = { settings: { paused: false, poll_seconds: 30, feedback_seconds: 300, max_runs: 3, max_gates: 2, model: "opus", effort: "high" }, projects: [] };
+    const pathname = (r: Awaited<ReturnType<typeof open>>) => r.state.location.pathname;
+
+    it("shows Factory at /settings and for a category it does not know, in a nav with the board link and each entry's values", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      await open("/settings", live);
+      const nav = await screen.findByRole("navigation", { name: "Settings" });
+      expect(within(nav).getByRole("link", { name: "← Board" }).getAttribute("href")).toBe("/");
+      expect(await screen.findByLabelText("Max runs")).toBeDefined();
+      expect(screen.getByRole("heading", { name: "Factory" })).toBeDefined();
+      expect(await within(nav).findByText(/3 runs at once/)).toBeDefined();
+      expect(within(nav).getByRole("link", { name: /^Factory/ }).getAttribute("aria-current")).toBe("page");
+      expect(within(nav).getByRole("link", { name: /^Projects/ }).textContent).toContain("0 projects · factory on 0");
+      expect(within(nav).getByRole("link", { name: /^Appearance/ }).textContent).toContain("dark");
+      expect(within(nav).getByRole("link", { name: /^Notifications/ }).textContent).toContain("cards · catch-up");
+      expect(within(nav).getByRole("link", { name: /^Machines/ }).textContent).toContain("1 machine");
+
+      document.body.innerHTML = "";
+      await open("/settings/nonsense", live);
+      expect(await screen.findByLabelText("Max runs")).toBeDefined();
+    });
+
+    it("lists each machine under Machines, linked to its page, with a chip", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      await open("/settings/machines", {
+        ...live,
+        records: [sample(ME, 1), sample(OTHER, 1)],
+        settings: settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "laptop", address: "100.64.0.2" }] }),
+        online: [ME],
+      });
+      const nav = await screen.findByRole("navigation", { name: "Settings" });
+      const laptop = await within(nav).findByRole("link", { name: /laptop/ });
+      expect(laptop.getAttribute("href")).toBe(`/settings/machines/${OTHER}`);
+      expect(laptop.textContent).toContain("offline");
+      expect(within(nav).getByRole("link", { name: /studio/ }).textContent).toContain("coordinator");
+      expect(within(nav).getByRole("link", { name: /^Machines/ }).textContent).toContain("2 machines · 1 offline");
+    });
+
+    it("shows a stub for Projects, Machines and a machine, each linking to where the control lives today", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      const r = await open("/settings/projects", live);
+      expect(await screen.findByRole("heading", { name: "Projects" })).toBeDefined();
+      expect(screen.getByRole("link", { name: "The board" }).getAttribute("href")).toBe("/");
+      await r.navigate({ to: "/settings/$category", params: { category: "machines" } });
+      expect(await screen.findByRole("heading", { name: "Machines" })).toBeDefined();
+      expect(screen.getByRole("link", { name: "The machines board" }).getAttribute("href")).toBe("/machines");
+      await r.navigate({ to: "/settings/machines/$machine", params: { machine: ME } });
+      expect(await screen.findByRole("heading", { name: ME })).toBeDefined();
+      expect(screen.getByRole("link", { name: "The machines board" }).getAttribute("href")).toBe("/machines");
+    });
+
+    it("opens on Cmd+, from the board, but not from a text field or a terminal", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      const r = await open("/", live);
+      const field = await screen.findByLabelText("What should Claude work on?");
+      fireEvent.keyDown(field, { key: ",", metaKey: true });
+      const xterm = document.body.appendChild(document.createElement("div"));
+      xterm.className = "xterm";
+      fireEvent.keyDown(xterm.appendChild(document.createElement("textarea")), { key: ",", metaKey: true });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(pathname(r)).toBe("/");
+
+      fireEvent.keyDown(document.body, { key: ",", metaKey: true });
+      await waitFor(() => expect(pathname(r)).toBe("/settings"));
+      xterm.remove();
+    });
+
+    it("opens from the palette's Settings, and each category from its own entry", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      const r = await open("/", live);
+      const pick = async (query: string, expected: RegExp) => {
+        fireEvent.keyDown(window, { key: "k", metaKey: true });
+        const palette = await screen.findByRole("dialog", { name: "Jump to" });
+        fireEvent.change(within(palette).getByRole("combobox"), { target: { value: query } });
+        expect(within(palette).getAllByRole("option")[0].textContent).toMatch(expected);
+        fireEvent.keyDown(within(palette).getByRole("combobox"), { key: "Enter" });
+      };
+      await pick("settings", /^Settings/);
+      await waitFor(() => expect(pathname(r)).toBe("/settings"));
+      await pick("settings appearance", /^Settings: Appearance/);
+      await waitFor(() => expect(pathname(r)).toBe("/settings/appearance"));
+      await pick("settings keyboard", /^Settings: Keyboard/);
+      await waitFor(() => expect(pathname(r)).toBe("/settings/keyboard"));
+    });
+
+    it("offers the Settings view in the palette's strip, saying when you are on it", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      await open("/settings", live);
+      fireEvent.keyDown(window, { key: "k", metaKey: true });
+      const palette = await screen.findByRole("dialog", { name: "Jump to" });
+      expect(within(within(palette).getByRole("navigation", { name: "Views" })).getByRole("button", { name: "Settings" }).getAttribute("aria-current")).toBe("page");
+    });
+
+    it("asks before leaving with an unsaved edit, and Cancel stays", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      const r = await open("/settings", live);
+      fireEvent.change(await screen.findByLabelText("Max runs"), { target: { value: "4" } });
+      expect(await screen.findByRole("region", { name: "Unsaved changes" })).toBeDefined();
+
+      fireEvent.click(screen.getByRole("link", { name: "← Board" }));
+      await waitFor(() => expect(confirm).toHaveBeenCalledTimes(1));
+      expect(pathname(r)).toBe("/settings");
+      expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("4");
+
+      confirm.mockReturnValue(true);
+      fireEvent.click(screen.getByRole("link", { name: "← Board" }));
+      await waitFor(() => expect(pathname(r)).toBe("/"));
+      confirm.mockRestore();
+    });
+
+    it("leaves without asking when nothing is unsaved", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      const r = await open("/settings", live);
+      await screen.findByLabelText("Max runs");
+      fireEvent.click(screen.getByRole("link", { name: "← Board" }));
+      await waitFor(() => expect(pathname(r)).toBe("/"));
+      expect(confirm).not.toHaveBeenCalled();
+      confirm.mockRestore();
+    });
+
+    it("shows the attention strip on /settings, as on /factory", async () => {
+      factoryNow = fleetFactory;
+      attention = [diskLow];
+      mockActions();
+      await open("/settings", live);
+      const list = await screen.findByRole("region", { name: "Needs attention" });
+      expect(slot().contains(list)).toBe(true);
+    });
+
+    it("shows Settings, not the launchpad, for a fleet with no workspaces", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      await open("/settings", { type: "state", protocol: 1, records: [sample(ME, 1)], settings: settings() });
+      expect(await screen.findByLabelText("Max runs")).toBeDefined();
+      expect(screen.queryByText("What should Claude work on?")).toBeNull();
+    });
+
+    it("shows the notification choices at /settings/notifications, from the bell's link", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      const r = await open("/", live);
+      fireEvent.click(await screen.findByRole("link", { name: "Notifications" }));
+      await waitFor(() => expect(pathname(r)).toBe("/settings/notifications"));
+      expect(await screen.findByRole("switch", { name: "Desktop alerts" })).toBeDefined();
+      fireEvent.click(screen.getByRole("switch", { name: "Cards in the page" }));
+      expect(JSON.parse(localStorage.getItem("foundry.notify")!).cards).toBe(false);
+      expect(within(screen.getByRole("navigation", { name: "Settings" })).getByRole("link", { name: /^Notifications/ }).textContent).toContain("catch-up");
+    });
   });
 
   it("does the app's actions from the palette: a new task, the next that needs you and the list of keys", async () => {
