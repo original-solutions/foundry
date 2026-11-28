@@ -64,9 +64,9 @@
 //!   recorded pass, shown unreachable and not at rest (`gating::at_rest`) on a machine
 //!   unreachable for 15 minutes, may be at work there and is an interruption as any other.
 //!   The pass calls [`advance`] for it before it polls a gate in flight. The resume that
-//!   interruption owes, the resumed session until a turn of it is read (its first message
-//!   asked again, its end an interruption of its own), and a stuck path it began stay this
-//!   step's.
+//!   interruption owes, the resumed session until a turn of it is read for anything but its
+//!   reminder (its first message asked again, its end an interruption of its own), and a stuck
+//!   path it began stay this step's.
 //!   A gate in flight is marked could not run (`gate-could-not-run`) before the interruption
 //!   is recorded, since the gate reads no gate while the run is this step's: on a machine gone
 //!   for `gate::MACHINE_GONE_AFTER` in the gate's own words, and on one that is not gone with
@@ -278,9 +278,9 @@ use serde_json::Value;
 
 use super::gating::{self, GATE_COULD_NOT_RUN, GATE_CREATED};
 use super::progress::{
-    GATE_REQUESTED, STUCK_DETAIL, STUCK_STOP, Seen, TEXT_CODE, TURN_READ, UNREACHABLE_FOR,
-    UNVERIFIED_CODE, WORKSPACE_CREATED, WORKSPACE_REQUESTED, build_name, feedback_name, highest,
-    numbered, pending_relaunch, read_progress, resume_name, step_text,
+    GATE_REQUESTED, RESULT_LINE_REMINDING, STUCK_DETAIL, STUCK_STOP, Seen, TEXT_CODE, TURN_READ,
+    UNREACHABLE_FOR, UNVERIFIED_CODE, WORKSPACE_CREATED, WORKSPACE_REQUESTED, build_name,
+    feedback_name, highest, numbered, pending_relaunch, read_progress, resume_name, step_text,
 };
 use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
 use super::{
@@ -887,7 +887,8 @@ fn pass(
     }
     // The gate has the pull request the session reported, unless the session may be at work
     // on a machine cut off for 15 minutes: that is an interruption all the same (#367). A
-    // session resumed since the report with no turn read yet is this step's too.
+    // session resumed since the report with no turn read yet (but for its reminder) is this
+    // step's too.
     let with_the_gate = (seen.pr_reported && !resumed_unread(&events))
         || (seen.pass.is_some() && seen.last_pr.is_some());
     let ended = if !with_the_gate || cut_off_at_work(ctx, &seen) {
@@ -909,8 +910,8 @@ fn pass(
 /// Whether this step has a run whose pull request is reported, which the gate holds otherwise
 /// (#367): its session may be at work on a machine unreachable for 15 minutes, it was
 /// interrupted since the report (the resume is owed, or no turn of the resumed session has
-/// been read, so its first message and its end are this step's, as for a run with no pull
-/// request reported), or a stuck path this step began is to be finished. The pass calls [`advance`]
+/// been read but for its reminder, so its first message and its end are this step's, as for a
+/// run with no pull request reported), or a stuck path this step began is to be finished. The pass calls [`advance`]
 /// for it, and polls no gate in flight first, since one is not read while the session may be
 /// at work. It reads no worker and writes nothing.
 pub fn takes_from_the_gate(ctx: &RunContext<'_>, events: &[RunEvent]) -> bool {
@@ -924,25 +925,36 @@ pub fn takes_from_the_gate(ctx: &RunContext<'_>, events: &[RunEvent]) -> bool {
 }
 
 /// Whether a resume's `session_interrupted` line follows the newest `pr_opened` with no turn
-/// read after it: the session that reported the pull request was interrupted, and no turn of
-/// the session resumed since has been read. The run's `pr_reported` stays set through the
-/// interruption, as `progress` reads the ledger, and `building` writes no second `pr_opened`
-/// when the resumed session reports the same pull request, only the turn read: from then on the
-/// run is the gate's again, as any run whose session reported its pull request.
+/// of the session resumed since read for anything but its reminder: the session that reported
+/// the pull request was interrupted, and the resumed one has not reported it. The run's
+/// `pr_reported` stays set through the interruption, as `progress` reads the ledger, and
+/// `building` writes no second `pr_opened` when the resumed session reports the same pull
+/// request, only the turn read. A turn read for the reminder to end with a result line (its
+/// `result-line-reminding <n>` written first) reports nothing. From any other turn read the run
+/// is the gate's again, as any run whose session reported its pull request: one that put the
+/// run in `needs-info` or `stuck` is `building`'s own.
 fn resumed_unread(events: &[RunEvent]) -> bool {
     let newest = |found: &dyn Fn(&RunEvent) -> bool| events.iter().rposition(found);
-    let interrupted = newest(&|event| {
+    let Some(interrupted) = newest(&|event| {
         event.event == names::SESSION_INTERRUPTED
             && event.data.get("relaunch") != Some(&Value::Bool(true))
-    });
+    }) else {
+        return false;
+    };
     let reported = newest(&|event| event.event == names::PR_OPENED);
-    let read = newest(&|event| step_text(event).is_some_and(|step| step.starts_with(TURN_READ)));
-    match (interrupted, reported) {
-        (Some(interrupted), Some(reported)) => {
-            interrupted > reported && read.is_none_or(|read| read < interrupted)
-        }
-        _ => false,
+    if reported.is_none_or(|reported| reported > interrupted) {
+        return false;
     }
+    let since: Vec<&str> = events[interrupted..].iter().filter_map(step_text).collect();
+    let reminded: BTreeSet<&str> = since
+        .iter()
+        .filter_map(|step| step.strip_prefix(RESULT_LINE_REMINDING))
+        .map(str::trim)
+        .collect();
+    !since
+        .iter()
+        .filter_map(|step| step.strip_prefix(TURN_READ))
+        .any(|n| !reminded.contains(n.trim()))
 }
 
 /// Whether the session of a run whose pull request is reported and has no recorded pass may be
