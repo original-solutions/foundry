@@ -1764,6 +1764,48 @@ describe("App", () => {
     expect(calls.map((c) => c.body)).toEqual([{ force: false }, { force: true }]);
   });
 
+  it("does nothing when Archive is chosen again for a workspace that is still archiving", async () => {
+    const calls = mockActions(new Promise<Response>(() => {}));
+    await open("/", live);
+    const card = screen.getByRole("article", { name: "fix login" });
+    fireEvent.click(within(card).getByRole("button", { name: "Archive fix login" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Archive fix login?" })).getByRole("button", { name: "Archive" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(await within(card).findAllByText("Archiving…")).not.toEqual([]);
+
+    fireEvent.click(within(card).getByRole("button", { name: "Archive fix login" }));
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(calls).toEqual([{ url: "/api/workspaces/w1/archive", method: "POST", body: { force: false } }]);
+  });
+
+  it("shows each archive held up, one dialog at a time, leaving one already open in place", async () => {
+    const both: UiMessage & { type: "state" } = { ...live, records: [...live.records, workspace(ME, "w2", "add search"), terminal(ME, "t3", "w2", "running")] };
+    let answerFirst: (response: Response) => void = () => {};
+    mockActions(
+      new Promise<Response>((resolve) => (answerFirst = resolve)),
+      json(409, { error: "workspace has unsaved work", uncommitted: ["src/b.rs"], unpushed: [], submodules: [] }),
+    );
+    await open("/", both);
+    fireEvent.click(within(screen.getByRole("article", { name: "fix login" })).getByRole("button", { name: "Archive fix login" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Archive fix login?" })).getByRole("button", { name: "Archive" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.click(within(screen.getByRole("article", { name: "add search" })).getByRole("button", { name: "Archive add search" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Archive add search?" })).getByRole("button", { name: "Archive" }));
+    const second = await screen.findByRole("dialog", { name: "Archive add search?" });
+    expect((await within(second).findByRole("region", { name: "Archiving now would lose this work" })).textContent).toContain("src/b.rs");
+
+    answerFirst(json(409, { error: "workspace has unsaved work", uncommitted: ["src/a.rs"], unpushed: [], submodules: [] }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(screen.getByRole("dialog", { name: "Archive add search?" })).toBeDefined();
+    expect(screen.queryByRole("dialog", { name: "Archive fix login?" })).toBeNull();
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Archive add search?" })).getByRole("button", { name: "Cancel" }));
+    const first = await screen.findByRole("dialog", { name: "Archive fix login?" });
+    expect(within(first).getByRole("region", { name: "Archiving now would lose this work" }).textContent).toContain("src/a.rs");
+  });
+
   it("opens the dialog again saying why an archive failed", async () => {
     mockActions(json(500, { error: "disk on fire" }));
     await open("/", live);

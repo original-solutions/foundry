@@ -1,4 +1,4 @@
-import { useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
+import { MutationObserver, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useId, type ReactNode } from "react";
 import { Dialog } from "radix-ui";
 import { ApiError, archiveWorkspace, type Blockers, type FileChange } from "./api";
@@ -34,7 +34,11 @@ export const archiveOf = (workspace: string) => ({
 export function useArchive() {
   const client = useQueryClient();
   return {
-    start: (workspace: string, force: boolean): Promise<Blockers | null> => client.getMutationCache().build(client, archiveOf(workspace)).execute(force),
+    start: (workspace: string, force: boolean): Promise<Blockers | null> => {
+      // An observer of its own, let go once answered, so the mutation is collected as one with no view.
+      const observer = new MutationObserver(client, archiveOf(workspace));
+      return observer.mutate(force).finally(() => observer.reset());
+    },
     archiving: (workspace: string) => client.isMutating({ mutationKey: archiveOf(workspace).mutationKey }) > 0,
   };
 }

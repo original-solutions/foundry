@@ -78,8 +78,10 @@
 //! `<data dir>/removing/<workspace id>`, git forgets the worktree, and the folder is deleted in
 //! the background. With the folder moved, git no longer reads it, so the second check is the
 //! last one; it reads what git's own check reads and refuses any checked-out submodule. A
-//! refusal from git, such as of a locked worktree, puts the folder back. A daemon that stops
-//! before the delete ends leaves the folder in `removing/`, and the next start deletes it.
+//! refusal from git, such as of a locked worktree, puts the folder back. A folder left in
+//! `removing/`, by a daemon that stopped before the delete ended or before the record said
+//! archived, is deleted by the next start only when its workspace's record is archived or gone;
+//! a live workspace's folder is put back where its worktree belongs.
 //!
 //! A create that dies after making its worktree and before writing its record leaves a worktree
 //! no record names. At start, [`Workspaces::sweep`] removes each worktree no live record names,
@@ -768,8 +770,8 @@ impl Workspaces {
     /// clone that cannot be read or whose worktrees cannot be listed is passed over, each with
     /// a log line. After [`SWEEP_WITHIN`] in all it stops where it is, says which clone it
     /// stopped in, and leaves the rest for the next start.
-    /// It also starts deleting, in the background, any worktree an archive moved aside and did
-    /// not finish deleting.
+    /// It also settles what an archive moved aside and did not finish with
+    /// ([`Inner::delete_moved_aside`]).
     pub async fn sweep(&self) -> Result<(), WorkspaceError> {
         self.inner.delete_moved_aside().await;
         self.inner.sweep(SWEEP_WITHIN).await
@@ -1793,12 +1795,12 @@ impl Inner {
         // cannot resolve a path whose folders are not there.
         if let Err(refused) = self.remove_worktree(clone, &listed, force).await {
             if let Err(error) = tokio::fs::rename(&aside, worktree).await {
-                tracing::error!(
-                    folder = %aside.display(),
-                    worktree = %worktree.display(),
-                    %error,
-                    "a worktree git would not remove could not be put back"
-                );
+                // The record stays live, so the next start puts the folder back.
+                return Err(io::Error::other(format!(
+                    "{refused}; and the worktree's folder could not be put back from {}: {error}",
+                    aside.display()
+                ))
+                .into());
             }
             return Err(refused);
         }
@@ -1830,8 +1832,10 @@ impl Inner {
         }
     }
 
-    /// Deletes, in the background, whatever an archive moved aside and did not finish
-    /// deleting before the daemon stopped.
+    /// Settles what an archive moved aside and did not finish with before the daemon stopped.
+    /// A folder of a workspace whose record is archived, or that no record names, is deleted in
+    /// the background. A live workspace's folder goes back where its worktree belongs, since
+    /// its archive did not finish. Anything else stays, with a log line.
     async fn delete_moved_aside(&self) {
         let mut entries = match tokio::fs::read_dir(self.data.join(REMOVING)).await {
             Ok(entries) => entries,
@@ -1843,7 +1847,7 @@ impl Inner {
         };
         loop {
             match entries.next_entry().await {
-                Ok(Some(entry)) => delete_in_background(entry.path()),
+                Ok(Some(entry)) => self.settle_moved_aside(entry.path()).await,
                 Ok(None) => return,
                 Err(error) => {
                     tracing::warn!(%error, "the folder of archived worktrees could not be read");
@@ -1851,6 +1855,51 @@ impl Inner {
                 }
             }
         }
+    }
+
+    /// Deletes or puts back `aside`, one entry of `removing/` ([`Inner::delete_moved_aside`]).
+    async fn settle_moved_aside(&self, aside: PathBuf) {
+        let left = |why: &str| {
+            tracing::warn!(folder = %aside.display(), "{why}, so it is left in removing/");
+        };
+        let Some(id) = aside
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| uuid::Uuid::parse_str(name).ok())
+            .map(WorkspaceId)
+        else {
+            return left("a folder names no workspace");
+        };
+        let record = match self.with_store(move |store| store.workspace(id)).await {
+            Ok(record) => record,
+            Err(error) => return left(&format!("its workspace could not be read: {error}")),
+        };
+        let body = match record {
+            Some(record) if !record.deleted => record.body,
+            _ => return delete_in_background(aside),
+        };
+        // Where git lists the worktree, or where a worktree named by its id belongs.
+        let back = match self
+            .registered_either(&self.clone_path(body.project), &body)
+            .await
+        {
+            Ok(Some((listed, _))) => listed,
+            Ok(None) => self.id_folder(body.project, body.id),
+            Err(error) => {
+                return left(&format!(
+                    "the worktrees of a live workspace's project could not be read: {error}"
+                ));
+            }
+        };
+        if !matches!(tokio::fs::try_exists(&back).await, Ok(false)) {
+            return left("a live workspace's folder is already where it belongs");
+        }
+        if let Err(error) = tokio::fs::rename(&aside, &back).await {
+            return left(&format!(
+                "a live workspace's folder could not be put back: {error}"
+            ));
+        }
+        tracing::info!(workspace = %id, folder = %back.display(), "a live workspace's folder was put back");
     }
 
     /// Takes back what a create that failed made. The worktree's folder was not there before

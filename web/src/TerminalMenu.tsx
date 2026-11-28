@@ -68,8 +68,11 @@ const Terminals = createContext<Context | undefined>(undefined);
 export function TerminalActions({ children, ...actions }: Actions & { children: ReactNode }) {
   const [asking, setAsking] = useState<string>();
   const [failed, setFailed] = useState<string>();
-  // The workspace whose archive dialog is open, with what held its last archive up or why it failed.
-  const [archiving, setArchiving] = useState<{ workspace: string; held?: Blockers; failed?: unknown }>();
+  // The archive dialogs to show, one at a time and first first, each workspace once: one opened
+  // here, or one an archive's answer opens again, with what held it up or why it failed.
+  const [asks, setAsks] = useState<{ workspace: string; held?: Blockers; failed?: unknown }[]>([]);
+  const ask = (next: (typeof asks)[number]) => setAsks((list) => [...list.filter((a) => a.workspace !== next.workspace), next]);
+  const done = (workspace: string) => setAsks((list) => list.filter((a) => a.workspace !== workspace));
   const archive = useArchive();
   const [archived, setArchived] = useState<{ name: string; branch: string }>();
   const [renaming, setRenaming] = useState<{ terminal: string; place: Place }>();
@@ -99,7 +102,7 @@ export function TerminalActions({ children, ...actions }: Actions & { children: 
     clear: (ids) => clearing.mutate(ids),
     shell: (workspace) => shell.mutate(workspace),
     archive: (workspace) => {
-      if (!archive.archiving(workspace)) setArchiving({ workspace });
+      if (!archive.archiving(workspace)) ask({ workspace });
     },
     renaming,
     rename: (id, place) => {
@@ -109,30 +112,34 @@ export function TerminalActions({ children, ...actions }: Actions & { children: 
     stopRenaming: () => setRenaming(undefined),
   };
   const target = asking ? locate(actions.machines, asking) : undefined;
-  const owner = archiving ? actions.machines.find((m) => m.workspaces.some((w) => w.id === archiving.workspace)) : undefined;
-  const leaving = owner?.workspaces.find((w) => w.id === archiving?.workspace);
+  // The first dialog whose workspace is still shown; one whose workspace went is passed over.
+  const shown = asks.flatMap((a) => {
+    const owner = actions.machines.find((m) => m.workspaces.some((w) => w.id === a.workspace));
+    const leaving = owner?.workspaces.find((w) => w.id === a.workspace);
+    return owner && leaving ? [{ ...a, owner, leaving }] : [];
+  })[0];
   // The dialog closes as the archive starts; the workspace's rows say it is archiving until it is gone.
   const start = ({ id, name, branch }: WorkspaceView, force: boolean) => {
-    setArchiving(undefined);
+    done(id);
     archive.start(id, force).then(
-      (held) => (held ? setArchiving({ workspace: id, held }) : setArchived({ name, branch })),
-      (failed: unknown) => setArchiving({ workspace: id, failed }),
+      (held) => (held ? ask({ workspace: id, held }) : setArchived({ name, branch })),
+      (failed: unknown) => ask({ workspace: id, failed }),
     );
   };
   return (
     <Terminals.Provider value={context}>
       {children}
       {asking && target && <EndDialog key={asking} id={asking} found={target} onDone={() => setAsking(undefined)} />}
-      {owner && leaving && (
+      {shown && (
         <ArchiveDialog
-          key={leaving.id}
-          workspace={leaving}
-          machine={owner}
+          key={shown.leaving.id}
+          workspace={shown.leaving}
+          machine={shown.owner}
           here={here}
-          held={archiving?.held}
-          failed={archiving?.failed}
-          onClose={() => setArchiving(undefined)}
-          onArchive={(force) => start(leaving, force)}
+          held={shown.held}
+          failed={shown.failed}
+          onClose={() => done(shown.leaving.id)}
+          onArchive={(force) => start(shown.leaving, force)}
         />
       )}
       {archived && (

@@ -1033,6 +1033,68 @@ async fn a_start_deletes_what_an_archive_left_to_delete() {
 }
 
 #[tokio::test]
+async fn a_start_deletes_what_an_archive_of_an_archived_workspace_left() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "done").await;
+    setup.workspaces.archive(id, false).await.unwrap();
+    emptied(&removing(&setup)).await;
+    let left = removing(&setup).join(id.to_string());
+    std::fs::create_dir_all(left.join("vendor")).unwrap();
+    std::fs::write(left.join("vendor").join("autoload.php"), "<?php").unwrap();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    emptied(&removing(&setup)).await;
+}
+
+#[tokio::test]
+async fn a_start_puts_back_the_folder_of_a_workspace_still_live() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "kept").await;
+    let worktree = setup.worktree(remote.project, "kept");
+    std::fs::write(worktree.join("notes.txt"), "mine").unwrap();
+    // As an archive leaves it when the daemon stops after moving the folder aside and before
+    // the record says archived, or when git refused and the folder could not be put back.
+    let aside = removing(&setup).join(id.to_string());
+    std::fs::create_dir_all(removing(&setup)).unwrap();
+    std::fs::rename(&worktree, &aside).unwrap();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("notes.txt")).unwrap(),
+        "mine"
+    );
+    assert!(!aside.exists());
+    assert!(!setup.record(id).unwrap().deleted);
+    assert!(git(&worktree, &["status", "--porcelain"]).contains("notes.txt"));
+}
+
+#[tokio::test]
+async fn a_start_leaves_in_removing_what_it_cannot_tell_was_archived() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "both").await;
+    let worktree = setup.worktree(remote.project, "both");
+    // A live workspace whose worktree is still where it belongs, so a copy cannot go back.
+    let copy = removing(&setup).join(id.to_string());
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(copy.join("notes.txt"), "mine").unwrap();
+    let stranger = removing(&setup).join("not-a-workspace");
+    std::fs::create_dir_all(&stranger).unwrap();
+    std::fs::write(stranger.join("keep.txt"), "k").unwrap();
+
+    setup.workspaces.sweep().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(copy.join("notes.txt").exists());
+    assert!(stranger.join("keep.txt").exists());
+    assert!(worktree.join("README.md").exists());
+}
+
+#[tokio::test]
 async fn an_archive_git_will_not_remove_leaves_the_worktree_where_it_was() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
@@ -1192,6 +1254,7 @@ async fn archive_with_force_of_a_detached_workspace_removes_its_folder_and_keeps
     setup.workspaces.archive(id, true).await.unwrap();
 
     assert!(!worktree.exists());
+    emptied(&removing(&setup)).await;
     assert!(setup.record(id).unwrap().deleted);
     assert_eq!(git(&clone, &["rev-parse", "refs/heads/adrift"]), tip);
     let terminals = setup.terminals_of(id);
