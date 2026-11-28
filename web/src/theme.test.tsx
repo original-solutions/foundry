@@ -136,4 +136,20 @@ describe("the shared theme state", () => {
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(storedTheme()).toBe("light");
   });
+
+  it("shows the pick of this page when storage is full but still readable", () => {
+    function Shows() {
+      return <output data-testid="theme">{useTheme()}</output>;
+    }
+    localStorage.setItem("foundry.theme", "dark");
+    render(<Shows />);
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("full");
+    });
+    act(() => setTheme("light"));
+    expect(screen.getByTestId("theme").textContent).toBe("light");
+    expect(document.documentElement.dataset.theme).toBe("light");
+    act(() => setTheme("dark"));
+    expect(screen.getByTestId("theme").textContent).toBe("dark");
+  });
 });

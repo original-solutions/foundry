@@ -54,8 +54,9 @@ describe("typing", () => {
 });
 
 describe("useSettingsKey", () => {
-  /** The key pressed at `target`, with the hook mounted on `run`. */
-  function mounted(run: () => void) {
+  /** The hook mounted on `run`, on a page whose platform is `platform`. */
+  function mounted(run: () => void, platform = "Linux x86_64") {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
     const task = document.createElement("input");
     const inTerminal = terminal();
     document.body.append(task, inTerminal.parentElement!);
@@ -67,16 +68,36 @@ describe("useSettingsKey", () => {
         view.unmount();
         task.remove();
         inTerminal.parentElement!.remove();
+        vi.restoreAllMocks();
       },
     };
   }
 
-  it("runs on Cmd+, and on Ctrl+, from the page", () => {
+  it("runs on Cmd+, on macOS, and not on Ctrl+, there", () => {
+    const run = vi.fn();
+    const { done } = mounted(run, "MacIntel");
+    fireEvent.keyDown(document.body, { key: ",", ctrlKey: true });
+    expect(run).not.toHaveBeenCalled();
+    fireEvent.keyDown(document.body, { key: ",", metaKey: true });
+    expect(run).toHaveBeenCalledTimes(1);
+    done();
+  });
+
+  it("runs on Ctrl+, elsewhere, and not on Cmd+, there", () => {
     const run = vi.fn();
     const { done } = mounted(run);
     fireEvent.keyDown(document.body, { key: ",", metaKey: true });
+    expect(run).not.toHaveBeenCalled();
     fireEvent.keyDown(document.body, { key: ",", ctrlKey: true });
-    expect(run).toHaveBeenCalledTimes(2);
+    expect(run).toHaveBeenCalledTimes(1);
+    done();
+  });
+
+  it("does not run with the other modifier held too", () => {
+    const run = vi.fn();
+    const { done } = mounted(run, "MacIntel");
+    fireEvent.keyDown(document.body, { key: ",", metaKey: true, ctrlKey: true });
+    expect(run).not.toHaveBeenCalled();
     done();
   });
 
@@ -84,8 +105,8 @@ describe("useSettingsKey", () => {
     const run = vi.fn();
     const { done } = mounted(run);
     fireEvent.keyDown(document.body, { key: "," });
-    fireEvent.keyDown(document.body, { key: ",", metaKey: true, altKey: true });
-    fireEvent.keyDown(document.body, { key: ",", metaKey: true, shiftKey: true });
+    fireEvent.keyDown(document.body, { key: ",", ctrlKey: true, altKey: true });
+    fireEvent.keyDown(document.body, { key: ",", ctrlKey: true, shiftKey: true });
     expect(run).not.toHaveBeenCalled();
     done();
   });
@@ -93,8 +114,7 @@ describe("useSettingsKey", () => {
   it("does not run while a text field or a terminal has focus", () => {
     const run = vi.fn();
     const { task, inTerminal, done } = mounted(run);
-    fireEvent.keyDown(task, { key: ",", metaKey: true });
-    fireEvent.keyDown(inTerminal, { key: ",", metaKey: true });
+    fireEvent.keyDown(task, { key: ",", ctrlKey: true });
     fireEvent.keyDown(inTerminal, { key: ",", ctrlKey: true });
     expect(run).not.toHaveBeenCalled();
     done();

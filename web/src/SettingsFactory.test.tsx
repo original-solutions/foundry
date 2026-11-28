@@ -22,6 +22,9 @@ async function show(...answers: Response[]) {
   await screen.findByLabelText("Max runs");
   return { calls, client: view.client as QueryClient };
 }
+/** What the daemon puts in place of each string of an answer when its secret store cannot be read. */
+const HIDDEN = "[hidden: the secret store could not be read]";
+
 const overviewChanges = (client: QueryClient, over: Partial<FactorySettings>) =>
   act(async () => {
     client.setQueryData(factoryKey, overview(over));
@@ -81,6 +84,7 @@ describe("SettingsFactory", () => {
 
     type("Poll seconds", "20");
     expect(row("Poll seconds").textContent).not.toContain("must be");
+    expect(bar()?.textContent).not.toContain("must be");
   });
 
   it("keeps the change and shows the daemon's refusal beside Save when it names no field", async () => {
@@ -151,5 +155,108 @@ describe("SettingsFactory", () => {
     await show();
     type("Model", "sonnet");
     expect(within(bar()!).getByText("Model opus → sonnet")).toBeDefined();
+  });
+
+  it("sends a model typed with a space after it as one word", async () => {
+    const { calls } = await show(json(200, { settings: { ...saved, model: "sonnet" } }), json(200, overview({ model: "sonnet" })));
+    type("Model", "sonnet ");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(calls.filter((c) => c.method === "POST")).toHaveLength(1));
+    expect(calls.find((c) => c.method === "POST")?.body).toMatchObject({ model: "sonnet" });
+  });
+
+  it("clears the stale mark when the field is edited again after it went stale", async () => {
+    const { client } = await show();
+    type("Max runs", "5");
+    await overviewChanges(client, { max_runs: 4 });
+    expect(row("Max runs").getAttribute("data-stale")).toBe("true");
+    type("Max runs", "6");
+    expect(row("Max runs").getAttribute("data-stale")).toBeNull();
+    expect(screen.getByRole("button", { name: "Save 1 change" })).toBeDefined();
+  });
+
+  it("asks again after a look when the field moves again, and the look lets the row stop being stale", async () => {
+    const { calls, client } = await show(json(200, { settings: { ...saved, max_runs: 5 } }), json(200, overview({ max_runs: 5 })));
+    type("Max runs", "5");
+    await overviewChanges(client, { max_runs: 4 });
+    fireEvent.click(screen.getByRole("button", { name: "Look again" }));
+    expect(row("Max runs").getAttribute("data-stale")).toBeNull();
+    expect(screen.getByRole("button", { name: "Save 1 change" })).toBeDefined();
+
+    await overviewChanges(client, { max_runs: 7 });
+    expect(row("Max runs").getAttribute("data-stale")).toBe("true");
+    expect(screen.getByRole("button", { name: "Look again" })).toBeDefined();
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(0);
+  });
+
+  it("asks again when a second, different field goes stale after a look", async () => {
+    const { client } = await show();
+    type("Max runs", "5");
+    type("Max gates", "9");
+    await overviewChanges(client, { max_runs: 4 });
+    fireEvent.click(screen.getByRole("button", { name: "Look again" }));
+    expect(screen.getByRole("button", { name: "Save 2 changes" })).toBeDefined();
+    await overviewChanges(client, { max_runs: 4, max_gates: 1 });
+    expect(row("Max gates").getAttribute("data-stale")).toBe("true");
+    expect(screen.getByRole("button", { name: "Look again" })).toBeDefined();
+  });
+
+  it("keeps what was typed when the answer hides model and effort, and shows no hidden text", async () => {
+    const { calls } = await show(json(200, { settings: { ...saved, model: HIDDEN, effort: HIDDEN, max_runs: 4 } }), json(200, overview({ model: HIDDEN, effort: HIDDEN, max_runs: 4 })));
+    type("Model", "sonnet");
+    type("Effort", "low");
+    type("Max runs", "4");
+    fireEvent.click(screen.getByRole("button", { name: "Save 3 changes" }));
+    await waitFor(() => expect(bar()).toBeNull());
+    expect(calls.find((c) => c.method === "POST")?.body).toMatchObject({ model: "sonnet", effort: "low" });
+    expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("sonnet");
+    expect((screen.getByLabelText("Effort") as HTMLInputElement).value).toBe("low");
+    expect(document.body.textContent).not.toContain("[hidden");
+    expect(Array.from(document.querySelectorAll("input")).some((i) => i.value.includes("[hidden"))).toBe(false);
+  });
+
+  it("releases a field typed back to its saved value, so it follows the overview again", async () => {
+    const { client } = await show();
+    type("Max runs", "5");
+    type("Max runs", "3");
+    expect(bar()).toBeNull();
+    await overviewChanges(client, { max_runs: 6 });
+    expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("6");
+    expect(bar()).toBeNull();
+  });
+
+  it("follows the overview after a save, with no bar for a field that was saved", async () => {
+    const { client } = await show(json(200, { settings: { ...saved, max_runs: 5 } }), json(200, overview({ max_runs: 5 })));
+    type("Max runs", "5");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(bar()).toBeNull());
+    await overviewChanges(client, { max_runs: 4 });
+    expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("4");
+    expect(bar()).toBeNull();
+  });
+
+  it("keeps an edit typed while the save is in flight, and does not mark it as changed elsewhere by the user's own save", async () => {
+    let answer: (r: Response) => void = () => {};
+    const pending = new Promise<Response>((resolve) => (answer = resolve));
+    mockFetch(json(200, overview()));
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    const first = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => (init?.method === "POST" ? pending : first(url, init)));
+    const view = await renderApp(<SettingsFactory {...pageProps()} />);
+    await screen.findByLabelText("Max runs");
+
+    type("Max runs", "5");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    type("Max runs", "6");
+    await act(async () => answer(json(200, { settings: { ...saved, max_runs: 5 } })));
+    await act(async () => {
+      view.client.setQueryData(factoryKey, overview({ max_runs: 5 }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("6");
+    expect(bar()?.textContent).toContain("Runs at once 5 → 6");
+    expect(row("Max runs").getAttribute("data-stale")).toBeNull();
+    expect(screen.getByRole("button", { name: "Save 1 change" })).toBeDefined();
   });
 });

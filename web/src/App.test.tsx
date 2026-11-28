@@ -1235,6 +1235,7 @@ describe("App", () => {
     });
 
     it("opens on Cmd+, from the board, but not from a text field or a terminal", async () => {
+      vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
       factoryNow = fleetFactory;
       mockActions();
       const r = await open("/", live);
@@ -1249,6 +1250,7 @@ describe("App", () => {
       fireEvent.keyDown(document.body, { key: ",", metaKey: true });
       await waitFor(() => expect(pathname(r)).toBe("/settings"));
       xterm.remove();
+      vi.restoreAllMocks();
     });
 
     it("opens from the palette's Settings, and each category from its own entry", async () => {
@@ -1325,6 +1327,65 @@ describe("App", () => {
       await open("/settings", { type: "state", protocol: 1, records: [sample(ME, 1)], settings: settings() });
       expect(await screen.findByLabelText("Max runs")).toBeDefined();
       expect(screen.queryByText("What should Claude work on?")).toBeNull();
+    });
+
+    it("reads the overview again when the settings or a factory status arrive, so the page and the nav follow", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      await open("/settings/factory", live);
+      expect(((await screen.findByLabelText("Max runs")) as HTMLInputElement).value).toBe("3");
+      const events = sockets("/api/events").at(-1)!;
+      const nav = () => screen.getByRole("navigation", { name: "Settings" });
+
+      factoryNow = { ...fleetFactory, settings: { ...fleetFactory.settings, max_runs: 4 } };
+      act(() => events.deliver(JSON.stringify({ type: "settings", protocol: 1, settings: settings({ seq: 99 }) })));
+      await waitFor(() => expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("4"));
+      await waitFor(() => expect(nav().textContent).toContain("4 runs at once"));
+
+      factoryNow = { ...fleetFactory, settings: { ...fleetFactory.settings, max_runs: 6 } };
+      act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: heldStatus(2) })));
+      await waitFor(() => expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("6"));
+      await waitFor(() => expect(nav().textContent).toContain("6 runs at once"));
+    });
+
+    it("does not render the board at /settings, for a fleet that has workspaces", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      await open("/settings", live);
+      await screen.findByLabelText("Max runs");
+      expect(screen.queryByRole("radiogroup", { name: "View" })).toBeNull();
+      expect(screen.queryByRole("textbox", { name: "New task" })).toBeNull();
+    });
+
+    it("shows the whole Factory summary in a title on the nav entry", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      await open("/settings", live);
+      const nav = await screen.findByRole("navigation", { name: "Settings" });
+      const line = "opus · high effort · 3 runs at once · 2 gates at once · looks every 30s · feedback every 300s";
+      await waitFor(() => expect(within(nav).getByRole("link", { name: /^Factory/ }).querySelector("[title]")?.getAttribute("title")).toBe(line));
+    });
+
+    it("counts desktop alerts in the Notifications summary only when the browser allows them", async () => {
+      factoryNow = fleetFactory;
+      localStorage.setItem("foundry.notify", JSON.stringify({ cards: true, desktop: true, away: true }));
+      mockActions();
+      await open("/settings", live);
+      const nav = await screen.findByRole("navigation", { name: "Settings" });
+      // This browser has no desktop alerts, so the choice is not on, whatever was kept.
+      expect(within(nav).getByRole("link", { name: /^Notifications/ }).textContent).toContain("cards · catch-up");
+      expect(within(nav).getByRole("link", { name: /^Notifications/ }).textContent).not.toContain("desktop");
+    });
+
+    it("closes the sidebar drawer when the bell in it is tapped", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      await open("/terminals/t1", live);
+      fireEvent.click(screen.getByRole("button", { name: "Workspaces" }));
+      const wrapper = () => screen.getByRole("navigation", { name: "Workspaces" }).closest("[data-fleet]")!;
+      expect(wrapper().className).toContain("fixed");
+      fireEvent.click(screen.getByRole("link", { name: "Notifications" }));
+      await waitFor(() => expect(wrapper().className).not.toContain("fixed"));
     });
 
     it("shows the notification choices at /settings/notifications, from the bell's link", async () => {
