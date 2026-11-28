@@ -362,7 +362,7 @@ describe("App", () => {
 
   it("paints the fleet this browser last saw at once, greyed, before the daemon answers, and goes live when it does", async () => {
     mockActions();
-    keep({ records: live.records, settings: live.settings, synced: true }, Date.now() - 180_000);
+    keep({ records: live.records, settings: live.settings, synced: true, held: {}, protocols: {} }, Date.now() - 180_000);
     const events = await before("/");
 
     // Nothing has arrived yet, and the board and sidebar are already there, frozen.
@@ -379,7 +379,7 @@ describe("App", () => {
 
   it("with a remembered fleet and a daemon that does not answer, keeps it frozen under a line that says so, instead of the empty page", async () => {
     mockActions();
-    keep({ records: live.records, settings: live.settings, synced: true }, Date.now() - 180_000);
+    keep({ records: live.records, settings: live.settings, synced: true, held: {}, protocols: {} }, Date.now() - 180_000);
     const events = await before("/");
 
     act(() => events.end(1006));
@@ -976,7 +976,7 @@ describe("App", () => {
   it("offers no factory controls from the fleet this browser remembers, only once the daemon's own settings arrive", async () => {
     mockActions();
     const remembered = settings({ project_factory: { p1: { on: true, login: "bot", paused: false } } });
-    keep({ records: live.records, settings: remembered, synced: true }, Date.now() - 180_000);
+    keep({ records: live.records, settings: remembered, synced: true, held: {}, protocols: {} }, Date.now() - 180_000);
     const events = await before("/");
     fireEvent.focus(screen.getByRole("textbox", { name: "New task" }));
     fireEvent.click(screen.getByRole("button", { name: "Projects" }));

@@ -142,7 +142,7 @@ function Layout() {
   // Until the daemon's first state, the fleet this browser last saw stands in for it, frozen.
   const memory = useMemory(sent, link.lostAt === undefined);
   const remembering = !sent.synced && memory !== undefined;
-  const state = remembering ? { records: memory.records, settings: memory.settings, synced: true } : sent;
+  const state = remembering ? { records: memory.records, settings: memory.settings, synced: true, held: {}, protocols: {} } : sent;
   const { terminalId } = useParams({ strict: false });
   const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
   const onFactory = useRouterState({ select: (s) => s.location.pathname === "/factory" });
