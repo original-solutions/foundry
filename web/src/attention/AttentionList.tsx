@@ -120,12 +120,13 @@ function Line({ item, group, settling }: { item: AttentionItem; group: Attention
   return (
     <li>
       <div className="flex items-baseline gap-2">
+        {/* w-0: a line is one unwrapped line, and without it the longest one sets the card's width (900 px on a 390 px phone); flex-1 gives it what is left. */}
         <button
           type="button"
           aria-expanded={open}
           title={item.what}
           onClick={() => setOpen(!open)}
-          className="flex min-w-0 flex-1 items-baseline gap-1.5 text-left text-neutral-200 hover:text-neutral-50"
+          className="flex w-0 min-w-0 flex-1 items-baseline gap-1.5 text-left text-neutral-200 hover:text-neutral-50"
         >
           <span aria-hidden="true" className="text-neutral-500">
             {open ? "▾" : "▸"}
