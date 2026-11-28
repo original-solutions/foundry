@@ -46,6 +46,14 @@ describe("Rail", () => {
     expect(screen.getByRole("link", { name: "The factory" }).getAttribute("href")).toBe("/factory");
   });
 
+  it("puts a gear link to Settings beside the theme button, at the foot", async () => {
+    await renderApp(<Rail machines={machines()} {...handlers()} />);
+    const gear = screen.getByRole("link", { name: "Settings" });
+    expect(gear.getAttribute("href")).toBe("/settings");
+    const theme = screen.getByRole("button", { name: /theme/ });
+    expect(gear.parentElement).toBe(theme.parentElement);
+  });
+
   it("shows every workspace as its terminals' states, each a link named by workspace, terminal and state, the open one marked", async () => {
     await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
 

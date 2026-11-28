@@ -1,7 +1,6 @@
-import { useId, useState } from "react";
+import { Link } from "@tanstack/react-router";
 import type { FactorySettings } from "./api";
 import { settingsLine, type Tally } from "./factory";
-import { FleetSettings } from "./FactorySettings";
 import { plural } from "./labels";
 
 /** The line's stations in the order an issue moves along them, each with the colour it shows in when something stands there. */
@@ -50,35 +49,24 @@ export function Line({ tally, label, small = false }: { tally: Tally; label: str
 }
 
 /**
- * The fleet's factory settings folded to one line that says them all, which opens to the form.
- * Settings change seldom; what the factory is doing is what the view leads with.
+ * The fleet's factory settings as one line that says them all, which links to Settings → Factory,
+ * where they are changed. Settings change seldom; what the factory is doing is what the view leads with.
  */
 export function SettingsFold({ settings }: { settings: FactorySettings }) {
-  const [open, setOpen] = useState(false);
-  const id = useId();
   return (
-    <div className="rounded-lg border border-neutral-800">
-      <button
-        type="button"
-        aria-expanded={open}
-        aria-controls={id}
-        aria-labelledby={`${id}-name`}
-        aria-describedby={`${id}-line`}
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full flex-wrap items-baseline gap-x-3 gap-y-0.5 rounded-lg px-3 py-2 text-left hover:bg-neutral-900"
-      >
-        <span id={`${id}-name`} className="text-xs font-medium text-neutral-200">
-          <span aria-hidden className={`mr-1.5 inline-block text-neutral-500 transition-transform ${open ? "rotate-90" : ""}`}>
-            ›
-          </span>
-          Settings for every project
+    <Link
+      to="/settings/$category"
+      params={{ category: "factory" }}
+      className="flex w-full flex-wrap items-baseline gap-x-3 gap-y-0.5 rounded-lg border border-neutral-800 px-3 py-2 text-left hover:bg-neutral-900"
+    >
+      <span className="text-xs font-medium text-neutral-200">
+        <span aria-hidden className="mr-1.5 inline-block text-neutral-500">
+          ›
         </span>
-        <span id={`${id}-line`} className="min-w-0 font-mono text-xs text-neutral-500">{settingsLine(settings)}</span>
-      </button>
-      <div id={id} hidden={!open} className="border-t border-neutral-800 [&>form]:rounded-none [&>form]:border-0">
-        {open && <FleetSettings settings={settings} />}
-      </div>
-    </div>
+        Settings for every project
+      </span>
+      <span className="min-w-0 font-mono text-xs text-neutral-500">{settingsLine(settings)}</span>
+    </Link>
   );
 }
 

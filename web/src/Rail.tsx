@@ -9,7 +9,7 @@ import { railKey } from "./collapsed";
 import { PanelIcon, stripOf } from "./Sidebar";
 import { StateGlyph } from "./StateGlyph";
 import { TerminalMenu } from "./TerminalMenu";
-import { ThemeButton } from "./ThemeButton";
+import { SettingsLink, ThemeButton } from "./ThemeButton";
 
 const statusDot = { online: "bg-emerald-400", offline: "bg-red-400", unknown: "bg-neutral-500" };
 
@@ -126,6 +126,7 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
       <div className="mt-auto flex flex-col items-center gap-1 pt-3">
         {alerts}
         <ThemeButton />
+        <SettingsLink />
       </div>
     </nav>
   );

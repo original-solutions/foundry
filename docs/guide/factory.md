@@ -34,18 +34,18 @@ The repo also needs a `.dw/config.yml` on its default branch. [Turn a project's 
 
 ## Settings for the whole fleet
 
-Under the line, **Settings for every project** shows them all on one line, such as `opus · high effort · 2 runs at once · 3 gates at once · looks every 30s · feedback every 300s`. Click it to open the form. The form applies to every project.
+Under the line, **Settings for every project** shows them all on one line, such as `opus · high effort · 2 runs at once · 3 gates at once · looks every 30s · feedback every 300s`. Click it to open **Settings → Factory**, where you change them. They apply to every project.
 
-- **Pause claims**. Stops every project from claiming new issues.
+- **Pause claims**. Stops every project from claiming new issues. Runs already going carry on.
 - **Model** and **Effort**. What each build session starts with. Each is one word.
-- **Max runs**. How many issues the factory works on at once, from its claim until its pull request.
-- **Max gates**. How many gates, the checks that test a build, run at once.
-- **Poll seconds**. How often the factory looks for new issues, from 10 to 60.
-- **Feedback seconds**. How often the factory looks for new comments on a pull request that is open.
+- **Runs at once**. How many issues the factory works on at once, from its claim until its pull request.
+- **Gates at once**. How many gates, the checks that test a build, run at once.
+- **Poll interval**. How often the factory looks for new issues, from 10 to 60 seconds.
+- **Feedback interval**. How often the factory looks for new comments on a pull request that is open.
 
-Click **Save**. The form checks every field before it sends and says what is wrong, so a poll of 5 stops with `poll_seconds must be a whole number from 10 to 60`. The daemon can still refuse a change, and its reason shows in the same place.
+An edit is not sent at once. A bar at the foot of the page lists each change as old → new, such as `1 change · Runs at once 3 → 4`, with **Discard** and **Save 1 change**. Save checks every field before it sends and says what is wrong beside the field, so a poll of 5 stops with `poll_seconds must be a whole number from 10 to 60`. The daemon can still refuse a change. Its reason shows beside Save, and the changes stay in the bar.
 
-![The settings form refusing a poll of 5 seconds](images/factory-settings-error.png)
+A field you have not touched follows the fleet's settings as they change. If someone else changes a field you are editing, its row says so and names the new value, and Save reads **Look again**. Press it, check the row, then press Save. Leaving the page with changes not saved asks first.
 
 ## What each project shows
 

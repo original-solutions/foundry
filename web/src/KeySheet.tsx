@@ -1,10 +1,11 @@
 import { useLayoutEffect, useRef } from "react";
 import { Modal } from "./Modal";
+import { typing } from "./shortcut";
 
 const mod = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? "⌘" : "Ctrl";
 
 /** Every key the app answers, by where it works: the keys to press, and what they do. */
-const groups: { where: string; keys: [string[], string][] }[] = [
+export const keyGroups: { where: string; keys: [string[], string][] }[] = [
   {
     where: "Anywhere",
     keys: [
@@ -13,6 +14,7 @@ const groups: { where: string; keys: [string[], string][] }[] = [
       [[mod, "F"], "Find in the open terminal"],
       [[mod, "\\"], "Open a terminal beside this one, or close the split"],
       [[mod, "B"], "Collapse the workspaces list to a rail of states, or expand it"],
+      [[mod, ","], "Settings"],
       [["Esc"], "Close what is on top: a dialog, sheet, drawer or card"],
       [["?"], "This list"],
     ],
@@ -82,12 +84,6 @@ const groups: { where: string; keys: [string[], string][] }[] = [
   },
 ];
 
-/** Whether a key typed at `target` is text for a field or a terminal, not a key for the app. */
-function typing(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  return target.isContentEditable || target.closest("input, textarea, select, .xterm") !== null;
-}
-
 /** Runs `run` on ?, unless it is typed into a field or a terminal. */
 export function useHelpKey(run: () => void) {
   const latest = useRef(run);
@@ -105,30 +101,39 @@ export function useHelpKey(run: () => void) {
   }, []);
 }
 
+/** Every group of `keyGroups` as a read-only list: the ? sheet and Settings → Keyboard both show it, so the two look alike. */
+export function KeyList() {
+  return (
+    <>
+      {keyGroups.map((group) => (
+        <section key={group.where}>
+          <h3 className="mb-1.5 text-[11px] font-semibold tracking-wider text-neutral-500 uppercase">{group.where}</h3>
+          <dl className="space-y-1">
+            {group.keys.map(([keys, what]) => (
+              <div key={what} className="flex items-baseline gap-3">
+                <dt className="flex w-24 shrink-0 gap-1">
+                  {keys.map((key) => (
+                    <kbd key={key} className="min-w-5 rounded border border-neutral-700 bg-neutral-800 px-1.5 py-px text-center font-sans text-xs text-neutral-200 shadow-[0_1px_0] shadow-neutral-700">
+                      {key}
+                    </kbd>
+                  ))}
+                </dt>
+                <dd className="text-neutral-300">{what}</dd>
+              </div>
+            ))}
+          </dl>
+        </section>
+      ))}
+    </>
+  );
+}
+
 /** The list of every key the app answers, opened by ? or the sidebar's Keyboard button. */
 export function KeySheet({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   return (
     <Modal open={open} onOpenChange={onOpenChange} wide title="Keyboard" description="Every key Foundry answers, by where it works. Esc closes this.">
       <div className="mt-4 max-h-[70dvh] space-y-4 overflow-y-auto">
-        {groups.map((group) => (
-          <section key={group.where}>
-            <h3 className="mb-1.5 text-[11px] font-semibold tracking-wider text-neutral-500 uppercase">{group.where}</h3>
-            <dl className="space-y-1">
-              {group.keys.map(([keys, what]) => (
-                <div key={what} className="flex items-baseline gap-3">
-                  <dt className="flex w-24 shrink-0 gap-1">
-                    {keys.map((key) => (
-                      <kbd key={key} className="min-w-5 rounded border border-neutral-700 bg-neutral-800 px-1.5 py-px text-center font-sans text-xs text-neutral-200 shadow-[0_1px_0] shadow-neutral-700">
-                        {key}
-                      </kbd>
-                    ))}
-                  </dt>
-                  <dd className="text-neutral-300">{what}</dd>
-                </div>
-              ))}
-            </dl>
-          </section>
-        ))}
+        <KeyList />
       </div>
     </Modal>
   );
