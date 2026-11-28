@@ -305,6 +305,7 @@ impl Vims for VimsCli {
 }
 
 /// Kills the child's process group and reaps the child.
+// This and `drain` repeat `factory::github::gh` and `factory::lease`; #382 shares them.
 fn kill_group(child: &mut Child) {
     if let Ok(pid) = i32::try_from(child.id()) {
         let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);

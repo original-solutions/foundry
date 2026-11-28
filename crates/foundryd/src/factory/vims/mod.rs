@@ -1278,6 +1278,26 @@ mod tests {
     }
 
     #[test]
+    fn a_login_at_the_top_beside_an_owner_is_for_that_owner_only() {
+        for answer in [
+            r#"{"login":"bot","org":"Trilogy-Care"}"#,
+            r#"{"login":"bot","owner":"Trilogy-Care"}"#,
+            r#"{"login":"bot","organization":"Trilogy-Care"}"#,
+            r#"{"login":"bot","account":"Trilogy-Care"}"#,
+            r#"{"login":"bot","account":{"login":"Trilogy-Care"}}"#,
+        ] {
+            let fake = FakeVims::new();
+            fake.on("github", Reply::ok(answer));
+            let links = fake.github().unwrap();
+            assert_eq!(links.login_for("trilogy-care"), Some("bot"), "{answer}");
+            assert_eq!(links.login_for("rawphp"), None, "{answer}");
+        }
+        let fake = FakeVims::new();
+        fake.on("github", Reply::ok(r#"{"org":"Trilogy-Care"}"#));
+        assert!(matches!(fake.github(), Err(VimsError::Unknown { .. })));
+    }
+
+    #[test]
     fn the_profile_says_whether_it_holds_a_skill() {
         let fake = FakeVims::new();
         fake.on(

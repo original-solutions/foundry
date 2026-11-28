@@ -468,22 +468,22 @@ impl GithubLinks {
         // kept as no owner, it would let a login answer for owners it was never named for.
         for item in list.into_iter().flatten() {
             let login = text(item, &[&["login"], &["user", "login"], &["githubLogin"]])?;
-            let owner = text(
-                item,
-                &[
-                    &["account", "login"],
-                    &["owner"],
-                    &["org"],
-                    &["organization"],
-                    &["account"],
-                ],
-            )?;
+            let owner = text(item, OWNER)?;
             links.push(GithubLink {
                 owner: Some(owner),
                 login,
             });
         }
         if !links.is_empty() {
+            return Some(GithubLinks { links });
+        }
+        // A login at the top beside an owner, read as an entry's, is for that owner only.
+        if let Some(owner) = text(&value, OWNER) {
+            let login = text(&value, &[&["login"], &["user", "login"]])?;
+            links.push(GithubLink {
+                owner: Some(owner),
+                login,
+            });
             return Some(GithubLinks { links });
         }
         // The answer names no owner the reader can place. Its login is for every owner only when
@@ -508,6 +508,16 @@ impl GithubLinks {
         Some(GithubLinks { links })
     }
 }
+
+/// Where a GitHub link's owner is, guessed: an entry's `account.login` (or `owner`, `org`,
+/// `organization`, or an `account` that is the name itself).
+const OWNER: &[&[&str]] = &[
+    &["account", "login"],
+    &["owner"],
+    &["org"],
+    &["organization"],
+    &["account"],
+];
 
 /// Whether `value` is a list or an object.
 fn nested(value: &Value) -> bool {
