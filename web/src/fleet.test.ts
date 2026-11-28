@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AnyRecord, FactoryStatus, UiMessage } from "./api";
+import type { AnyRecord, FactoryStatus, MachineHeld, UiMessage } from "./api";
 import { apply, branchOf, byUrgency, coordinatorOrder, emptyState, fleet, locate, machineNumbers, machineStats, rows, terminalRunning } from "./fleet";
 import type { Glyph } from "./labels";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
@@ -613,5 +613,32 @@ describe("a workspace's base, project and branch", () => {
   it("shows its branch, or the first 7 characters of its commit when its branch is empty", () => {
     const [machine] = fleet([sample(ME, 1), workspace(ME, "w2", "fix login"), commitOnly()], settings());
     expect(machine.workspaces.map(branchOf)).toEqual(["fix-login", "0123456"]);
+  });
+});
+
+describe("apply and what machines hold", () => {
+  const held = (logins: string[]): MachineHeld => ({ logins, skill: true, default: logins[0], gateway: { key: true, management: false } });
+
+  it("keeps held and protocols from a state message", () => {
+    const message: UiMessage = { ...(full([]) as Extract<UiMessage, { type: "state" }>), held: { m1: held(["os-factory"]) }, protocols: { m1: 6 } };
+    const state = apply(emptyState, message);
+    expect(state.held).toEqual({ m1: held(["os-factory"]) });
+    expect(state.protocols).toEqual({ m1: 6 });
+  });
+
+  it("gives empty maps for a state without them", () => {
+    let state = apply(emptyState, { ...(full([]) as Extract<UiMessage, { type: "state" }>), held: { m1: held(["a"]) }, protocols: { m1: 7 } });
+    state = apply(state, full([]));
+    expect(state.held).toEqual({});
+    expect(state.protocols).toEqual({});
+    expect(emptyState.held).toEqual({});
+    expect(emptyState.protocols).toEqual({});
+  });
+
+  it("replaces one machine's held on a held message and leaves the others", () => {
+    let state = apply(emptyState, { ...(full([]) as Extract<UiMessage, { type: "state" }>), held: { m1: held(["a"]), m2: held(["b"]) } });
+    state = apply(state, { type: "held", protocol: 6, machine: "m1", held: held(["c"]) });
+    expect(state.held.m1.logins).toEqual(["c"]);
+    expect(state.held.m2.logins).toEqual(["b"]);
   });
 });
