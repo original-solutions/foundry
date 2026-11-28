@@ -167,7 +167,7 @@ function Shared({ machine }: { machine: MachineView }) {
   const listed = machine.listed;
   const set = (patch: Partial<Texts>) => {
     const keys = Object.keys(patch) as Key[];
-    setRefusals((r) => r.filter((x) => x.key === undefined || !(keys as string[]).includes(x.key)));
+    setRefusals((r) => r.filter((x) => x.key === undefined || !(keys as string[]).includes(x.key) && !(x.key === "limits" && keys.some((k) => k !== "name"))));
     setDraft((d) => {
       let edits = { ...d.edits };
       let from = { ...d.from };
@@ -236,7 +236,8 @@ function Shared({ machine }: { machine: MachineView }) {
         {defs.map((def) => {
           const key = def.key;
           const control = `${id}-${key}`;
-          const refusal = refusals.find((r) => r.key === key);
+          // A refused Clear limits is about the limits as a whole, so every limit row shows it.
+          const refusal = refusals.find((r) => r.key === key || (r.key === "limits" && key !== "name"));
           const isStale = stale.includes(key) || (clearing && key !== "name" && stale.includes("limits"));
           return (
             <Row
