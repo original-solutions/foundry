@@ -364,8 +364,8 @@ pub struct HeldUp {
     /// from a peer built before held-up runs named it.
     #[serde(default)]
     pub pr_url: Option<String>,
-    /// The sessions the run launched. Empty in a status from a peer built before held-up runs
-    /// named them.
+    /// The session the run launched last (at most one today). Empty in a status from a peer
+    /// built before held-up runs named it.
     #[serde(default)]
     pub sessions: Vec<SessionId>,
 }

@@ -1683,7 +1683,8 @@ impl<'a, 'w> Pass<'a, 'w> {
             for done in of_kind {
                 if labelled.contains(&done.run.run.issue()) {
                     // A finished run's events are read only while a person holds it up. One
-                    // that cannot be read names no workspace; it is still held up, and the failed read is logged so a store that keeps failing shows.
+                    // that cannot be read names no workspace or session; it is still held up,
+                    // and the failed read is logged so a store that keeps failing shows.
                     let progress = self
                         .ledger
                         .read(&done.run.run)
@@ -1691,7 +1692,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                             tracing::warn!(
                                 project = %world.project.id,
                                 run = %done.run.run,
-                                "factory: a held-up run's events could not be read, so it names no workspace: {error}"
+                                "factory: a held-up run's events could not be read, so it names no workspace or session: {error}"
                             );
                         })
                         .map(|events| read_progress(&events))

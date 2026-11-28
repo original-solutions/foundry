@@ -18,8 +18,8 @@
 //! | Setting overwritten | the shared settings hold an overwritten setting | the settings |
 //! | Update refused | a machine's newest sample names a refused tag | the sample |
 //! | Gateway unhealthy | this machine's read of the gateway fails | [`crate::gateway`] |
-//! | Run stuck | the believed status lists a stuck run | the factory statuses |
-//! | Run needs info | the believed status lists a run that asked questions | the factory statuses |
+//! | Run stuck | the believed status lists a stuck run | the factory statuses, and the run's session and its terminal |
+//! | Run needs info | the believed status lists a run that asked questions | the factory statuses, and the run's session and its terminal |
 //! | Factory idle | the believed status gives a reason, or for [`IDLE_AFTER`] since it saw the factory on this machine has neither held the lease nor heard from its holder | the factory statuses and [`Quiet`], given by [`Attention::with_factory`] |
 //! | Foreign claim | the believed status lists an issue claimed by something other than Foundry | the factory statuses |
 //! | Gate infra | the believed status lists a run whose gate could not run at all | the factory statuses |
@@ -577,7 +577,7 @@ pub fn fleet_items(fleet: &Fleet, factory: &FactoryFleet<'_>) -> Vec<Item> {
         ));
     }
 
-    items.extend(factory_items(fleet, factory, &on, acting));
+    items.extend(factory_items(fleet, factory, &on, acting, &closed));
     items
 }
 
@@ -587,31 +587,25 @@ fn factory_items(
     factory: &FactoryFleet<'_>,
     on: &[OnProject<'_>],
     acting: MachineId,
+    closed: &dyn Fn(TerminalId) -> bool,
 ) -> Vec<Item> {
     let quiet = factory
         .quiet
         .map(|quiet| quiet.of(&fleet.settings, &on.iter().map(|p| p.project.id).collect()))
         .unwrap_or_default();
-    // The terminal of each session whose record is held and not deleted, when that terminal is
-    // not closed: the checks the "session failed" row makes.
-    let mut closed: BTreeSet<TerminalId> = BTreeSet::new();
-    for record in &fleet.records {
-        if let AnyRecord::Terminal(r) = record
-            && r.deleted
-        {
-            closed.insert(r.body.id);
-        }
-    }
-    let open_sessions: BTreeMap<SessionId, TerminalId> = fleet
-        .records
-        .iter()
-        .filter_map(|record| match record {
-            AnyRecord::Session(r) if !r.deleted && !closed.contains(&r.body.terminal) => {
-                Some((r.body.id, r.body.terminal))
-            }
-            _ => None,
-        })
-        .collect();
+    // The sessions a held-up run names, found only when some status holds a run up: a session's
+    // terminal is offered when its record is held, not deleted, and its terminal is not closed
+    // (`closed`, the one the "session failed" row uses).
+    let sessions = std::cell::LazyCell::new(|| {
+        fleet
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                AnyRecord::Session(r) if !r.deleted => Some((r.body.id, r.body.terminal)),
+                _ => None,
+            })
+            .collect::<BTreeMap<SessionId, TerminalId>>()
+    });
     let mut items = Vec::new();
     for &OnProject { project, believed } in on {
         let quiet = quiet
@@ -652,7 +646,8 @@ fn factory_items(
             item.terminal = held
                 .sessions
                 .iter()
-                .find_map(|id| open_sessions.get(id).copied());
+                .filter_map(|id| sessions.get(id).copied())
+                .find(|&terminal| !closed(terminal));
             items.push(item);
         }
         for run in &status.gate_infra {
