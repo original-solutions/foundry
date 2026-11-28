@@ -31,7 +31,12 @@ export function useShortcut(key: string, run: (() => void) | undefined) {
 }
 
 /** The keys that open Settings, as the palette and the sheet name them. */
-export const settingsKey = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? "⌘," : "Ctrl ,";
+export const settingsKey = onMac() ? "⌘," : "Ctrl ,";
+
+/** Whether this page runs on a Mac, where the app's key is Cmd and Ctrl is left to the shell. */
+function onMac(): boolean {
+  return typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+}
 
 /** Whether a key typed at `target` is text for a field or a terminal, not a key for the app. */
 export function typing(target: EventTarget | null): boolean {
@@ -40,8 +45,8 @@ export function typing(target: EventTarget | null): boolean {
 }
 
 /**
- * Runs `run` on Cmd+, (Ctrl+, off macOS), unless it is typed into a field or a terminal, where a
- * comma is text. Not with Alt or Shift.
+ * Runs `run` on Cmd+, on macOS and Ctrl+, elsewhere, unless it is typed into a field or a
+ * terminal, where a comma is text. Not with the other of the two, Alt or Shift.
  */
 export function useSettingsKey(run: () => void) {
   const latest = useRef(run);
@@ -50,7 +55,8 @@ export function useSettingsKey(run: () => void) {
   });
   useLayoutEffect(() => {
     const listener = (event: KeyboardEvent) => {
-      if (event.key !== "," || event.altKey || event.shiftKey || !(event.metaKey || event.ctrlKey) || typing(event.target)) return;
+      const [right, other] = onMac() ? [event.metaKey, event.ctrlKey] : [event.ctrlKey, event.metaKey];
+      if (event.key !== "," || event.altKey || event.shiftKey || !right || other || typing(event.target)) return;
       event.preventDefault();
       latest.current();
     };

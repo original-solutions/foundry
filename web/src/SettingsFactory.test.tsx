@@ -240,7 +240,7 @@ describe("SettingsFactory", () => {
     let answer: (r: Response) => void = () => {};
     const pending = new Promise<Response>((resolve) => (answer = resolve));
     mockFetch(json(200, overview()));
-    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn<(url: string, init?: RequestInit) => Promise<Response>>>;
     const first = fetchMock.getMockImplementation()!;
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => (init?.method === "POST" ? pending : first(url, init)));
     const view = await renderApp(<SettingsFactory {...pageProps()} />);

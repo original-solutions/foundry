@@ -76,14 +76,26 @@ export const SettingsFactory: FC<PageProps> = () => {
   );
 };
 
-function Form({ saved }: { saved: FactorySettings }) {
+function Form({ saved: overview }: { saved: FactorySettings }) {
   const client = useQueryClient();
   const id = useId();
-  /** What was typed, by field: only the fields touched. The rest are the overview's. */
-  const [edits, setEdits] = useState<Partial<Texts>>({});
-  /** What the overview held for each edited field when it was last edited, to tell that it moved since. */
-  const [from, setFrom] = useState<Partial<Texts>>({});
+  /**
+   * What was typed, by field (only the fields touched; the rest are the overview's), and what the
+   * overview held for each edited field when it was last edited or looked at, to tell that it
+   * moved since. Together, so a save settles both in one step.
+   */
+  const [draft, setDraft] = useState<{ edits: Partial<Texts>; from: Partial<Texts> }>({ edits: {}, from: {} });
+  const { edits, from } = draft;
   const [refusals, setRefusals] = useState<Refusal[]>([]);
+  // A model or effort the daemon could not show (its secret store is unreadable) is kept as last read or sent.
+  const [known, setKnown] = useState({ model: overview.model === HIDDEN ? "" : overview.model, effort: overview.effort === HIDDEN ? "" : overview.effort });
+  // Adopted when the overview changes, not on every render, so a word just sent is not put back by the overview it replaces.
+  const [seen, setSeen] = useState({ model: overview.model, effort: overview.effort });
+  if (overview.model !== seen.model || overview.effort !== seen.effort) {
+    setSeen({ model: overview.model, effort: overview.effort });
+    setKnown({ model: overview.model === HIDDEN ? known.model : overview.model, effort: overview.effort === HIDDEN ? known.effort : overview.effort });
+  }
+  const saved: FactorySettings = { ...overview, model: overview.model === HIDDEN ? known.model : overview.model, effort: overview.effort === HIDDEN ? known.effort : overview.effort };
 
   const now = texts(saved);
   const values: Texts = { ...now, ...edits };
@@ -96,15 +108,16 @@ function Form({ saved }: { saved: FactorySettings }) {
     setRefusals((r) => r.filter((x) => x.key !== key));
     // Put back to what the overview holds, it is untouched again and follows it.
     const same = diff(now, { ...now, [key]: value }, defs).length === 0;
-    setEdits((e) => (same ? without(e, key) : { ...e, [key]: value }));
-    setFrom((f) => (same ? without(f, key) : { ...f, [key]: now[key] }));
+    setDraft((d) => (same ? { edits: without(d.edits, key), from: without(d.from, key) } : { edits: { ...d.edits, [key]: value }, from: { ...d.from, [key]: now[key] } }));
   };
 
   const discard = () => {
-    setEdits({});
-    setFrom({});
+    setDraft({ edits: {}, from: {} });
     setRefusals([]);
   };
+
+  /** Takes what the overview holds now as seen for every stale field, so each is marked again only if it moves again. */
+  const look = () => setDraft((d) => ({ ...d, from: { ...d.from, ...Object.fromEntries(stale.map((key) => [key, now[key as keyof Texts]])) } }));
 
   const save = async (): Promise<Refusal[]> => {
     const next: FactorySettings = {
@@ -122,15 +135,22 @@ function Form({ saved }: { saved: FactorySettings }) {
     };
     const wrong = checkSettings(next);
     // The check's message begins with the name of the field it refuses.
-    if (wrong !== null) return refuse([{ key: wrong.split(" ")[0], message: wrong }]);
+    if (wrong !== null) return refuse([{ key: defs.find((d) => wrong.startsWith(`${d.key} `))?.key, message: wrong }]);
     const sent = { ...edits };
     try {
       const answer = await saveFactorySettings(next);
       // A word the daemon could not show is kept as it was sent.
       const settings = { ...answer, model: answer.model === HIDDEN ? next.model : answer.model, effort: answer.effort === HIDDEN ? next.effort : answer.effort };
+      setKnown({ model: settings.model, effort: settings.effort });
       client.setQueryData<FactoryOverview>(factoryKey, (old) => old && { ...old, settings });
-      setEdits((e) => unsent(e, sent));
-      setFrom((f) => unsent(f, sent));
+      const answered = texts(settings);
+      setDraft((d) => {
+        // Typing since the send is kept, and is measured from what the save made the overview.
+        const kept = unsent(d.edits, sent);
+        const keptFrom: Partial<Texts> = {};
+        for (const key of Object.keys(kept) as (keyof Texts)[]) (keptFrom as Record<string, unknown>)[key] = key in sent ? answered[key] : d.from[key];
+        return { edits: kept, from: keptFrom };
+      });
       void client.invalidateQueries({ queryKey: factoryKey });
       return refuse([]);
     } catch (e) {
@@ -175,7 +195,7 @@ function Form({ saved }: { saved: FactorySettings }) {
           );
         })}
       </div>
-      <ReviewBar changes={changes} onSave={save} onDiscard={discard} stale={stale} />
+      <ReviewBar changes={changes} onSave={save} onDiscard={discard} stale={stale} onLook={look} />
     </>
   );
 }

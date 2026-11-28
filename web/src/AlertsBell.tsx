@@ -135,9 +135,9 @@ export const blockedHint: Partial<Record<DesktopStatus, string>> = {
 
 /**
  * The bell: a link to Settings → Notifications, where how news of a session reaches you is
- * chosen. Filled when desktop alerts are on, struck through when nothing is.
+ * chosen; `onClick` is for a drawer that closes on a pick. Filled when desktop alerts are on, struck through when nothing is.
  */
-export function NotifyButton({ notify, desktop }: { notify: Notify; desktop: DesktopStatus; onChoose: (change: Partial<Notify>) => void }) {
+export function NotifyButton({ notify, desktop, onClick }: { notify: Notify; desktop: DesktopStatus; onClick?: () => void }) {
   const desktopOn = notify.desktop && desktop === "allowed";
   const silent = !notify.cards && !desktopOn && !notify.away;
   return (
@@ -145,6 +145,7 @@ export function NotifyButton({ notify, desktop }: { notify: Notify; desktop: Des
       to="/settings/$category"
       params={{ category: "notifications" }}
       aria-label="Notifications"
+      onClick={onClick}
       title="Notifications: how a session that finishes or needs you reaches you"
       className={`rounded p-1 hover:bg-neutral-800 ${desktopOn ? "text-sky-400 hover:text-sky-300" : "text-neutral-400 hover:text-neutral-200"}`}
     >
