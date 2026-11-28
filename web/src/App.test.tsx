@@ -719,7 +719,7 @@ describe("App", () => {
     expect(sidebar().className).toMatch(/(^| )hidden md:flex/);
   });
 
-  it("opens the machines view from the board's switch or a machine's name in the sidebar, and its samples draw as they arrive", async () => {
+  it("opens the machines view from the board's switch, its samples drawing as they arrive, and a machine's page from its name in the sidebar", async () => {
     mockActions();
     const router = await open("/", live);
     fireEvent.click(screen.getByRole("radio", { name: "Machines" }));
@@ -739,8 +739,8 @@ describe("App", () => {
 
     const name = within(screen.getByRole("navigation", { name: "Workspaces" })).getByRole("link", { name: "studio" });
     fireEvent.click(name);
-    await waitFor(() => expect(router.state.location.pathname).toBe("/machines"));
-    expect(screen.getByRole("region", { name: "Machines" })).toBeDefined();
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/settings/machines/${ME}`));
+    expect(await screen.findByRole("heading", { name: "In the shared settings" })).toBeDefined();
   });
 
   it("lists this machine's own session in the sidebar when the machine list does not hold this machine", async () => {
@@ -807,7 +807,7 @@ describe("App", () => {
     mockActions();
     const waiting = sample(ME, 2) as AnyRecord & { kind: "machine_sample" };
     await open("/", { ...live, records: [{ ...waiting, body: { ...waiting.body, version: "0.9.0", update_ready: "v0.9.1" } }, ...live.records.slice(1)] });
-    const badge = await screen.findByRole("button", { name: /v0\.9\.1 on 1 machine/ });
+    const badge = await screen.findByRole("link", { name: /v0\.9\.1 on 1 machine/ });
     expect(document.querySelector("main")!.firstElementChild!.contains(badge)).toBe(true);
   });
 
@@ -1259,7 +1259,7 @@ describe("App", () => {
       expect(within(nav).getByRole("link", { name: /^Machines/ }).textContent).toContain("2 machines · 1 offline");
     });
 
-    it("shows a stub for Projects, Machines and a machine, each linking to where the control lives today", async () => {
+    it("shows a stub for Projects, and the Machines page and a machine's page with their controls", async () => {
       factoryNow = fleetFactory;
       mockActions();
       const r = await open("/settings/projects", { ...live, settings: settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }] }) });
@@ -1267,10 +1267,11 @@ describe("App", () => {
       expect(screen.getByRole("link", { name: "The board" }).getAttribute("href")).toBe("/");
       await r.navigate({ to: "/settings/$category", params: { category: "machines" } });
       expect(await screen.findByRole("heading", { name: "Machines" })).toBeDefined();
-      expect(screen.getByRole("link", { name: "The machines board" }).getAttribute("href")).toBe("/machines");
+      expect(screen.getByRole("list", { name: "Coordinator order" })).toBeDefined();
+      expect(screen.getByRole("region", { name: "Install the waiting release" })).toBeDefined();
       await r.navigate({ to: "/settings/machines/$machine", params: { machine: ME } });
       await waitFor(() => expect(document.querySelector("section[aria-label='studio']")).not.toBeNull());
-      expect(screen.getByRole("link", { name: "The machines board" }).getAttribute("href")).toBe("/machines");
+      expect(screen.getByRole("heading", { name: "In the shared settings" })).toBeDefined();
     });
 
     it("opens on Cmd+, from the board, but not from a text field or a terminal", async () => {

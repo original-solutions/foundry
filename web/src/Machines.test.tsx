@@ -1,11 +1,10 @@
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { useState } from "react";
+import { fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fleet, type MachineView } from "./fleet";
+import { fleet } from "./fleet";
 import { Machines } from "./Machines";
 import { remember } from "./samples";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
-import { json, mockFetch, renderApp } from "./test-utils";
+import { renderApp } from "./test-utils";
 
 const twoMachines = settings({
   machines: [

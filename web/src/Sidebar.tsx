@@ -10,7 +10,6 @@ import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
 import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { FactoryIcon, FactoryMark } from "./FactoryMark";
-import { MachineName } from "./Machines";
 import { glyphFill, glyphText, StateGlyph, StateLabel } from "./StateGlyph";
 import { ended } from "./ends";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
@@ -206,34 +205,19 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
           return (
             <section key={machine.id} aria-label={machine.name} className="space-y-2">
               <div className="px-1">
-                <div className="group/machine flex items-center gap-2">
+                <div className="flex items-center gap-2">
                   <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${statusDot[machine.status]}`} />
-                  <MachineName machine={machine} className="text-sm font-semibold">
-                    {(rename) => (
-                      <>
-                        <h2 className="min-w-0 truncate font-semibold">
-                          <Link
-                            to="/machines"
-                            onClick={onNavigate}
-                            title={`${machine.id}: its load, memory, disk and workspaces`}
-                            className="rounded hover:underline hover:decoration-neutral-600 hover:underline-offset-4"
-                          >
-                            {machine.name}
-                          </Link>
-                        </h2>
-                        {rename && (
-                          <Action
-                            label={`Rename ${machine.name}`}
-                            title="Rename"
-                            onClick={rename}
-                            className="shrink-0 pointer-fine:opacity-0 pointer-fine:group-hover/machine:opacity-100 pointer-fine:focus-visible:opacity-100"
-                          >
-                            <path d="M10.5 2.5l3 3L6 13H3v-3z" />
-                          </Action>
-                        )}
-                      </>
-                    )}
-                  </MachineName>
+                  <h2 className="min-w-0 truncate font-semibold">
+                    <Link
+                      to="/settings/machines/$machine"
+                      params={{ machine: machine.id }}
+                      onClick={onNavigate}
+                      title={`${machine.id}: its name, limits and update`}
+                      className="rounded hover:underline hover:decoration-neutral-600 hover:underline-offset-4"
+                    >
+                      {machine.name}
+                    </Link>
+                  </h2>
                   <span className={`text-xs ${statusColour[machine.status]}`}>{machine.status}</span>
                   {ids.length > 0 && (
                     <button

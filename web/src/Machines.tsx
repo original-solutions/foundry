@@ -1,12 +1,8 @@
-import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useRef, useState, type ReactNode } from "react";
-import { post, refused, type Limits } from "./api";
 import { byUrgency, rows, type MachineView } from "./fleet";
 import { plural, urgency, type Glyph } from "./labels";
 import { NextTaskHead, RoomLine } from "./MachineRoom";
-import { button, dangerButton, field, Modal, primaryButton } from "./Modal";
-import { NameField } from "./NameField";
+import { limitsText } from "./machineApi";
 import { heardAgo, scaled, span, spanWords, type History, type Point } from "./samples";
 import { rooms, type Room } from "./room";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
@@ -50,9 +46,10 @@ interface Props {
  * its load per core drawn over the last ten minutes (or since the page opened), its free memory and disk, its terminals
  * counted by state and its workspaces, each opening its most urgent terminal. An offline machine
  * keeps its card, greyed, with its last known numbers; nothing of it is hidden. Cards run in the
- * order machines take the coordinator role, the one holding it marked, and each listed machine
- * moves up or down that order (the whole new order is posted, and the board follows the settings
- * that come back). The home's third view, under the head it shares with the board and the timeline.
+ * order machines take the coordinator role, the one holding it marked. Each card links to its
+ * machine's settings page, where its name, limits, update and removal are; the order and adding a
+ * machine are in Settings → Machines. The home's third view, under the head it shares with the
+ * board and the timeline.
  *
  * With another machine listed, the view is headed by where a task Foundry chooses the machine for
  * would go now (`rooms`), and each card says whether it is that pick, has room or is full and by
@@ -65,22 +62,6 @@ export function Machines({ machines, history, here, connected, onCreate }: Props
   const ranked = machines.filter((m) => m.rank !== undefined).sort((a, b) => a.rank! - b.rank!);
   const sorted = [...ranked, ...machines.filter((m) => m.rank === undefined)];
   const order = ranked.map((m) => m.id);
-  // One move at a time; the board reorders when the new settings arrive.
-  // The order the board showed when a move was accepted: the moves wait until the board shows
-  // another order, so a second move is never computed from the old one. The wait ends the first
-  // time the shown order differs, and is forgotten then, so the old order coming back later
-  // (moved elsewhere) does not start it again.
-  const [posted, setPosted] = useState<{ from: string }>();
-  const shown = order.join(",");
-  if (posted !== undefined && posted.from !== shown) setPosted(undefined);
-  const move = useMutation({
-    mutationFn: async (next: string[]) => {
-      const { status, json } = await post("/api/machines/priority", { order: next });
-      if (status !== 204) throw refused(status, json);
-      setPosted({ from: shown });
-    },
-  });
-  const waiting = move.isPending || posted?.from === shown;
   const next = rooms(machines);
   // Foundry chooses only among several: the task box offers it once another machine is listed.
   const several = machines.some((m) => m.listed && m.id !== here);
@@ -95,8 +76,8 @@ export function Machines({ machines, history, here, connected, onCreate }: Props
           Disconnected from the daemon: these are the last numbers this page saw, until it reconnects.
         </p>
       )}
-      <div className="flex flex-wrap items-start justify-end gap-3">
-        {several && (
+      {several && (
+        <div className="flex flex-wrap items-start justify-end gap-3">
           <NextTaskHead
             pick={next.pick && machines.find((m) => m.id === next.pick)?.name}
             count={machines.length}
@@ -104,13 +85,7 @@ export function Machines({ machines, history, here, connected, onCreate }: Props
             reasons={next.reasons}
             onCreate={onCreate && (() => onCreate("choose"))}
           />
-        )}
-        <AddMachine machines={machines} />
-      </div>
-      {move.error && (
-        <p role="alert" className="rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-300">
-          {move.error.message}
-        </p>
+        </div>
       )}
       <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,24rem),1fr))] gap-4">
         {sorted.map((machine) => (
@@ -118,12 +93,9 @@ export function Machines({ machines, history, here, connected, onCreate }: Props
             key={machine.id}
             machine={machine}
             order={order}
-            moving={waiting}
-            onMove={(next) => move.mutate(next)}
             points={history[machine.id]?.points ?? []}
             heard={history[machine.id]?.heard}
             here={machine.id === here}
-            known={here !== undefined}
             now={now}
             room={next.room.get(machine.id) ?? { kind: "unknown" }}
             several={several}
@@ -135,22 +107,12 @@ export function Machines({ machines, history, here, connected, onCreate }: Props
   );
 }
 
-/** `order` with the machines at `from` and `to` swapped. */
-function swapped(order: string[], from: number, to: number): string[] {
-  const next = order.slice();
-  [next[from], next[to]] = [next[to], next[from]];
-  return next;
-}
-
 function MachineCard({
   machine,
   order,
-  moving,
-  onMove,
   points,
   heard,
   here,
-  known,
   now,
   room,
   several,
@@ -158,12 +120,9 @@ function MachineCard({
 }: {
   machine: MachineView;
   order: string[];
-  moving: boolean;
-  onMove: (order: string[]) => void;
   points: Point[];
   heard?: number;
   here: boolean;
-  known: boolean;
   now: number;
   room: Room;
   several: boolean;
@@ -185,30 +144,18 @@ function MachineCard({
     >
       <header className="flex flex-wrap items-center gap-x-2 gap-y-1 px-4 pt-3.5">
         <span aria-hidden="true" className={`size-2 shrink-0 rounded-full ${statusDot[status]}`} />
-        <MachineName machine={machine} className="text-[15px] font-semibold">
-          {(rename) => (
-            <h3 className="min-w-0 truncate text-[15px] font-semibold text-neutral-100" title={rename ? undefined : machine.id}>
-              {rename ? (
-                <button
-                  type="button"
-                  onClick={rename}
-                  title={`${machine.id}: click to rename`}
-                  className="max-w-full truncate rounded text-left hover:underline hover:decoration-neutral-600 hover:underline-offset-4"
-                >
-                  {machine.name}
-                </button>
-              ) : (
-                machine.name
-              )}
-            </h3>
-          )}
-        </MachineName>
+        <h3 className="min-w-0 truncate text-[15px] font-semibold text-neutral-100" title={machine.id}>
+          {machine.name}
+        </h3>
         {here && <span className="rounded-full bg-neutral-800 px-2 py-px text-[11px] font-medium text-neutral-300">This machine</span>}
         {machine.acting && <span className="rounded-full bg-sky-400/10 px-2 py-px text-[11px] font-medium text-sky-300">Coordinator</span>}
         <span className="ml-auto flex items-baseline gap-1.5 text-xs">
           <span className={statusText[status]}>{status}</span>
           {ago && <span className="text-neutral-500">· heard {ago}</span>}
         </span>
+        <Link to="/settings/machines/$machine" params={{ machine: machine.id }} className="text-xs text-sky-300 hover:underline">
+          Settings
+        </Link>
       </header>
       <p className="truncate px-4 font-mono text-[11px] text-neutral-600">{machine.id}</p>
       <p className="px-4 pt-1 text-xs text-neutral-400">
@@ -221,41 +168,11 @@ function MachineCard({
         )}
         {sample?.update_ready && <span className="text-sky-300"> · {sample.update_ready} waiting</span>}
       </p>
-      <div className="flex items-center justify-between gap-2 px-4 pt-1.5">
-        <p className="min-w-0 text-xs text-neutral-400">{machine.limits ? limitsText(machine.limits) : "No limits"}</p>
-        {machine.listed && <LimitsDialog machine={machine} />}
-      </div>
+      <p className="px-4 pt-1.5 text-xs text-neutral-400">{machine.limits ? limitsText(machine.limits) : "No limits"}</p>
       {machine.rank !== undefined && order.length >= 2 && (
-        <div className="flex items-center justify-between gap-2 px-4 pt-1.5">
-          <p className="min-w-0 text-xs text-neutral-400">
-            Coordinator order {machine.rank + 1} of {order.length}
-          </p>
-          <span className="flex gap-1">
-            <button
-              type="button"
-              className={button}
-              aria-label={`Move ${machine.name} up in the coordinator order`}
-              disabled={moving || machine.rank === 0}
-              onClick={() => onMove(swapped(order, machine.rank!, machine.rank! - 1))}
-            >
-              ↑
-            </button>
-            <button
-              type="button"
-              className={button}
-              aria-label={`Move ${machine.name} down in the coordinator order`}
-              disabled={moving || machine.rank === order.length - 1}
-              onClick={() => onMove(swapped(order, machine.rank!, machine.rank! + 1))}
-            >
-              ↓
-            </button>
-          </span>
-        </div>
-      )}
-      {machine.listed && known && !here && (
-        <div className="flex justify-end px-4 pt-1.5">
-          <RemoveDialog machine={machine} />
-        </div>
+        <p className="px-4 pt-1.5 text-xs text-neutral-400">
+          Coordinator order {machine.rank + 1} of {order.length}
+        </p>
       )}
       <RoomLine name={machine.name} room={room} several={several} onCreate={onCreate} />
 
@@ -356,298 +273,6 @@ function MachineCard({
         {machine.workspaces.length === 0 && <li className="px-2 py-1.5 text-xs text-neutral-500">No workspaces on this machine</li>}
       </ul>
     </article>
-  );
-}
-
-/**
- * What an add answered: the command to run on the new machine, how long its code works, and the
- * address the name resolved to.
- */
-interface Added {
-  name: string;
-  command: string;
-  expiresInSecs: number;
-  address: string;
-}
-
-/** Asks the daemon for a join code for the machine Tailscale calls `name`. */
-async function addMachine(name: string): Promise<Added> {
-  const { status, json } = await post("/api/machines/add", { name });
-  if (status !== 201) throw refused(status, json);
-  return { name, command: String(json.command), expiresInSecs: Number(json.expires_in_secs), address: String(json.address) };
-}
-
-/**
- * The board's Add machine button and its dialog. The person types the new machine's Tailscale
- * name and gets the one command to run there; a refusal shows in the dialog and keeps the text.
- * Once a listed machine of that name, or at the address it resolved to, arrives in the settings,
- * the dialog says it joined: a machine lists itself under its own Tailscale name, which differs
- * from a full name or an address typed. Closing it forgets the command.
- */
-function AddMachine({ machines }: { machines: MachineView[] }) {
-  const [open, setOpen] = useState(false);
-  const [name, setName] = useState("");
-  const [copied, setCopied] = useState<"copied" | "selected" | null>(null);
-  const command = useRef<HTMLElement>(null);
-  const add = useMutation({ mutationFn: addMachine });
-  const added = add.data;
-  const joined =
-    added !== undefined &&
-    machines.some((m) => m.listed && (m.name.trim().toLowerCase() === added.name.toLowerCase() || m.address === added.address));
-  const change = (next: boolean) => {
-    setOpen(next);
-    if (!next) {
-      setName("");
-      setCopied(null);
-      add.reset();
-    }
-  };
-  const copy = async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied("copied");
-    } catch {
-      // No clipboard outside a secure context, as on a Tailscale address: select it to copy by hand.
-      const range = document.createRange();
-      if (command.current) range.selectNodeContents(command.current);
-      window.getSelection()?.removeAllRanges();
-      window.getSelection()?.addRange(range);
-      setCopied("selected");
-    }
-  };
-  return (
-    <Modal
-      open={open}
-      onOpenChange={change}
-      trigger="Add machine"
-      title="Add machine"
-      description={added ? `Run this on ${added.name}, where foundryd is installed.` : "Type the new machine's Tailscale name to get the command to run on it."}
-    >
-      {added ? (
-        <div className="mt-3 flex flex-col gap-2">
-          <div className="flex items-start gap-2">
-            <pre className="min-w-0 flex-1 overflow-x-auto rounded bg-neutral-950 px-2 py-1.5 text-xs">
-              <code ref={command}>{added.command}</code>
-            </pre>
-            <button type="button" className={button} onClick={() => void copy(added.command)}>
-              {copied === "copied" ? "Copied" : "Copy"}
-            </button>
-          </div>
-          <p className="text-xs text-neutral-500">
-            {copied === "selected" ? "Selected: press Ctrl+C or ⌘C to copy it. " : ""}
-            The code works once and expires in {Math.round(added.expiresInSecs / 60)} minutes.
-          </p>
-          {joined ? (
-            <p role="status" className="text-xs text-emerald-400">
-              {added.name} joined
-            </p>
-          ) : (
-            <p className="text-xs text-neutral-500">Waiting for {added.name} to join…</p>
-          )}
-        </div>
-      ) : (
-        <form
-          className="mt-3 flex flex-col gap-2"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (name.trim() && !add.isPending) add.mutate(name.trim());
-          }}
-        >
-          <label className="text-xs text-neutral-400">
-            Name
-            <input
-              autoFocus
-              autoComplete="off"
-              spellCheck={false}
-              value={name}
-              placeholder="Tailscale name, e.g. trilogy-mac"
-              onChange={(e) => setName(e.target.value)}
-              className={field}
-            />
-          </label>
-          {add.isError && (
-            <p role="alert" className="text-xs text-red-400">
-              {add.error.message}
-            </p>
-          )}
-          <div className="flex justify-end">
-            <button type="submit" className={primaryButton} disabled={!name.trim() || add.isPending}>
-              Add
-            </button>
-          </div>
-        </form>
-      )}
-    </Modal>
-  );
-}
-
-/** Bytes as gigabytes for the card's line: at most three decimals. */
-const gbShown = (bytes: number) => Number((bytes / 1e9).toFixed(3));
-
-/** A machine's limits in a line. */
-const limitsText = (l: Limits) => `At most ${plural(l.max_sessions, "session")} · load ${l.max_load_per_core} per core · ${gbShown(l.min_free_disk)} GB disk free`;
-
-/** What the limits dialog sends: the fields as numbers (a blank one is null, which the daemon refuses), or a clear. */
-type LimitsAction = { fields: { max_sessions: number | null; max_load_per_core: number | null; min_free_disk_gb: number | null } } | "clear";
-
-async function sendLimits({ id, action }: { id: string; action: LimitsAction }): Promise<void> {
-  const { status, json } = action === "clear" ? await post(`/api/machines/${id}/limits/clear`) : await post(`/api/machines/${id}/limits`, action.fields);
-  if (status !== 204) throw refused(status, json);
-}
-
-const asNumber = (text: string) => (text.trim() === "" ? null : Number(text));
-
-/**
- * A listed machine's Limits button and its dialog: three number fields filled from its current
- * limits (the disk in gigabytes) or empty, Save to set them and Clear to remove them. The dialog
- * closes once the daemon takes the change; a refusal shows in it and keeps the values. Opening it
- * fills the fields again from the limits then.
- */
-function LimitsDialog({ machine }: { machine: MachineView }) {
-  const { limits } = machine;
-  const [open, setOpen] = useState(false);
-  const [sessions, setSessions] = useState("");
-  const [load, setLoad] = useState("");
-  const [disk, setDisk] = useState("");
-  const send = useMutation({ mutationFn: sendLimits, onSuccess: () => setOpen(false) });
-  const change = (next: boolean) => {
-    if (next) {
-      setSessions(limits ? String(limits.max_sessions) : "");
-      setLoad(limits ? String(limits.max_load_per_core) : "");
-      setDisk(limits ? String(limits.min_free_disk / 1e9) : "");
-    }
-    send.reset();
-    setOpen(next);
-  };
-  const numberField = (label: string, value: string, set: (text: string) => void, attrs: { min: number | string; step: number | string }) => (
-    <label className="text-xs text-neutral-400">
-      {label}
-      <input type="number" inputMode="decimal" {...attrs} value={value} onChange={(e) => set(e.target.value)} className={field} />
-    </label>
-  );
-  return (
-    <Modal open={open} onOpenChange={change} trigger="Limits" title={machine.name} description="Placement skips this machine while it has this many sessions or more, this load per core or more, or less free disk than this.">
-      <form
-        className="mt-3 flex flex-col gap-2"
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (send.isPending) return;
-          send.mutate({ id: machine.id, action: { fields: { max_sessions: asNumber(sessions), max_load_per_core: asNumber(load), min_free_disk_gb: asNumber(disk) } } });
-        }}
-      >
-        {numberField("Max sessions", sessions, setSessions, { min: 1, step: 1 })}
-        {numberField("Max load per core", load, setLoad, { min: 0, step: "any" })}
-        {numberField("Min free disk (GB)", disk, setDisk, { min: 0, step: "any" })}
-        {send.isError && (
-          <p role="alert" className="text-xs text-red-400">
-            {send.error.message}
-          </p>
-        )}
-        <div className="flex justify-end gap-2">
-          <button type="button" className={button} disabled={!limits || send.isPending} onClick={() => send.mutate({ id: machine.id, action: "clear" })}>
-            Clear
-          </button>
-          <button type="submit" className={primaryButton} disabled={send.isPending}>
-            Save
-          </button>
-        </div>
-      </form>
-    </Modal>
-  );
-}
-
-/** Removes machine `id` from the fleet: every machine then revokes its key and closes its links. */
-async function removeMachine(id: string): Promise<void> {
-  const { status, json } = await post(`/api/machines/${encodeURIComponent(id)}/remove`);
-  if (status !== 204) throw refused(status, json);
-}
-
-/**
- * Another listed machine's Remove from fleet button and its confirmation. Nothing is sent until
- * the person confirms; the dialog closes once the daemon takes it, and a refusal (as when this
- * machine is the one named) shows in it.
- */
-function RemoveDialog({ machine }: { machine: MachineView }) {
-  const [open, setOpen] = useState(false);
-  const remove = useMutation({ mutationFn: removeMachine, onSuccess: () => setOpen(false) });
-  const change = (next: boolean) => {
-    remove.reset();
-    setOpen(next);
-  };
-  return (
-    <Modal
-      open={open}
-      onOpenChange={change}
-      trigger="Remove from fleet"
-      title={`Remove ${machine.name}`}
-      description={`${machine.name} will be cut off from every machine and cannot join again under its current identity. Its workspaces stay on its disk.`}
-    >
-      <div className="mt-3 flex flex-col gap-2">
-        {remove.isError && (
-          <p role="alert" className="text-xs text-red-400">
-            {remove.error.message}
-          </p>
-        )}
-        <div className="flex justify-end gap-2">
-          <button type="button" className={button} onClick={() => change(false)}>
-            Cancel
-          </button>
-          <button type="button" className={dangerButton} disabled={remove.isPending} onClick={() => remove.mutate(machine.id)}>
-            Remove from fleet
-          </button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-/** Renames machine `id` through the daemon, which sends the name to the acting coordinator. */
-async function renameMachine({ id, name }: { id: string; name: string }): Promise<void> {
-  const { status, json } = await post(`/api/machines/${id}/rename`, { name });
-  if (status !== 204) throw refused(status, json);
-}
-
-/**
- * A machine's name, renamed in place. `children` draws the name and is given what opens the
- * field, which starts on the name with all of it selected, or nothing for a machine the machine
- * list does not hold yet, which the daemon cannot rename. Enter sends the name, trimmed, and
- * closes the field once the daemon takes it; the new name shows once it arrives in the settings,
- * on every machine. The name it already has sends nothing. Escape closes it and sends nothing.
- * The field is the shared `NameField`: busy while the name is on its way, a refusal under it.
- * `className` sizes the field's text to the name it stands in for.
- */
-export function MachineName({
-  machine,
-  className,
-  children,
-}: {
-  machine: { id: string; name: string; listed: boolean };
-  className: string;
-  children: (rename: (() => void) | undefined) => ReactNode;
-}) {
-  const [text, setText] = useState<string | null>(null);
-  const rename = useMutation({ mutationFn: renameMachine, onSuccess: () => setText(null) });
-  const close = () => {
-    setText(null);
-    rename.reset();
-  };
-  if (text === null) return <>{children(machine.listed ? () => setText(machine.name) : undefined)}</>;
-  const save = () => {
-    const name = text.trim();
-    if (name === machine.name) return close();
-    if (!rename.isPending) rename.mutate({ id: machine.id, name });
-  };
-  return (
-    <NameField
-      label="Machine name"
-      text={text}
-      onText={setText}
-      busy={rename.isPending}
-      error={rename.isError ? rename.error.message : undefined}
-      onSave={save}
-      onCancel={close}
-      className={className}
-    />
   );
 }
 

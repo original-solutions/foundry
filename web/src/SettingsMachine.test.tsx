@@ -32,9 +32,11 @@ function show(id: string, extra: { records?: AnyRecord[]; given?: SharedSettings
   return renderApp(<SettingsMachine {...pageProps({ state, machines, here: extra.here ?? ME })} machineId={id} />);
 }
 
-const type = (label: string, value: string) => fireEvent.change(screen.getByLabelText(label), { target: { value } });
+/** The input a label names; the review bar's entry for a change carries the same name. */
+const field = (label: string) => screen.getAllByLabelText<HTMLInputElement>(label).find((el) => el.tagName === "INPUT")!;
+const type = (label: string, value: string) => fireEvent.change(field(label), { target: { value } });
 const bar = () => screen.queryByRole("region", { name: "Unsaved changes" });
-const field = (label: string) => screen.getByLabelText<HTMLInputElement>(label);
+const row = (label: string) => field(label).closest("[data-row]") as HTMLElement;
 
 describe("SettingsMachine", () => {
   it("shows its sections in order: the update, the shared settings, then Remove", async () => {
@@ -119,7 +121,7 @@ describe("SettingsMachine", () => {
     type("Max sessions", "0");
     fireEvent.click(screen.getByRole("button", { name: "Save 2 changes" }));
 
-    await waitFor(() => expect(bar()?.textContent).toContain("max_sessions must be at least 1"));
+    await waitFor(() => expect(row("Max sessions").textContent).toContain("max_sessions must be at least 1"));
     expect(bar()?.textContent).toContain("1 change");
     expect(bar()?.textContent).toContain("Max sessions 4 → 0");
     expect(bar()?.textContent).not.toContain("Name laptop");
@@ -272,6 +274,6 @@ describe("SettingsMachine", () => {
     await show("nope");
     expect(screen.getByText("No machine nope in this fleet")).toBeDefined();
     expect(screen.getByRole("link", { name: "Settings → Machines" }).getAttribute("href")).toBe("/settings/machines");
-    expect(screen.queryByLabelText("Name")).toBeNull();
+    expect(screen.queryByRole("textbox")).toBeNull();
   });
 });
