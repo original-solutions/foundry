@@ -9,6 +9,8 @@ const item = (id: string, kind: string, over: Partial<AttentionItem> = {}): Atte
   what: `what of ${id}`,
   todo: `todo of ${kind}`,
   terminal: null,
+  issue_url: null,
+  pr_url: null,
   ...over,
 });
 

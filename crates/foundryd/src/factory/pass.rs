@@ -1603,6 +1603,8 @@ impl<'a, 'w> Pass<'a, 'w> {
                         kind,
                         reason: k.seen.stuck.clone().unwrap_or_default(),
                         workspaces: workspaces_of(&k.seen),
+                        pr_url: k.seen.last_pr.as_ref().map(|pr| pr.url.clone()),
+                        sessions: sessions_of(&k.seen),
                     });
                 }
                 _ if k.info.unreadable || !k.info.confirmed => {}
@@ -1620,13 +1622,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                         gate_retries_used: used,
                         minutes_used: k.seen.worked_ms / 60_000,
                         workspaces: workspaces_of(&k.seen),
-                        sessions: k
-                            .seen
-                            .thread_id
-                            .as_deref()
-                            .and_then(|s| s.parse().ok().map(SessionId))
-                            .into_iter()
-                            .collect(),
+                        sessions: sessions_of(&k.seen),
                         run,
                     });
                 }
@@ -1687,25 +1683,31 @@ impl<'a, 'w> Pass<'a, 'w> {
             for done in of_kind {
                 if labelled.contains(&done.run.run.issue()) {
                     // A finished run's events are read only while a person holds it up. One
-                    // that cannot be read names no workspace; it is still held up, and the
-                    // failed read is logged so a store that keeps failing shows.
-                    let workspaces = self
+                    // that cannot be read names no workspace or session; it is still held up,
+                    // and the failed read is logged so a store that keeps failing shows.
+                    let progress = self
                         .ledger
                         .read(&done.run.run)
                         .inspect_err(|error| {
                             tracing::warn!(
                                 project = %world.project.id,
                                 run = %done.run.run,
-                                "factory: a held-up run's events could not be read, so it names no workspace: {error}"
+                                "factory: a held-up run's events could not be read, so it names no workspace or session: {error}"
                             );
                         })
-                        .map(|events| workspaces_of(&read_progress(&events)))
-                        .unwrap_or_default();
+                        .map(|events| read_progress(&events))
+                        .ok();
                     self.results.held_up.push(HeldUp {
                         run: done.run.run.clone(),
                         kind,
                         reason: done.reason.clone().unwrap_or_default(),
-                        workspaces,
+                        workspaces: progress.as_ref().map(workspaces_of).unwrap_or_default(),
+                        pr_url: progress
+                            .as_ref()
+                            .and_then(|seen| seen.last_pr.as_ref())
+                            .map(|pr| pr.url.clone())
+                            .or_else(|| done.run.pr_url.clone()),
+                        sessions: progress.as_ref().map(sessions_of).unwrap_or_default(),
                     });
                 }
             }
@@ -1787,6 +1789,15 @@ impl PassResults {
     fn live(&mut self, run: LiveRun) {
         self.runs.push(run);
     }
+}
+
+/// The session a run's progress says it launched last, as a list of at most one.
+fn sessions_of(seen: &super::runs::progress::Seen) -> Vec<SessionId> {
+    seen.thread_id
+        .as_deref()
+        .and_then(|s| s.parse().ok().map(SessionId))
+        .into_iter()
+        .collect()
 }
 
 /// The workspaces a run's progress names, oldest first: the build workspace, then each resume and
@@ -5246,6 +5257,8 @@ mod tests {
                     kind: HeldUpKind::Stuck,
                     reason: "the gate failed 3 times".into(),
                     workspaces: vec![workspace_of(5, 1)],
+                    pr_url: None,
+                    sessions: vec![],
                 }]
             );
         }
@@ -5263,6 +5276,8 @@ mod tests {
                     kind: HeldUpKind::NeedsInfo,
                     reason: "Which login?".into(),
                     workspaces: vec![workspace_of(5, 1)],
+                    pr_url: None,
+                    sessions: vec![],
                 }]
             );
         }
@@ -5285,6 +5300,8 @@ mod tests {
                     kind: HeldUpKind::Stuck,
                     reason: "the gate failed 3 times".into(),
                     workspaces: vec![],
+                    pr_url: None,
+                    sessions: vec![],
                 }]
             );
         }
@@ -5312,6 +5329,139 @@ mod tests {
             assert_eq!(held.len(), 1, "{held:?}");
             assert_eq!(held[0].run, run);
             assert_eq!(held[0].workspaces, vec![workspace_of(5, 1)]);
+        }
+
+        const PR: &str = "https://github.com/o/foundry/pull/40";
+        const FINISHED_PR: &str = "https://github.com/o/foundry/pull/41";
+
+        fn thread_of(issue: u64) -> SessionId {
+            SessionId(uuid::Uuid::from_u128(0xd000 + u128::from(issue)))
+        }
+
+        /// A stuck run of `issue` that launched [`thread_of`] and, when `opened`, reported
+        /// [`PR`]; when `finished` it ended with `finished_pr` on its `finished` event.
+        fn stuck_run_reporting(
+            rig: &Rig,
+            issue: u64,
+            opened: bool,
+            finished: Option<Option<&str>>,
+        ) -> RunId {
+            let run = rig.run_in(issue, 1, State::Building);
+            let cause = Cause::new(CauseStep::Start, "test");
+            let mut events = vec![
+                Event::StepChanged {
+                    step: format!("workspace-created {}", workspace_of(issue, 1)),
+                },
+                Event::SessionLaunched {
+                    thread_id: thread_of(issue).to_string(),
+                    worktree: None,
+                    branch: Some(format!("fac/{issue}-1")),
+                    model_instance: None,
+                    model: None,
+                    model_options: None,
+                    resumed_from: None,
+                    base: Some("main".into()),
+                    title: None,
+                },
+            ];
+            if opened {
+                events.push(Event::PrOpened {
+                    pr: 40,
+                    url: PR.into(),
+                });
+            }
+            events.push(Event::StateChanged {
+                from: State::Building,
+                to: State::Stuck,
+            });
+            if let Some(pr_url) = finished {
+                events.push(Event::Stuck {
+                    reason: "no".into(),
+                    branch: None,
+                    commits_ahead: None,
+                });
+                events.push(Event::Finished {
+                    outcome: Outcome::Stuck,
+                    total_ms: 0,
+                    gate_attempts: 0,
+                    review_cycles: None,
+                    pr_url: pr_url.map(str::to_owned),
+                    pr_end: None,
+                });
+            }
+            for event in events {
+                rig.ledger.write(&run, &event, &cause).unwrap();
+            }
+            run
+        }
+
+        fn held_of(rig: &mut Rig, issue: u64) -> HeldUp {
+            rig.hub.issue(issue, &["factory:stuck"]);
+            rig.pass();
+            let held = rig.status().held_up;
+            assert_eq!(held.len(), 1, "{held:?}");
+            held.into_iter().next().unwrap()
+        }
+
+        #[test]
+        fn a_live_stuck_run_names_its_pull_request_and_session() {
+            let mut rig = Rig::new();
+            stuck_run_reporting(&rig, 5, true, None);
+            let held = held_of(&mut rig, 5);
+            assert_eq!(held.pr_url.as_deref(), Some(PR));
+            assert_eq!(held.sessions, vec![thread_of(5)]);
+        }
+
+        #[test]
+        fn a_live_stuck_run_that_reported_no_pull_request_names_none() {
+            let mut rig = Rig::new();
+            stuck_run_reporting(&rig, 5, false, None);
+            let held = held_of(&mut rig, 5);
+            assert_eq!(held.pr_url, None);
+            assert_eq!(held.sessions, vec![thread_of(5)]);
+        }
+
+        #[test]
+        fn a_finished_stuck_run_names_its_pull_request_and_session() {
+            let mut rig = Rig::new();
+            stuck_run_reporting(&rig, 5, true, Some(Some(FINISHED_PR)));
+            let held = held_of(&mut rig, 5);
+            assert_eq!(held.pr_url.as_deref(), Some(PR), "the events win");
+            assert_eq!(held.sessions, vec![thread_of(5)]);
+        }
+
+        #[test]
+        fn a_finished_stuck_run_with_no_reported_pull_request_falls_back_to_its_finished_one() {
+            let mut rig = Rig::new();
+            stuck_run_reporting(&rig, 5, false, Some(Some(FINISHED_PR)));
+            let held = held_of(&mut rig, 5);
+            assert_eq!(held.pr_url.as_deref(), Some(FINISHED_PR));
+            assert_eq!(held.sessions, vec![thread_of(5)]);
+        }
+
+        /// A finished run whose events cannot be read keeps the pull request it finished with.
+        #[test]
+        fn a_held_up_run_whose_events_cannot_be_read_keeps_its_finished_pull_request() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = stuck_run_reporting(&rig, 5, false, Some(Some(FINISHED_PR)));
+            rig.pass();
+            super::a_run_this_build_cannot_read::unreadable_row(&rig, &run);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            let held = rig.status().held_up;
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert_eq!(held[0].pr_url.as_deref(), Some(FINISHED_PR));
+            assert!(held[0].workspaces.is_empty() && held[0].sessions.is_empty());
+        }
+
+        #[test]
+        fn a_finished_stuck_run_with_no_pull_request_at_all_names_none() {
+            let mut rig = Rig::new();
+            stuck_run_reporting(&rig, 5, false, Some(None));
+            let held = held_of(&mut rig, 5);
+            assert_eq!(held.pr_url, None);
+            assert_eq!(held.sessions, vec![thread_of(5)]);
         }
 
         /// A machine the builder's runs move to in a round.
@@ -5718,6 +5868,8 @@ mod tests {
                     kind: HeldUpKind::Stuck,
                     reason: "the gate failed 3 times".into(),
                     workspaces: vec![workspace_of(300, 1)],
+                    pr_url: None,
+                    sessions: vec![],
                 }]
             );
         }

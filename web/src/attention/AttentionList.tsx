@@ -151,12 +151,22 @@ function Line({ item, group, settling }: { item: AttentionItem; group: Attention
   );
 }
 
-/** Whether the item has a terminal to open or a button of its own. */
-const acts = (item: AttentionItem) => item.terminal !== null || dismissable(item) || closable(item);
+/** Whether the item has a link or terminal to open or a button of its own. */
+const acts = (item: AttentionItem) => item.issue_url !== null || item.pr_url !== null || item.terminal !== null || dismissable(item) || closable(item);
 
 function Actions({ item, settling }: { item: AttentionItem; settling: Settling }) {
   return (
     <>
+      {item.issue_url && (
+        <a href={item.issue_url} target="_blank" rel="noreferrer" className="text-sky-400 hover:text-sky-300">
+          Issue
+        </a>
+      )}
+      {item.pr_url && (
+        <a href={item.pr_url} target="_blank" rel="noreferrer" className="text-sky-400 hover:text-sky-300">
+          Pull request
+        </a>
+      )}
       {item.terminal && (
         <Link to="/terminals/$terminalId" params={{ terminalId: item.terminal }} className="text-sky-400 hover:text-sky-300">
           Open terminal
