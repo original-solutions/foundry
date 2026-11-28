@@ -1,7 +1,9 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it } from "vitest";
-import { KeySheet, useHelpKey } from "./KeySheet";
+import { KeySheet, keyGroups, useHelpKey } from "./KeySheet";
+import { SettingsKeyboard } from "./SettingsKeyboard";
+import { pageProps } from "./test-utils";
 
 function Harness() {
   const [open, setOpen] = useState(false);
@@ -62,3 +64,20 @@ describe("KeySheet", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 });
+
+describe("keyGroups", () => {
+  it("lists ⌘, for Settings under Anywhere", () => {
+    const anywhere = keyGroups.find((g) => g.where === "Anywhere")!;
+    expect(anywhere.keys.find(([, what]) => what === "Settings")?.[0].slice(1)).toEqual([","]);
+  });
+});
+
+describe("SettingsKeyboard", () => {
+  it("renders every group of keyGroups, read-only", () => {
+    render(<SettingsKeyboard {...pageProps()} />);
+    for (const group of keyGroups) expect(screen.getByRole("heading", { name: group.where })).toBeDefined();
+    expect(screen.getByText("Settings")).toBeDefined();
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+});
+

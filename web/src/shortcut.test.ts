@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { isShortcut } from "./shortcut";
+import { fireEvent, renderHook } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { isShortcut, typing, useSettingsKey } from "./shortcut";
 
 /** A keydown on `target` (the page, or inside the terminal). */
 function press(key: string, mods: { metaKey?: boolean; ctrlKey?: boolean; altKey?: boolean; shiftKey?: boolean } = {}, target: Element = document.body) {
@@ -34,5 +35,68 @@ describe("isShortcut", () => {
     expect(isShortcut(press("j", { metaKey: true }), "k")).toBe(false);
     expect(isShortcut(press("k", { metaKey: true, altKey: true }), "k")).toBe(false);
     expect(isShortcut(press("k", { metaKey: true, shiftKey: true }), "k")).toBe(false);
+  });
+});
+
+describe("typing", () => {
+  it("is true in a field, a select, an editable element and the terminal, and not elsewhere", () => {
+    const field = document.createElement("input");
+    expect(typing(field)).toBe(true);
+    expect(typing(document.createElement("select"))).toBe(true);
+    expect(typing(terminal())).toBe(true);
+    const editable = document.createElement("div");
+    Object.defineProperty(editable, "isContentEditable", { value: true });
+    expect(typing(editable)).toBe(true);
+    expect(typing(document.createElement("button"))).toBe(false);
+    expect(typing(document.body)).toBe(false);
+    expect(typing(null)).toBe(false);
+  });
+});
+
+describe("useSettingsKey", () => {
+  /** The key pressed at `target`, with the hook mounted on `run`. */
+  function mounted(run: () => void) {
+    const task = document.createElement("input");
+    const inTerminal = terminal();
+    document.body.append(task, inTerminal.parentElement!);
+    const view = renderHook(() => useSettingsKey(run));
+    return {
+      task,
+      inTerminal,
+      done: () => {
+        view.unmount();
+        task.remove();
+        inTerminal.parentElement!.remove();
+      },
+    };
+  }
+
+  it("runs on Cmd+, and on Ctrl+, from the page", () => {
+    const run = vi.fn();
+    const { done } = mounted(run);
+    fireEvent.keyDown(document.body, { key: ",", metaKey: true });
+    fireEvent.keyDown(document.body, { key: ",", ctrlKey: true });
+    expect(run).toHaveBeenCalledTimes(2);
+    done();
+  });
+
+  it("does not run on the key alone, or with Alt or Shift", () => {
+    const run = vi.fn();
+    const { done } = mounted(run);
+    fireEvent.keyDown(document.body, { key: "," });
+    fireEvent.keyDown(document.body, { key: ",", metaKey: true, altKey: true });
+    fireEvent.keyDown(document.body, { key: ",", metaKey: true, shiftKey: true });
+    expect(run).not.toHaveBeenCalled();
+    done();
+  });
+
+  it("does not run while a text field or a terminal has focus", () => {
+    const run = vi.fn();
+    const { task, inTerminal, done } = mounted(run);
+    fireEvent.keyDown(task, { key: ",", metaKey: true });
+    fireEvent.keyDown(inTerminal, { key: ",", metaKey: true });
+    fireEvent.keyDown(inTerminal, { key: ",", ctrlKey: true });
+    expect(run).not.toHaveBeenCalled();
+    done();
   });
 });
