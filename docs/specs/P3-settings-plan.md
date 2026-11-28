@@ -14,7 +14,7 @@
 
 - P1's and P2's constraints still hold: one binary, Tailscale and localhost only, a machine writes only its own records, secrets in no log, error, record or API response, no `unsafe` without `// SAFETY:`.
 - Tests first. No production change without a failing test before it.
-- The gate, from the repo root after `npm --prefix web ci && npm --prefix web run build`: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `npm --prefix web run check`. Issue 1 also runs `npm --prefix web run e2e`.
+- The gate is the one in `AGENTS.md`. Issue 1 also runs `npm --prefix web run e2e`.
 - Edit only the files your issue names. Issue 1 makes every new web file the later issues fill.
 - New wire fields are `#[serde(default)]` on the Rust side and optional on the TypeScript side. A record or message written before this plan still parses, and so does one from a later build.
 - A secret's value is never echoed. Every refusal on the new routes is a fixed sentence.
