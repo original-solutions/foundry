@@ -119,8 +119,8 @@ import { SettingsPage } from "./SettingsPage";
  *
  * Settings (`/settings`, `/settings/$category`, `/settings/machines/$machine`) takes the place of the
  * board: categories on the left in two groups, Fleet (Factory, Projects, Machines) and This browser
- * (Notifications, Appearance, Keyboard), each with a line of its current values, and the chosen
- * category's page on the right. Changes to shared settings collect in a review bar and are saved
+ * (Notifications, Appearance, Keyboard), each but Keyboard with a line of its current values (hidden
+ * below 720px, where the nav is one row of categories), and the chosen category's page on the right. Changes to shared settings collect in a review bar and are saved
  * together; a browser setting saves as it changes. A gear beside the theme button in the sidebar and
  * the rail, Cmd+, (Ctrl+, off macOS) outside a field or the terminal, and the jump palette's
  * "Settings" and "Settings: {category}" entries all open it.
