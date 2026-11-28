@@ -1133,6 +1133,87 @@ async fn a_start_leaves_in_removing_what_it_cannot_tell_was_archived() {
 }
 
 #[tokio::test]
+async fn a_start_puts_back_the_folder_of_a_live_workspace_git_already_forgot() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "forgot").await;
+    let worktree = setup.worktree(remote.project, "forgot");
+    std::fs::write(worktree.join("notes.txt"), "mine").unwrap();
+    // As an archive leaves it when the daemon stops after git forgot the worktree and before
+    // the record says archived.
+    let aside = removing(&setup).join(id.to_string());
+    std::fs::create_dir_all(removing(&setup)).unwrap();
+    std::fs::rename(&worktree, &aside).unwrap();
+    let clone = setup.clone_of(remote.project);
+    git(&clone, &["worktree", "prune"]);
+    assert!(!git(&clone, &["worktree", "list", "--porcelain"]).contains(&id.to_string()));
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("notes.txt")).unwrap(),
+        "mine"
+    );
+    assert!(!aside.exists());
+    assert!(!setup.record(id).unwrap().deleted);
+}
+
+/// The sweep's one deadline covers what archives left in removing/ too: one it cannot get
+/// through in time is left for the next start, with a WARN line saying so.
+#[tokio::test]
+async fn sweep_leaves_removing_to_the_next_start_at_its_deadline() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "late").await;
+    let worktree = setup.worktree(remote.project, "late");
+    let aside = removing(&setup).join(id.to_string());
+    std::fs::create_dir_all(removing(&setup)).unwrap();
+    std::fs::rename(&worktree, &aside).unwrap();
+    let logs = Logged::default();
+    let _guard = logs.capture();
+
+    setup.workspaces.inner.sweep(Duration::ZERO).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(aside.join("README.md").exists());
+    assert!(!worktree.exists());
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("removing/"))
+        .unwrap_or_else(|| panic!("no line names removing/: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("next start"), "{line}");
+}
+
+/// A worktree that cannot be moved aside, here as `removing` is a file, is removed where it
+/// is, as before: by git, or for a forced detached folder, outright.
+#[tokio::test]
+async fn an_archive_that_cannot_move_aside_removes_the_worktree_where_it_is() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let plain = setup.create(&remote, "main", "plain").await;
+    let adrift = setup.create(&remote, "main", "adrift").await;
+    let worktree = setup.worktree(remote.project, "plain");
+    let detached = detach(&setup, remote.project, "adrift");
+    std::fs::write(removing(&setup), "not a folder").unwrap();
+
+    setup.workspaces.archive(plain, false).await.unwrap();
+    setup.workspaces.archive(adrift, true).await.unwrap();
+
+    let clone = setup.clone_of(remote.project);
+    let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
+    for (id, folder, branch) in [(plain, &worktree, "plain"), (adrift, &detached, "adrift")] {
+        assert!(!folder.exists(), "{}", folder.display());
+        assert!(setup.record(id).unwrap().deleted);
+        assert!(!worktrees.contains(&id.to_string()), "{worktrees}");
+        let branches = git(&clone, &["branch", "--list", branch]);
+        assert!(branches.contains(branch), "the branch is kept: {branches}");
+    }
+    assert!(removing(&setup).is_file());
+}
+
+#[tokio::test]
 async fn an_archive_git_will_not_remove_leaves_the_worktree_where_it_was() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);

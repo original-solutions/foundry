@@ -770,10 +770,9 @@ impl Workspaces {
     /// clone that cannot be read or whose worktrees cannot be listed is passed over, each with
     /// a log line. After [`SWEEP_WITHIN`] in all it stops where it is, says which clone it
     /// stopped in, and leaves the rest for the next start.
-    /// It also settles what an archive moved aside and did not finish with
-    /// ([`Inner::delete_moved_aside`]).
+    /// It first settles what an archive moved aside and did not finish with
+    /// ([`Inner::delete_moved_aside`]), within the same deadline.
     pub async fn sweep(&self) -> Result<(), WorkspaceError> {
-        self.inner.delete_moved_aside().await;
         self.inner.sweep(SWEEP_WITHIN).await
     }
 }
@@ -1527,6 +1526,16 @@ impl Inner {
 
     async fn sweep(&self, within: Duration) -> Result<(), WorkspaceError> {
         let deadline = tokio::time::Instant::now() + within;
+        if tokio::time::timeout_at(deadline, self.delete_moved_aside())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                folder = %self.data.join(REMOVING).display(),
+                "the sweep ran out of time settling removing/; what is left there waits for the \
+                 next start"
+            );
+        }
         // Every owner's records count: the machine's identity can be made again while its data
         // directory stays, and a record only ever keeps a worktree. Projects come from the
         // settings, as a create's do, so a store made again removes nothing until settings reach
