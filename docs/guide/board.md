@@ -17,7 +17,7 @@ The colours keep clear of the state colours, so a face never reads as a state. E
 Each workspace is one card. The coloured bar on its left edge takes the colour of its most urgent terminal.
 
 - **Title.** The workspace name. Click it to open its most urgent terminal. Below it, the project and the branch, led by the project's face. A workspace that sits on a commit, with no branch, shows the first 7 characters of that commit instead, such as `demo · fedcba9`.
-- **Factory mark.** A workspace the factory builds in has a violet **factory #N** after its name, where N is the issue it builds. Click it to open the issue on GitHub. Its line in the sidebar, and in the board's list, has the same mark.
+- **Factory mark.** A workspace the factory builds in has a violet **factory #N** after its name, where N is the issue it builds. Click it to open the issue on GitHub. Its line in the board's list has the same mark. In the sidebar the mark is short, **#N**, since the workspace's name already says it is a factory task.
 - **Machine name.** Shown at the right of the title when the fleet has more than one machine.
 - **Terminals.** One row per session or shell, most urgent first. A row has its state glyph, its name, and its state label. For a session on this machine, the row also has the title it took from its first prompt, and underneath what it is doing right now, such as "Edit src/auth/redirect.ts" or the question it asked you. Click a row to open that terminal. A card shows four rows, then "+N more". A workspace with none says "No terminals".
 - **What Claude said.** When a session on this machine is **Ready** or **Ended**, what Claude said at the end of its last turn shows under its row, three lines at a time. Click it to read it all.
@@ -120,7 +120,7 @@ The sidebar is the same fleet as a list. It sits at the left on a wide screen. F
 
 A folded workspace is one row: its project's face, its name and a strip of state glyphs, most urgent first. The strip shows six, then "+N". Click a glyph to open that terminal. Click the face or the name to unfold.
 
-Under its name, a folded workspace shows its project, then where its work stands, such as "Draft PR #307 · Checks running", "Building", "Pushed · No PR yet" or "PR #9 merged", the pull request a link to it on GitHub. An unfolded workspace shows the same line, then its branch with a row of actions, and every terminal with its state label and what it is doing.
+Under its name, a folded workspace shows its project, then where its work stands, such as "Draft PR #307 · Checks running", "Building", "Pushed · No PR yet" or "PR #9 merged", the pull request a link to it on GitHub. An unfolded workspace ends that line with its branch, or its commit when it has no branch, unless the branch is the workspace's own name, as a factory task's is. Under that line come its terminals, each with its state label and what it is doing.
 
 A thin bar hangs from each workspace's face to its bottom, folded or not, so you can see where one workspace ends and the next begins. It takes the colour of the workspace's most urgent terminal, the same colour as the bar on its board card.
 
@@ -130,7 +130,7 @@ The workspace you are in unfolds by itself and folds again when you leave. One y
 
 ### A workspace's actions
 
-Point at an unfolded workspace and a row of buttons shows at the right of its branch line. On a touch screen they are always shown.
+Point at an unfolded workspace and a row of buttons shows on its name's line, after the name and before any factory mark. On a touch screen they are always shown.
 
 - **Changes.** Opens the changes sheet.
 - **New session.** Asks for a model and a first prompt, then starts Claude Code in this workspace.
