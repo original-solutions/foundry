@@ -1603,6 +1603,8 @@ impl<'a, 'w> Pass<'a, 'w> {
                         kind,
                         reason: k.seen.stuck.clone().unwrap_or_default(),
                         workspaces: workspaces_of(&k.seen),
+                        pr_url: k.seen.last_pr.as_ref().map(|pr| pr.url.clone()),
+                        sessions: sessions_of(&k.seen),
                     });
                 }
                 _ if k.info.unreadable || !k.info.confirmed => {}
@@ -1620,13 +1622,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                         gate_retries_used: used,
                         minutes_used: k.seen.worked_ms / 60_000,
                         workspaces: workspaces_of(&k.seen),
-                        sessions: k
-                            .seen
-                            .thread_id
-                            .as_deref()
-                            .and_then(|s| s.parse().ok().map(SessionId))
-                            .into_iter()
-                            .collect(),
+                        sessions: sessions_of(&k.seen),
                         run,
                     });
                 }
@@ -1689,7 +1685,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                     // A finished run's events are read only while a person holds it up. One
                     // that cannot be read names no workspace; it is still held up, and the
                     // failed read is logged so a store that keeps failing shows.
-                    let workspaces = self
+                    let progress = self
                         .ledger
                         .read(&done.run.run)
                         .inspect_err(|error| {
@@ -1699,13 +1695,19 @@ impl<'a, 'w> Pass<'a, 'w> {
                                 "factory: a held-up run's events could not be read, so it names no workspace: {error}"
                             );
                         })
-                        .map(|events| workspaces_of(&read_progress(&events)))
-                        .unwrap_or_default();
+                        .map(|events| read_progress(&events))
+                        .ok();
                     self.results.held_up.push(HeldUp {
                         run: done.run.run.clone(),
                         kind,
                         reason: done.reason.clone().unwrap_or_default(),
-                        workspaces,
+                        workspaces: progress.as_ref().map(workspaces_of).unwrap_or_default(),
+                        pr_url: progress
+                            .as_ref()
+                            .and_then(|seen| seen.last_pr.as_ref())
+                            .map(|pr| pr.url.clone())
+                            .or_else(|| done.run.pr_url.clone()),
+                        sessions: progress.as_ref().map(sessions_of).unwrap_or_default(),
                     });
                 }
             }
@@ -1787,6 +1789,15 @@ impl PassResults {
     fn live(&mut self, run: LiveRun) {
         self.runs.push(run);
     }
+}
+
+/// The session a run's progress says it launched last, as a list of at most one.
+fn sessions_of(seen: &super::runs::progress::Seen) -> Vec<SessionId> {
+    seen.thread_id
+        .as_deref()
+        .and_then(|s| s.parse().ok().map(SessionId))
+        .into_iter()
+        .collect()
 }
 
 /// The workspaces a run's progress names, oldest first: the build workspace, then each resume and

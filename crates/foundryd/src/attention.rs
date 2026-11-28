@@ -146,6 +146,10 @@ pub struct Item {
     pub todo: String,
     /// The terminal to open to act on it, when there is one.
     pub terminal: Option<TerminalId>,
+    /// The GitHub issue of the run it is about, when it is about a run.
+    pub issue_url: Option<String>,
+    /// The pull request the run reported, when it did.
+    pub pr_url: Option<String>,
 }
 
 /// What every source reads: the records held from every owner, the shared settings, the
@@ -185,6 +189,8 @@ impl Fleet {
             what,
             todo,
             terminal: None,
+            issue_url: None,
+            pr_url: None,
         }
     }
 }
@@ -586,6 +592,26 @@ fn factory_items(
         .quiet
         .map(|quiet| quiet.of(&fleet.settings, &on.iter().map(|p| p.project.id).collect()))
         .unwrap_or_default();
+    // The terminal of each session whose record is held and not deleted, when that terminal is
+    // not closed: the checks the "session failed" row makes.
+    let mut closed: BTreeSet<TerminalId> = BTreeSet::new();
+    for record in &fleet.records {
+        if let AnyRecord::Terminal(r) = record
+            && r.deleted
+        {
+            closed.insert(r.body.id);
+        }
+    }
+    let open_sessions: BTreeMap<SessionId, TerminalId> = fleet
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            AnyRecord::Session(r) if !r.deleted && !closed.contains(&r.body.terminal) => {
+                Some((r.body.id, r.body.terminal))
+            }
+            _ => None,
+        })
+        .collect();
     let mut items = Vec::new();
     for &OnProject { project, believed } in on {
         let quiet = quiet
@@ -611,16 +637,26 @@ fn factory_items(
                     "Answer them in a comment on the issue",
                 ),
             };
-            items.push(fleet.item(
+            let mut item = fleet.item(
                 kind,
                 &held.run,
                 writer,
                 format!("{what}: {}", redact(&held.reason)),
                 todo.to_owned(),
-            ));
+            );
+            item.issue_url = Some(issue_url(&held.run));
+            item.pr_url = held
+                .pr_url
+                .clone()
+                .filter(|url| url.starts_with("https://github.com/"));
+            item.terminal = held
+                .sessions
+                .iter()
+                .find_map(|id| open_sessions.get(id).copied());
+            items.push(item);
         }
         for run in &status.gate_infra {
-            items.push(fleet.item(
+            let mut item = fleet.item(
                 Kind::GateInfra,
                 run,
                 writer,
@@ -632,7 +668,9 @@ fn factory_items(
                  disk and can fetch the repo; the factory tries the gate again after 1, 2, 4 and \
                  8 passes"
                     .to_owned(),
-            ));
+            );
+            item.issue_url = Some(issue_url(run));
+            items.push(item);
         }
         for claim in &status.foreign {
             items.push(fleet.item(
@@ -655,6 +693,11 @@ fn factory_items(
         }
     }
     items
+}
+
+/// The GitHub page of `run`'s issue.
+fn issue_url(run: &RunId) -> String {
+    format!("https://github.com/{}/issues/{}", run.repo(), run.issue())
 }
 
 /// `owner/name#N` of `run`'s issue.
