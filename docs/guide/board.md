@@ -120,7 +120,7 @@ The sidebar is the same fleet as a list. It sits at the left on a wide screen. F
 
 A folded workspace is one row: its project's face, its name and a strip of state glyphs, most urgent first. The strip shows six, then "+N". Click a glyph to open that terminal. Click the face or the name to unfold.
 
-Under its name, a folded workspace shows its project, then where its work stands, such as "Draft PR #307 · Checks running", "Building", "Pushed · No PR yet" or "PR #9 merged", the pull request a link to it on GitHub. An unfolded workspace ends that line with its branch, or its commit when it has no branch, unless the branch is the workspace's own name, as a factory task's is. Under that line come its terminals, each with its state label and what it is doing.
+Under its name, a folded workspace shows its project, then where its work stands, such as "Draft PR #307 · Checks running", "Building", "Pushed · No PR yet" or "PR #9 merged", the pull request a link to it on GitHub. An unfolded workspace ends that line with its branch, or its commit when it has no branch, unless the branch is the workspace's own name, as a factory task's is. Under that line come its terminals, one line each: the state glyph, the name, then what the session is doing right now, such as "Edit src/auth/redirect.ts" or the question it asks you, or, with nothing in flight, its title (the name you gave it, or its first prompt), and last the state label. While the step shows, point at the row to read the title.
 
 A thin bar hangs from each workspace's face to its bottom, folded or not, so you can see where one workspace ends and the next begins. It takes the colour of the workspace's most urgent terminal, the same colour as the bar on its board card.
 
