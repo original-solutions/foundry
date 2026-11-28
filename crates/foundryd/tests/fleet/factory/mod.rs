@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use foundry_proto::factory::{
@@ -79,6 +79,37 @@ pub const WAIT: Duration = Duration::from_secs(120);
 
 /// How long a whole test may run in its child process.
 const CHILD_WAIT: Duration = Duration::from_secs(300);
+
+/// How many child processes run at once. Each runs three daemons, and the factory's limits are
+/// on a clock ten times as fast as the wall clock, so a child slowed by the others sees its
+/// steps take ten times as long on the factory's clock.
+const AT_ONCE: usize = 6;
+
+/// One of the [`AT_ONCE`] places a child process runs in, held until it is dropped.
+struct Place;
+
+static PLACES: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+impl Place {
+    /// Waits for a free place and takes it.
+    fn take() -> Place {
+        let (taken, freed) = &PLACES;
+        let mut taken = lock(taken);
+        while *taken >= AT_ONCE {
+            taken = freed.wait(taken).unwrap_or_else(PoisonError::into_inner);
+        }
+        *taken += 1;
+        Place
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let (taken, freed) = &PLACES;
+        *lock(taken) -= 1;
+        freed.notify_one();
+    }
+}
 
 /// Names the test a child process runs.
 const CHILD: &str = "FOUNDRY_FLEET_FACTORY_TEST";
@@ -151,10 +182,7 @@ where
         ),
     )
     .unwrap();
-    // One child at a time: each runs three daemons, and the factory's limits are on a clock
-    // ten times as fast as the wall clock.
-    static ALONE: Mutex<()> = Mutex::new(());
-    let _alone = lock(&ALONE);
+    let _place = Place::take();
     let path = format!(
         "{}:{}",
         bin.display(),

@@ -1,12 +1,14 @@
-# CI runs the Rust tests with cargo-nextest, split across runners (.github/workflows/check.yml).
-# The factory gate runs them with `cargo test`.
+# The Rust tests run with cargo-nextest: in the factory gate (.dw/config.yml) and on CI, split
+# across runners (.github/workflows/check.yml).
 
 [test-groups]
 # Each fleet factory test runs three daemons in a child process on a clock ten times as fast as the
-# wall clock. Under `cargo test` a mutex in tests/fleet/factory/mod.rs runs one child at a time;
-# nextest runs every test in a process of its own, so this group does the same.
-fleet-factory = { max-threads = 1 }
+# wall clock. Under `cargo test`, `AT_ONCE` in tests/fleet/factory/mod.rs bounds how many children
+# run at once; nextest runs every test in a process of its own, so this group does the same.
+fleet-factory = { max-threads = 6 }
 
 [[profile.default.overrides]]
 filter = 'binary(fleet) & test(/^factory::/)'
 test-group = 'fleet-factory'
+# The longest tests: started first, they run beside the rest instead of after it.
+priority = 100
