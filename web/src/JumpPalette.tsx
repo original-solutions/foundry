@@ -375,7 +375,9 @@ function Panel({
           <>
             <span>↵ do it</span>
             <span>esc back</span>
-            <span className="ml-auto">{target?.label}</span>
+            <span title={target?.fullLabel} className="ml-auto">
+              {target?.label}
+            </span>
           </>
         ) : (
           <>

@@ -39,6 +39,8 @@ interface Lane {
   workspace: string;
   glyph: Glyph;
   label: string;
+  /** The label uncut, when it cuts its factory run's reason short. */
+  fullLabel?: string;
   bars: Bar[];
   /** When its turns in the window stood waiting on you. */
   waits: Wait[];
@@ -229,7 +231,7 @@ function LaneRow({
       <button
         type="button"
         onClick={() => onSteps(lane.terminal)}
-        title={`${named}: ${lane.label}`}
+        title={`${named}: ${lane.fullLabel ?? lane.label}`}
         className="flex min-w-0 items-center gap-2 py-1.5 pr-3 pl-4 text-left text-sm text-neutral-200"
       >
         <StateGlyph glyph={lane.glyph} />
@@ -238,7 +240,10 @@ function LaneRow({
             <Named name={lane.name} title={lane.title} />
           </span>
           <span className="block truncate text-[11px] text-neutral-500">
-            {lane.workspace} · <span className={glyphText[lane.glyph]}>{lane.label}</span>
+            {lane.workspace} ·{" "}
+            <span title={lane.fullLabel} className={glyphText[lane.glyph]}>
+              {lane.label}
+            </span>
             {waitingNow && <span className={glyphText[lane.glyph]}>{` for ${took(now - waitingNow.start)}`}</span>}
           </span>
         </span>

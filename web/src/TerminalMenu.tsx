@@ -361,7 +361,9 @@ function EndDialog({ id, found, onDone }: { id: string; found: Located; onDone: 
         <span className="truncate">
           {found.workspace.name} / {found.title ?? found.name}
         </span>
-        <span className="ml-auto shrink-0 text-neutral-500">{found.label}</span>
+        <span title={found.fullLabel} className="ml-auto shrink-0 text-neutral-500">
+          {found.label}
+        </span>
       </p>
       {end.isError && (
         <p role="alert" className="mt-2 text-xs text-red-400">

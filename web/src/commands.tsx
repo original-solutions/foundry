@@ -109,7 +109,7 @@ export function useCommands({ screen, next, onNext, onCreate, onKeys, sidebar }:
             key: "next",
             title: "Next that needs you",
             group: "Do" as const,
-            about: `${next.next.workspace} / ${next.next.name}: ${next.next.label}.`,
+            about: `${next.next.workspace} / ${next.next.name}: ${next.next.fullLabel ?? next.next.label}.`,
             also: "needs you waiting answer",
             hint: `${needs} ${needs === 1 ? "needs" : "need"} you`,
             keys: nextKey,

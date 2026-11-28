@@ -2016,6 +2016,33 @@ describe("App", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("shows a held-up run's whole reason on hover in the palette's actions and the End dialog", async () => {
+    mockActions();
+    const reason = "gate red: make check fails on main, see the gate log";
+    const records = live.records.map((r) => (r.kind === "session" && r.body.id === "s1" ? session(ME, "s1", "w1", "t1", "idle", { model: "sonnet" }) : r));
+    await open("/terminals/t1", { ...live, records });
+    const events = sockets("/api/events").at(-1)!;
+    const held = { run: "original-solutions__foundry__170__1", kind: "stuck", reason, workspaces: ["w1"] };
+    act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: { ...heldStatus(2), held_up: [held] } })));
+    const cut = "Stuck · gate red: make check…";
+
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Jump to" });
+    const input = within(palette).getByRole("combobox");
+    fireEvent.change(input, { target: { value: "login sonnet" } });
+    fireEvent.keyDown(input, { key: "Tab" });
+    expect(within(palette).getByRole("listbox", { name: "Actions for fix login / sonnet" })).toBeDefined();
+    expect(within(palette).getByText(cut, { selector: ".ml-auto" }).getAttribute("title")).toBe(`Stuck · ${reason}`);
+    fireEvent.keyDown(input, { key: "Escape" });
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull());
+
+    fireEvent.keyDown(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "More" }), { key: "Enter" });
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "End sonnet…" }));
+    const end = await screen.findByRole("dialog", { name: "End sonnet?" });
+    expect(within(end).getByText(cut).getAttribute("title")).toBe(`Stuck · ${reason}`);
+  });
+
   it("acts on a pick from the palette: Tab lists what can be done with it, typing narrows the list and Enter does it", async () => {
     mockActions();
     await open("/terminals/t1", live);

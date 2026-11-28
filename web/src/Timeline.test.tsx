@@ -2,8 +2,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AnyRecord, Mark, SessionState } from "./api";
-import { fleet } from "./fleet";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { fleet, withFactory } from "./fleet";
+import { factoryStatus, ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { RETRY_EVERY } from "./poll";
 import { STEPS_EVERY } from "./StepsPanel";
 import { json } from "./test-utils";
@@ -113,6 +113,19 @@ describe("Timeline", () => {
     // The sonnet session's only turn was 2½ hours ago; the third only a reminder; the peer's are kept on its machine.
     expect(screen.getByText("3 more sessions took no turns in the last hour")).toBeDefined();
     expect(reads.some((url) => url.includes("/s4/"))).toBe(false);
+  });
+
+  it("says a held-up run's stage on its lane, with the whole reason on hover", async () => {
+    const reason = "gate red: make check fails on main, see the gate log";
+    const machines = withFactory(fleet(withS1("idle"), listed()), factoryStatus("p1", {}, { "o__r__1027__2": { kind: "stuck", workspaces: ["w1"], reason } }));
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Timeline machines={machines} traced={traced} onSteps={vi.fn()} />
+      </QueryClientProvider>,
+    );
+    const head = await waitFor(() => within(lane(/^opus .*fix login/)).getByRole("button", { name: /^opus/ }));
+    expect(head.getAttribute("title")).toBe(`opus · fix login: Stuck · ${reason}`);
+    expect(within(head).getByText("Stuck · gate red: make check…").getAttribute("title")).toBe(`Stuck · ${reason}`);
   });
 
   it("adds up the window: turns, agent time, tool calls and questions", async () => {
