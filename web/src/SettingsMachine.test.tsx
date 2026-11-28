@@ -317,6 +317,8 @@ describe("SettingsMachine", () => {
         const out = pending();
         await show(ME, { records: ready(ME) });
         fireEvent.click(screen.getByRole("button", { name: "Install" }));
+        // The serving machine's call goes last, once the others (none here) have answered.
+        await waitFor(() => expect(out).toHaveLength(1));
         await act(async () => end(out[0]));
         expect(await screen.findByText(/^Sent, outcome unknown/)).toBeDefined();
         expect(screen.queryByRole("button", { name: "Install" })).toBeNull();

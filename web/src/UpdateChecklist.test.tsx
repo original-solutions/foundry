@@ -362,6 +362,7 @@ describe("UpdateChecklist", () => {
       fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
       first.unmount();
       show([at(ME, 1, { version: "0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Done" }));
       expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(true);
       expect(within(dialog()).getByText(/still out/i)).toBeDefined();
       act(() => sent.calls[0].answer({ status: 202, json: {} }));

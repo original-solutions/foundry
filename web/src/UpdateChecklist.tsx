@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { installUpdate, refused } from "./api";
 import type { MachineView } from "./fleet";
 import { button, primaryButton } from "./Modal";
@@ -6,7 +6,7 @@ import { button, primaryButton } from "./Modal";
 /** What became of one install call: not sent yet (the serving machine's, while others are out), out, answered, or dropped. */
 export type Call = { kind: "queued" } | { kind: "out" } | { kind: "answered"; status: number; json: Record<string, unknown> } | { kind: "dropped" };
 
-/** A machine the checklist sent an install to, with the tag it sent, kept until the checklist closes. */
+/** A machine an install was sent to, with the tag it sent and what became of the call. */
 export interface Row {
   id: string;
   name: string;
@@ -30,6 +30,13 @@ function runs(version: string | null | undefined, tag: string): boolean {
   return !!a && !!b && a.every((n, i) => n === b[i]);
 }
 
+/** Whether `version` is the version `tag` names or a later one, compared as three numbers. */
+function atOrPast(version: string | null | undefined, tag: string): boolean {
+  const a = version ? numbers(version) : undefined;
+  const b = tagNumbers(tag);
+  return !!a && !!b && (a[0] - b[0] || a[1] - b[1] || a[2] - b[2]) >= 0;
+}
+
 /** Higher tags first; a tag that is not `v` and three numbers last. */
 export function newestFirst(a: string, b: string): number {
   const x = tagNumbers(a);
@@ -46,7 +53,8 @@ export function rowSays(row: Row, machine: MachineView | undefined): { text: str
   const { call } = row;
   if (call.kind === "queued") return { text: "Waits for the others: this machine restarts last", tone: "text-neutral-400" };
   if (call.kind === "out") return { text: "Sending…", tone: "text-neutral-400" };
-  if (call.kind === "dropped" || call.status === 504) return { text: "Sent, outcome unknown", tone: "text-amber-300" };
+  // Only an answered call is left once it may not have run; the kind check says so to the compiler.
+  if (mayHaveRun(call) || call.kind !== "answered") return { text: "Sent, outcome unknown", tone: "text-amber-300" };
   const { status, json } = call;
   const error = refused(status, json).message;
   if (status === 202) return { text: "Restarting", tone: "text-sky-300" };
@@ -58,73 +66,123 @@ export function rowSays(row: Row, machine: MachineView | undefined): { text: str
   return { text: `Failed: ${error}`, tone: "text-red-300" };
 }
 
+/** Whether a call ended with no answer that says what happened: the install may have run. */
+export const mayHaveRun = (call: Call) => call.kind === "dropped" || (call.kind === "answered" && call.status === 504);
+
+/**
+ * The installs this page sent since it loaded, shared by the checklist and every machine's page,
+ * so leaving one for the other keeps what was sent and the hold on sending more.
+ */
+interface Installs {
+  /** The newest install sent to each machine, by id. */
+  calls: Record<string, Row>;
+  /** The machines the checklist's last Install sent to, in its order, until Done. */
+  batch?: string[];
+  /** Installs are out: no more may start, so none is cut off by the serving machine's restart. */
+  busy: boolean;
+  /**
+   * The tag the serving machine's own call was for, when it answered 202 (`sure`) or gave no answer
+   * (it may have run): it restarts, until its sample runs that tag or a later one, or refused it.
+   */
+  restartingTo?: { tag: string; sure: boolean };
+}
+
+const fresh: Installs = { calls: {}, busy: false };
+let installs = fresh;
+const listeners = new Set<() => void>();
+function change(next: (now: Installs) => Installs) {
+  installs = next(installs);
+  for (const listener of listeners) listener();
+}
+const subscribe = (listener: () => void) => {
+  listeners.add(listener);
+  return () => void listeners.delete(listener);
+};
+const read = () => installs;
+
+/** Forgets every install sent, as a reload does. */
+export function forgetInstalls() {
+  change(() => fresh);
+}
+
+/**
+ * Sends each picked machine its tag, the machine serving the page (`here`) last, so its restart
+ * cuts off no other call, and notes what each call became. `batch` marks them as the checklist's.
+ */
+export async function install(picked: { id: string; name: string; tag: string }[], here: string | undefined, batch: boolean): Promise<void> {
+  const rows: Row[] = picked.map((p) => ({ ...p, call: { kind: p.id === here ? "queued" : "out" } }));
+  change((s) => ({ ...s, busy: true, batch: batch ? rows.map((r) => r.id) : s.batch, calls: { ...s.calls, ...Object.fromEntries(rows.map((r) => [r.id, r])) } }));
+  const settle = (row: Row, call: Call) => change((s) => ({ ...s, calls: { ...s.calls, [row.id]: { ...row, call } } }));
+  const send = async (row: Row): Promise<Call> => {
+    const call: Call = await installUpdate(row.id, row.tag).then(
+      ({ status, json }) => ({ kind: "answered", status, json }),
+      () => ({ kind: "dropped" }),
+    );
+    settle(row, call);
+    return call;
+  };
+  await Promise.all(rows.filter((r) => r.id !== here).map(send));
+  const last = rows.find((r) => r.id === here);
+  if (last) {
+    settle(last, { kind: "out" });
+    const call = await send(last);
+    if (mayHaveRun(call)) change((s) => ({ ...s, restartingTo: { tag: last.tag, sure: false } }));
+    else if (call.kind === "answered" && call.status === 202) change((s) => ({ ...s, restartingTo: { tag: last.tag, sure: true } }));
+  }
+  change((s) => ({ ...s, busy: false }));
+}
+
+/**
+ * The installs sent, and `held`: why no install may start now, or nothing. The restart hold lifts
+ * for good once the serving machine's sample runs the tag or a later one, or refused it.
+ */
+export function useInstalls(machines: MachineView[], here: string | undefined) {
+  const state = useSyncExternalStore(subscribe, read);
+  const served = machines.find((m) => m.id === here)?.sample;
+  const to = state.restartingTo;
+  const back = to !== undefined && (atOrPast(served?.version, to.tag) || served?.update_refused === to.tag);
+  useEffect(() => {
+    if (back) change((s) => (s.restartingTo === to ? { ...s, restartingTo: undefined } : s));
+  }, [back, to]);
+  const restarting = back ? undefined : to;
+  const held = restarting?.sure
+    ? "This machine is restarting on the new release. Install again once it is back."
+    : restarting
+      ? "This machine may be restarting: its install went out and no answer came. Install again once it is back, or reload the page if it never restarts."
+      : state.busy
+        ? "The last install is still out. Install again once it has answered."
+        : undefined;
+  return { calls: state.calls, batch: state.batch, held };
+}
+
 /**
  * The checklist that installs the release waiting on the fleet: each listed machine with a release
  * waiting, ticked until unticked, and the tag shown for it. Install sends that tag to each machine
- * ticked, the machine serving the page (`here`) last, so its restart cuts off no other call. One
- * batch is out at a time, and none goes while the serving machine restarts: from its 202, or its
- * call ending with no answer, until its sample runs or refused the tag. Once sent, each machine's
- * row says what became of its call until Done puts the checklist back; a batch keeps going after
- * Done. What it sent lives only here, until the page it is on is left or reloaded.
+ * ticked, the machine serving the page (`here`) last (`install`). Nothing goes while installs are
+ * out or the serving machine restarts (`useInstalls`). Once sent, each machine's row says what
+ * became of its call until Done puts the checklist back; the installs keep going after Done, and
+ * after the page is left, which keeps the rows and the hold until the page reloads.
  */
 export function UpdateChecklist({ machines, here }: { machines: MachineView[]; here: string | undefined }) {
   // Machines unticked by hand; every other waiting machine is ticked, one made ready later too.
   const [unticked, setUnticked] = useState<Set<string>>(new Set());
-  const [rows, setRows] = useState<Row[]>();
-  /** A batch is out, from this checklist or one put back since: no other may start, so none is cut off by the serving machine's restart. */
-  const [busy, setBusy] = useState(false);
-  /**
-   * The tag the serving machine's own call was for, when it answered 202 (`sure`) or gave no answer
-   * (it may have run): it restarts, until its sample runs or refused that tag.
-   */
-  const [restartingTo, setRestartingTo] = useState<{ tag: string; sure: boolean }>();
-
-  // Adjusted while rendering: once the serving machine's sample runs or refused the tag, it is back, for good.
-  const served = machines.find((m) => m.id === here)?.sample;
-  if (restartingTo !== undefined && (runs(served?.version, restartingTo.tag) || served?.update_refused === restartingTo.tag)) setRestartingTo(undefined);
+  const { calls, batch, held } = useInstalls(machines, here);
+  const rows = batch?.map((id) => calls[id]);
 
   const waiting = machines.flatMap((m) => (m.listed && m.sample?.update_ready ? [{ machine: m, tag: m.sample.update_ready }] : []));
   const ticked = (id: string) => !unticked.has(id);
 
   const done = () => {
-    setRows(undefined);
+    change((s) => ({ ...s, batch: undefined }));
     setUnticked(new Set());
   };
 
-  const install = async () => {
-    const picked: Row[] = waiting
-      .filter((w) => ticked(w.machine.id))
-      .map((w) => ({ id: w.machine.id, name: w.machine.name, tag: w.tag, call: { kind: w.machine.id === here ? "queued" : "out" } }));
-    setRows(picked);
-    setBusy(true);
-    // Once Done puts the checklist back its rows are gone, and an answer has no row to land in.
-    const settle = (id: string, call: Call) => setRows((now) => now?.map((r) => (r.id === id ? { ...r, call } : r)));
-    const send = async (row: Row): Promise<Call> => {
-      const call: Call = await installUpdate(row.id, row.tag).then(
-        ({ status, json }) => ({ kind: "answered", status, json }),
-        () => ({ kind: "dropped" }),
-      );
-      settle(row.id, call);
-      return call;
-    };
-    await Promise.all(picked.filter((r) => r.id !== here).map(send));
-    const last = picked.find((r) => r.id === here);
-    if (last) {
-      settle(last.id, { kind: "out" });
-      const call = await send(last);
-      const status = call.kind === "answered" ? call.status : undefined;
-      if (call.kind === "dropped" || status === 504) setRestartingTo({ tag: last.tag, sure: false });
-      else if (status === 202) setRestartingTo({ tag: last.tag, sure: true });
-    }
-    setBusy(false);
-  };
-  const held = restartingTo?.sure
-    ? "This machine is restarting on the new release. Install again once it is back."
-    : restartingTo
-      ? "This machine may be restarting: its install went out and no answer came. Install again once it is back, or reload the page if it never restarts."
-      : busy
-        ? "The last install is still out. Install again once it has answered."
-        : undefined;
+  const installTicked = () =>
+    install(
+      waiting.filter((w) => ticked(w.machine.id)).map((w) => ({ id: w.machine.id, name: w.machine.name, tag: w.tag })),
+      here,
+      true,
+    );
 
   return (
     <section aria-labelledby="update-checklist">
@@ -177,7 +235,7 @@ export function UpdateChecklist({ machines, here }: { machines: MachineView[]; h
             Done
           </button>
         ) : (
-          <button type="button" className={primaryButton} disabled={here === undefined || held !== undefined || !waiting.some((w) => ticked(w.machine.id))} onClick={() => void install()}>
+          <button type="button" className={primaryButton} disabled={here === undefined || held !== undefined || !waiting.some((w) => ticked(w.machine.id))} onClick={() => void installTicked()}>
             Install
           </button>
         )}

@@ -1,7 +1,6 @@
 import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useId, useState, type ReactNode } from "react";
-import { installUpdate } from "./api";
 import type { MachineView } from "./fleet";
 import { MachineKept } from "./MachineKept";
 import { limitsText, removeMachine, renameMachine, sendLimits } from "./machineApi";
@@ -9,7 +8,7 @@ import { button, dangerButton, field, Modal, primaryButton } from "./Modal";
 import { diff, type Field, type Refusal } from "./reviewDiff";
 import { ReviewBar, useLeaveGuard } from "./ReviewBar";
 import { Page, Row, type PageProps } from "./SettingsPage";
-import { rowSays, type Call, type Row as Sent } from "./UpdateChecklist";
+import { install, rowSays, useInstalls } from "./UpdateChecklist";
 
 /**
  * Settings → one machine's page, at `/settings/machines/$machine`, with the same sections in the
@@ -30,9 +29,10 @@ export function SettingsMachine({ state, machines, here, machineId }: PageProps 
     );
   return (
     <Page title={machine.name}>
-      <div className="flex flex-col gap-8">
-        <Update machine={machine} serving={machine.id === here} />
-        <Shared key={machine.id} machine={machine} />
+      {/* Keyed, so a page opened for another machine starts with none of this one's state. */}
+      <div key={machine.id} className="flex flex-col gap-8">
+        <Update machine={machine} machines={machines} here={here} />
+        <Shared machine={machine} />
         <MachineKept machine={machine} held={state.held[machine.id]} protocols={state.protocols} here={here} />
         {machine.listed && here !== undefined && machine.id !== here && <Remove machine={machine} />}
       </div>
@@ -53,40 +53,32 @@ function Section({ id, title, children }: { id: string; title: string; children:
 
 /**
  * The release ready on the machine, while one is: "{tag} is ready" and Install, which sends that
- * tag and then says what became of the call as the checklist does. On the machine serving the page
- * it says first that the machine restarts. Install is not offered again while the call is out or
- * the machine restarts; after a call that may have run on the serving machine, nor until a newer
- * tag is ready. The section stays while a call it sent has something to say.
+ * tag and then says what became of the call as the checklist does, whichever of the two sent it.
+ * On the machine serving the page it says first that the machine restarts. Install is not offered
+ * while any install is out or the serving machine restarts (`useInstalls`), nor while this
+ * machine's own call for that tag is out or answered 202.
  */
-function Update({ machine, serving }: { machine: MachineView; serving: boolean }) {
+function Update({ machine, machines, here }: { machine: MachineView; machines: MachineView[]; here: string | undefined }) {
   const id = useId();
-  const [sent, setSent] = useState<Sent>();
+  const { calls, held } = useInstalls(machines, here);
   const tag = machine.sample?.update_ready ?? undefined;
-  if (!tag && !sent) return null;
+  if (!tag) return null;
 
-  const install = async (tag: string) => {
-    const row: Sent = { id: machine.id, name: machine.name, tag, call: { kind: "out" } };
-    setSent(row);
-    const call: Call = await installUpdate(machine.id, tag).then(
-      ({ status, json }) => ({ kind: "answered", status, json }),
-      () => ({ kind: "dropped" }),
-    );
-    setSent({ ...row, call });
-  };
+  const sent = calls[machine.id];
   const call = sent?.call;
-  const mayHaveRun = call?.kind === "dropped" || (call?.kind === "answered" && call.status === 504);
-  const held = sent?.tag === tag && (call?.kind === "out" || (call?.kind === "answered" && call.status === 202) || (serving && mayHaveRun));
+  const going = sent?.tag === tag && (call?.kind === "queued" || call?.kind === "out" || (call?.kind === "answered" && call.status === 202));
   const says = sent && rowSays(sent, machine);
 
   return (
     <Section id={id} title="Update">
-      {tag && <p className="mt-1 text-sm text-neutral-200">{tag} is ready</p>}
-      {tag && serving && (
+      <p className="mt-1 text-sm text-neutral-200">{tag} is ready</p>
+      {machine.id === here && (
         <p className="mt-1 text-xs text-amber-300">This machine serves this page: it restarts to install the release, and the page reconnects once it is back. Its terminals keep running.</p>
       )}
       {says && <p className={`mt-1 text-xs ${says.tone}`}>{says.text}</p>}
-      {tag && !held && (
-        <button type="button" className={`${primaryButton} mt-2`} onClick={() => void install(tag)}>
+      {held && !going && <p className="mt-1 text-xs text-amber-300">{held}</p>}
+      {!held && !going && (
+        <button type="button" className={`${primaryButton} mt-2`} onClick={() => void install([{ id: machine.id, name: machine.name, tag }], here, false)}>
           Install
         </button>
       )}
@@ -117,6 +109,18 @@ const defs: (Field<Texts> & { help: string; attrs?: { min: number | string; step
 ];
 
 const asNumber = (text: string) => (text.trim() === "" ? null : Number(text));
+
+/** The first limit outside the range the daemon takes, with the daemon's own sentence for it, or nothing. */
+function checkLimits(t: Texts): Refusal | undefined {
+  const sessions = asNumber(t.max_sessions);
+  if (sessions === null || !Number.isInteger(sessions) || sessions < 1 || sessions > 4294967295)
+    return { key: "max_sessions", message: "the maximum sessions is a whole number from 1 to 4294967295" };
+  const load = asNumber(t.max_load_per_core);
+  if (load === null || !Number.isFinite(load) || load <= 0) return { key: "max_load_per_core", message: "the maximum load per core is a number above 0" };
+  const disk = asNumber(t.min_free_disk_gb);
+  if (disk === null || !Number.isFinite(disk) || disk < 0) return { key: "min_free_disk_gb", message: "the minimum free disk is a number of gigabytes, 0 or more" };
+  return undefined;
+}
 
 const without = <T extends object>(from: T, keys: readonly (keyof T)[]): T => {
   const out = { ...from };
@@ -201,7 +205,9 @@ function Shared({ machine }: { machine: MachineView }) {
         (e: unknown) => ({ keys, error: { key, message: e instanceof Error ? e.message : "The change was not saved." } }),
       );
     if (renaming) sends.push(answer(["name"], "name", renameMachine({ id: machine.id, name })));
-    if (limiting) {
+    const wrong = limiting && !clearing ? checkLimits(values) : undefined;
+    if (wrong) sends.push(Promise.resolve({ keys: [], error: wrong }));
+    else if (limiting) {
       const action = clearing
         ? ("clear" as const)
         : { fields: { max_sessions: asNumber(values.max_sessions), max_load_per_core: asNumber(values.max_load_per_core), min_free_disk_gb: asNumber(values.min_free_disk_gb) } };
