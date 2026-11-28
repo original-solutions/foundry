@@ -649,7 +649,7 @@ pub(super) struct Round {
     archiving: Option<String>,
     archive_asked: bool,
     /// The target recorded for the resume and not given up.
-    machine: Option<Target>,
+    target: Option<Target>,
     /// The machines recorded for it that were given up.
     gave_up: Vec<MachineId>,
     requested: bool,
@@ -665,10 +665,6 @@ pub(super) struct Round {
 
 fn parse_machine(text: &str) -> Option<MachineId> {
     uuid::Uuid::parse_str(text).ok().map(MachineId)
-}
-
-fn parse_target(text: &str) -> Option<Target> {
-    text.parse().ok()
 }
 
 /// The newest `session_interrupted` line that is a resume, and the steps after it.
@@ -703,13 +699,13 @@ pub(super) fn read_round(events: &[RunEvent]) -> Option<Round> {
         } else if let Some(rest) = numbered(step, MACHINE_GIVEN_UP, k) {
             // What the machine was asked is its own: the next machine starts the round again.
             round.gave_up.extend(parse_machine(rest));
-            round.machine = None;
+            round.target = None;
             round.requested = false;
             round.workspace = None;
             round.sending = false;
             round.ending_sessions = false;
         } else if let Some(rest) = numbered(step, MACHINE, k) {
-            round.machine = parse_target(rest);
+            round.target = rest.parse().ok();
             round.requested = false;
             round.workspace = None;
             round.sending = false;
@@ -1583,7 +1579,7 @@ fn carry_on(
         }
         return Ok(ResumeStep::Waiting(Wait::Archive));
     }
-    let target = match (round.machine, placed) {
+    let target = match (round.target, placed) {
         (Some(target), _) => target,
         (None, Some(target)) => {
             if let Some(machine) = target.machine()

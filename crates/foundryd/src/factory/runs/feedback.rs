@@ -830,10 +830,6 @@ fn second_before(ms: u64) -> String {
     format!("{}Z", &text[..19])
 }
 
-fn parse_target(text: &str) -> Option<Target> {
-    text.parse().ok()
-}
-
 /// The id feedback on the issue carries, so that it cannot collide with a review's or a pull
 /// request comment's.
 fn issue_comment_feedback_id(id: &str) -> String {
@@ -944,7 +940,7 @@ struct Round {
     items: Vec<String>,
     /// The body of the first message.
     message: String,
-    machine: Option<Target>,
+    target: Option<Target>,
     /// The workspace the archive is of, as written: an id.
     archiving: Option<String>,
     archive_asked: bool,
@@ -999,12 +995,12 @@ impl Round {
             } else if numbered(step, ARCHIVE_ASKED, n).is_some() {
                 round.archive_asked = true;
             } else if numbered(step, MACHINE_GIVEN_UP, n).is_some() {
-                round.machine = None;
+                round.target = None;
                 round.requested = false;
                 round.workspace = None;
                 round.sending = false;
             } else if let Some(rest) = numbered(step, MACHINE, n) {
-                round.machine = parse_target(rest);
+                round.target = rest.parse().ok();
                 round.requested = false;
                 round.workspace = None;
                 round.sending = false;
@@ -1242,7 +1238,7 @@ fn read_and_decide(
         "feedback-machine",
     )?;
     let round = Round {
-        machine: Some(target),
+        target: Some(target),
         ..round
     };
     decision_phase(ctx, run, events, seen, &round, last, &mut at)?;
@@ -1478,7 +1474,7 @@ fn decision_phase(
 ) -> Result<bool, RunError> {
     let issue = run.issue();
     let mut did = false;
-    let Some(target) = round.machine else {
+    let Some(target) = round.target else {
         return Ok(false);
     };
     if seen.state == Some(State::PrOpen) {
@@ -1662,7 +1658,7 @@ fn carry_on(
         title = Some(detail.title);
     }
     // The machine: recorded with the decision, or placed again when the pass was cut before it.
-    let target = match round.machine {
+    let target = match round.target {
         Some(target) => target,
         None => {
             let target = match placing::place_run(ctx.view, shared, &ctx.project.login, reserved) {
@@ -1686,7 +1682,7 @@ fn carry_on(
         slots.runs_free -= 1;
     }
     let placed = Round {
-        machine: Some(target),
+        target: Some(target),
         ..round.clone()
     };
     at.machine = Some(target.to_string());
