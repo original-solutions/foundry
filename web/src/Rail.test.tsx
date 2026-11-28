@@ -27,22 +27,123 @@ const handlers = () => ({ onExpand: vi.fn(), onJump: vi.fn(), onCreate: vi.fn() 
 afterEach(() => localStorage.clear());
 
 describe("Rail", () => {
+  const rail = () => screen.getByRole("navigation", { name: "Workspaces" });
+  const sessions = () => screen.getByRole("button", { name: /^Sessions/ });
+  const list = () => screen.queryByRole("region", { name: "Sessions" });
+  const labels = (group: string) => within(within(list()!).getByRole("group", { name: group })).getAllByRole("link").map((l) => l.getAttribute("aria-label"));
+
+  it("shows no terminals of its own: one Sessions button carries how many need you", async () => {
+    await renderApp(<Rail machines={machines()} {...handlers()} />);
+
+    expect(within(rail()).queryAllByRole("link", { name: / \/ / })).toEqual([]);
+    expect(sessions().getAttribute("aria-label")).toBe("Sessions: 1 needs you");
+    expect(sessions().getAttribute("aria-expanded")).toBe("false");
+    expect(sessions().textContent).toBe("1");
+    expect(list()).toBeNull();
+  });
+
+  it("opens the sessions as one list grouped by state, most urgent first, each a link to its terminal", async () => {
+    await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
+    fireEvent.click(sessions());
+
+    expect(sessions().getAttribute("aria-expanded")).toBe("true");
+    expect(within(list()!).getAllByRole("group").map((g) => g.getAttribute("aria-label"))).toEqual(["Needs you", "Working", "Ready"]);
+    expect(labels("Needs you")).toEqual(["on the laptop / opus: Needs you"]);
+    expect(labels("Working")).toEqual(["fix login / opus: Working"]);
+    expect(labels("Ready")).toHaveLength(9);
+    const open = within(list()!).getByRole("link", { name: "fix login / shell: Open" });
+    expect(open.getAttribute("href")).toBe("/terminals/t2");
+    expect(open.getAttribute("aria-current")).toBe("true");
+    // A row says which machine it is on when there is more than one.
+    expect(within(list()!).getByRole("link", { name: "on the laptop / opus: Needs you" }).textContent).toMatch(/laptop/);
+  });
+
   it("says a live factory run's stuck session is quiet, as the board does", async () => {
     const records = [sample(ME, 1), workspace(ME, "w1", "fac 162"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "stuck")];
     const run = withFactory(fleet(records, settings()), factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1"] }));
     await renderApp(<Rail machines={run} {...handlers()} />);
-    const group = within(screen.getByRole("navigation", { name: "Workspaces" })).getByRole("group", { name: "fac 162" });
-    expect(within(group).getByRole("link").getAttribute("aria-label")).toBe("fac 162 / opus: Quiet 10+ min");
+    fireEvent.click(sessions());
+
+    expect(labels("Working")).toEqual(["fac 162 / opus: Quiet 10+ min"]);
   });
 
-  it("heads each workspace's column with its project's face, so columns can be told apart", async () => {
+  it("closes the list when a session is picked, on Escape, or from its button", async () => {
     await renderApp(<Rail machines={machines()} {...handlers()} />);
-    const login = screen.getByRole("group", { name: "fix login" });
-    expect(within(login).getByTitle("fix login · demo").textContent).toBe("DE");
+
+    fireEvent.click(sessions());
+    fireEvent.click(within(list()!).getByRole("link", { name: "fix login / opus: Working" }));
+    expect(list()).toBeNull();
+
+    fireEvent.click(sessions());
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    expect(list()).toBeNull();
+    expect(document.activeElement).toBe(sessions());
+
+    fireEvent.click(sessions());
+    fireEvent.click(sessions());
+    expect(list()).toBeNull();
+  });
+
+  it("docks the list beside the rail, where a pick leaves it open, and keeps it docked next time", async () => {
+    const { unmount } = await renderApp(<Rail machines={machines()} {...handlers()} />);
+    fireEvent.click(sessions());
+    fireEvent.click(within(list()!).getByRole("button", { name: "Dock beside the rail" }));
+
+    fireEvent.click(within(list()!).getByRole("link", { name: "fix login / opus: Working" }));
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(list()).not.toBeNull();
+    unmount();
+
+    await renderApp(<Rail machines={machines()} {...handlers()} />);
+    expect(list()).not.toBeNull();
+    fireEvent.click(within(list()!).getByRole("button", { name: "Undock" }));
+    fireEvent.click(within(list()!).getByRole("link", { name: "fix login / opus: Working" }));
+    expect(list()).toBeNull();
+  });
+
+  it("leaves the focus where it is when a docked list shows by itself, and takes it when opened from its button", async () => {
+    localStorage.setItem("foundry.sessions", "docked");
+    await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
+
+    expect(list()).not.toBeNull();
+    expect(document.activeElement).toBe(document.body);
+
+    fireEvent.click(sessions());
+    expect(list()).toBeNull();
+    fireEvent.click(sessions());
+    expect(document.activeElement).toBe(within(list()!).getByRole("link", { name: "fix login / shell: Open" }));
+  });
+
+  it("is one Tab stop, on the open terminal's row or else the first, which moves with the focus", async () => {
+    localStorage.setItem("foundry.sessions", "docked");
+    const { unmount } = await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
+    const stops = () => within(list()!).getAllByRole("link").filter((l) => l.tabIndex === 0).map((l) => l.getAttribute("aria-label"));
+
+    expect(stops()).toEqual(["fix login / shell: Open"]);
+    fireEvent.focus(within(list()!).getByRole("link", { name: "fix login / opus: Working" }));
+    expect(stops()).toEqual(["fix login / opus: Working"]);
+    unmount();
+
+    await renderApp(<Rail machines={machines()} {...handlers()} />);
+    expect(stops()).toEqual(["on the laptop / opus: Needs you"]);
+  });
+
+  it("walks the list with the arrows from the session that is open", async () => {
+    await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
+    fireEvent.click(sessions());
+
+    const links = within(list()!).getAllByRole("link");
+    expect(document.activeElement).toBe(links[2]);
+    fireEvent.keyDown(links[2], { key: "ArrowUp" });
+    expect(document.activeElement).toBe(links[1]);
+    fireEvent.keyDown(links[1], { key: "End" });
+    expect(document.activeElement).toBe(links.at(-1));
+    fireEvent.keyDown(links.at(-1)!, { key: "Home" });
+    expect(document.activeElement).toBe(links[0]);
   });
 
   it("links to the factory beside the board", async () => {
-    await renderApp(<Rail machines={machines()} onExpand={() => {}} onJump={() => {}} onCreate={() => {}} />);
+    await renderApp(<Rail machines={machines()} {...handlers()} />);
     expect(screen.getByRole("link", { name: "The factory" }).getAttribute("href")).toBe("/factory");
   });
 
@@ -52,31 +153,6 @@ describe("Rail", () => {
     expect(gear.getAttribute("href")).toBe("/settings");
     const theme = screen.getByRole("button", { name: /theme/ });
     expect(gear.parentElement).toBe(theme.parentElement);
-  });
-
-  it("shows every workspace as its terminals' states, each a link named by workspace, terminal and state, the open one marked", async () => {
-    await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
-
-    const rail = screen.getByRole("navigation", { name: "Workspaces" });
-    const login = within(rail).getByRole("group", { name: "fix login" });
-    const links = within(login).getAllByRole("link");
-    expect(links.map((l) => l.getAttribute("aria-label"))).toEqual(["fix login / opus: Working", "fix login / shell: Open"]);
-    expect(links[1].getAttribute("aria-current")).toBe("true");
-    expect(links[1].getAttribute("href")).toBe("/terminals/t2");
-    // The workspace of the open terminal stands out from the others.
-    expect(login.getAttribute("data-open")).toBe("true");
-    expect(within(rail).getByRole("group", { name: "many" }).getAttribute("data-open")).toBeNull();
-    // Another machine's workspaces are under its name, its state as plain as this one's.
-    expect(within(within(rail).getByRole("group", { name: "on the laptop" })).getByRole("link").getAttribute("aria-label")).toBe("on the laptop / opus: Needs you");
-    expect(within(rail).getByRole("link", { name: /^laptop/ }).getAttribute("href")).toBe("/machines");
-  });
-
-  it("shows six terminals of a workspace and counts the rest", async () => {
-    await renderApp(<Rail machines={machines()} {...handlers()} />);
-
-    const many = screen.getByRole("group", { name: "many" });
-    expect(within(many).getAllByRole("link")).toHaveLength(6);
-    expect(within(many).getByText("+2").getAttribute("title")).toBe("2 more in many");
   });
 
   it("expands to the full list, jumps and starts a task from its buttons", async () => {
@@ -90,22 +166,6 @@ describe("Rail", () => {
     expect(on.onJump).toHaveBeenCalledOnce();
     expect(on.onCreate).toHaveBeenCalledOnce();
     expect(screen.getByRole("link", { name: "The board" }).getAttribute("href")).toBe("/");
-  });
-
-  it("is one Tab stop whose arrows walk the terminals", async () => {
-    await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
-
-    const links = within(screen.getByRole("navigation", { name: "Workspaces" })).getAllByRole("link", { name: / \/ / });
-    expect(links.filter((l) => l.tabIndex === 0).map((l) => l.getAttribute("href"))).toEqual(["/terminals/t2"]);
-    links[1].focus();
-    fireEvent.keyDown(links[1], { key: "ArrowDown" });
-    expect(document.activeElement).toBe(links[2]);
-    fireEvent.keyDown(links[2], { key: "ArrowUp" });
-    expect(document.activeElement).toBe(links[1]);
-    fireEvent.keyDown(links[1], { key: "End" });
-    expect(document.activeElement).toBe(links.at(-1));
-    fireEvent.keyDown(links.at(-1)!, { key: "Home" });
-    expect(document.activeElement).toBe(links[0]);
   });
 });
 

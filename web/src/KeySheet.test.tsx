@@ -48,7 +48,7 @@ describe("KeySheet", () => {
       "Drop the comment being written",
       "Send the reply",
       "Close the reply box",
-      "Move along the collapsed rail",
+      "Move through the rail's Sessions list",
       "Close what is on top: a dialog, sheet, drawer or card",
     ]) {
       expect(sheet.textContent).toContain(what);

@@ -1,17 +1,15 @@
 import { Link } from "@tanstack/react-router";
-import { useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { SparkIcon } from "./FirstPrompt";
 import { jumpKey, SearchIcon } from "./JumpPalette";
+import { FactoryIcon } from "./FactoryMark";
 import { Mark } from "./Mark";
-import { ProjectFace } from "./ProjectFace";
-import { rows, type MachineView } from "./fleet";
+import { type MachineView } from "./fleet";
+import { needing } from "./needing";
 import { railKey } from "./collapsed";
-import { PanelIcon, stripOf } from "./Sidebar";
-import { StateGlyph } from "./StateGlyph";
-import { TerminalMenu } from "./TerminalMenu";
+import { PanelIcon } from "./Sidebar";
+import { loadDocked, saveDocked, SessionList } from "./SessionList";
 import { SettingsLink, ThemeButton } from "./ThemeButton";
-
-const statusDot = { online: "bg-emerald-400", offline: "bg-red-400", unknown: "bg-neutral-500" };
 
 interface Props {
   machines: MachineView[];
@@ -28,107 +26,106 @@ interface Props {
 
 /**
  * The sidebar collapsed to a strip as narrow as a button, for a window too narrow for the full
- * list beside a terminal, or a terminal wanting the room. It still shows every terminal's state:
- * each workspace is a column of glyphs (the most urgent first, six at most, the open one always),
- * each a link to its terminal named by workspace, terminal and state, and the open terminal's
- * workspace stands out. The board, jump, a new task and the bell keep a button each. The terminals
- * are one Tab stop that the arrows walk, as in the full list.
+ * list beside a terminal, or a terminal wanting the room. It holds only buttons: the board, the
+ * factory, the sessions, jump, a new task and the bell. Sessions carries how many need you and
+ * opens every terminal as one list (`SessionList`), over the terminal until another terminal opens
+ * (a pick, or from a row's menu), Escape is pressed or the terminal is clicked, or docked beside the rail to stay open.
  */
 export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }: Props) {
-  const [focused, setFocused] = useState<string>();
-  const listed = machines.flatMap((m) => m.workspaces.flatMap((w) => stripOf(rows(w), selected).map((r) => r.terminal)));
-  const stop = [focused, selected].find((id) => id !== undefined && listed.includes(id)) ?? listed[0];
+  const [docked, setDocked] = useState(loadDocked);
+  const [open, setOpen] = useState(docked);
+  // The floating list closes when another terminal opens, by a pick or from a row's menu, so it never covers that terminal.
+  const [was, setWas] = useState(selected);
+  if (was !== selected) {
+    setWas(selected);
+    if (!docked) setOpen(false);
+  }
+  // A docked list that shows by itself leaves the focus where it is; opened from its button, it takes it.
+  const [asked, setAsked] = useState(false);
+  const button = useRef<HTMLButtonElement>(null);
+  const need = needing(machines).length;
+  const flying = open && !docked;
 
-  const keys = (event: KeyboardEvent<HTMLElement>) => {
-    const here = event.target instanceof HTMLElement ? event.target.closest<HTMLElement>("[data-rail]") : null;
-    if (!here || event.metaKey || event.ctrlKey || event.altKey) return;
-    const all = [...event.currentTarget.querySelectorAll<HTMLElement>("[data-rail]")];
-    const at = all.indexOf(here);
-    const to = { ArrowDown: all[at + 1], ArrowUp: all[at - 1], Home: all[0], End: all.at(-1) }[event.key];
-    if (!to) return;
-    event.preventDefault();
-    to.focus();
+  useEffect(() => {
+    if (!flying) return;
+    const close = () => setOpen(false);
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      close();
+      button.current?.focus();
+    };
+    const onDown = (event: PointerEvent) => {
+      if (event.target instanceof Element && event.target.closest("main")) close();
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("pointerdown", onDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerdown", onDown);
+    };
+  }, [flying]);
+
+  const dock = (on: boolean) => {
+    saveDocked(on);
+    setDocked(on);
   };
 
   return (
-    <nav aria-label="Workspaces" onKeyDown={keys} className="flex h-full w-12 shrink-0 flex-col items-center gap-1 overflow-y-auto bg-neutral-900 py-3 text-neutral-400 [scrollbar-width:none]">
-      <Link to="/" aria-label="The board" title="The board" className="grid size-8 place-items-center rounded-md hover:bg-neutral-800">
-        <Mark className="size-4 text-emerald-400" />
-      </Link>
-      <Link to="/factory" aria-label="The factory" title="The factory" className="grid size-8 place-items-center rounded-md hover:bg-neutral-800 hover:text-neutral-200">
-        <FactoryIcon className="size-4" />
-      </Link>
-      <RailButton label="Expand sidebar" title={`Show every workspace and terminal by name (${railKey})`} onClick={onExpand}>
-        <PanelIcon className="size-4" />
-      </RailButton>
-      <RailButton label="Jump to" title={`Jump to (${jumpKey})`} onClick={onJump}>
-        <SearchIcon className="size-4" />
-      </RailButton>
-      <RailButton label="New task" title="Give Claude a new task" onClick={onCreate}>
-        <SparkIcon className="size-4 text-emerald-400" />
-      </RailButton>
-      {machines.map((machine) => (
-        <section key={machine.id} aria-label={machine.name} className="mt-2 flex w-full flex-col items-center gap-3 border-t border-neutral-800 pt-3">
-          <Link
-            to="/machines"
-            aria-label={`${machine.name} ${machine.status}`}
-            title={`${machine.name}: ${machine.status}`}
-            className="grid size-6 place-items-center rounded hover:bg-neutral-800"
-          >
-            <span aria-hidden="true" className={`size-1.5 rounded-full ${statusDot[machine.status]}`} />
-          </Link>
-          {machine.workspaces.map((workspace) => {
-            const list = rows(workspace);
-            const shown = stripOf(list, selected);
-            const open = list.some((r) => r.terminal === selected);
-            const rest = list.length - shown.length;
-            return (
-              <div
-                key={workspace.id}
-                role="group"
-                aria-label={workspace.name}
-                data-open={open || undefined}
-                className={`flex flex-col items-center gap-px rounded-lg p-0.5 ${open ? "bg-neutral-800/70 ring-1 ring-neutral-700" : ""}`}
-              >
-                <ProjectFace project={workspace.project} title={`${workspace.name} · ${workspace.project}`} className="mt-0.5 mb-0.5 size-5 text-[9px]" />
-                {shown.map((row) => {
-                  const name = `${workspace.name} / ${row.name}: ${row.label}`;
-                  const current = row.terminal === selected;
-                  return (
-                    <TerminalMenu key={row.terminal} id={row.terminal}>
-                      <Link
-                        to="/terminals/$terminalId"
-                        params={{ terminalId: row.terminal }}
-                        aria-label={name}
-                        title={row.title ? `${name}\n${row.title}` : name}
-                        aria-current={current ? "true" : undefined}
-                        data-rail=""
-                        tabIndex={row.terminal === stop ? 0 : -1}
-                        onFocus={() => setFocused(row.terminal)}
-                        className={`grid size-7 place-items-center rounded-md hover:bg-neutral-700 ${current ? "bg-neutral-700" : ""}`}
-                      >
-                        <StateGlyph glyph={row.glyph} />
-                      </Link>
-                    </TerminalMenu>
-                  );
-                })}
-                {rest > 0 && (
-                  <span title={`${rest} more in ${workspace.name}`} className="pb-0.5 text-[10px] leading-3 text-neutral-500">
-                    +{rest}
-                  </span>
-                )}
-                {list.length === 0 && <span title={`${workspace.name}: no terminals`} aria-hidden="true" className="m-2.5 size-2 rounded-full border border-neutral-600" />}
-              </div>
-            );
-          })}
-        </section>
-      ))}
-      <div className="mt-auto flex flex-col items-center gap-1 pt-3">
-        {alerts}
-        <ThemeButton />
-        <SettingsLink />
-      </div>
-    </nav>
+    <>
+      <nav aria-label="Workspaces" className="flex h-full w-12 shrink-0 flex-col items-center gap-1 overflow-y-auto border-r border-neutral-800 bg-neutral-900 py-3 text-neutral-400 [scrollbar-width:none]">
+        <Link to="/" aria-label="The board" title="The board" className="grid size-8 place-items-center rounded-md hover:bg-neutral-800">
+          <Mark className="size-4 text-emerald-400" />
+        </Link>
+        <Link to="/factory" aria-label="The factory" title="The factory" className="grid size-8 place-items-center rounded-md hover:bg-neutral-800 hover:text-neutral-200">
+          <FactoryIcon className="size-4" />
+        </Link>
+        <span aria-hidden="true" className="my-1.5 h-px w-6 bg-neutral-800" />
+        <button
+          ref={button}
+          type="button"
+          aria-label={need > 0 ? `Sessions: ${need} need${need === 1 ? "s" : ""} you` : "Sessions"}
+          aria-expanded={open}
+          title="Every session and shell, by state"
+          onClick={() => {
+            setAsked(true);
+            setOpen(!open);
+          }}
+          className={`relative grid size-8 place-items-center rounded-md hover:bg-neutral-800 hover:text-neutral-200 ${open ? "bg-neutral-800 text-neutral-200" : ""}`}
+        >
+          <SessionsIcon className="size-4" />
+          {need > 0 && (
+            <span aria-hidden="true" className="absolute -top-0.5 -right-1 min-w-4 rounded-full bg-amber-400 px-1 text-center text-[10px] leading-4 font-semibold text-neutral-950 tabular-nums">
+              {need}
+            </span>
+          )}
+        </button>
+        <RailButton label="Jump to" title={`Jump to (${jumpKey})`} onClick={onJump}>
+          <SearchIcon className="size-4" />
+        </RailButton>
+        <RailButton label="New task" title="Give Claude a new task" onClick={onCreate}>
+          <SparkIcon className="size-4 text-emerald-400" />
+        </RailButton>
+        <div className="mt-auto flex flex-col items-center gap-1 pt-3">
+          <RailButton label="Expand sidebar" title={`Show every workspace and terminal by name (${railKey})`} onClick={onExpand}>
+            <PanelIcon className="size-4" />
+          </RailButton>
+          {alerts}
+          <ThemeButton />
+          <SettingsLink />
+        </div>
+      </nav>
+      {open && <SessionList machines={machines} selected={selected} docked={docked} focus={asked} onDock={dock} onPick={() => !docked && setOpen(false)} />}
+    </>
+  );
+}
+
+/** Three lines with a dot before each: a list of sessions. */
+function SessionsIcon({ className }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" className={className}>
+      <path d="M6 4h7.5M6 8h7.5M6 12h7.5" />
+      <path d="M2.5 4h.01M2.5 8h.01M2.5 12h.01" strokeWidth="2" />
+    </svg>
   );
 }
 
@@ -137,14 +134,5 @@ function RailButton({ label, title, onClick, children }: { label: string; title:
     <button type="button" aria-label={label} title={title} onClick={onClick} className="grid size-8 place-items-center rounded-md hover:bg-neutral-800 hover:text-neutral-200">
       {children}
     </button>
-  );
-}
-
-/** A factory's roofline: the factory view. */
-export function FactoryIcon({ className }: { className?: string }) {
-  return (
-    <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" className={className}>
-      <path d="M2 14V7l4 2.5V7l4 2.5V3h4v11z" />
-    </svg>
   );
 }

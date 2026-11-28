@@ -8,7 +8,7 @@ import { router, routeTree } from "./App";
 import { button, dangerButton, pressed, viewLook } from "./Modal";
 import { keep, KEEP_AFTER, recall } from "./memory";
 import { nextSteps } from "./next";
-import { ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { FakeSocket, json, mockFetch, type Call } from "./test-utils";
 
 // What the stand-in terminals show on every row, and the link finder the last one opened registered.
@@ -80,7 +80,7 @@ let shipping: Shipping = quiet;
 /** What a plain read of /api/factory answers, when a test sets one; left out of the calls, as the other reads are. */
 let factoryNow: unknown;
 
-function mockActions(...answers: Response[]): Call[] {
+function mockActions(...answers: (Response | Promise<Response>)[]): Call[] {
   const calls: Call[] = [];
   vi.stubGlobal(
     "fetch",
@@ -396,6 +396,43 @@ describe("App", () => {
     expect(document.querySelector("[data-stale]")).not.toBeNull();
   });
 
+  it("keeps the machine's sweep from acting on a remembered fleet until the daemon's state arrives", async () => {
+    mockActions();
+    const remembered = [...live.records, terminal(ME, "t3", "w1", "exited", { exit_code: 0 }), workspace(ME, "w2", "fix logout")];
+    keep({ records: remembered, settings: live.settings, synced: true, held: {}, protocols: {} }, Date.now() - 180_000);
+    const events = await before("/");
+    const sweep = () => [
+      screen.getByTitle("Clear the terminals that ended in every workspace on this machine, with their final screens"),
+      within(screen.getByRole("navigation", { name: "Workspaces" })).getByRole("button", { name: "Archive 1 empty" }),
+    ];
+    expect(sweep().map((b) => b.hasAttribute("disabled"))).toEqual([true, true]);
+
+    act(() => events.open());
+    act(() => events.deliver(JSON.stringify({ ...live, records: remembered })));
+
+    expect(sweep().map((b) => b.hasAttribute("disabled"))).toEqual([false, false]);
+  });
+
+  it("keeps the machine's sweep waiting while the link to the daemon is lost, until it sends again", async () => {
+    mockActions();
+    const swept = { ...live, records: [...live.records, terminal(ME, "t3", "w1", "exited", { exit_code: 0 }), workspace(ME, "w2", "fix logout")] };
+    await open("/", swept);
+    const sweep = () => [
+      screen.getByTitle("Clear the terminals that ended in every workspace on this machine, with their final screens"),
+      within(screen.getByRole("navigation", { name: "Workspaces" })).getByRole("button", { name: "Archive 1 empty" }),
+    ];
+    expect(sweep().map((b) => b.hasAttribute("disabled"))).toEqual([false, false]);
+
+    act(() => sockets("/api/events").at(-1)!.end(1006));
+    expect(sweep().map((b) => b.hasAttribute("disabled"))).toEqual([true, true]);
+
+    await act(() => new Promise((resolve) => setTimeout(resolve, 600)));
+    const again = sockets("/api/events").at(-1)!;
+    act(() => again.open());
+    act(() => again.deliver(JSON.stringify(swept)));
+    expect(sweep().map((b) => b.hasAttribute("disabled"))).toEqual([false, false]);
+  });
+
   it("keeps the live fleet in this browser for the next load, never a frozen one", async () => {
     mockActions();
     await open("/", live);
@@ -501,14 +538,16 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Workspaces" }).getAttribute("aria-expanded")).toBe("false");
   });
 
-  it("collapses the sidebar to a rail of states with its button or Cmd+B, keeps the choice, and expands the same ways", async () => {
+  it("collapses the sidebar to a rail with its button or Cmd+B, keeps the choice, and expands the same ways", async () => {
     await open("/terminals/t1", live);
     expect(screen.getByRole("link", { name: /^sonnet/ })).toBeDefined();
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
     const rail = screen.getByRole("navigation", { name: "Workspaces" });
     expect(rail.id).not.toBe("sidebar");
-    expect(within(rail).getByRole("link", { name: "fix login / sonnet: Working" }).getAttribute("aria-current")).toBe("page");
+    fireEvent.click(within(rail).getByRole("button", { name: /^Sessions/ }));
+    const list = screen.getByRole("region", { name: "Sessions" });
+    expect(within(list).getByRole("link", { name: "fix login / sonnet: Working" }).getAttribute("aria-current")).toBe("page");
     expect(localStorage.getItem("foundry.rail")).toBe("1");
 
     fireEvent.keyDown(window, { key: "b", metaKey: true });
@@ -1648,6 +1687,168 @@ describe("App", () => {
     await waitFor(() => expect(calls.map((c) => c.url).sort()).toEqual(["/api/terminals/t3/close", "/api/terminals/t4/close"]));
   });
 
+  it("clears every ended terminal of every workspace on a machine at once from its heading", async () => {
+    const calls = mockActions(...Array.from({ length: 3 }, () => new Response(null, { status: 204 })));
+    await open("/terminals/t1", {
+      ...ended,
+      records: [...ended.records, workspace(ME, "w2", "fix logout"), terminal(ME, "t5", "w2", "exited", { exit_code: 0 })],
+    });
+    const sidebar = screen.getByRole("navigation");
+
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Clear 3 ended" }));
+
+    await waitFor(() => expect(calls.map((c) => c.url).sort()).toEqual(["/api/terminals/t3/close", "/api/terminals/t4/close", "/api/terminals/t5/close"]));
+  });
+
+  it("clears the ended terminals from the rail's sessions list", async () => {
+    const calls = mockActions(new Response(null, { status: 204 }));
+    await open("/terminals/t1", ended);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+
+    // The shell that failed needs you, as on the board; only the clean exit has ended.
+    const list = screen.getByRole("region", { name: "Sessions" });
+    expect(within(within(list).getByRole("group", { name: "Needs you" })).getByRole("link").getAttribute("aria-label")).toMatch(/Failed · exit 2$/);
+    fireEvent.click(within(within(list).getByRole("group", { name: "Ended" })).getByRole("button", { name: "Clear 1" }));
+
+    await waitFor(() => expect(calls.map((c) => c.url)).toEqual(["/api/terminals/t3/close"]));
+  });
+
+  it("archives every workspace on a machine with no terminals left, keeping those with work to lose", async () => {
+    let answer = () => {};
+    const held = new Promise<Response>((resolve) => (answer = () => resolve(new Response(null, { status: 204 }))));
+    const calls = mockActions(held, json(409, { uncommitted: ["a.txt"], unpushed: [], submodules: [], detached: false }));
+    await open("/terminals/t1", {
+      ...live,
+      records: [...live.records, workspace(ME, "w2", "fix logout"), workspace(ME, "w3", "fix signup")],
+    });
+    const sidebar = screen.getByRole("navigation");
+
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Archive 2 empty" }));
+    expect((await within(sidebar).findByRole("button", { name: "Archiving 2…" })).hasAttribute("disabled")).toBe(true);
+    answer();
+
+    await waitFor(() =>
+      expect(calls.sort((a, b) => a.url.localeCompare(b.url))).toEqual([
+        { url: "/api/workspaces/w2/archive", method: "POST", body: { force: false } },
+        { url: "/api/workspaces/w3/archive", method: "POST", body: { force: false } },
+      ]),
+    );
+    expect((await within(sidebar).findByRole("status")).textContent).toBe("1 kept: it has work archiving would lose. Archive it from its row.");
+  });
+
+  it("says on the board that each workspace the machine's sweep archives is archiving, as a single archive does", async () => {
+    const calls = mockActions(new Promise<Response>(() => {}), new Promise<Response>(() => {}));
+    await open("/", { ...live, records: [...live.records, workspace(ME, "w2", "fix logout"), workspace(ME, "w3", "fix signup")] });
+    const card = (name: string) => screen.getByRole("article", { name });
+    expect(within(card("fix logout")).queryByText("Archiving…")).toBeNull();
+
+    fireEvent.click(within(screen.getByRole("navigation", { name: "Workspaces" })).getByRole("button", { name: "Archive 2 empty" }));
+
+    await waitFor(() => expect(within(card("fix logout")).getByText("Archiving…")).toBeDefined());
+    expect(within(card("fix signup")).getByText("Archiving…")).toBeDefined();
+    expect(within(card("fix login")).queryByText("Archiving…")).toBeNull();
+    expect(calls.map((c) => c.url).sort()).toEqual(["/api/workspaces/w2/archive", "/api/workspaces/w3/archive"]);
+  });
+
+  it("says what the sweep archived, kept and could not archive when one archive of several fails", async () => {
+    mockActions(new Response(null, { status: 204 }), json(409, { uncommitted: ["a.txt"], unpushed: [], submodules: [], detached: false }), json(500, { error: "disk full" }));
+    await open("/terminals/t1", {
+      ...live,
+      records: [...live.records, workspace(ME, "w2", "fix logout"), workspace(ME, "w3", "fix signup"), workspace(ME, "w4", "fix search")],
+    });
+    const sidebar = screen.getByRole("navigation");
+
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Archive 3 empty" }));
+
+    expect((await within(sidebar).findByRole("status")).textContent).toBe(
+      "1 kept: it has work archiving would lose. Archive it from its row. Could not archive 1 of the 3 empty workspaces: disk full.",
+    );
+  });
+
+  it("leaves a factory run's workspace with no terminals out of the machine's sweep, live or held up", async () => {
+    const calls = mockActions(new Response(null, { status: 204 }));
+    await open("/terminals/t1", {
+      ...live,
+      records: [...live.records, workspace(ME, "w2", "fac 162"), workspace(ME, "w3", "fac 170"), workspace(ME, "w4", "fix signup")],
+    });
+    const status = factoryStatus("p1", { "original-solutions__foundry__162__1": ["w2"] }, { "original-solutions__foundry__170__1": { kind: "stuck", workspaces: ["w3"] } }).p1;
+    act(() => sockets("/api/events").at(-1)!.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status })));
+    const sidebar = screen.getByRole("navigation");
+
+    fireEvent.click(await within(sidebar).findByRole("button", { name: "Archive 1 empty" }));
+
+    await waitFor(() => expect(calls.map((c) => c.url)).toEqual(["/api/workspaces/w4/archive"]));
+  });
+
+  it("leaves a workspace of a project whose factory is on out of the sweep until the project's factory status is known", async () => {
+    const calls = mockActions(new Response(null, { status: 204 }), new Response(null, { status: 204 }));
+    await open("/terminals/t1", {
+      ...live,
+      records: [...live.records, workspace(ME, "w2", "fac 162"), workspace(ME, "w3", "fix signup", { project: "p2" })],
+      settings: settings({
+        projects: [
+          { id: "p1", name: "demo", repo: "/tmp/demo.git" },
+          { id: "p2", name: "other", repo: "/tmp/other.git" },
+        ],
+        project_factory: { p1: { on: true, login: "bot", paused: false } },
+      }),
+    });
+    const sidebar = screen.getByRole("navigation");
+    expect(within(sidebar).getByRole("button", { name: "Archive 1 empty" })).toBeDefined();
+
+    // Once p1's status says no run holds w2, it is empty like any other.
+    act(() => sockets("/api/events").at(-1)!.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: factoryStatus("p1", {}).p1 })));
+    expect(await within(sidebar).findByRole("button", { name: "Archive 2 empty" })).toBeDefined();
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Archive 2 empty" }));
+    await waitFor(() => expect(calls.map((c) => c.url).sort()).toEqual(["/api/workspaces/w2/archive", "/api/workspaces/w3/archive"]));
+  });
+
+  it("sweeps only its own machine: another machine's ended terminals and empty workspaces stay", async () => {
+    const calls = mockActions(...Array.from({ length: 4 }, () => new Response(null, { status: 204 })));
+    await open("/terminals/t1", {
+      ...ended,
+      records: [
+        ...ended.records,
+        workspace(ME, "w2", "fix logout"),
+        workspace(ME, "w7", "fix search"),
+        terminal(ME, "t8", "w7", "exited", { exit_code: 0 }),
+        sample(OTHER, 1),
+        workspace(OTHER, "w5", "far off"),
+        terminal(OTHER, "t9", "w5", "exited", { exit_code: 0 }),
+        workspace(OTHER, "w6", "far empty"),
+      ],
+      settings: settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "laptop", address: "10.0.0.2" }], priority: [ME, OTHER] }),
+    });
+    const studio = screen.getByRole("region", { name: "studio" });
+    // The laptop has its own sweep, for its own terminal and workspace.
+    expect(within(screen.getByRole("region", { name: "laptop" })).getByRole("button", { name: "Archive 1 empty" })).toBeDefined();
+
+    fireEvent.click(within(studio).getByRole("button", { name: "Clear 3 ended" }));
+    fireEvent.click(within(studio).getByRole("button", { name: "Archive 1 empty" }));
+
+    await waitFor(() =>
+      expect(calls.map((c) => c.url).sort()).toEqual(["/api/terminals/t3/close", "/api/terminals/t4/close", "/api/terminals/t8/close", "/api/workspaces/w2/archive"]),
+    );
+  });
+
+  it("closes the floating sessions list on a press in the main pane, and keeps a docked one open", async () => {
+    mockActions();
+    await open("/terminals/t1", live);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    const main = document.querySelector("main")!;
+
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+    expect(screen.getByRole("region", { name: "Sessions" })).toBeDefined();
+    fireEvent.pointerDown(main);
+    expect(screen.queryByRole("region", { name: "Sessions" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Dock beside the rail" }));
+    fireEvent.pointerDown(main);
+    expect(screen.getByRole("region", { name: "Sessions" })).toBeDefined();
+  });
+
   it("ends a running session from the header's menu only after asking, then moves to the next tab once it is gone", async () => {
     const calls = mockActions(new Response(null, { status: 204 }));
     const router = await open("/terminals/t1", live);
@@ -1995,6 +2196,38 @@ describe("App", () => {
     expect(await within(tabs).findByRole("textbox", { name: "Session name" })).toBeDefined();
     expect(within(sidebar).queryByRole("textbox")).toBeNull();
     expect(calls).toEqual([]);
+  });
+
+  it("renames a session from the rail's sessions list in its tab, the sidebar's row being hidden", async () => {
+    const calls = mockActions();
+    await open("/", live);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+
+    fireEvent.contextMenu(within(screen.getByRole("region", { name: "Sessions" })).getByRole("link", { name: /^fix login \/ sonnet/ }));
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Rename" }));
+
+    const tabs = await screen.findByRole("tablist", { name: "Terminals in fix login" });
+    expect(await within(tabs).findByRole("textbox", { name: "Session name" })).toBeDefined();
+    // The floating list closed as the terminal opened, so it does not cover the tab being renamed.
+    expect(screen.queryByRole("region", { name: "Sessions" })).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
+  it("closes the floating sessions list for good when another terminal opens from a row's menu, so coming back does not bring it up", async () => {
+    mockActions();
+    const router = await open("/terminals/t1", live);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+
+    fireEvent.contextMenu(within(screen.getByRole("region", { name: "Sessions" })).getByRole("link", { name: /^fix login \/ shell/ }));
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Open" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    expect(screen.queryByRole("region", { name: "Sessions" })).toBeNull();
+
+    await act(() => router.navigate({ to: "/terminals/$terminalId", params: { terminalId: "t1" } }));
+    expect(screen.queryByRole("region", { name: "Sessions" })).toBeNull();
+    expect(screen.getByRole("button", { name: /^Sessions/ }).getAttribute("aria-expanded")).toBe("false");
   });
 
   it("opens a workspace's changes at a file its terminal names, on ⌘-click", async () => {

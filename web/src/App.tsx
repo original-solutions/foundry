@@ -361,7 +361,8 @@ function Layout() {
             <div className="flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
               <div className="relative flex min-h-0 flex-1">
                 {rail && (
-                  <div {...frozen} className="hidden shrink-0 md:flex">
+                  // Raised, so the sessions list floats over the terminal even while a stale fleet dims the rail.
+                  <div {...frozen} className="relative z-30 hidden shrink-0 md:flex">
                     <Rail machines={machines} selected={terminalId} onExpand={flipRail} onJump={openJump} onCreate={() => openCreate()} alerts={<NotifyButton {...notify} />} />
                   </div>
                 )}
@@ -378,6 +379,7 @@ function Layout() {
                       alerts={<NotifyButton {...notify} onClick={close} />}
                       onKeys={() => setKeysOpen(true)}
                       onRail={rail ? undefined : flipRail}
+                      stale={stale}
                     />
                   </div>
                 )}
