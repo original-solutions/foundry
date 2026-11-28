@@ -129,8 +129,8 @@ fn quoted(text: &str) -> String {
 /// answer names an operation: JSON with `error.code` (or `code`, or an `error` that is a code),
 /// or, when `plain`, a line that starts with a code, such as `Error: PRECONDITION_FAILED: …`.
 /// The checks saw the codes and not the shape they came in, so both are guesses. A code beside
-/// an operation (an `operation`, its id, or a state other than failed) is that operation's, so
-/// Vims took the call and it is no refusal. Whether any other code is a refusal of Vims's is
+/// anything the answer names ([`answer::Named`]: an operation, a workspace or an id) or a state
+/// other than failed is that thing's, so Vims took the call and it is no refusal. Whether any other code is a refusal of Vims's is
 /// [`Refusal::is_vims_s`]'s to say.
 fn coded(text: &str, plain: bool) -> Option<(Refusal, bool)> {
     let text = text.trim();
@@ -151,9 +151,12 @@ fn coded(text: &str, plain: bool) -> Option<(Refusal, bool)> {
             .find(|code| is_code(code))?;
         let message =
             answer::text(&value, &[&["error", "message"], &["message"]]).unwrap_or_default();
-        // Guessed, as `Change::read` guesses them: an operation's id and state.
-        let operation = value.get("operation").is_some_and(Value::is_object)
-            || answer::text(&value, &[&["id"], &["operationId"], &["operation_id"]]).is_some()
+        // Anything the answer names (an operation, a workspace, or an id), or a state other
+        // than failed, says Vims took the call.
+        let named = answer::Named::in_answer(&value);
+        let operation = named.operation
+            || named.workspace
+            || named.id.is_some()
             || answer::text(&value, &[&["status"], &["state"]])
                 .is_some_and(|state| OpState::read(&state) != OpState::Failed);
         return Some((Refusal::new(code, message), operation));

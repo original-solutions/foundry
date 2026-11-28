@@ -452,7 +452,7 @@ pub trait Vims: Send + Sync {
         read(
             &call,
             self.call(&call)?,
-            Change::read_made,
+            |stdout| Change::read_made(stdout, answer::GRANTED),
             "an operation, a workspace or nothing",
         )
     }
@@ -476,7 +476,7 @@ pub trait Vims: Send + Sync {
         read(
             &call,
             self.call(&call)?,
-            Change::read_made,
+            |stdout| Change::read_made(stdout, answer::REMOVED),
             "an operation, a workspace or nothing",
         )
     }
@@ -1009,7 +1009,36 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_with_its_own_id_and_a_state_no_operation_has_is_made() {
+    fn a_grant_on_its_own_id_is_made_only_by_a_state_that_says_so_for_its_direction() {
+        for (state, put, rm) in [
+            ("active", true, false),
+            ("granted", true, false),
+            ("revoked", false, true),
+            ("removed", false, true),
+            ("revoking", false, false),
+            ("rejected", false, false),
+            ("denied", false, false),
+            ("mystery", false, false),
+        ] {
+            let answer = format!(r#"{{"id":"tg_1","status":"{state}"}}"#);
+            let fake = FakeVims::new();
+            fake.on("workspace turn-grant put", Reply::ok(answer.clone()))
+                .on("workspace turn-grant rm", Reply::ok(answer));
+            let granted = fake.grant("wsp_1", "fetch", "conn_gh", "30m", "k1");
+            assert_eq!(granted.is_ok(), put, "put {state}: {granted:?}");
+            if let Err(error) = granted {
+                assert!(matches!(error, VimsError::Unknown { .. }), "put {state}");
+            }
+            let removed = fake.ungrant("wsp_1", "fetch", "conn_gh", "k2");
+            assert_eq!(removed.is_ok(), rm, "rm {state}: {removed:?}");
+            if let Err(error) = removed {
+                assert!(matches!(error, VimsError::Unknown { .. }), "rm {state}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_grant_with_its_own_id_and_the_state_of_its_direction_is_made() {
         let fake = FakeVims::new();
         fake.on(
             "workspace turn-grant put",

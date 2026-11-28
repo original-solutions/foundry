@@ -145,15 +145,16 @@ impl Change {
 
     /// As [`Change::read`], for a change whose answer may be the thing it made, such as a
     /// grant: an answer that is no error, names neither an operation nor a workspace, and has
-    /// no state, a done state, or a state no operation has beside its own id, is the change
-    /// made. Guessed: P2c records no grant's answer.
-    pub(super) fn read_made(stdout: &str) -> Option<Self> {
-        Self::read_or(stdout, Some(Change::Done))
+    /// no state, a done state, or one of `made` beside its own id (such as [`GRANTED`]), is the
+    /// change made. Any other state cannot be read. Guessed: P2c records no grant's answer.
+    pub(super) fn read_made(stdout: &str, made: &[&str]) -> Option<Self> {
+        Self::read_or(stdout, Some(made))
     }
 
-    /// The change `stdout` answers, or `otherwise` for an answer that is no error, names
-    /// neither an operation nor a workspace, and whose state says the change is made.
-    fn read_or(stdout: &str, otherwise: Option<Self>) -> Option<Self> {
+    /// The change `stdout` answers, or, when `made` is given, [`Change::Done`] for an answer
+    /// that is no error, names neither an operation nor a workspace, and whose state says the
+    /// change is made.
+    fn read_or(stdout: &str, made_by: Option<&[&str]>) -> Option<Self> {
         if stdout.trim().is_empty() {
             return Some(Change::Done);
         }
@@ -168,43 +169,67 @@ impl Change {
         if failed && state.is_none() {
             return None;
         }
-        // Guessed: an operation is under `operation`, or is the answer when it has an
-        // operation id, or an `id` that is no workspace's (`wsp_`, which the checks saw); a
-        // workspace is under `workspace`, or is the answer when its `id` is a workspace's. Where
-        // the answer may be the thing made, a bare `id` is an operation's only with a state an
-        // operation has.
-        let made = otherwise.is_some();
-        let id = text(&value, &[&["id"]]);
+        // Where the answer may be the thing made, a bare `id` is an operation's only with a
+        // state an operation has.
+        let made = made_by.is_some();
+        let named = Named::in_answer(&value);
+        let id = named.id.as_deref();
         let operation_state = state
             .as_ref()
             .is_some_and(|state| !matches!(state, OpState::Other(_)));
-        let operation = value.get("operation").is_some_and(Value::is_object)
-            || text(&value, &[&["operationId"], &["operation_id"]]).is_some()
-            || id
-                .as_deref()
-                .is_some_and(|id| !id.starts_with("wsp_") && (operation_state || !made));
+        let operation = named.operation
+            || (id.is_some() && !named.is_workspace() && (operation_state || !made));
         if operation {
             return Operation::from_value(&value).map(Change::Operation);
         }
-        let workspace = value.get("workspace").is_some_and(Value::is_object)
-            || id.as_deref().is_some_and(|id| id.starts_with("wsp_"));
-        if workspace {
+        if named.workspace || named.is_workspace() {
             return Workspace::from_value(&value).map(Change::Workspace);
         }
         // The change is made only by an answer that is no error and whose state, if it has one,
-        // says it is done, or is a state no operation has on the thing's own id. A failed or
-        // cancelled state is never the change made, and work under way, or a state nothing
-        // names on no id, may not have happened yet.
+        // says it is done, or is one of `made_by`'s on the thing's own id. A failed or cancelled
+        // state is never the change made; work under way, or any other word, may not have
+        // happened yet, so the caller finds out by the key.
+        let made_by = made_by?;
         let made_state = match &state {
             None | Some(OpState::Finished) => true,
-            Some(OpState::Other(_)) => id.is_some(),
+            Some(OpState::Other(word)) => id.is_some() && made_by.contains(&word.as_str()),
             Some(OpState::Running | OpState::Failed | OpState::Cancelled) => false,
         };
-        if failed || !made_state {
-            None
-        } else {
-            otherwise
+        (!failed && made_state).then_some(Change::Done)
+    }
+}
+
+/// The states a grant's own answer has once it is made. Guessed: P2c records no grant's answer.
+pub(super) const GRANTED: &[&str] = &["active", "granted"];
+
+/// The states a grant's own answer has once it is taken away. Guessed, as [`GRANTED`] is.
+pub(super) const REMOVED: &[&str] = &["revoked", "removed"];
+
+/// What an answer names, by its guessed fields. The checks saw a workspace's id, `wsp_…`; the
+/// rest are guesses. A failure's code and [`Change::read`] both read it.
+pub(super) struct Named {
+    /// An operation, under `operation` or by `operationId`.
+    pub operation: bool,
+    /// A workspace, under `workspace`.
+    pub workspace: bool,
+    /// The answer's own `id`: a workspace's when it starts `wsp_`, else an operation's or
+    /// another thing's.
+    pub id: Option<String>,
+}
+
+impl Named {
+    pub(super) fn in_answer(value: &Value) -> Self {
+        Named {
+            operation: value.get("operation").is_some_and(Value::is_object)
+                || text(value, &[&["operationId"], &["operation_id"]]).is_some(),
+            workspace: value.get("workspace").is_some_and(Value::is_object),
+            id: text(value, &[&["id"]]),
         }
+    }
+
+    /// Whether the answer's own `id` is a workspace's.
+    pub(super) fn is_workspace(&self) -> bool {
+        self.id.as_deref().is_some_and(|id| id.starts_with("wsp_"))
     }
 }
 
@@ -488,7 +513,9 @@ impl GithubLinks {
         }
         // The answer names no owner the reader can place. Its login is for every owner only when
         // nothing else in it could hold owners: a list under a name not guessed, or in a shape
-        // not guessed, would let the login answer for owners it was never named for.
+        // not guessed, would let the login answer for owners it was never named for. An owner
+        // under a scalar field not guessed is not caught: where `vims github` names owners is
+        // unknown until the contract test or #360 pins it.
         if let Value::Object(fields) = &value {
             let flat = |value: &Value| {
                 value
