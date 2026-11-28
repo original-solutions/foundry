@@ -301,15 +301,36 @@ describe("SettingsMachine", () => {
       expect(screen.getByRole("button", { name: "Install" })).toBeDefined();
     });
 
-    it("goes once the machine's release is no longer ready", async () => {
+    /** Shows laptop's page over the samples the test can change, as the events socket would. */
+    async function sampled(first: AnyRecord[]) {
+      let change: (next: AnyRecord[]) => void = () => {};
+      function Live() {
+        const [records, setRecords] = useState(first);
+        change = setRecords;
+        const machines = fleet(records, limited, {}, [ME, OTHER]);
+        return <SettingsMachine {...pageProps({ state: { ...emptyState, synced: true, settings: limited }, machines, here: ME })} machineId={OTHER} />;
+      }
+      await renderApp(<Live />);
+      return (next: AnyRecord[]) => act(() => change(next));
+    }
+
+    it("drops the status of an older tag's install when a newer release is ready", async () => {
       mockFetch(json(202, {}));
-      const view = await show(OTHER, { records: ready(OTHER) });
+      const next = await sampled(ready(OTHER));
       fireEvent.click(screen.getByRole("button", { name: "Install" }));
       await screen.findByText(/^Restarting/);
-      const machines = fleet([at(ME, 1), at(OTHER, 2, { version: "0.9.1" })], limited, {}, [ME, OTHER]);
-      view.rerender(<></>);
-      view.unmount();
-      await renderApp(<SettingsMachine {...pageProps({ state: { ...emptyState, synced: true, settings: limited }, machines, here: ME })} machineId={OTHER} />);
+      next([at(ME, 1), at(OTHER, 2, { version: "0.9.1", update_ready: "v0.9.2" })]);
+      expect(screen.getByText("v0.9.2 is ready")).toBeDefined();
+      expect(screen.getByRole("button", { name: "Install" })).toBeDefined();
+      expect(screen.queryByText(/^(Restarting|Running)/)).toBeNull();
+    });
+
+    it("goes once the machine's release is no longer ready", async () => {
+      mockFetch(json(202, {}));
+      const next = await sampled(ready(OTHER));
+      fireEvent.click(screen.getByRole("button", { name: "Install" }));
+      await screen.findByText(/^Restarting/);
+      next([at(ME, 1), at(OTHER, 2, { version: "0.9.1" })]);
       expect(screen.queryByRole("heading", { name: "Update" })).toBeNull();
     });
 
