@@ -6866,7 +6866,7 @@ mod tests {
         use super::*;
         use crate::factory::gate::{self, MACHINE_GONE_AFTER};
         use crate::factory::runs::gating::{
-            ARCHIVE_TRIES, GATE_COULD_NOT_RUN, GATE_CUT_OFF, GATE_LEFT, gate_running,
+            ARCHIVE_TRIES, GATE_COULD_NOT_RUN, GATE_CUT_OFF, GATE_LEFT, UNSEEN_PASSES, gate_running,
         };
         use crate::factory::runs::progress::GATE_REQUESTED;
 
@@ -7486,24 +7486,7 @@ mod tests {
         #[test]
         fn a_fifth_failure_to_run_is_the_gates_stuck_and_spends_no_resume() {
             let (mut rig, run) = reported();
-            let gone = gate::could_not_run(None, MACHINE_GONE_AFTER, None).unwrap();
-            for k in 1..=4 {
-                rig.step(
-                    &run,
-                    &format!("{GATE_REQUESTED}1 {k} {HEAD} {BASE_TIP} {}", m1()),
-                );
-                let wait = gate::backoff(k).unwrap();
-                rig.step(
-                    &run,
-                    &format!("{GATE_COULD_NOT_RUN}1 {k} {k} {wait} {gone}"),
-                );
-            }
-            rig.step(
-                &run,
-                &format!("{GATE_REQUESTED}1 5 {HEAD} {BASE_TIP} {}", m2()),
-            );
-            rig.step(&run, &format!("gate-created 5 {}", gate_workspace()));
-            assert!(gate_running(&rig.events(&run)));
+            fifth_in_flight(&rig, &run);
             rig.view = at_work(UNREACHABLE_FOR);
             let step = pass(&rig, &run);
             assert!(matches!(step, ResumeStep::Stuck { .. }), "{step:?}");
@@ -7516,6 +7499,112 @@ mod tests {
             assert!(interruptions(&rig, &run).is_empty());
             assert_eq!(rig.ctx().seen(&run).unwrap().state, Some(State::Stuck));
             assert!(create_calls(&rig).is_empty());
+        }
+
+        /// Attempt 1 has four failures to run on the build machine, and its fifth gate is in
+        /// flight on `m2`.
+        fn fifth_in_flight(rig: &Rig, run: &RunId) {
+            let gone = gate::could_not_run(None, MACHINE_GONE_AFTER, None).unwrap();
+            for k in 1..=4 {
+                rig.step(
+                    run,
+                    &format!("{GATE_REQUESTED}1 {k} {HEAD} {BASE_TIP} {}", m1()),
+                );
+                let wait = gate::backoff(k).unwrap();
+                rig.step(run, &format!("{GATE_COULD_NOT_RUN}1 {k} {k} {wait} {gone}"));
+            }
+            rig.step(
+                run,
+                &format!("{GATE_REQUESTED}1 5 {HEAD} {BASE_TIP} {}", m2()),
+            );
+            rig.step(run, &format!("gate-created 5 {}", gate_workspace()));
+            assert!(gate_running(&rig.events(run)));
+        }
+
+        /// A pass cut short by a lost lease anywhere after the fifth failure to run is written
+        /// still ends stuck by the gate's rule: the next pass that has the run takes the stuck
+        /// path again, or, once the gate has begun it, leaves it to the gate. No interruption is
+        /// recorded and no resume is spent.
+        #[test]
+        fn a_pass_cut_short_after_a_fifth_failure_to_run_still_ends_stuck() {
+            for held in 0.. {
+                let (mut rig, run) = reported();
+                fifth_in_flight(&rig, &run);
+                rig.view = at_work(UNREACHABLE_FOR);
+                rig.guard = Box::new(HeldFor::new(held));
+                if advance(&rig.ctx(), &run).is_ok() {
+                    assert!(held > 0, "the lease was never lost");
+                    break;
+                }
+                rig.guard = Box::new(crate::factory::worker::AlwaysHeld(1));
+                if takes_from_the_gate(&rig.ctx(), &rig.events(&run)) {
+                    let step = advance(&rig.ctx(), &run).unwrap();
+                    assert!(
+                        matches!(step, ResumeStep::Stuck { .. }),
+                        "cut at {held}: {step:?}"
+                    );
+                    assert_eq!(
+                        rig.ctx().seen(&run).unwrap().state,
+                        Some(State::Stuck),
+                        "cut at {held}"
+                    );
+                } else {
+                    let seen = rig.ctx().seen(&run).unwrap();
+                    assert!(
+                        seen.stuck_stop.is_some() || seen.state == Some(State::Stuck),
+                        "cut at {held}: the gate has a run with no stuck path begun"
+                    );
+                }
+                assert!(interruptions(&rig, &run).is_empty(), "cut at {held}");
+                assert!(create_calls(&rig).is_empty(), "cut at {held}");
+            }
+        }
+
+        /// A pass that wrote the fifth failure to run and stopped before the gate's stuck path
+        /// began (a refusal or a failed write: no lease check lies between them) leaves a run
+        /// with no gate in flight. The next pass takes the gate's stuck path, as the gate does
+        /// for its own fifth failure, and records no interruption.
+        #[test]
+        fn a_fifth_failure_to_run_with_no_stuck_path_begun_is_the_gates_stuck() {
+            let (mut rig, run) = reported();
+            fifth_in_flight(&rig, &run);
+            rig.step(&run, "gate-archiving 5");
+            rig.step(&run, "gate-archived 5");
+            rig.step(&run, &format!("{GATE_COULD_NOT_RUN}1 5 5 - {GATE_CUT_OFF}"));
+            assert!(!gate_running(&rig.events(&run)));
+            rig.view = at_work(UNREACHABLE_FOR);
+            assert!(takes_from_the_gate(&rig.ctx(), &rig.events(&run)));
+            let step = pass(&rig, &run);
+            assert!(matches!(step, ResumeStep::Stuck { .. }), "{step:?}");
+            assert_eq!(could_not_runs(&rig, &run), 5);
+            assert!(interruptions(&rig, &run).is_empty());
+            assert_eq!(rig.ctx().seen(&run).unwrap().state, Some(State::Stuck));
+            assert!(create_calls(&rig).is_empty());
+        }
+
+        /// A gate whose create is not answered and that the fleet does not show yet may still
+        /// be made: it keeps its slot, by the gate's rule, until `UNSEEN_PASSES` passes have
+        /// not shown it and it is recorded left. Only then could it not run, and the
+        /// interruption is recorded.
+        #[test]
+        fn a_gate_not_shown_yet_keeps_its_slot_until_the_gate_is_left() {
+            let (mut rig, run) = reported();
+            rig.step(
+                &run,
+                &format!("{GATE_REQUESTED}1 1 {HEAD} {BASE_TIP} {}", m2()),
+            );
+            rig.view = at_work(UNREACHABLE_FOR);
+            for _ in 1..UNSEEN_PASSES {
+                assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Gate));
+                assert!(interruptions(&rig, &run).is_empty());
+                assert_eq!(could_not_runs(&rig, &run), 0);
+                assert!(gate_running(&rig.events(&run)));
+            }
+            pass_one(&rig, &run);
+            assert_eq!(could_not_runs(&rig, &run), 1);
+            assert_eq!(interruptions(&rig, &run).len(), 1);
+            assert!(!gate_running(&rig.events(&run)));
+            assert_eq!(gate_archives(&rig), 0);
         }
 
         /// A stuck path this step began for a cut-off run (its resumes used) stays this step's
