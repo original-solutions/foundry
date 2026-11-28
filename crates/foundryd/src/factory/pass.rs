@@ -1583,14 +1583,6 @@ impl<'a, 'w> Pass<'a, 'w> {
         let world = self.world;
         let known = self.known()?;
         let unfinished: BTreeSet<RunId> = known.iter().map(|k| k.info.id.clone()).collect();
-        // The workspace a run's progress names as its current one, if any.
-        let workspace_of = |seen: &super::runs::progress::Seen| -> Vec<WorkspaceId> {
-            seen.workspace
-                .as_deref()
-                .and_then(|w| w.parse().ok().map(WorkspaceId))
-                .into_iter()
-                .collect()
-        };
         for k in &known {
             let run = k.info.id.clone();
             match k.info.state {
@@ -1604,17 +1596,12 @@ impl<'a, 'w> Pass<'a, 'w> {
                         run,
                         kind,
                         reason: k.seen.stuck.clone().unwrap_or_default(),
-                        workspaces: workspace_of(&k.seen),
+                        workspaces: workspaces_of(&k.seen),
                     });
                 }
                 _ if k.info.unreadable || !k.info.confirmed => {}
                 state => {
-                    let machine = k
-                        .seen
-                        .machine
-                        .as_deref()
-                        .and_then(machine_id)
-                        .unwrap_or(world.me);
+                    let machine = live_machine_of(&k.seen).unwrap_or(world.me);
                     let used = super::runs::progress::next_gate_attempt(&k.seen).saturating_sub(1);
                     self.results.live(LiveRun {
                         title: self.title(run.issue()),
@@ -1626,7 +1613,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                         machine,
                         gate_retries_used: used,
                         minutes_used: k.seen.worked_ms / 60_000,
-                        workspaces: workspace_of(&k.seen),
+                        workspaces: workspaces_of(&k.seen),
                         sessions: k
                             .seen
                             .thread_id
@@ -1706,7 +1693,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                                 "factory: a held-up run's events could not be read, so it names no workspace: {error}"
                             );
                         })
-                        .map(|events| workspace_of(&read_progress(&events)))
+                        .map(|events| workspaces_of(&read_progress(&events)))
                         .unwrap_or_default();
                     self.results.held_up.push(HeldUp {
                         run: done.run.run.clone(),
@@ -1794,6 +1781,43 @@ impl PassResults {
     fn live(&mut self, run: LiveRun) {
         self.runs.push(run);
     }
+}
+
+/// The workspaces a run's progress names, oldest first: the build workspace, then each resume and
+/// feedback round's, none twice.
+fn workspaces_of(seen: &super::runs::progress::Seen) -> Vec<WorkspaceId> {
+    let mut listed: Vec<WorkspaceId> = seen
+        .workspace
+        .as_deref()
+        .and_then(|w| w.parse().ok().map(WorkspaceId))
+        .into_iter()
+        .collect();
+    for round in &seen.round_workspaces {
+        if let Some(id) = round.workspace.parse().ok().map(WorkspaceId)
+            && !listed.contains(&id)
+        {
+            listed.push(id);
+        }
+    }
+    listed
+}
+
+/// The machine of a run's newest workspace: the machine its newest round named, when that round's
+/// workspace is the newest listed; otherwise the claim's. `None` when neither parses.
+fn live_machine_of(seen: &super::runs::progress::Seen) -> Option<MachineId> {
+    let newest = workspaces_of(seen).pop();
+    let build = seen
+        .workspace
+        .as_deref()
+        .and_then(|w| w.parse().ok().map(WorkspaceId));
+    let from_round = seen
+        .round_workspaces
+        .iter()
+        .rev()
+        .find(|round| round.workspace.parse().ok().map(WorkspaceId) == newest)
+        .filter(|_| build != newest)
+        .and_then(|round| round.machine.as_deref().and_then(machine_id));
+    from_round.or_else(|| seen.machine.as_deref().and_then(machine_id))
 }
 
 /// A machine id as the ledger writes one.
@@ -5099,6 +5123,296 @@ mod tests {
             assert_eq!(held.len(), 1, "{held:?}");
             assert_eq!(held[0].run, run);
             assert_eq!(held[0].workspaces, vec![workspace_of(5, 1)]);
+        }
+
+        /// A machine the builder's runs move to in a round.
+        fn mover() -> MachineId {
+            MachineId(uuid::Uuid::from_u128(0x3))
+        }
+
+        /// A second machine a run's rounds move to: after giving up `mover`, or in a later round.
+        fn other_mover() -> MachineId {
+            MachineId(uuid::Uuid::from_u128(0x4))
+        }
+
+        /// The workspace round `name` (`r1`, `f1`) of `issue` is made in.
+        fn round_workspace(issue: u64, name: u128) -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(
+                0xc000 + u128::from(issue) * 0x10 + name,
+            ))
+        }
+
+        fn steps(rig: &Rig, run: &RunId, steps: &[String]) {
+            let cause = Cause::new(CauseStep::Start, "test");
+            for step in steps {
+                let event = Event::StepChanged { step: step.clone() };
+                rig.ledger.write(run, &event, &cause).unwrap();
+            }
+        }
+
+        fn resumed(issue: u64) -> Vec<String> {
+            vec![
+                format!("resume-machine 1 {}", mover()),
+                format!("resume-workspace 1 {}", round_workspace(issue, 1)),
+            ]
+        }
+
+        #[test]
+        fn a_live_run_resumed_on_another_machine_names_both_workspaces_and_the_new_machine() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    vec![format!("workspace-created {}", workspace_of(5, 1))],
+                    resumed(5),
+                ]
+                .concat(),
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(
+                live[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 1)]
+            );
+            assert_eq!(live[0].machine, mover());
+        }
+
+        #[test]
+        fn a_live_run_with_a_feedback_round_names_the_feedback_workspace() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    format!("workspace-created {}", workspace_of(5, 1)),
+                    format!("feedback-machine 1 {}", mover()),
+                    format!("feedback-workspace 1 {}", round_workspace(5, 2)),
+                ],
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(
+                live[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 2)]
+            );
+            assert_eq!(live[0].machine, mover());
+        }
+
+        #[test]
+        fn a_run_names_a_round_workspace_once_and_keeps_the_claims_machine_without_a_round_machine()
+        {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    format!("workspace-created {}", workspace_of(5, 1)),
+                    format!("resume-workspace 1 {}", workspace_of(5, 1)),
+                    format!("feedback-workspace 1 {}", round_workspace(5, 2)),
+                    format!("feedback-workspace 1 {}", round_workspace(5, 2)),
+                ],
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(
+                live[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 2)]
+            );
+            assert_eq!(live[0].machine, builder_machine());
+        }
+
+        #[test]
+        fn a_run_whose_round_gave_up_its_machine_forgets_the_workspace_made_there() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    format!("workspace-created {}", workspace_of(5, 1)),
+                    format!("resume-machine 1 {}", mover()),
+                    format!("resume-workspace 1 {}", round_workspace(5, 1)),
+                    format!("resume-machine-given-up 1 {}", mover()),
+                    format!("resume-machine 1 {}", other_mover()),
+                    format!("resume-workspace 1 {}", round_workspace(5, 2)),
+                ],
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(
+                live[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 2)]
+            );
+            assert_eq!(live[0].machine, other_mover());
+        }
+
+        #[test]
+        fn a_run_whose_round_gave_up_its_machine_after_the_workspace_names_only_the_build_workspace()
+         {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            let mut given_up = resumed(5);
+            given_up.push(format!("resume-machine-given-up 1 {}", mover()));
+            steps(
+                &rig,
+                &run,
+                &[
+                    vec![format!("workspace-created {}", workspace_of(5, 1))],
+                    given_up,
+                ]
+                .concat(),
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(live[0].workspaces, vec![workspace_of(5, 1)]);
+            assert_eq!(live[0].machine, builder_machine());
+        }
+
+        #[test]
+        fn a_round_workspace_that_is_the_build_workspace_keeps_the_claims_machine() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    format!("workspace-created {}", workspace_of(5, 1)),
+                    format!("resume-machine 1 {}", mover()),
+                    format!("resume-workspace 1 {}", workspace_of(5, 1)),
+                ],
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(live[0].workspaces, vec![workspace_of(5, 1)]);
+            assert_eq!(live[0].machine, builder_machine());
+        }
+
+        #[test]
+        fn a_live_run_resumed_then_given_feedback_names_every_workspace_oldest_first_and_the_newest_machine()
+         {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    vec![format!("workspace-created {}", workspace_of(5, 1))],
+                    resumed(5),
+                    vec![
+                        format!("feedback-machine 1 {}", other_mover()),
+                        format!("feedback-workspace 1 {}", round_workspace(5, 2)),
+                    ],
+                ]
+                .concat(),
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(
+                live[0].workspaces,
+                vec![
+                    workspace_of(5, 1),
+                    round_workspace(5, 1),
+                    round_workspace(5, 2)
+                ]
+            );
+            assert_eq!(live[0].machine, other_mover());
+        }
+
+        #[test]
+        fn a_held_up_run_that_was_resumed_names_its_resume_workspace() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    vec![format!("workspace-created {}", workspace_of(5, 1))],
+                    resumed(5),
+                ]
+                .concat(),
+            );
+            let cause = Cause::new(CauseStep::Start, "test");
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::StateChanged {
+                        from: State::Building,
+                        to: State::Stuck,
+                    },
+                    &cause,
+                )
+                .unwrap();
+            rig.pass();
+            let held = rig.status().held_up;
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert_eq!(
+                held[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 1)]
+            );
+        }
+
+        #[test]
+        fn a_finished_held_up_run_that_was_resumed_names_its_resume_workspace() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    vec![format!("workspace-created {}", workspace_of(5, 1))],
+                    resumed(5),
+                ]
+                .concat(),
+            );
+            let cause = Cause::new(CauseStep::Start, "test");
+            for event in [
+                Event::Stuck {
+                    reason: "no".into(),
+                    branch: None,
+                    commits_ahead: None,
+                },
+                Event::StateChanged {
+                    from: State::Building,
+                    to: State::Stuck,
+                },
+                Event::Finished {
+                    outcome: Outcome::Stuck,
+                    total_ms: 0,
+                    gate_attempts: 0,
+                    review_cycles: None,
+                    pr_url: None,
+                    pr_end: None,
+                },
+            ] {
+                rig.ledger.write(&run, &event, &cause).unwrap();
+            }
+            rig.pass();
+            let held = rig.status().held_up;
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert_eq!(
+                held[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 1)]
+            );
         }
 
         #[test]
