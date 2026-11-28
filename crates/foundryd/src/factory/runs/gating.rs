@@ -506,8 +506,9 @@ pub enum Interrupted {
     /// No gate is in flight, or it could not run and its slot is free: the interruption is
     /// recorded.
     Clear,
-    /// Its forced archive was answered "unreachable" and is waited out: the gate keeps its
-    /// slot, and the interruption waits with it.
+    /// Its forced archive is not done yet: answered "unreachable" and waited out, or a gate
+    /// the fleet does not show yet given its passes. The gate keeps its slot, and the
+    /// interruption waits with it.
     Waiting,
     /// Its failure to run was the fifth of its attempt: the run is stuck, as any gate's
     /// fifth failure makes it, and no interruption is recorded. `reason` is the public one.
@@ -525,23 +526,30 @@ pub enum Interrupted {
 /// - On a machine that is not gone its commands may still run, so its workspace is archived by
 ///   force first (`archive_gate` while placing gates): the gate holds its slot until it is
 ///   archived or recorded left, a refusal is an error asked again next pass, and an
-///   "unreachable" answer is [`Interrupted::Waiting`]. Then it could not run with
-///   [`GATE_CUT_OFF`].
+///   "unreachable" answer, or a gate the fleet does not show yet (`UNSEEN_PASSES` passes), is
+///   [`Interrupted::Waiting`]. Then it could not run with [`GATE_CUT_OFF`].
 ///
 /// The failure to run is counted for its attempt and waited out as the gate's are, and a fifth
-/// is the gate's stuck. The newest gate with neither a verdict nor a failure to run is the one
-/// in flight, archived or left included, so a pass cut short after the archive writes the
-/// failure to run in the next pass, and one cut after the failure to run finds nothing here.
+/// is the gate's stuck: a pass cut short before that stuck path began takes it again, and once
+/// it has begun the run is the gate's to finish (`resume::takes_from_the_gate`). The newest gate
+/// with neither a verdict nor a failure to run is the one in flight, archived or left included,
+/// so a pass cut short after the archive writes the failure to run in the next pass, and one
+/// cut after a failure to run that was not the fifth finds nothing here.
 pub fn interrupted(
     ctx: &RunContext<'_>,
     run: &RunId,
     events: &[RunEvent],
 ) -> Result<Interrupted, RunError> {
     let log = Log::read(events);
+    // A fifth failure to run written by a pass cut short before its stuck path began.
+    let fifth = log
+        .active_cnr()
+        .filter(|cnr| gate::backoff(cnr.failures).is_none())
+        .cloned();
     let Some(req) = log
         .reqs
         .last()
-        .filter(|req| !req.cnr && req.ended.is_none())
+        .filter(|req| fifth.is_some() || (!req.cnr && req.ended.is_none()))
         .cloned()
     else {
         return Ok(Interrupted::Clear);
@@ -563,6 +571,16 @@ pub fn interrupted(
         url: last.url,
         session: session_id(&thread)?,
     };
+    if let Some(cnr) = fifth {
+        let GateStep::Stuck { reason } =
+            gate.stuck("gate-could-not-run", could_not_run_stop(&cnr.reason))?
+        else {
+            return Err(RunError::Invalid(
+                "the gate's stuck path did not end stuck".into(),
+            ));
+        };
+        return Ok(Interrupted::Stuck { reason });
+    }
     let gone = uuid::Uuid::parse_str(&req.machine)
         .ok()
         .map(MachineId)
@@ -574,6 +592,15 @@ pub fn interrupted(
         }
     }
     let (_, log) = gate.fresh()?;
+    // A gate not shown yet is given its passes (`gate-unseen`) and may still be made.
+    let held = log
+        .reqs
+        .iter()
+        .find(|r| r.k == req.k)
+        .is_some_and(|r| !r.archived && r.left.is_none());
+    if gone.is_none() && held {
+        return Ok(Interrupted::Waiting);
+    }
     let reason = gone.as_deref().unwrap_or(GATE_CUT_OFF);
     Ok(
         match gate.could_not_run(&log, req.attempt, req.k, reason)? {

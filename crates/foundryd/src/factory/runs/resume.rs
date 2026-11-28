@@ -404,8 +404,8 @@ pub enum Wait {
     /// The setup terminal is running, or its exit is not known.
     Setup,
     /// The forced archive of a gate in flight, which the interruption of its run's session
-    /// stops, was answered "unreachable": waited out by the gate's rule before the
-    /// interruption is recorded (#367).
+    /// stops, is not done: an "unreachable" answer or a gate the fleet does not show yet,
+    /// waited out by the gate's rule before the interruption is recorded (#367).
     Gate,
 }
 
@@ -959,7 +959,10 @@ fn resumed_unread(events: &[RunEvent]) -> bool {
 /// at rest as the gate reads one (`gating::at_rest`), whose reported pull request the gate
 /// takes (#294). A recorded pass is the gate's to finish, with no session.
 fn cut_off_at_work(ctx: &RunContext<'_>, seen: &Seen) -> bool {
-    if !seen.pr_reported || seen.pass.is_some() {
+    // A stuck path begun is finished by the step that began it: the gate's, such as a fifth
+    // failure to run, is the gate's to finish.
+    if !seen.pr_reported || seen.pass.is_some() || seen.stuck.is_some() || seen.stuck_stop.is_some()
+    {
         return false;
     }
     let Some(session) = seen
