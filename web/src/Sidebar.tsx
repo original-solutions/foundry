@@ -515,16 +515,19 @@ function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspa
           {...tab(row.terminal)}
           onDoubleClick={row.session ? naming?.start : undefined}
           title={row.title ? `${row.name}: ${row.title}` : undefined}
-          className={`flex items-start gap-2 rounded px-2 py-1.5 hover:bg-neutral-800 md:py-1 ${current ? "bg-neutral-800 text-neutral-50" : ended ? "text-neutral-500" : ""}`}
+          className={`flex items-center gap-2 rounded px-2 py-1.5 hover:bg-neutral-800 md:py-1 ${current ? "bg-neutral-800 text-neutral-50" : ended ? "text-neutral-500" : ""}`}
         >
-          <span className="flex h-5 shrink-0 items-center">
-            <StateGlyph glyph={row.glyph} />
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="flex items-baseline gap-2 leading-5">
-              <Named name={row.name} title={row.title} /> <span className={`shrink-0 text-xs ${ended ? "" : glyphText[row.glyph]}`}>{row.label}</span>
-            </span>
-            {row.now && <Now step={row.now} />}
+          <StateGlyph glyph={row.glyph} />
+          <span className="flex min-w-0 flex-1 items-baseline gap-2 leading-5">
+            {row.now ? (
+              // Busy: the step takes the title's place on the line; the title stays for screen readers and the tooltip.
+              <span className="flex min-w-0 flex-1 items-baseline gap-2">
+                <span className={`max-w-1/2 shrink-0 truncate ${row.title ? "text-neutral-500" : ""}`}>{row.name}</span> {row.title && <span className="sr-only">{row.title}</span>} <Now step={row.now} className="min-w-0 flex-1" />
+              </span>
+            ) : (
+              <Named name={row.name} title={row.title} />
+            )}{" "}
+            <span className={`shrink-0 text-xs ${ended ? "" : glyphText[row.glyph]}`}>{row.label}</span>
           </span>
         </Link>
       </TerminalMenu>
