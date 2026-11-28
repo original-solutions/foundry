@@ -49,6 +49,7 @@ pub mod lifecycle;
 pub mod messages;
 pub mod pass;
 pub mod placing;
+pub mod process;
 pub mod runs;
 pub mod status;
 pub mod text;
