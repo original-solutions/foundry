@@ -339,7 +339,7 @@ describe("SettingsMachine", () => {
         await act(async () => end(out[0]));
         expect(await screen.findByText(/^Sent, outcome unknown/)).toBeDefined();
         expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
-        expect(screen.getByText(/may be restarting/i)).toBeDefined();
+        expect(screen.getByText(/the machine serving this page may be restarting/i)).toBeDefined();
       });
 
       it(`offers Install again on another machine when its call ${how}`, async () => {
@@ -365,7 +365,6 @@ describe("SettingsMachine", () => {
     it("opens another machine's page with none of the last machine's unsaved edits", async () => {
       const open = await both(OTHER);
       type("Name", "desk");
-      vi.spyOn(window, "confirm").mockReturnValue(true);
       open(ME);
       expect(field("Name").value).toBe("studio");
       expect(bar()).toBeNull();
