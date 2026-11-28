@@ -13,8 +13,8 @@ const overview = (over: Partial<FactorySettings> = {}): FactoryOverview => ({ se
 
 const type = (label: string, value: string) => fireEvent.change(screen.getByLabelText(label), { target: { value } });
 const bar = () => screen.queryByRole("region", { name: "Unsaved changes" });
-/** The row of a field: what its label names, with its control and any note under it. */
-const row = (label: string) => screen.getByLabelText(label).closest("[data-row]") as HTMLElement;
+/** The row of a field: what its label names, with its control and any note under it. The review bar's entry can carry the same name, so the row's own control is the one in a row. */
+const row = (label: string) => screen.getAllByLabelText(label).find((el) => el.closest("[data-row]"))!.closest("[data-row]") as HTMLElement;
 
 async function show(...answers: Response[]) {
   const calls = mockFetch(json(200, overview()), ...answers);
@@ -85,6 +85,35 @@ describe("SettingsFactory", () => {
     type("Poll seconds", "20");
     expect(row("Poll seconds").textContent).not.toContain("must be");
     expect(bar()?.textContent).not.toContain("must be");
+  });
+
+  it.each([
+    ["Poll seconds", "5", ["10", "60"]],
+    ["Poll seconds", "61", ["10", "60"]],
+    ["Max runs", "-1", ["0", "4294967295"]],
+    ["Max runs", "", ["whole number"]],
+    ["Max gates", "1.5", ["whole number"]],
+    ["Feedback seconds", "", ["whole number"]],
+    ["Model", "-x", ["one word"]],
+    ["Effort", "two words", ["one word"]],
+  ])("refuses %s of %j beside its field and sends nothing", async (label, value, shows) => {
+    const { calls } = await show();
+    type(label, value);
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => {
+      for (const text of shows) expect(row(label).textContent).toContain(text);
+    });
+    // A send starts a microtask later; wait for it before saying nothing was sent.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(0);
+  });
+
+  it("says why when the overview cannot be read, with no form and no Loading", async () => {
+    mockFetch(json(500, { error: "the factory could not be read" }));
+    await renderApp(<SettingsFactory {...pageProps()} />);
+    expect((await screen.findByRole("alert")).textContent).toContain("the factory could not be read");
+    expect(screen.queryByText("Loading…")).toBeNull();
+    expect(screen.queryByLabelText("Max runs")).toBeNull();
   });
 
   it("keeps the change and shows the daemon's refusal beside Save when it names no field", async () => {

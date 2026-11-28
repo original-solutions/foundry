@@ -101,30 +101,39 @@ export function useHelpKey(run: () => void) {
   }, []);
 }
 
+/** Every group of `keyGroups` as a read-only list: the ? sheet and Settings → Keyboard both show it, so the two look alike. */
+export function KeyList() {
+  return (
+    <>
+      {keyGroups.map((group) => (
+        <section key={group.where}>
+          <h3 className="mb-1.5 text-[11px] font-semibold tracking-wider text-neutral-500 uppercase">{group.where}</h3>
+          <dl className="space-y-1">
+            {group.keys.map(([keys, what]) => (
+              <div key={what} className="flex items-baseline gap-3">
+                <dt className="flex w-24 shrink-0 gap-1">
+                  {keys.map((key) => (
+                    <kbd key={key} className="min-w-5 rounded border border-neutral-700 bg-neutral-800 px-1.5 py-px text-center font-sans text-xs text-neutral-200 shadow-[0_1px_0] shadow-neutral-700">
+                      {key}
+                    </kbd>
+                  ))}
+                </dt>
+                <dd className="text-neutral-300">{what}</dd>
+              </div>
+            ))}
+          </dl>
+        </section>
+      ))}
+    </>
+  );
+}
+
 /** The list of every key the app answers, opened by ? or the sidebar's Keyboard button. */
 export function KeySheet({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   return (
     <Modal open={open} onOpenChange={onOpenChange} wide title="Keyboard" description="Every key Foundry answers, by where it works. Esc closes this.">
       <div className="mt-4 max-h-[70dvh] space-y-4 overflow-y-auto">
-        {keyGroups.map((group) => (
-          <section key={group.where}>
-            <h3 className="mb-1.5 text-[11px] font-semibold tracking-wider text-neutral-500 uppercase">{group.where}</h3>
-            <dl className="space-y-1">
-              {group.keys.map(([keys, what]) => (
-                <div key={what} className="flex items-baseline gap-3">
-                  <dt className="flex w-24 shrink-0 gap-1">
-                    {keys.map((key) => (
-                      <kbd key={key} className="min-w-5 rounded border border-neutral-700 bg-neutral-800 px-1.5 py-px text-center font-sans text-xs text-neutral-200 shadow-[0_1px_0] shadow-neutral-700">
-                        {key}
-                      </kbd>
-                    ))}
-                  </dt>
-                  <dd className="text-neutral-300">{what}</dd>
-                </div>
-              ))}
-            </dl>
-          </section>
-        ))}
+        <KeyList />
       </div>
     </Modal>
   );

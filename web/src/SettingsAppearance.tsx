@@ -1,7 +1,7 @@
 import type { FC } from "react";
 import { Page, Row, type PageProps } from "./SettingsPage";
 import { setTheme, useTheme, type Theme } from "./theme";
-import { button } from "./Modal";
+import { viewLook } from "./Modal";
 
 const themes: { theme: Theme; label: string }[] = [
   { theme: "dark", label: "Dark" },
@@ -17,9 +17,17 @@ export const SettingsAppearance: FC<PageProps> = () => {
   return (
     <Page title="Appearance">
       <Row label="Theme" help="Kept in this browser. The toggle beside the workspaces list sets the same choice.">
-        <div role="radiogroup" aria-label="Theme" className="flex gap-2">
+        {/* Built as the board's View switch is, so every radiogroup in the app looks alike. */}
+        <div role="radiogroup" aria-label="Theme" className="inline-flex gap-0.5 rounded-lg border border-neutral-800 bg-neutral-900 p-0.5 text-xs">
           {themes.map((t) => (
-            <button key={t.theme} type="button" role="radio" aria-checked={theme === t.theme} onClick={() => setTheme(t.theme)} className={`${button} aria-checked:border-sky-400/50 aria-checked:bg-sky-400/10 aria-checked:text-sky-200`}>
+            <button
+              key={t.theme}
+              type="button"
+              role="radio"
+              aria-checked={theme === t.theme}
+              onClick={() => setTheme(t.theme)}
+              className={`rounded-md px-2.5 py-1 font-medium transition-colors ${theme === t.theme ? viewLook.on : viewLook.off}`}
+            >
               {t.label}
             </button>
           ))}
