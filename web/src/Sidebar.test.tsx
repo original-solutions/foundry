@@ -41,6 +41,12 @@ const props = { onCreate: () => {} };
 
 /** Unfolds a workspace by its name, as a click on it does. */
 const unfold = (name: string) => fireEvent.click(screen.getByRole("button", { name }));
+/** The text a sighted reader sees in an element: everything but its screen-reader-only spans. */
+function visibleText(el: Element) {
+  const copy = el.cloneNode(true) as Element;
+  copy.querySelectorAll(".sr-only").forEach((n) => n.remove());
+  return copy.textContent ?? "";
+}
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -223,7 +229,43 @@ describe("Sidebar", () => {
     const working = within(group).getByRole("link", { name: /opus 1 fix the login bug.*Working/ });
     expect(within(working).getByText("Edit src/login.ts")).toBeDefined();
     expect(working.getAttribute("title")).toBe("opus 1: fix the login bug");
-    expect(within(group).getByRole("link", { name: /opus 2 write the release notes.*Ready/ })).toBeDefined();
+    expect(visibleText(working)).not.toContain("fix the login bug");
+    const idle = within(group).getByRole("link", { name: /opus 2 write the release notes.*Ready/ });
+    expect(visibleText(idle)).toContain("write the release notes");
+  });
+
+  it("puts each session row on one line, with the step in place of the title while it works", async () => {
+    const records = [workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "working"), terminal(ME, "t2", "w1"), session(ME, "s2", "w1", "t2", "idle")];
+    const briefs = {
+      s1: { title: "fix the login bug", now: { kind: "tool" as const, tool: "Edit", text: "Edit src/login.ts" } },
+      s2: { title: "write the release notes", now: null },
+    };
+    await renderApp(<Sidebar machines={fleet(records, settings(), briefs)} {...props} />);
+    unfold("fix login");
+    const group = screen.getByRole("group", { name: "fix login" });
+
+    for (const name of [/opus 1/, /opus 2/]) {
+      const link = within(group).getByRole("link", { name });
+      // One line: the glyph sits centred on it, not at the top of a two-line block.
+      expect(link.className).toMatch(/(^| )items-center( |$)/);
+      expect(link.className).not.toMatch(/(^| )items-start( |$)/);
+      expect(link.className).toMatch(/(^| )py-1\.5( |$)/);
+      expect(link.className).toMatch(/(^| )md:py-1( |$)/);
+      expect(link.querySelectorAll(".leading-5")).toHaveLength(1);
+    }
+
+    const working = within(group).getByRole("link", { name: /opus 1/ });
+    const step = within(working).getByText("Edit src/login.ts");
+    const hidden = within(working).getByText("fix the login bug");
+    expect(hidden.className).toMatch(/(^| )sr-only( |$)/);
+    // The title is read before the step, and the step shares the line with the name and the label.
+    expect(hidden.compareDocumentPosition(step) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(step.className).toMatch(/(^| )truncate( |$)/);
+    expect(step.className).toContain("font-mono");
+    const line = working.querySelector(".leading-5")!;
+    expect(line.contains(step)).toBe(true);
+    expect(line.contains(within(working).getByText("Working"))).toBe(true);
+    expect(within(working).getByText("opus 1").className).toMatch(/(^| )text-neutral-500( |$)/);
   });
 
   it("highlights the selected terminal", async () => {
