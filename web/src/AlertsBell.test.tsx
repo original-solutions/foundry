@@ -1,7 +1,9 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionState } from "./api";
 import { Announcer, NotifyButton, useAlerts } from "./AlertsBell";
+import { SettingsNotifications } from "./SettingsNotifications";
+import { pageProps, renderApp } from "./test-utils";
 import { fleet } from "./fleet";
 import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
@@ -29,7 +31,7 @@ function Harness({ state, onOpen }: { state: SessionState; onOpen: (terminal: st
   const { spoken, news, ...notify } = useAlerts(world(state), true, onOpen);
   return (
     <>
-      <NotifyButton {...notify} />
+      <SettingsNotifications {...pageProps({ notify })} />
       <Announcer spoken={spoken} />
       <output data-testid="cards">{news ? `${news.n}:${news.alerts.map((a) => a.body).join(",")}` : ""}</output>
     </>
@@ -56,50 +58,71 @@ afterEach(() => {
   localStorage.clear();
 });
 
-const openPanel = () => fireEvent.click(screen.getByRole("button", { name: "Notifications" }));
 const toggle = (name: RegExp) => screen.getByRole("switch", { name });
 const cards = () => screen.getByTestId("cards").textContent;
 
 describe("NotifyButton", () => {
+  it("is a link to the Notifications page, with the bell, and opens no panel", async () => {
+    const { container } = await renderApp(<NotifyButton notify={{ cards: true, desktop: false, away: true }} desktop="ask" onChoose={() => {}} />);
+    const link = await screen.findByRole("link", { name: "Notifications" });
+    expect(link.getAttribute("href")).toBe("/settings/notifications");
+    expect(container.querySelector("svg")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Notifications" })).toBeNull();
+    fireEvent.click(link);
+    expect(screen.queryByRole("switch")).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("is filled while desktop alerts are on, and struck through when nothing is", async () => {
+    const { container, unmount } = await renderApp(<NotifyButton notify={{ cards: true, desktop: true, away: true }} desktop="allowed" onChoose={() => {}} />);
+    await screen.findByRole("link", { name: "Notifications" });
+    expect(container.querySelector("svg")?.getAttribute("fill")).toBe("currentColor");
+    unmount();
+    const quiet = await renderApp(<NotifyButton notify={{ cards: false, desktop: false, away: false }} desktop="allowed" onChoose={() => {}} />);
+    await screen.findByRole("link", { name: "Notifications" });
+    expect(quiet.container.querySelector("svg path[d^='M2.5']")).not.toBeNull();
+  });
+});
+
+describe("SettingsNotifications", () => {
   it("sets every way news reaches you in one place: cards, desktop alerts and the catch-up", () => {
     render(<Harness state="working" onOpen={() => {}} />);
-    openPanel();
-    const panel = screen.getByRole("dialog", { name: "Notifications" });
-    expect(within(panel).getAllByRole("switch").map((s) => [s.getAttribute("aria-label"), s.getAttribute("aria-checked")])).toEqual([
+    expect(screen.getAllByRole("switch").map((s) => [s.getAttribute("aria-label"), s.getAttribute("aria-checked")])).toEqual([
       ["Cards in the page", "true"],
       ["Desktop alerts", "false"],
       ["Catch-up when you come back", "true"],
     ]);
-    expect(panel.textContent).toContain("screen reader");
+    expect(document.body.textContent).toContain("screen reader");
 
     fireEvent.click(toggle(/^Cards/));
     fireEvent.click(toggle(/^Catch-up/));
     expect(JSON.parse(localStorage.getItem("foundry.notify")!)).toEqual({ cards: false, desktop: false, away: false });
   });
 
-  it("turns desktop alerts on once the browser allows them", async () => {
+  it("turns desktop alerts on once the browser allows them, and says the permission beside them", async () => {
     render(<Harness state="working" onOpen={() => {}} />);
-    openPanel();
+    expect(screen.getByText("Browser permission: not asked yet")).toBeDefined();
     FakeNotification.permission = "granted";
     await act(async () => fireEvent.click(toggle(/^Desktop/)));
     expect(FakeNotification.requestPermission).toHaveBeenCalled();
     expect(toggle(/^Desktop/).getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByText("Browser permission: allowed")).toBeDefined();
     expect(JSON.parse(localStorage.getItem("foundry.notify")!).desktop).toBe(true);
   });
 
   it("says when the browser blocks desktop alerts, or has none, and keeps the rest", () => {
     FakeNotification.permission = "denied";
     const { unmount } = render(<Harness state="working" onOpen={() => {}} />);
-    openPanel();
     expect(toggle(/^Desktop/).hasAttribute("disabled")).toBe(true);
-    expect(screen.getByRole("dialog").textContent).toContain("site settings");
+    expect(document.body.textContent).toContain("site settings");
+    expect(screen.getByText("Browser permission: blocked")).toBeDefined();
     unmount();
 
     vi.stubGlobal("Notification", undefined);
     render(<Harness state="working" onOpen={() => {}} />);
-    openPanel();
     expect(toggle(/^Desktop/).hasAttribute("disabled")).toBe(true);
     expect(toggle(/^Cards/).hasAttribute("disabled")).toBe(false);
+    expect(screen.getByText("Browser permission: not supported")).toBeDefined();
   });
 });
 
