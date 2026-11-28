@@ -7223,6 +7223,82 @@ mod tests {
             assert_eq!(event_count(&rig, &run), before);
         }
 
+        /// A turn read for the reminder to end with a result line is no report: the resumed
+        /// session stays this step's, and its end is an interruption of its own.
+        #[test]
+        fn a_resumed_session_read_for_its_reminder_stays_the_resume_steps() {
+            let (mut rig, run) = resumed_after_cut_off();
+            rig.step(&run, "result-line-reminding 1");
+            rig.step(&run, "turn-read 1");
+            rig.step(&run, "result-line-reminded");
+            rig.view = resumed_in(SessionState::Failed);
+            never_written(&rig);
+            assert!(takes_from_the_gate(&rig.ctx(), &rig.events(&run)));
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::Archiving { resumes: 2, .. }
+            ));
+        }
+
+        /// A gate on a machine that is not gone whose create was not answered is found in the
+        /// fleet by the gate's name, and an earlier gate's workspace is not the one archived.
+        #[test]
+        fn a_gate_with_no_recorded_workspace_is_found_by_its_name() {
+            let (mut rig, run) = reported();
+            let earlier = WorkspaceId(uuid::Uuid::from_u128(0x6a6));
+            rig.step(
+                &run,
+                &format!("{GATE_REQUESTED}1 1 {HEAD} {BASE_TIP} {}", m2()),
+            );
+            rig.step(&run, &format!("gate-created 1 {earlier}"));
+            rig.step(&run, "gate-archived 1");
+            rig.step(
+                &run,
+                &format!("{GATE_REQUESTED}2 2 {HEAD} {BASE_TIP} {}", m2()),
+            );
+            assert!(gate_running(&rig.events(&run)));
+            rig.view = FleetView::builder()
+                .online(m2())
+                .workspace(workspace_record(m1(), old(), BRANCH, None))
+                .workspace(workspace_record(m2(), gate_workspace(), "fac/8-1-g2", None))
+                .session(session_record(session(), old(), SessionState::Unreachable))
+                .turn(turn_of(session(), old(), 1, 2))
+                .unreachable(m1(), UNREACHABLE_FOR)
+                .build();
+            pass_one(&rig, &run);
+            assert!(
+                rig.steps(&run)
+                    .contains(&format!("{GATE_COULD_NOT_RUN}2 2 1 1 {GATE_CUT_OFF}"))
+            );
+            assert_eq!(
+                rig.worker.calls(),
+                vec![
+                    Call::Archive {
+                        workspace: gate_workspace()
+                    },
+                    archived_call()
+                ]
+            );
+        }
+
+        /// A gate archive the worker refuses is no error: the interruption is recorded in the
+        /// same pass, and the gate archives a gate that could not run before it places another.
+        #[test]
+        fn a_gate_archive_that_fails_does_not_hold_the_interruption() {
+            let (mut rig, run) = reported();
+            rig.step(
+                &run,
+                &format!("{GATE_REQUESTED}1 1 {HEAD} {BASE_TIP} {}", m2()),
+            );
+            rig.step(&run, &format!("gate-created 1 {}", gate_workspace()));
+            rig.view = at_work(UNREACHABLE_FOR);
+            rig.worker
+                .on_archive(Err(WorkerError::Failed("refused".into())));
+            pass_one(&rig, &run);
+            assert_eq!(interruptions(&rig, &run).len(), 1);
+            assert!(!gate_running(&rig.events(&run)));
+        }
+
         /// A stuck path this step began for a cut-off run (its resumes used) stays this step's
         /// to finish once the fleet no longer shows the session cut off.
         #[test]
