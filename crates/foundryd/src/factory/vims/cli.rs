@@ -85,14 +85,16 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
             stderr,
         } => {
             // Stdout can carry the command's own output, so only its JSON answer, whole or on
-            // its last line, is read there; stderr is read for any JSON line, and for a code in
-            // plain text when it holds none. A code is no refusal when either answer names
-            // something Vims took (an operation, a workspace, an id, or a state other than
-            // failed), or when an `exec` waits, since it can print its command's output on
-            // either: the command ran.
+            // its last line, is read for a code there; stderr is read for any JSON line, and for
+            // a code in plain text when it holds none. A code is no refusal when any JSON on
+            // either stream names something Vims took (an operation, a workspace, an id, or a
+            // state other than failed), or when an `exec` waits, since it can print its
+            // command's output on either: the command ran.
             let out = json_answer(&stdout, false);
             let err = json_answer(&stderr, true);
-            let took = out.iter().chain(err.iter()).any(names_work);
+            let took = [&stdout, &stderr]
+                .into_iter()
+                .any(|text| json_objects(text).any(|value| names_work(&value)));
             let coded = out.as_ref().and_then(json_code).or_else(|| match &err {
                 Some(err) => json_code(err),
                 None => plain_code(&stderr),
@@ -149,6 +151,14 @@ fn json_answer(text: &str, any_line: bool) -> Option<Value> {
                 lines.next().and_then(line)
             }
         })
+        .filter(Value::is_object)
+}
+
+/// Every JSON object in `text`: all of it, and each of its lines.
+fn json_objects(text: &str) -> impl Iterator<Item = Value> + '_ {
+    std::iter::once(text)
+        .chain(text.lines())
+        .filter_map(|text| serde_json::from_str::<Value>(text.trim()).ok())
         .filter(Value::is_object)
 }
 
@@ -836,6 +846,21 @@ mod tests {
             assert!(
                 matches!(&error, VimsError::Unknown { code: Some(found), .. } if found == code),
                 "{stdout} / {stderr}: {error:?}"
+            );
+        }
+        // Work named on a line other than the one the code is read from counts too.
+        for script in [
+            "echo '{\"id\":\"op_7\",\"status\":\"queued\"}' >&2\necho '{\"error\":{\"code\":\"QUOTA_EXCEEDED\"}}' >&2\nexit 1",
+            "echo '{\"id\":\"op_7\",\"status\":\"queued\"}'\necho 'hint: try again'\necho 'Error: PRECONDITION_FAILED: paused' >&2\nexit 1",
+            "printf '{\\n  \"id\": \"op_7\"\\n}\\n'\necho 'Error: PRECONDITION_FAILED: paused' >&2\nexit 1",
+        ] {
+            let program = fake_vims(dir.path(), script);
+            let error = vims_at(&program, Arc::new(SystemClock))
+                .call(&exec_call())
+                .unwrap_err();
+            assert!(
+                matches!(&error, VimsError::Unknown { code: Some(_), .. }),
+                "{script}: {error:?}"
             );
         }
         // Stdout that names nothing leaves stderr's code a refusal.
