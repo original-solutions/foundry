@@ -34,14 +34,17 @@ interface Props {
 export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }: Props) {
   const [docked, setDocked] = useState(loadDocked);
   const [open, setOpen] = useState(docked);
-  // The floating list is for the terminal it was opened on: opening another, by a pick or from a row's menu, closes it.
-  const [openedOn, setOpenedOn] = useState(selected);
-  const shown = open && (docked || openedOn === selected);
+  // The floating list closes when another terminal opens, by a pick or from a row's menu, so it never covers that terminal.
+  const [was, setWas] = useState(selected);
+  if (was !== selected) {
+    setWas(selected);
+    if (!docked) setOpen(false);
+  }
   // A docked list that shows by itself leaves the focus where it is; opened from its button, it takes it.
   const [asked, setAsked] = useState(false);
   const button = useRef<HTMLButtonElement>(null);
   const need = needing(machines).length;
-  const flying = shown && !docked;
+  const flying = open && !docked;
 
   useEffect(() => {
     if (!flying) return;
@@ -65,7 +68,6 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
   const dock = (on: boolean) => {
     saveDocked(on);
     setDocked(on);
-    setOpenedOn(selected);
   };
 
   return (
@@ -82,14 +84,13 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
           ref={button}
           type="button"
           aria-label={need > 0 ? `Sessions: ${need} need${need === 1 ? "s" : ""} you` : "Sessions"}
-          aria-expanded={shown}
+          aria-expanded={open}
           title="Every session and shell, by state"
           onClick={() => {
             setAsked(true);
-            setOpenedOn(selected);
-            setOpen(!shown);
+            setOpen(!open);
           }}
-          className={`relative grid size-8 place-items-center rounded-md hover:bg-neutral-800 hover:text-neutral-200 ${shown ? "bg-neutral-800 text-neutral-200" : ""}`}
+          className={`relative grid size-8 place-items-center rounded-md hover:bg-neutral-800 hover:text-neutral-200 ${open ? "bg-neutral-800 text-neutral-200" : ""}`}
         >
           <SessionsIcon className="size-4" />
           {need > 0 && (
@@ -113,7 +114,7 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
           <SettingsLink />
         </div>
       </nav>
-      {shown && <SessionList machines={machines} selected={selected} docked={docked} focus={asked} onDock={dock} onPick={() => !docked && setOpen(false)} />}
+      {open && <SessionList machines={machines} selected={selected} docked={docked} focus={asked} onDock={dock} onPick={() => !docked && setOpen(false)} />}
     </>
   );
 }

@@ -51,6 +51,8 @@ interface Props {
   onKeys?: () => void;
   /** Collapses the list to the rail, on a wide screen. */
   onRail?: () => void;
+  /** Whether the fleet shown is not the daemon's live word (remembered, or the link is lost): a machine's sweep waits for it. */
+  stale?: boolean;
 }
 
 /** The terminals a folded workspace (or the rail) shows: the most urgent first, and the open one always. */
@@ -70,7 +72,7 @@ const TYPEAHEAD_MS = 600;
  * unfolds or goes in), Home and End go to the ends, and typing a name's first letters goes to the
  * next one it starts. A workspace's actions show while the keyboard is in it, the Tab after it.
  */
-export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys, onRail }: Props) {
+export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys, onRail, stale }: Props) {
   // A workspace is one line of its states unless it is unfolded: the board already shows every
   // terminal, so the list stays an index. The workspace you are in unfolds, and folds again when
   // you leave it; one you unfold yourself stays open.
@@ -249,7 +251,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                     {machineStats(machine.sample)}
                   </span>
                 </div>
-                {terminals && <Tidy over={over} empty={sweepable(machine)} clear={terminals.clear} />}
+                {terminals && <Tidy over={over} empty={sweepable(machine)} clear={terminals.clear} stale={stale} />}
               </div>
               <div className="space-y-3">
                 {machine.workspaces.map((workspace) => (
@@ -299,9 +301,10 @@ function sweepable(machine: MachineView): string[] {
  * workspace left with no terminals (`empty`). Archiving is not forced, so the daemon keeps any
  * workspace with work it would lose, and the line says how many it kept. Each archive is the same
  * mutation a single one is (`archiveOf`), so every view sees it under way; one that fails leaves
- * the others to finish, and the line says how many could not be archived and why.
+ * the others to finish, and the line says how many could not be archived and why. While the fleet
+ * shown is not the daemon's live word (`stale`), both wait: what it lists as ended or empty may not be.
  */
-function Tidy({ over, empty, clear }: { over: string[]; empty: string[]; clear: (ids: string[]) => void }) {
+function Tidy({ over, empty, clear, stale = false }: { over: string[]; empty: string[]; clear: (ids: string[]) => void; stale?: boolean }) {
   const client = useQueryClient();
   const archive = useMutation({
     mutationFn: async (ids: string[]) => {
@@ -321,7 +324,13 @@ function Tidy({ over, empty, clear }: { over: string[]; empty: string[]; clear: 
   return (
     <div className="mt-1 flex flex-wrap items-center gap-x-1">
       {over.length > 0 && (
-        <button type="button" onClick={() => clear(over)} title="Clear the terminals that ended in every workspace on this machine, with their final screens" className={action}>
+        <button
+          type="button"
+          onClick={() => clear(over)}
+          disabled={stale}
+          title="Clear the terminals that ended in every workspace on this machine, with their final screens"
+          className={action}
+        >
           Clear {over.length} ended
         </button>
       )}
@@ -330,7 +339,7 @@ function Tidy({ over, empty, clear }: { over: string[]; empty: string[]; clear: 
         <button
           type="button"
           onClick={() => archive.mutate(empty)}
-          disabled={archive.isPending}
+          disabled={stale || archive.isPending}
           title="Archive every workspace on this machine with no terminals left. Their branches stay; one with work archiving would lose is kept."
           className={action}
         >

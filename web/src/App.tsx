@@ -379,6 +379,7 @@ function Layout() {
                       alerts={<NotifyButton {...notify} onClick={close} />}
                       onKeys={() => setKeysOpen(true)}
                       onRail={rail ? undefined : flipRail}
+                      stale={stale}
                     />
                   </div>
                 )}

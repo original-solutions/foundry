@@ -396,6 +396,23 @@ describe("App", () => {
     expect(document.querySelector("[data-stale]")).not.toBeNull();
   });
 
+  it("keeps the machine's sweep from acting on a remembered fleet until the daemon's state arrives", async () => {
+    mockActions();
+    const remembered = [...live.records, terminal(ME, "t3", "w1", "exited", { exit_code: 0 }), workspace(ME, "w2", "fix logout")];
+    keep({ records: remembered, settings: live.settings, synced: true, held: {}, protocols: {} }, Date.now() - 180_000);
+    const events = await before("/");
+    const sweep = () => [
+      screen.getByTitle("Clear the terminals that ended in every workspace on this machine, with their final screens"),
+      within(screen.getByRole("navigation", { name: "Workspaces" })).getByRole("button", { name: "Archive 1 empty" }),
+    ];
+    expect(sweep().map((b) => b.hasAttribute("disabled"))).toEqual([true, true]);
+
+    act(() => events.open());
+    act(() => events.deliver(JSON.stringify({ ...live, records: remembered })));
+
+    expect(sweep().map((b) => b.hasAttribute("disabled"))).toEqual([false, false]);
+  });
+
   it("keeps the live fleet in this browser for the next load, never a frozen one", async () => {
     mockActions();
     await open("/", live);
@@ -2175,6 +2192,22 @@ describe("App", () => {
     // The floating list closed as the terminal opened, so it does not cover the tab being renamed.
     expect(screen.queryByRole("region", { name: "Sessions" })).toBeNull();
     expect(calls).toEqual([]);
+  });
+
+  it("closes the floating sessions list for good when another terminal opens from a row's menu, so coming back does not bring it up", async () => {
+    mockActions();
+    const router = await open("/terminals/t1", live);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+
+    fireEvent.contextMenu(within(screen.getByRole("region", { name: "Sessions" })).getByRole("link", { name: /^fix login \/ shell/ }));
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Open" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    expect(screen.queryByRole("region", { name: "Sessions" })).toBeNull();
+
+    await act(() => router.navigate({ to: "/terminals/$terminalId", params: { terminalId: "t1" } }));
+    expect(screen.queryByRole("region", { name: "Sessions" })).toBeNull();
+    expect(screen.getByRole("button", { name: /^Sessions/ }).getAttribute("aria-expanded")).toBe("false");
   });
 
   it("opens a workspace's changes at a file its terminal names, on ⌘-click", async () => {

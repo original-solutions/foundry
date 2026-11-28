@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { useEffect, useRef, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { byUrgency, needingRows, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import type { Glyph } from "./labels";
 import { factoryBadge } from "./FactoryMark";
@@ -75,6 +75,10 @@ export function SessionList({ machines, selected, docked, focus, onDock, onPick 
   const terminals = useTerminalActions();
   const ref = useRef<HTMLElement>(null);
   const count = groups.reduce((n, g) => n + g.items.length, 0);
+  // One Tab stop, as the sidebar's list: the row last focused, else the open terminal's, else the first.
+  const [focused, setFocused] = useState<string>();
+  const ids = groups.flatMap((g) => g.items.map((i) => i.row.terminal));
+  const stop = [focused, selected].find((id) => id !== undefined && ids.includes(id)) ?? ids[0];
 
   useEffect(() => {
     if (!focus) return;
@@ -137,7 +141,15 @@ export function SessionList({ machines, selected, docked, focus, onDock, onPick 
               <ul>
                 {items.map(({ row, workspace, machine }) => (
                   <li key={row.terminal}>
-                    <SessionRow row={row} workspace={workspace} machine={many ? machine : undefined} current={row.terminal === selected} onPick={onPick} />
+                    <SessionRow
+                      row={row}
+                      workspace={workspace}
+                      machine={many ? machine : undefined}
+                      current={row.terminal === selected}
+                      stop={row.terminal === stop}
+                      onFocus={() => setFocused(row.terminal)}
+                      onPick={onPick}
+                    />
                   </li>
                 ))}
               </ul>
@@ -149,7 +161,24 @@ export function SessionList({ machines, selected, docked, focus, onDock, onPick 
   );
 }
 
-function SessionRow({ row, workspace, machine, current, onPick }: { row: Row; workspace: WorkspaceView; machine?: string; current: boolean; onPick: () => void }) {
+function SessionRow({
+  row,
+  workspace,
+  machine,
+  current,
+  stop,
+  onFocus,
+  onPick,
+}: {
+  row: Row;
+  workspace: WorkspaceView;
+  machine?: string;
+  current: boolean;
+  /** Whether Tab stops here. */
+  stop: boolean;
+  onFocus: () => void;
+  onPick: () => void;
+}) {
   const name = `${workspace.name} / ${row.name}: ${row.label}`;
   const quiet = row.glyph === "done" || row.glyph === "away";
   // No place for the menu: its Rename opens the terminal and edits the name in its tab, since the sidebar's row is not shown beside the rail.
@@ -162,7 +191,8 @@ function SessionRow({ row, workspace, machine, current, onPick }: { row: Row; wo
         aria-current={current ? "true" : undefined}
         title={row.title ? `${name}\n${row.title}` : name}
         data-session={row.terminal}
-        tabIndex={-1}
+        tabIndex={stop ? 0 : -1}
+        onFocus={onFocus}
         onClick={onPick}
         className={`grid grid-cols-[0.75rem_minmax(0,1fr)_auto] items-center gap-x-2 rounded-md px-2 py-1.5 hover:bg-neutral-800 focus-visible:outline-2 focus-visible:outline-emerald-400 ${
           current ? "bg-neutral-800 shadow-[inset_2px_0_0] shadow-emerald-400" : ""
