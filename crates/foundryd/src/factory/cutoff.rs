@@ -456,9 +456,20 @@ exec "$agent" "$@""#;
         }
     }
 
+    /// Aborts the server and closes every terminal the fixture started: the terminals' own drop
+    /// leaves their holders running, as a daemon that stops must.
     impl Drop for Fx {
         fn drop(&mut self) {
+            use std::io::Write as _;
             self.server.abort();
+            let Ok(entries) = std::fs::read_dir(self.data.path().join("terminals")) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(entry.path()) {
+                    let _ = stream.write_all(&foundry_holder::protocol::Request::Close.encode());
+                }
+            }
         }
     }
 
