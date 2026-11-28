@@ -1033,7 +1033,7 @@ fn live_workspace(
 }
 
 fn unreachable_long(ctx: &RunContext<'_>, machine: MachineId) -> bool {
-    ctx.view.unreachable_for(machine) >= UNREACHABLE_FOR
+    ctx.view.unreachable_for(Target::Machine(machine)) >= UNREACHABLE_FOR
 }
 
 /// A step recorded, with the lease checked first so that a lost lease writes nothing.
@@ -1699,7 +1699,7 @@ fn carry_on(
         if let Some(live) = live_workspace(ctx, run, events, old)
             && !live.gone(ctx)
         {
-            if ctx.view.online(live.machine) {
+            if ctx.view.online(Target::Machine(live.machine)) {
                 archive_old(ctx, run, n, old, Records::Nothing)?;
             }
             return Ok(FeedbackStep::Preparing(Wait::Archive));
@@ -1988,7 +1988,8 @@ mod tests {
     use crate::factory::messages::{self, LAUNCH_FAILED};
     use crate::factory::runs::resume::BRANCH_REFUSED;
     use crate::factory::worker::{
-        Call, CreateWorkspace, FleetView, FleetViewBuilder, HostCall, Target, WorkerError,
+        Call, CreateWorkspace, FleetView, FleetViewBuilder, HostCall, StoreView, Target,
+        WorkerError,
     };
     use crate::sessions::factory::BODY_PATH;
     use crate::workspaces::{Checkout, FactoryTag, Setup};
@@ -2177,7 +2178,7 @@ mod tests {
 
     /// The machine online, with a sample, a token for the project's login and the skill.
     fn fleet_with(sessions: u32) -> FleetViewBuilder {
-        FleetView::builder()
+        StoreView::builder()
             .online(m1())
             .sample(sample(m1(), sessions))
             .held(
@@ -2254,7 +2255,7 @@ mod tests {
     }
 
     /// The fleet once the round's workspace shows, its setup done.
-    fn round_view() -> FleetView {
+    fn round_view() -> StoreView {
         fleet()
             .workspace(workspace_record(
                 fresh(),
@@ -3537,7 +3538,7 @@ mod tests {
             assert!(world.writes().is_empty());
             assert_eq!(world.rig.sim.labels(), ["factory:pr-open"]);
             // No machine at all.
-            world.rig.view = FleetView::builder().build();
+            world.rig.view = StoreView::builder().build();
             assert!(matches!(world.go(), FeedbackStep::Waiting { .. }));
             assert_eq!(world.count(), before + 1);
         }
@@ -4073,7 +4074,7 @@ mod tests {
 
     /// The round's workspace and its session in `state`, with a turn record when `turn` gives
     /// the turn and the count of prompts.
-    fn session_view(state: SessionState, turn: Option<(u64, u64)>) -> FleetView {
+    fn session_view(state: SessionState, turn: Option<(u64, u64)>) -> StoreView {
         let mut builder = fleet()
             .workspace(workspace_record(
                 fresh(),
@@ -4464,7 +4465,7 @@ mod tests {
             assert_eq!(pass(&world), FeedbackStep::Preparing(Wait::Workspace));
             // m1 answered the create and then went away; m2 can take the round.
             let away = |span| {
-                FleetView::builder()
+                StoreView::builder()
                     .unreachable(m1(), span)
                     .online(m2)
                     .sample(sample(m2, 0))
@@ -5279,7 +5280,7 @@ mod tests {
     }
 
     /// The build session idle in the build workspace, its newest turn (turn 1, one prompt) read.
-    fn building_view(state: SessionState, turn: Option<(u64, u64)>) -> FleetView {
+    fn building_view(state: SessionState, turn: Option<(u64, u64)>) -> StoreView {
         let mut builder = fleet()
             .workspace(workspace_record(old(), "fac/8-1", None))
             .session(Record {

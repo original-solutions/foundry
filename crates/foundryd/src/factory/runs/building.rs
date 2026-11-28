@@ -1071,7 +1071,7 @@ mod tests {
     use crate::factory::messages::{
         self, SESSION_GONE, TIME_LIMIT, WRONG_ACCOUNT, WorkLeft, reminder,
     };
-    use crate::factory::worker::{Call, FleetView, WorkerError};
+    use crate::factory::worker::{Call, StoreView, WorkerError};
     use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
     use crate::sessions::turns::TurnText;
 
@@ -1210,7 +1210,7 @@ mod tests {
     /// The fleet shows the session in `state`, with the newest turn `turn` after `prompts`
     /// prompts (and a question waiting when `question`). `turn` 0 shows no turn record.
     fn show_with(rig: &mut Rig, state: SessionState, turn: u64, prompts: u64, question: bool) {
-        let mut view = FleetView::builder()
+        let mut view = StoreView::builder()
             .online(rig.machine)
             .session(session_record(state));
         if turn > 0 {
@@ -2647,7 +2647,7 @@ mod tests {
                     show_with(rig, SessionState::Idle, 2, 2, true);
                 }),
                 ("gone", |rig| {
-                    rig.view = FleetView::builder().online(rig.machine).build();
+                    rig.view = StoreView::builder().online(rig.machine).build();
                 }),
             ];
             for (shape, session_ends) in shapes {
@@ -3101,7 +3101,7 @@ mod tests {
         #[test]
         fn when_the_thread_no_longer_exists() {
             let (mut rig, run) = built();
-            rig.view = FleetView::builder().online(rig.machine).build();
+            rig.view = StoreView::builder().online(rig.machine).build();
             let before = rig.events(&run).len();
             assert_eq!(pass(&rig, &run), BuildStep::Interrupted);
             no_writes(&rig);

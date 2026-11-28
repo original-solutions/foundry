@@ -584,7 +584,13 @@ pub fn interrupted(
     let gone = uuid::Uuid::parse_str(&req.machine)
         .ok()
         .map(MachineId)
-        .and_then(|machine| gate::could_not_run(None, ctx.view.unreachable_for(machine), None));
+        .and_then(|machine| {
+            gate::could_not_run(
+                None,
+                ctx.view.unreachable_for(Target::Machine(machine)),
+                None,
+            )
+        });
     if gone.is_none() {
         match gate.archive_gate(&req, Mode::Place)? {
             Archive::Done => {}
@@ -1184,8 +1190,9 @@ impl Gate<'_, '_> {
 
     /// Whether the view shows the build machine unreachable for `progress::UNREACHABLE_FOR`.
     fn build_machine_gone(&self, seen: &Seen, workspace: WorkspaceId) -> bool {
-        self.build_machine(seen, workspace)
-            .is_some_and(|machine| self.ctx.view.unreachable_for(machine) >= UNREACHABLE_FOR)
+        self.build_machine(seen, workspace).is_some_and(|machine| {
+            self.ctx.view.unreachable_for(Target::Machine(machine)) >= UNREACHABLE_FOR
+        })
     }
 
     /// The build session ended, once, by the build workspace's rule (`archive_build`): on a
@@ -1426,9 +1433,9 @@ impl Gate<'_, '_> {
             )
             .map(|()| Archive::Done)
         };
-        if machine
-            .is_some_and(|machine| ctx.view.unreachable_for(machine) >= gate::MACHINE_GONE_AFTER)
-        {
+        if machine.is_some_and(|machine| {
+            ctx.view.unreachable_for(Target::Machine(machine)) >= gate::MACHINE_GONE_AFTER
+        }) {
             return left(LEFT_GONE);
         }
         if ids.is_empty() {
@@ -1852,7 +1859,11 @@ impl Gate<'_, '_> {
                 // The fleet shows only its machines: a host is refused as the fleet worker
                 // refuses one.
                 let machine = fleet_machine(target)?;
-                let gone = gate::could_not_run(None, ctx.view.unreachable_for(machine), None);
+                let gone = gate::could_not_run(
+                    None,
+                    ctx.view.unreachable_for(Target::Machine(machine)),
+                    None,
+                );
                 return self.unseen(&req, machine, gone);
             }
         };
@@ -1863,7 +1874,7 @@ impl Gate<'_, '_> {
         });
         let gone = gate::could_not_run(
             None,
-            ctx.view.unreachable_for(owner),
+            ctx.view.unreachable_for(Target::Machine(owner)),
             terminal.map(|(_, state, code)| (state, code)),
         );
         if gone.is_some() {
@@ -1914,7 +1925,10 @@ impl Gate<'_, '_> {
         machine: MachineId,
         gone: Option<String>,
     ) -> Result<GateStep, RunError> {
-        if gone.is_some() || req.created.is_none() || !self.ctx.view.online(machine) {
+        if gone.is_some()
+            || req.created.is_none()
+            || !self.ctx.view.online(Target::Machine(machine))
+        {
             return self.running_or_gone(req, gone);
         }
         self.step(
@@ -2764,7 +2778,7 @@ mod tests {
         self, CommandFailure, FailedCheck, GateFailure, SESSION_GONE, STOPPED_BY_HAND,
     };
     use crate::factory::worker::{
-        AlwaysHeld, Call, FleetView, FleetViewBuilder, HostCall, Lost, Target, WorkerError,
+        AlwaysHeld, Call, FleetViewBuilder, HostCall, Lost, StoreView, Target, WorkerError,
     };
     use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
     use crate::workspaces::{Checkout, Setup};
@@ -3181,7 +3195,7 @@ mod tests {
         question: bool,
         gates: &[G],
     ) {
-        let mut view = gate_machine(FleetView::builder()).session(session_record(state));
+        let mut view = gate_machine(StoreView::builder()).session(session_record(state));
         if turn > 0 {
             view = view.turn(SessionTurn {
                 session: session(),
@@ -3212,7 +3226,7 @@ mod tests {
         gates: &[G],
         span: Duration,
     ) {
-        let mut view = FleetView::builder()
+        let mut view = StoreView::builder()
             .online(builder())
             .session(session_record(state))
             .turn(SessionTurn {
@@ -4246,7 +4260,7 @@ mod tests {
         #[test]
         fn a_thread_that_is_gone_at_gate_time_sends_the_issue_to_stuck() {
             let (mut rig, run, _hub) = built();
-            rig.view = gate_machine(FleetView::builder()).build();
+            rig.view = gate_machine(StoreView::builder()).build();
             let step = go(&rig, &run);
             assert_stuck(&rig, &run, &step, "session-gone", SESSION_GONE);
             assert_eq!(creates(&rig), 0);
@@ -5459,7 +5473,7 @@ mod tests {
             show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
             rig.worker.on_tail(Ok(PASS_TAIL.into()));
             assert!(matches!(try_go(&rig, &run), Err(RunError::Send(_))));
-            rig.view = gate_machine(FleetView::builder()).build();
+            rig.view = gate_machine(StoreView::builder()).build();
             let step = go(&rig, &run);
             assert_stuck(&rig, &run, &step, "session-gone", SESSION_GONE);
         }
@@ -5469,7 +5483,7 @@ mod tests {
             let (mut rig, run, hub) = built();
             gated_with(&mut rig, &run, &hub, BUSY);
             hub.set_checks(HEAD, RED);
-            rig.view = gate_machine(FleetView::builder()).build();
+            rig.view = gate_machine(StoreView::builder()).build();
             let step = go(&rig, &run);
             assert_stuck(&rig, &run, &step, "session-gone", SESSION_GONE);
         }
@@ -5838,7 +5852,7 @@ mod tests {
         #[test]
         fn a_gate_with_no_machine_that_qualifies_backs_off() {
             let (mut rig, run, _hub) = built();
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(builder())
                 .session(session_record(SessionState::Idle))
                 .turn(SessionTurn {
@@ -6217,7 +6231,7 @@ mod tests {
                     ..draft_on(HEAD)
                 },
             );
-            let view = gate_machine(FleetView::builder())
+            let view = gate_machine(StoreView::builder())
                 .session(session_record(SessionState::Idle))
                 .turn(SessionTurn {
                     session: session(),
@@ -8593,7 +8607,7 @@ mod tests {
         #[test]
         fn a_build_workspace_whose_machine_is_gone_does_not_hold_pr_open() {
             let (mut rig, run, _hub) = at_pr_open();
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .session(session_record(SessionState::Idle))
                 .unreachable(builder(), crate::factory::runs::progress::UNREACHABLE_FOR)
                 .build();
@@ -8613,7 +8627,7 @@ mod tests {
         #[test]
         fn a_build_workspace_whose_machine_is_unreachable_for_less_than_15_minutes_is_asked() {
             let (mut rig, run, _hub) = at_pr_open();
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .session(session_record(SessionState::Idle))
                 .unreachable(
                     builder(),
@@ -8798,7 +8812,7 @@ mod tests {
         /// The gate `k` exited with `code` on the online gate machine, and the build machine
         /// the view shows unreachable for `span`.
         fn build_machine_away(rig: &mut Rig, run: &RunId, k: u32, code: i32, span: Duration) {
-            let mut view = FleetView::builder()
+            let mut view = StoreView::builder()
                 .online(machine())
                 .session(session_record(SessionState::Idle))
                 .turn(SessionTurn {
