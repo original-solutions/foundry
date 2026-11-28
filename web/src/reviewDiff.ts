@@ -26,9 +26,10 @@ function asNumber(value: unknown): number {
   return NaN;
 }
 
-/** Whether two values are one: numbers by their number, so "05" is 5, anything else as it is. */
+/** Whether two values are one: numbers, and text that is only a number, by their number, so "05" is 5; anything else as it is. */
 function same(a: unknown, b: unknown): boolean {
-  if (typeof a === "number" || typeof b === "number") {
+  const digits = (v: unknown) => typeof v === "string" && /^-?\d+(\.\d+)?$/.test(v.trim());
+  if (typeof a === "number" || typeof b === "number" || (digits(a) && digits(b))) {
     const x = asNumber(a);
     const y = asNumber(b);
     return !Number.isNaN(x) && x === y;

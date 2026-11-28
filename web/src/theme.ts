@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from "react";
 import { readStored, store } from "./storage";
 
 // Dark or light. The page carries the choice as `data-theme` on <html>; index.css remaps the
@@ -23,7 +24,29 @@ export function applyTheme(theme: Theme, root: HTMLElement = document.documentEl
   root.dataset.theme = theme;
 }
 
-export function saveTheme(theme: Theme) {
-  // When not kept, the choice holds until the page reloads.
-  store(KEY, theme);
+/** The pick of this page when the browser keeps nothing. */
+let unkept: Theme | undefined;
+const listeners = new Set<() => void>();
+
+function current(): Theme {
+  const kept = readStored(KEY);
+  if (kept === "light" || kept === "dark") return kept;
+  return unkept ?? "dark";
+}
+
+function subscribe(listener: () => void) {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+/** The theme, kept in this browser, which the sidebar's toggle and Settings → Appearance both read, so each shows the other's change at once. */
+export function useTheme(): Theme {
+  return useSyncExternalStore(subscribe, current);
+}
+
+/** Shows `theme` on the page and keeps it for next time; when not kept, it holds for this page. */
+export function setTheme(theme: Theme) {
+  unkept = store(KEY, theme) ? undefined : theme;
+  applyTheme(theme);
+  for (const listener of listeners) listener();
 }

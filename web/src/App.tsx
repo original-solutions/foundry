@@ -22,7 +22,7 @@ import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
 import { TerminalActions } from "./TerminalMenu";
 import { fleet, locate, needsYouIn, rows, terminalRunning, withFactory } from "./fleet";
-import { useShortcut } from "./shortcut";
+import { useSettingsKey, useShortcut } from "./shortcut";
 import { useBriefs } from "./useBriefs";
 import { machineQuery } from "./api";
 import { useFleet } from "./useFleet";
@@ -40,6 +40,7 @@ import { WaitingList } from "./placement/WaitingList";
 import { upNext } from "./needing";
 import { NextUp, useOpenStanding } from "./NextUp";
 import { SplitEnded } from "./SplitTasks";
+import { SettingsPage } from "./SettingsPage";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
@@ -146,6 +147,7 @@ function Layout() {
   const { terminalId } = useParams({ strict: false });
   const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
   const onFactory = useRouterState({ select: (s) => s.location.pathname === "/factory" });
+  const onSettings = useRouterState({ select: (s) => s.location.pathname.startsWith("/settings") });
   const briefs = useBriefs(state.records);
   const { data: here } = useQuery(machineQuery);
   const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
@@ -290,13 +292,17 @@ function Layout() {
     setJump((open) => (open ? undefined : "jump"));
   });
   useShortcut("b", flipRail);
+  useSettingsKey(() => {
+    setDrawer(false);
+    void navigate({ to: "/settings" });
+  });
   useShortcut("f", terminalId ? () => setFinding((n) => n + 1) : undefined);
   useShortcut("\\", terminalId ? () => (split ? setSplit(undefined) : setJump("beside")) : undefined);
   const next = upNext(machines, terminalId);
   const standing = useOpenStanding(terminalId, located !== undefined && needsYouIn(located.glyph, located.workspace.factory));
   useShortcut("j", next ? () => show(next.next.terminal) : undefined);
   const commands = useCommands({
-    screen: terminalId ? "terminal" : onMachines ? "machines" : onFactory ? "factory" : "home",
+    screen: terminalId ? "terminal" : onMachines ? "machines" : onFactory ? "factory" : onSettings ? "settings" : "home",
     next,
     onNext: show,
     onCreate: () => openCreate(),
@@ -312,8 +318,8 @@ function Layout() {
   const workspaces = machines.flatMap((m) => m.workspaces);
   // A fleet with no workspaces opens on the first-run page, kept while its create is under way or
   // its workspace was made but its session failed, so what happened stays on screen.
-  const firstRun = !terminalId && !onMachines && !onFactory && state.synced && (workspaces.length === 0 || launch.create.isPending || (launch.made && launch.create.isError));
-  const board = !terminalId && !onMachines && !onFactory && !firstRun;
+  const firstRun = !terminalId && !onMachines && !onFactory && !onSettings && state.synced && (workspaces.length === 0 || launch.create.isPending || (launch.made && launch.create.isError));
+  const board = !terminalId && !onMachines && !onFactory && !onSettings && !firstRun;
 
   // On a narrow screen the sidebar is a drawer over whatever is shown: the board, the machines view
   // or a terminal. Collapsed to the rail, it is only the drawer, and the rail takes its place.
@@ -428,6 +434,7 @@ function Layout() {
                     <div {...frozen} className="absolute inset-0 empty:hidden">
                       {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={started} onMenu={() => setDrawer(true)} />}
                       {!terminalId && onFactory && state.synced && <Factory statuses={state.factory} settings={state.settings} machines={machines} />}
+                      {!terminalId && onSettings && state.synced && <SettingsPage notify={notify} machines={machines} here={here} state={state} />}
                       {/* The board, the timeline and the machines are one element, so their shared head is never remounted. */}
                       {((board && state.synced) || (!terminalId && onMachines)) && (
                         <Board
@@ -526,7 +533,10 @@ const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: "/" });
 const terminalRoute = createRoute({ getParentRoute: () => rootRoute, path: "/terminals/$terminalId" });
 const machinesRoute = createRoute({ getParentRoute: () => rootRoute, path: "/machines" });
 const factoryRoute = createRoute({ getParentRoute: () => rootRoute, path: "/factory" });
+const settingsRoute = createRoute({ getParentRoute: () => rootRoute, path: "/settings" });
+const settingsCategoryRoute = createRoute({ getParentRoute: () => rootRoute, path: "/settings/$category" });
+const settingsMachineRoute = createRoute({ getParentRoute: () => rootRoute, path: "/settings/machines/$machine" });
 
-export const routeTree = rootRoute.addChildren([indexRoute, terminalRoute, machinesRoute, factoryRoute]);
+export const routeTree = rootRoute.addChildren([indexRoute, terminalRoute, machinesRoute, factoryRoute, settingsRoute, settingsCategoryRoute, settingsMachineRoute]);
 export const router = createRouter({ routeTree });
 

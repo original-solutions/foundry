@@ -1193,7 +1193,7 @@ describe("App", () => {
       expect(screen.getByRole("heading", { name: "Factory" })).toBeDefined();
       expect(await within(nav).findByText(/3 runs at once/)).toBeDefined();
       expect(within(nav).getByRole("link", { name: /^Factory/ }).getAttribute("aria-current")).toBe("page");
-      expect(within(nav).getByRole("link", { name: /^Projects/ }).textContent).toContain("0 projects · factory on 0");
+      expect(within(nav).getByRole("link", { name: /^Projects/ }).textContent).toContain("1 project · factory on 0");
       expect(within(nav).getByRole("link", { name: /^Appearance/ }).textContent).toContain("dark");
       expect(within(nav).getByRole("link", { name: /^Notifications/ }).textContent).toContain("cards · catch-up");
       expect(within(nav).getByRole("link", { name: /^Machines/ }).textContent).toContain("1 machine");
@@ -1223,14 +1223,14 @@ describe("App", () => {
     it("shows a stub for Projects, Machines and a machine, each linking to where the control lives today", async () => {
       factoryNow = fleetFactory;
       mockActions();
-      const r = await open("/settings/projects", live);
+      const r = await open("/settings/projects", { ...live, settings: settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }] }) });
       expect(await screen.findByRole("heading", { name: "Projects" })).toBeDefined();
       expect(screen.getByRole("link", { name: "The board" }).getAttribute("href")).toBe("/");
       await r.navigate({ to: "/settings/$category", params: { category: "machines" } });
       expect(await screen.findByRole("heading", { name: "Machines" })).toBeDefined();
       expect(screen.getByRole("link", { name: "The machines board" }).getAttribute("href")).toBe("/machines");
       await r.navigate({ to: "/settings/machines/$machine", params: { machine: ME } });
-      expect(await screen.findByRole("heading", { name: ME })).toBeDefined();
+      await waitFor(() => expect(document.querySelector("section[aria-label='studio']")).not.toBeNull());
       expect(screen.getByRole("link", { name: "The machines board" }).getAttribute("href")).toBe("/machines");
     });
 
@@ -1238,7 +1238,7 @@ describe("App", () => {
       factoryNow = fleetFactory;
       mockActions();
       const r = await open("/", live);
-      const field = await screen.findByLabelText("What should Claude work on?");
+      const field = await screen.findByRole("textbox", { name: "New task" });
       fireEvent.keyDown(field, { key: ",", metaKey: true });
       const xterm = document.body.appendChild(document.createElement("div"));
       xterm.className = "xterm";

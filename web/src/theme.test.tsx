@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import tailwindTheme from "tailwindcss/theme.css?raw";
 import appCss from "./index.css?raw";
 import { ThemeButton } from "./ThemeButton";
@@ -98,6 +98,9 @@ describe("the theme choice", () => {
 });
 
 describe("the shared theme state", () => {
+  // An earlier test leaves this page holding a theme the blocked storage would not keep.
+  beforeEach(() => setTheme("dark"));
+
   it("shows a change made in one place in the other at once", () => {
     function Both() {
       return (
