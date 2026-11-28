@@ -6955,6 +6955,8 @@ mod tests {
         fn records_nothing_and_stays_building_short_of_15_minutes() {
             let (mut rig, run) = reported();
             rig.view = at_work(UNREACHABLE_FOR - Duration::from_secs(1));
+            // The gate keeps the run: the pass does not hand it to this step.
+            assert!(!takes_from_the_gate(&rig.ctx(), &rig.events(&run)));
             let before = event_count(&rig, &run);
             assert!(is_skipped(&pass(&rig, &run)));
             assert_eq!(event_count(&rig, &run), before);
