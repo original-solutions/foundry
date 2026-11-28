@@ -56,7 +56,8 @@ function Section({ id, title, children }: { id: string; title: string; children:
  * tag and then says what became of the call as the checklist does, whichever of the two sent it.
  * On the machine serving the page it says first that the machine restarts. Install is not offered
  * while any install is out or the serving machine restarts (`useInstalls`), nor while this
- * machine's own call for that tag is out or answered 202.
+ * machine's own call for that tag is out or answered 202. It waits, as the checklist does, until
+ * the page knows which machine serves it, since that decides the restart warning and hold.
  */
 function Update({ machine, machines, here }: { machine: MachineView; machines: MachineView[]; here: string | undefined }) {
   const id = useId();
@@ -78,7 +79,7 @@ function Update({ machine, machines, here }: { machine: MachineView; machines: M
       {says && <p className={`mt-1 text-xs ${says.tone}`}>{says.text}</p>}
       {held && !going && <p className="mt-1 text-xs text-amber-300">{held}</p>}
       {!held && !going && (
-        <button type="button" className={`${primaryButton} mt-2`} onClick={() => void install([{ id: machine.id, name: machine.name, tag }], here, false)}>
+        <button type="button" className={`${primaryButton} mt-2`} disabled={here === undefined} onClick={() => void install([{ id: machine.id, name: machine.name, tag }], here, false)}>
           Install
         </button>
       )}
