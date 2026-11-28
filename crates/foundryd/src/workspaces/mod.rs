@@ -74,7 +74,12 @@
 //! terminals, checks again for what they wrote as they were hung up, removes the worktree and
 //! keeps the branch. A refusal at the first check changes nothing; a refusal at the second
 //! leaves the terminals closed and the worktree as it is. Only a forced archive passes `--force`
-//! to git, so without it git refuses whatever the checks missed.
+//! to git. The removal does not wait for the worktree's files to go: its folder is moved to
+//! `<data dir>/removing/<workspace id>`, git forgets the worktree, and the folder is deleted in
+//! the background. With the folder moved, git no longer reads it, so the second check is the
+//! last one; it reads what git's own check reads and refuses any checked-out submodule. A
+//! refusal from git, such as of a locked worktree, puts the folder back. A daemon that stops
+//! before the delete ends leaves the folder in `removing/`, and the next start deletes it.
 //!
 //! A create that dies after making its worktree and before writing its record leaves a worktree
 //! no record names. At start, [`Workspaces::sweep`] removes each worktree no live record names,
@@ -129,6 +134,10 @@ const BRANCH_AT_MOST: usize = 100;
 /// generous; it is there so a remote that stops answering cannot hold a project's lock for
 /// good.
 const GIT_WITHIN: Duration = Duration::from_secs(10 * 60);
+
+/// The folder in the data folder an archive moves a worktree into, to delete it after it
+/// answers.
+const REMOVING: &str = "removing";
 
 /// How long the sweep at start may run in all, so a git call that hangs cannot hold the daemon's
 /// start for [`GIT_WITHIN`] per worktree.
@@ -759,7 +768,10 @@ impl Workspaces {
     /// clone that cannot be read or whose worktrees cannot be listed is passed over, each with
     /// a log line. After [`SWEEP_WITHIN`] in all it stops where it is, says which clone it
     /// stopped in, and leaves the rest for the next start.
+    /// It also starts deleting, in the background, any worktree an archive moved aside and did
+    /// not finish deleting.
     pub async fn sweep(&self) -> Result<(), WorkspaceError> {
+        self.inner.delete_moved_aside().await;
         self.inner.sweep(SWEEP_WITHIN).await
     }
 }
@@ -1451,9 +1463,13 @@ impl Inner {
                 folder = %worktree.display(),
                 "archive anyway deletes a folder git no longer lists as a worktree, unread"
             );
-            remove_any(&worktree).await?;
+            match self.move_aside(id, &worktree).await {
+                Some(aside) => delete_in_background(aside),
+                None => remove_any(&worktree).await?,
+            }
         } else if there {
-            self.remove_worktree(&clone, &worktree, force).await?;
+            self.remove_worktree_aside(id, &clone, &worktree, force)
+                .await?;
         } else if let Some((listed, _)) = self.registered_either(&clone, &body).await? {
             // Removed by hand: git forgets this worktree, and only this one, so its branch can be
             // checked out again. Named as git listed it, since git cannot resolve a path whose
@@ -1752,6 +1768,89 @@ impl Inner {
         }
         args.extend([OsStr::new("--"), worktree.as_os_str()]);
         self.git(clone, "worktree", args).await
+    }
+
+    /// Removes worktree `worktree` of `clone` without waiting for its files to go, which in a
+    /// workspace with its dependencies installed takes seconds: the folder is moved to
+    /// `removing/<id>` ([`Inner::move_aside`]), git forgets the worktree by the path it lists,
+    /// and the moved folder is deleted in the background. Git's refusal, such as of a locked
+    /// worktree, puts the folder back where it was and is the answer. A worktree git does not
+    /// list here, or a folder that cannot be moved, is removed by git where it is.
+    async fn remove_worktree_aside(
+        &self,
+        id: WorkspaceId,
+        clone: &Path,
+        worktree: &Path,
+        force: bool,
+    ) -> Result<(), WorkspaceError> {
+        let Some((listed, _)) = self.registered(clone, worktree).await? else {
+            return self.remove_worktree(clone, worktree, force).await.map(drop);
+        };
+        let Some(aside) = self.move_aside(id, worktree).await else {
+            return self.remove_worktree(clone, worktree, force).await.map(drop);
+        };
+        // With its folder gone, git only forgets the worktree, named as it listed it, since it
+        // cannot resolve a path whose folders are not there.
+        if let Err(refused) = self.remove_worktree(clone, &listed, force).await {
+            if let Err(error) = tokio::fs::rename(&aside, worktree).await {
+                tracing::error!(
+                    folder = %aside.display(),
+                    worktree = %worktree.display(),
+                    %error,
+                    "a worktree git would not remove could not be put back"
+                );
+            }
+            return Err(refused);
+        }
+        delete_in_background(aside);
+        Ok(())
+    }
+
+    /// Moves `folder` to `removing/<id>` in the data folder, so it can be deleted after the
+    /// archive answers. A rename, so only on the same file system; none, with the folder where
+    /// it was, when it cannot be moved.
+    async fn move_aside(&self, id: WorkspaceId, folder: &Path) -> Option<PathBuf> {
+        let removing = self.data.join(REMOVING);
+        let aside = removing.join(id.to_string());
+        let moved = async {
+            tokio::fs::create_dir_all(&removing).await?;
+            tokio::fs::rename(folder, &aside).await
+        }
+        .await;
+        match moved {
+            Ok(()) => Some(aside),
+            Err(error) => {
+                tracing::debug!(
+                    folder = %folder.display(),
+                    %error,
+                    "a worktree could not be moved aside, so it is removed where it is"
+                );
+                None
+            }
+        }
+    }
+
+    /// Deletes, in the background, whatever an archive moved aside and did not finish
+    /// deleting before the daemon stopped.
+    async fn delete_moved_aside(&self) {
+        let mut entries = match tokio::fs::read_dir(self.data.join(REMOVING)).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(error) => {
+                tracing::warn!(%error, "the folder of archived worktrees could not be read");
+                return;
+            }
+        };
+        loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => delete_in_background(entry.path()),
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "the folder of archived worktrees could not be read");
+                    return;
+                }
+            }
+        }
     }
 
     /// Takes back what a create that failed made. The worktree's folder was not there before
@@ -2317,6 +2416,20 @@ async fn remove_any(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
+}
+
+/// Deletes `folder` in the background. One that cannot be deleted is logged and stays in
+/// `removing/` for the next start to try again.
+fn delete_in_background(folder: PathBuf) {
+    tokio::spawn(async move {
+        if let Err(error) = remove_any(&folder).await {
+            tracing::warn!(
+                folder = %folder.display(),
+                %error,
+                "an archived worktree could not be deleted; the next start tries again"
+            );
+        }
+    });
 }
 
 /// `/bin/sh` running `script` with `args` as its positional parameters, so no argument is

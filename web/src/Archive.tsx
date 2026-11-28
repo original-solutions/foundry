@@ -1,5 +1,5 @@
-import { useMutation, useMutationState, useQuery } from "@tanstack/react-query";
-import { useId, useState, type ReactNode } from "react";
+import { useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useId, type ReactNode } from "react";
 import { Dialog } from "radix-ui";
 import { ApiError, archiveWorkspace, type Blockers, type FileChange } from "./api";
 import { changesQuery } from "./ChangesPanel";
@@ -27,6 +27,19 @@ export const archiveOf = (workspace: string) => ({
 });
 
 /**
+ * Starts archiving a workspace apart from any view, under `archiveOf`'s key, so the dialog that
+ * asked can close at once and every view sees the archive under way (`useLeaving`). Answers what
+ * the daemon held it up for, or null once archived; `archiving(workspace)` says whether one runs.
+ */
+export function useArchive() {
+  const client = useQueryClient();
+  return {
+    start: (workspace: string, force: boolean): Promise<Blockers | null> => client.getMutationCache().build(client, archiveOf(workspace)).execute(force),
+    archiving: (workspace: string) => client.isMutating({ mutationKey: archiveOf(workspace).mutationKey }) > 0,
+  };
+}
+
+/**
  * Whether `workspace` is being archived from this page, or was. Its worktree is going or gone,
  * so its changes are not read or shown: a read mid-archive would see its files as deleted.
  */
@@ -41,9 +54,10 @@ export function useLeaving(workspace: string): boolean {
  * Asks before archiving `workspace`, and shows what archiving it means before anything is sent:
  * the commits that stay on its branch, the uncommitted files that go with the worktree, and every
  * terminal that stops, with a turn it would cut short. Its changes are read once, as the changes
- * sheet reads them, or the daemon's reason they cannot be; the daemon still decides, and when it
- * holds the archive up, its list of what would be lost is shown, with a folder that is no longer a
- * git worktree said so, and Archive anyway forces it. While the archive runs, its button says so.
+ * sheet reads them, or the daemon's reason they cannot be. Confirming asks `onArchive` to archive,
+ * which runs apart from the dialog. The daemon still decides: when it held the last archive up,
+ * the dialog is shown again with what would be lost (`held`), with a folder that is no longer a git
+ * worktree said so, and Archive anyway forces it; when the last archive failed, it says why (`failed`).
  *
  * For a workspace on another machine than `here`, the one serving the UI, its changes are not read:
  * that read answers only for this machine's workspaces. The dialog says so, still lists the
@@ -54,30 +68,28 @@ export function ArchiveDialog({
   workspace,
   machine,
   here,
+  held,
+  failed,
   onClose,
-  onArchived,
+  onArchive,
 }: {
   workspace: WorkspaceView;
   /** The machine that owns the workspace. */
   machine: Pick<MachineView, "id" | "name">;
   /** The machine serving the UI, once known. */
   here?: string;
+  /** What the daemon held the last archive up for. */
+  held?: Blockers;
+  /** Why the last archive failed. */
+  failed?: unknown;
   onClose: () => void;
-  onArchived: (name: string, branch: string) => void;
+  /** Archives the workspace, forced once the daemon held it up. */
+  onArchive: (force: boolean) => void;
 }) {
-  const [blockers, setBlockers] = useState<Blockers | null>(null);
   const leaving = useLeaving(workspace.id);
   const elsewhere = here !== undefined && machine.id !== here;
   const changes = useQuery({ ...changesQuery(workspace.id), enabled: !leaving && !elsewhere, retry: false });
-  const archive = useMutation({
-    ...archiveOf(workspace.id),
-    onSuccess: (held) => {
-      setBlockers(held);
-      if (held) return;
-      onArchived(workspace.name, workspace.branch);
-      onClose();
-    },
-  });
+  const blockers = held ?? null;
   const lost = changes.data?.files.filter((f) => f.uncommitted) ?? [];
   const terminals = rows(workspace);
   const cuts = terminals.some((r) => cut[r.glyph]);
@@ -164,20 +176,15 @@ export function ArchiveDialog({
           </Part>
         )}
       </div>
-      {archive.isError && (
+      {failed !== undefined && (
         <p role="alert" className="mt-3 text-xs text-red-400">
-          {couldNot(`archive ${workspace.name}`, archive.error)}
+          {couldNot(`archive ${workspace.name}`, failed)}
         </p>
       )}
       <div className="mt-5 flex justify-end gap-2">
         <Dialog.Close className={button}>Cancel</Dialog.Close>
-        <button
-          type="button"
-          onClick={() => archive.mutate(blockers !== null)}
-          disabled={archive.isPending}
-          className={risky ? dangerButton : primaryButton}
-        >
-          {archive.isPending ? "Archiving…" : blockers ? "Archive anyway" : "Archive"}
+        <button type="button" onClick={() => onArchive(blockers !== null)} className={risky ? dangerButton : primaryButton}>
+          {blockers ? "Archive anyway" : "Archive"}
         </button>
       </div>
     </Modal>

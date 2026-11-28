@@ -954,6 +954,106 @@ async fn a_worktree_removed_by_hand_still_archives() {
     );
 }
 
+/// The folder an archive moves a worktree into before it deletes it.
+fn removing(setup: &Setup) -> PathBuf {
+    setup.data.path().join("removing")
+}
+
+/// Waits until `dir` is gone or empty, as a delete in the background leaves it.
+async fn emptied(dir: &Path) {
+    let start = Instant::now();
+    while dir.exists() && !names_in(dir).is_empty() {
+        assert!(
+            start.elapsed() < WAIT,
+            "{} still holds {:?}",
+            dir.display(),
+            names_in(dir)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_archive_answers_before_its_worktrees_files_are_deleted() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let setup = Setup::new();
+    let remote = setup.project(&[(".gitignore", "build/\n")]);
+    let id = setup.create(&remote, "main", "heavy").await;
+    let worktree = setup.worktree(remote.project, "heavy");
+    // A file in a folder no one may write cannot be deleted, so the archive answers only if
+    // it does not wait for the delete.
+    let build = worktree.join("build");
+    std::fs::create_dir_all(&build).unwrap();
+    std::fs::write(build.join("out.bin"), "o").unwrap();
+    std::fs::set_permissions(&build, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let logs = Logged::default();
+    let _guard = logs.capture();
+
+    let archived = setup.workspaces.archive(id, false).await;
+
+    let aside = removing(&setup).join(id.to_string());
+    let mode = std::fs::Permissions::from_mode(0o755);
+    let _ = std::fs::set_permissions(aside.join("build"), mode.clone());
+    let _ = std::fs::set_permissions(&build, mode);
+    archived.unwrap();
+    assert!(setup.record(id).unwrap().deleted);
+    assert!(!worktree.exists());
+    let clone = setup.clone_of(remote.project);
+    let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
+    assert!(!worktrees.contains(&id.to_string()), "{worktrees}");
+    let branches = git(&clone, &["branch", "--list", "heavy"]);
+    assert!(branches.contains("heavy"), "the branch is kept: {branches}");
+}
+
+#[tokio::test]
+async fn an_archive_deletes_the_worktree_it_moved_aside() {
+    let setup = Setup::new();
+    let remote = setup.project(&[(".gitignore", "build/\n")]);
+    let id = setup.create(&remote, "main", "built").await;
+    let worktree = setup.worktree(remote.project, "built");
+    std::fs::create_dir_all(worktree.join("build")).unwrap();
+    std::fs::write(worktree.join("build").join("out.bin"), "o").unwrap();
+
+    setup.workspaces.archive(id, false).await.unwrap();
+
+    assert!(!worktree.exists());
+    emptied(&removing(&setup)).await;
+}
+
+#[tokio::test]
+async fn a_start_deletes_what_an_archive_left_to_delete() {
+    let setup = Setup::new();
+    let left = removing(&setup).join(WorkspaceId::random().to_string());
+    std::fs::create_dir_all(left.join("vendor")).unwrap();
+    std::fs::write(left.join("vendor").join("autoload.php"), "<?php").unwrap();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    emptied(&removing(&setup)).await;
+}
+
+#[tokio::test]
+async fn an_archive_git_will_not_remove_leaves_the_worktree_where_it_was() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "locked").await;
+    let worktree = setup.worktree(remote.project, "locked");
+    let clone = setup.clone_of(remote.project);
+    git(
+        &clone,
+        &["worktree", "lock", "--", worktree.to_str().unwrap()],
+    );
+
+    for force in [false, true] {
+        let err = setup.workspaces.archive(id, force).await;
+        assert!(matches!(err, Err(WorkspaceError::Git { .. })), "{err:?}");
+        assert!(!setup.record(id).unwrap().deleted);
+        assert!(worktree.join("README.md").exists());
+        assert!(!removing(&setup).join(id.to_string()).exists());
+        git(&worktree, &["status", "--porcelain"]);
+    }
+}
+
 /// Leaves workspace `branch`'s folder on disk but no longer a git worktree of its project's
 /// clone: its admin folder in the clone goes, so git lists no worktree there.
 fn detach(setup: &Setup, project: ProjectId, branch: &str) -> PathBuf {

@@ -12,6 +12,7 @@ import { FactoryMark } from "./FactoryMark";
 import { MachineName } from "./Machines";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
+import { useLeaving } from "./Archive";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { SessionNameField, useRenaming } from "./SessionName";
 import { SparkIcon } from "./FirstPrompt";
@@ -395,11 +396,13 @@ function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, 
  * or opened a pull request), and every `CHECKS_EVERY` only while its pull request's checks run;
  * never on window focus or reconnect, since each read runs git and asks GitHub on the owner. Not
  * read while `readable` is off (its machine is offline). A read that fails or has not answered
- * leaves the project alone, and says nothing of why. `branch`, when given, ends the line.
+ * leaves the project alone, and says nothing of why. `branch`, when given, ends the line. While the
+ * workspace is being archived, the line says so in place of where it stands, and reads nothing.
  */
 function StandingLine({ workspace, list, readable, branch }: { workspace: WorkspaceView; list: Row[]; readable: boolean; branch?: string }) {
   const [ref, onScreen] = useOnScreen<HTMLParagraphElement>();
-  const enabled = readable && onScreen;
+  const leaving = useLeaving(workspace.id);
+  const enabled = readable && onScreen && !leaving;
   const { data, isError } = useQuery({
     ...shippingQuery(workspace.id),
     enabled,
@@ -413,11 +416,17 @@ function StandingLine({ workspace, list, readable, branch }: { workspace: Worksp
   useReadOnChange(workspace.id, list.map((r) => `${r.terminal}:${r.glyph}`).join(" "));
 
   const working = list.some((r) => r.glyph === "starting" || r.glyph === "working");
-  const stands = readable && data && !isError ? standing(data, working) : undefined;
-  const title = [workspace.project, stands?.text, branch].filter((part) => part !== undefined).join(" · ");
+  const stands = !leaving && readable && data && !isError ? standing(data, working) : undefined;
+  const title = [workspace.project, leaving ? "Archiving…" : stands?.text, branch].filter((part) => part !== undefined).join(" · ");
   return (
     <p ref={ref} title={title} className="truncate pr-1 pl-2 text-xs text-neutral-500">
       <span>{workspace.project}</span>
+      {leaving && (
+        <>
+          <span className="text-neutral-600"> · </span>
+          <span>Archiving…</span>
+        </>
+      )}
       {stands && (
         <>
           <span className="text-neutral-600"> · </span>

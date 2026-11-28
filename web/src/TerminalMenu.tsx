@@ -1,12 +1,12 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { ContextMenu, Dialog, DropdownMenu } from "radix-ui";
 import { createContext, Fragment, useContext, useEffect, useRef, useState, type ComponentType, type PointerEvent, type ReactElement, type ReactNode } from "react";
-import { closeTerminal, machineQuery, startShell } from "./api";
+import { closeTerminal, machineQuery, startShell, type Blockers } from "./api";
 import { couldNot } from "./labels";
-import { ArchiveDialog } from "./Archive";
+import { ArchiveDialog, useArchive } from "./Archive";
 import { ended, endOf } from "./ends";
 import { matches, MD } from "./media";
-import { locate, type Located, type MachineView } from "./fleet";
+import { locate, type Located, type MachineView, type WorkspaceView } from "./fleet";
 import { button, dangerButton, Modal } from "./Modal";
 import { StateGlyph } from "./StateGlyph";
 
@@ -68,7 +68,9 @@ const Terminals = createContext<Context | undefined>(undefined);
 export function TerminalActions({ children, ...actions }: Actions & { children: ReactNode }) {
   const [asking, setAsking] = useState<string>();
   const [failed, setFailed] = useState<string>();
-  const [archiving, setArchiving] = useState<string>();
+  // The workspace whose archive dialog is open, with what held its last archive up or why it failed.
+  const [archiving, setArchiving] = useState<{ workspace: string; held?: Blockers; failed?: unknown }>();
+  const archive = useArchive();
   const [archived, setArchived] = useState<{ name: string; branch: string }>();
   const [renaming, setRenaming] = useState<{ terminal: string; place: Place }>();
   useEffect(() => {
@@ -96,7 +98,9 @@ export function TerminalActions({ children, ...actions }: Actions & { children: 
     },
     clear: (ids) => clearing.mutate(ids),
     shell: (workspace) => shell.mutate(workspace),
-    archive: setArchiving,
+    archive: (workspace) => {
+      if (!archive.archiving(workspace)) setArchiving({ workspace });
+    },
     renaming,
     rename: (id, place) => {
       if (!place && id !== actions.current) actions.onOpen(id);
@@ -105,13 +109,32 @@ export function TerminalActions({ children, ...actions }: Actions & { children: 
     stopRenaming: () => setRenaming(undefined),
   };
   const target = asking ? locate(actions.machines, asking) : undefined;
-  const owner = archiving ? actions.machines.find((m) => m.workspaces.some((w) => w.id === archiving)) : undefined;
-  const leaving = owner?.workspaces.find((w) => w.id === archiving);
+  const owner = archiving ? actions.machines.find((m) => m.workspaces.some((w) => w.id === archiving.workspace)) : undefined;
+  const leaving = owner?.workspaces.find((w) => w.id === archiving?.workspace);
+  // The dialog closes as the archive starts; the workspace's rows say it is archiving until it is gone.
+  const start = ({ id, name, branch }: WorkspaceView, force: boolean) => {
+    setArchiving(undefined);
+    archive.start(id, force).then(
+      (held) => (held ? setArchiving({ workspace: id, held }) : setArchived({ name, branch })),
+      (failed: unknown) => setArchiving({ workspace: id, failed }),
+    );
+  };
   return (
     <Terminals.Provider value={context}>
       {children}
       {asking && target && <EndDialog key={asking} id={asking} found={target} onDone={() => setAsking(undefined)} />}
-      {owner && leaving && <ArchiveDialog key={leaving.id} workspace={leaving} machine={owner} here={here} onClose={() => setArchiving(undefined)} onArchived={(name, branch) => setArchived({ name, branch })} />}
+      {owner && leaving && (
+        <ArchiveDialog
+          key={leaving.id}
+          workspace={leaving}
+          machine={owner}
+          here={here}
+          held={archiving?.held}
+          failed={archiving?.failed}
+          onClose={() => setArchiving(undefined)}
+          onArchive={(force) => start(leaving, force)}
+        />
+      )}
       {archived && (
         <p
           role="status"

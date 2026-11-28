@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Changes } from "./api";
+import { ApiError, type Blockers, type Changes } from "./api";
 import { ArchiveDialog } from "./Archive";
 import { fleet, type WorkspaceView } from "./fleet";
 import { dangerButton, primaryButton } from "./Modal";
@@ -41,17 +41,15 @@ function fixLogin(): WorkspaceView {
   return fleet(records, settings(), { s1: { title: "fix the login bug", now: null } })[0].workspaces[0];
 }
 
-/** Answers the changes read with `read` and each archive with the next of `archives`; gives back every request. */
-function stub(read: () => Response | Promise<Response>, ...archives: (Response | Promise<Response>)[]): Call[] {
+/** Answers the changes read with `read`; any other request is unexpected. Gives back every request. */
+function stub(read: () => Response | Promise<Response>): Call[] {
   const calls: Call[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init: RequestInit = {}) => {
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       if (url === "/api/workspaces/w1/changes") return read();
-      const next = archives.shift();
-      if (!next) throw new Error("unexpected request");
-      return next;
+      throw new Error("unexpected request");
     }),
   );
   return calls;
@@ -62,14 +60,26 @@ const posts = (calls: Call[]) => calls.filter((c) => c.method === "POST");
 const studio = { id: ME, name: "studio" };
 const attic = { id: OTHER, name: "attic" };
 
-/** Shows the dialog for "fix login" on `machine`, from the UI `here` serves (not known yet when null). */
-async function show(onClose = vi.fn(), onArchived = vi.fn(), machine = studio, here: string | null = ME) {
-  await renderApp(<ArchiveDialog workspace={fixLogin()} machine={machine} here={here ?? undefined} onClose={onClose} onArchived={onArchived} />);
+interface Shown {
+  onClose?: () => void;
+  onArchive?: (force: boolean) => void;
+  machine?: typeof studio;
+  /** The machine serving the UI; not known yet when null. */
+  here?: string | null;
+  held?: Blockers;
+  failed?: unknown;
+}
+
+/** Shows the dialog for "fix login" on `machine` (studio), from the UI `here` (studio) serves. */
+async function show({ onClose = vi.fn(), onArchive = vi.fn(), machine = studio, here = ME, held, failed }: Shown = {}) {
+  await renderApp(<ArchiveDialog workspace={fixLogin()} machine={machine} here={here ?? undefined} held={held} failed={failed} onClose={onClose} onArchive={onArchive} />);
   return screen.findByRole("dialog", { name: "Archive fix login?" });
 }
 
 /** The same dialog for "fix login" on another machine, attic. */
-const showElsewhere = (onClose = vi.fn(), onArchived = vi.fn()) => show(onClose, onArchived, attic, ME);
+const showElsewhere = (shown: Shown = {}) => show({ ...shown, machine: attic, here: ME });
+
+const unsaved: Blockers = { uncommitted: ["src/a.rs"], unpushed: ["abc123 wip"], submodules: ["vendor/x"], detached: false };
 const reads = (calls: Call[]) => calls.filter((c) => c.url.endsWith("/changes"));
 
 describe("ArchiveDialog", () => {
@@ -121,18 +131,19 @@ describe("ArchiveDialog", () => {
 
     stub(() => json(200, { ...changes, files: [file("src/login.ts", 30, 4)] }));
     const quiet = fleet([workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "idle")], settings())[0].workspaces[0];
-    await renderApp(<ArchiveDialog workspace={quiet} machine={studio} here={ME} onClose={vi.fn()} onArchived={vi.fn()} />);
+    await renderApp(<ArchiveDialog workspace={quiet} machine={studio} here={ME} onClose={vi.fn()} onArchive={vi.fn()} />);
     dialog = await screen.findByRole("dialog", { name: "Archive fix login?" });
     expect(await within(dialog).findByText("Every change is committed.")).toBeDefined();
     expect(within(dialog).getByRole("button", { name: "Archive" }).className).toBe(primaryButton);
   });
 
   it("still archives when its changes cannot be read, and says they could not be", async () => {
-    const calls = stub(() => Promise.reject(new TypeError("Failed to fetch")), new Response(null, { status: 204 }));
-    const dialog = await show();
+    const onArchive = vi.fn();
+    stub(() => Promise.reject(new TypeError("Failed to fetch")));
+    const dialog = await show({ onArchive });
     expect(await within(dialog).findByText(/can.t be read from here/)).toBeDefined();
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
-    await waitFor(() => expect(posts(calls)).toHaveLength(1));
+    expect(onArchive).toHaveBeenCalledWith(false);
   });
 
   it("says in what stays on the branch why the daemon could not read its changes", async () => {
@@ -152,92 +163,62 @@ describe("ArchiveDialog", () => {
     expect(kept.textContent).not.toMatch(/can.t be read from here/);
   });
 
-  it("says it is archiving while the archive runs, and Cancel still closes it", async () => {
-    const onClose = vi.fn();
-    stub(
-      () => json(200, changes),
-      new Promise<Response>(() => {}),
-    );
-    const dialog = await show(onClose);
+  it("asks for an archive without force once confirmed, and sends nothing itself", async () => {
+    const onArchive = vi.fn();
+    const calls = stub(() => json(200, changes));
+    const dialog = await show({ onArchive });
+
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
 
-    const busy = await within(dialog).findByRole("button", { name: "Archiving…" });
-    expect((busy as HTMLButtonElement).disabled).toBe(true);
-    expect(within(dialog).queryByRole("button", { name: "Archive" })).toBeNull();
-    const cancel = within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
-    expect(cancel.disabled).toBe(false);
-    fireEvent.click(cancel);
-    expect(onClose).toHaveBeenCalled();
+    expect(onArchive).toHaveBeenCalledWith(false);
+    expect(posts(calls)).toEqual([]);
   });
 
   it("says why it cannot check a workspace whose folder is no longer a git worktree, and still lists its unpushed commits", async () => {
-    const onArchived = vi.fn();
-    const calls = stub(
-      () => json(200, changes),
-      json(409, { error: "archive refused: its folder is no longer a git worktree", uncommitted: [], unpushed: ["abc123 wip"], submodules: [], detached: true }),
-      new Response(null, { status: 204 }),
-    );
-    const dialog = await show(vi.fn(), onArchived);
+    const onArchive = vi.fn();
+    stub(() => json(200, changes));
+    const dialog = await show({ onArchive, held: { uncommitted: [], unpushed: ["abc123 wip"], submodules: [], detached: true } });
 
-    fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
-    const held = await within(dialog).findByRole("region", { name: "Archiving now would lose this work" });
+    const held = within(dialog).getByRole("region", { name: "Archiving now would lose this work" });
     expect(held.textContent).toContain("Its folder is no longer a git worktree, so what is in it can't be checked. Archive anyway deletes the folder; branch fix-login stays.");
     expect(within(held).getByText("fix-login").tagName).toBe("CODE");
     expect(held.textContent).toContain("abc123 wip");
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive anyway" }));
-    await waitFor(() => expect(onArchived).toHaveBeenCalled());
-    expect(posts(calls).map((c) => c.body)).toEqual([{ force: false }, { force: true }]);
+    expect(onArchive).toHaveBeenCalledWith(true);
   });
 
-  it("archives without force once confirmed, and says what it kept", async () => {
-    const onArchived = vi.fn();
-    const onClose = vi.fn();
-    const calls = stub(() => json(200, changes), new Response(null, { status: 204 }));
-    const dialog = await show(onClose, onArchived);
+  it("lists what held the archive up and asks to archive anyway with force", async () => {
+    const onArchive = vi.fn();
+    stub(() => json(200, changes));
+    const dialog = await show({ onArchive, held: unsaved });
 
-    fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
-
-    await waitFor(() => expect(onArchived).toHaveBeenCalledWith("fix login", "fix-login"));
-    expect(posts(calls)).toEqual([{ url: "/api/workspaces/w1/archive", method: "POST", body: { force: false } }]);
-    expect(onClose).toHaveBeenCalled();
-  });
-
-  it("lists what holds an archive up on 409 and archives anyway with force", async () => {
-    const onArchived = vi.fn();
-    const calls = stub(
-      () => json(200, changes),
-      json(409, { error: "workspace has unsaved work", uncommitted: ["src/a.rs"], unpushed: ["abc123 wip"], submodules: ["vendor/x"] }),
-      new Response(null, { status: 204 }),
-    );
-    const dialog = await show(vi.fn(), onArchived);
-
-    fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
-    const held = await within(dialog).findByRole("region", { name: "Archiving now would lose this work" });
+    const held = within(dialog).getByRole("region", { name: "Archiving now would lose this work" });
     expect(held.textContent).toContain("src/a.rs");
     expect(held.textContent).toContain("abc123 wip");
     expect(held.textContent).toContain("vendor/x");
     expect(held.textContent).not.toMatch(/no longer a git worktree/);
+    expect(within(dialog).queryByRole("button", { name: "Archive" })).toBeNull();
     expect(within(dialog).getByRole("button", { name: "Archive anyway" }).className).toBe(dangerButton);
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive anyway" }));
 
-    await waitFor(() => expect(onArchived).toHaveBeenCalled());
-    expect(posts(calls).map((c) => c.body)).toEqual([{ force: false }, { force: true }]);
+    expect(onArchive).toHaveBeenCalledWith(true);
   });
 
-  it("shows the text of any other error in the dialog", async () => {
-    stub(() => json(200, changes), json(500, { error: "disk on fire" }));
-    const dialog = await show();
+  it("says why the archive failed, and archives again from there", async () => {
+    const onArchive = vi.fn();
+    stub(() => json(200, changes));
+    const dialog = await show({ onArchive, failed: new ApiError("disk on fire", 500) });
 
+    expect(within(dialog).getByRole("alert").textContent).toBe("Could not archive fix login: disk on fire.");
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
-
-    expect((await within(dialog).findByRole("alert")).textContent).toBe("Could not archive fix login: disk on fire.");
+    expect(onArchive).toHaveBeenCalledWith(false);
   });
 
   it("reads and shows the changes while the machine serving the UI is not known yet", async () => {
     const calls = stub(() => json(200, changes));
-    const dialog = await show(vi.fn(), vi.fn(), attic, null);
+    const dialog = await show({ machine: attic, here: null });
     const kept = await within(dialog).findByRole("region", { name: "Kept on fix-login" });
     await waitFor(() => expect(kept.textContent).toContain("Check the session on login"));
     expect(within(dialog).getByRole("region", { name: "Lost with the worktree" }).textContent).toContain("README.md");
@@ -263,61 +244,31 @@ describe("ArchiveDialog", () => {
       expect(posts(calls)).toEqual([]);
     });
 
-    it("archives without force, closes and says what it kept on 204", async () => {
-      const onArchived = vi.fn();
-      const onClose = vi.fn();
-      const calls = stub(() => json(200, changes), new Response(null, { status: 204 }));
-      const dialog = await showElsewhere(onClose, onArchived);
+    it("lists what the owner held the archive up for and asks to archive anyway with force", async () => {
+      const onArchive = vi.fn();
+      const calls = stub(() => json(200, changes));
+      const dialog = await showElsewhere({ onArchive, held: unsaved });
 
-      fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
-
-      await waitFor(() => expect(onArchived).toHaveBeenCalledWith("fix login", "fix-login"));
-      expect(onClose).toHaveBeenCalled();
-      expect(posts(calls)).toEqual([{ url: "/api/workspaces/w1/archive", method: "POST", body: { force: false } }]);
-      expect(reads(calls)).toEqual([]);
-    });
-
-    it("lists what the owner holds the archive up for on 409 and archives anyway with force", async () => {
-      const onArchived = vi.fn();
-      const calls = stub(
-        () => json(200, changes),
-        json(409, { error: "workspace has unsaved work", uncommitted: ["src/a.rs"], unpushed: ["abc123 wip"], submodules: ["vendor/x"] }),
-        new Response(null, { status: 204 }),
-      );
-      const dialog = await showElsewhere(vi.fn(), onArchived);
-
-      fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
-      const held = await within(dialog).findByRole("region", { name: "Archiving now would lose this work" });
+      const held = within(dialog).getByRole("region", { name: "Archiving now would lose this work" });
       expect(held.textContent).toContain("src/a.rs");
       expect(held.textContent).toContain("abc123 wip");
       expect(held.textContent).toContain("vendor/x");
 
       fireEvent.click(within(dialog).getByRole("button", { name: "Archive anyway" }));
 
-      await waitFor(() => expect(onArchived).toHaveBeenCalled());
-      expect(posts(calls).map((c) => c.body)).toEqual([{ force: false }, { force: true }]);
+      expect(onArchive).toHaveBeenCalledWith(true);
       expect(reads(calls)).toEqual([]);
-    });
-
-    it("stays open and says why on any other refusal", async () => {
-      const onClose = vi.fn();
-      stub(() => json(200, changes), json(503, { error: "attic is offline" }));
-      const dialog = await showElsewhere(onClose);
-
-      fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
-
-      expect((await within(dialog).findByRole("alert")).textContent).toBe("Could not archive fix login: attic is offline.");
-      expect(onClose).not.toHaveBeenCalled();
-      expect(screen.getByRole("dialog", { name: "Archive fix login?" })).toBeDefined();
     });
   });
 
   it("sends nothing on Cancel", async () => {
     const onClose = vi.fn();
+    const onArchive = vi.fn();
     const calls = stub(() => json(200, changes));
-    const dialog = await show(onClose);
+    const dialog = await show({ onClose, onArchive });
     fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
     expect(onClose).toHaveBeenCalled();
+    expect(onArchive).not.toHaveBeenCalled();
     expect(posts(calls)).toEqual([]);
   });
 });
