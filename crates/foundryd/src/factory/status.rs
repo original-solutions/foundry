@@ -671,6 +671,8 @@ mod tests {
             kind: HeldUpKind::Stuck,
             reason: "gate still red".into(),
             workspaces: vec![],
+            pr_url: None,
+            sessions: vec![],
         }];
         let foreign = vec![ForeignClaim {
             issue: 8,
