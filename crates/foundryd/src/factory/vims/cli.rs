@@ -85,12 +85,21 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
             stderr,
         } => {
             // Stdout can carry the command's own output, so only its JSON answer, whole or on
-            // its last line, is read for a code there; stderr is read for one in plain text too.
-            // An `exec` that waits can print its command's output on either, so a code there is
-            // never a refusal: the command ran.
-            let coded = coded(&stdout, false).or_else(|| coded(&stderr, true));
+            // its last line, is read there; stderr is read for any JSON line, and for a code in
+            // plain text when it holds none. A code is no refusal when either answer names
+            // something Vims took (an operation, a workspace, an id, or a state other than
+            // failed), or when an `exec` waits, since it can print its command's output on
+            // either: the command ran.
+            let out = json_answer(&stdout, false);
+            let err = json_answer(&stderr, true);
+            let took = out.iter().chain(err.iter()).any(names_work);
+            let coded = out.as_ref().and_then(json_code).or_else(|| match &err {
+                Some(err) => json_code(err),
+                None => plain_code(&stderr),
+            });
             if !call.runs_attached()
-                && let Some((refusal, false)) = coded.as_ref()
+                && !took
+                && let Some(refusal) = coded.as_ref()
                 && refusal.is_vims_s()
             {
                 return Err(VimsError::Refused {
@@ -109,7 +118,7 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
             Err(VimsError::Unknown {
                 command,
                 reason: reason.trim_end_matches([':', ' ']).to_owned(),
-                code: coded.map(|(coded, _)| coded.code),
+                code: coded.map(|coded| coded.code),
             })
         }
     }
@@ -125,45 +134,50 @@ fn quoted(text: &str) -> String {
     format!("{cut}{}", one_line(&text[start..]))
 }
 
-/// The code and message of the failure `text` reports, when it names one, and whether the
-/// answer names an operation: JSON with `error.code` (or `code`, or an `error` that is a code),
-/// or, when `plain`, a line that starts with a code, such as `Error: PRECONDITION_FAILED: …`.
-/// The checks saw the codes and not the shape they came in, so both are guesses. A code beside
-/// anything the answer names ([`answer::Named`]: an operation, a workspace or an id) or a state
-/// other than failed is that thing's, so Vims took the call and it is no refusal. Whether any other code is a refusal of Vims's is
-/// [`Refusal::is_vims_s`]'s to say.
-fn coded(text: &str, plain: bool) -> Option<(Refusal, bool)> {
+/// The JSON object `text` answers: all of it, or its last line, or, when `any_line`, its last
+/// line that is JSON.
+fn json_answer(text: &str, any_line: bool) -> Option<Value> {
     let text = text.trim();
-    let json = serde_json::from_str::<Value>(text).ok().or_else(|| {
-        let mut lines = text.lines().rev();
-        if plain {
-            lines.find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
-        } else {
-            lines
-                .next()
-                .and_then(|line| serde_json::from_str::<Value>(line.trim()).ok())
-        }
-    });
-    if let Some(value) = json.filter(Value::is_object) {
-        let code = [&["error", "code"][..], &["code"], &["error"]]
-            .into_iter()
-            .filter_map(|path| answer::text(&value, &[path]))
-            .find(|code| is_code(code))?;
-        let message =
-            answer::text(&value, &[&["error", "message"], &["message"]]).unwrap_or_default();
-        // Anything the answer names (an operation, a workspace, or an id), or a state other
-        // than failed, says Vims took the call.
-        let named = answer::Named::in_answer(&value);
-        let operation = named.operation
-            || named.workspace
-            || named.id.is_some()
-            || answer::text(&value, &[&["status"], &["state"]])
-                .is_some_and(|state| OpState::read(&state) != OpState::Failed);
-        return Some((Refusal::new(code, message), operation));
-    }
-    if !plain {
-        return None;
-    }
+    let line = |line: &str| serde_json::from_str::<Value>(line.trim()).ok();
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .or_else(|| {
+            let mut lines = text.lines().rev();
+            if any_line {
+                lines.find_map(line)
+            } else {
+                lines.next().and_then(line)
+            }
+        })
+        .filter(Value::is_object)
+}
+
+/// Whether an answer names something Vims took: anything [`answer::Named`] reads (an
+/// operation, a workspace or an id), or a state other than failed.
+fn names_work(value: &Value) -> bool {
+    let named = answer::Named::in_answer(value);
+    named.operation
+        || named.workspace
+        || named.id.is_some()
+        || answer::text(value, &[&["status"], &["state"]])
+            .is_some_and(|state| OpState::read(&state) != OpState::Failed)
+}
+
+/// The code and message of the failure a JSON answer reports: `error.code`, or `code`, or an
+/// `error` that is a code. The checks saw the codes and not the shape they came in, so this is
+/// a guess. Whether the code is a refusal of Vims's is [`Refusal::is_vims_s`]'s to say.
+fn json_code(value: &Value) -> Option<Refusal> {
+    let code = [&["error", "code"][..], &["code"], &["error"]]
+        .into_iter()
+        .filter_map(|path| answer::text(value, &[path]))
+        .find(|code| is_code(code))?;
+    let message = answer::text(value, &[&["error", "message"], &["message"]]).unwrap_or_default();
+    Some(Refusal::new(code, message))
+}
+
+/// The code and message of a line of `text` that starts with a code, such as
+/// `Error: PRECONDITION_FAILED: …`. Guessed, as [`json_code`] is.
+fn plain_code(text: &str) -> Option<Refusal> {
     text.lines().find_map(|line| {
         let line = line.trim();
         let line = ["Error: ", "error: "]
@@ -172,7 +186,7 @@ fn coded(text: &str, plain: bool) -> Option<(Refusal, bool)> {
             .unwrap_or(line);
         let (code, message) = line.split_once(':').unwrap_or((line, ""));
         // In free text a code is a word with an `_` in it, so a capitalised word is not one.
-        (is_code(code) && code.contains('_')).then(|| (Refusal::new(code, message.trim()), false))
+        (is_code(code) && code.contains('_')).then(|| Refusal::new(code, message.trim()))
     })
 }
 
@@ -790,6 +804,50 @@ mod tests {
             error.refusal().map(|refusal| refusal.code.as_str()),
             Some("PRECONDITION_FAILED")
         );
+    }
+
+    #[test]
+    fn a_refusal_on_stderr_beside_an_operation_on_stdout_is_no_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        for (stdout, stderr, code) in [
+            (
+                r#"{"id":"op_7","status":"queued","workspaceId":"wsp_9"}"#,
+                "Error: PRECONDITION_FAILED: stdin upload failed",
+                "PRECONDITION_FAILED",
+            ),
+            (
+                r#"{"workspace":{"id":"wsp_9"}}"#,
+                r#"{"error":{"code":"QUOTA_EXCEEDED"}}"#,
+                "QUOTA_EXCEEDED",
+            ),
+            (
+                "",
+                r#"{"id":"op_7","error":{"code":"PRECONDITION_FAILED"}}"#,
+                "PRECONDITION_FAILED",
+            ),
+        ] {
+            let program = fake_vims(
+                dir.path(),
+                &format!("echo '{stdout}'\necho '{stderr}' >&2\nexit 1"),
+            );
+            let error = vims_at(&program, Arc::new(SystemClock))
+                .call(&exec_call())
+                .unwrap_err();
+            assert!(
+                matches!(&error, VimsError::Unknown { code: Some(found), .. } if found == code),
+                "{stdout} / {stderr}: {error:?}"
+            );
+        }
+        // Stdout that names nothing leaves stderr's code a refusal.
+        let program = fake_vims(
+            dir.path(),
+            "echo '{\"message\":\"bad request\"}'\necho 'Error: PRECONDITION_FAILED: paused' >&2\nexit 1",
+        );
+        let error = vims_at(&program, Arc::new(SystemClock))
+            .call(&exec_call())
+            .unwrap_err();
+        assert_eq!(error.code(), Some("PRECONDITION_FAILED"));
+        assert!(error.refusal().is_some(), "{error:?}");
     }
 
     #[test]
