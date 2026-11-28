@@ -444,7 +444,7 @@ pub fn placed(ctx: &RunContext<'_>, run: &RunId, target: Target) -> Result<Resum
 /// run that ended is an orphan, except those of a stuck run, which are kept to be looked at.
 /// It reads no worker and no clock.
 pub fn orphans(
-    view: &FleetView,
+    view: &dyn FleetView,
     project: ProjectId,
     run: &RunId,
     events: &[RunEvent],
@@ -514,7 +514,7 @@ pub fn orphans(
             superseded
                 && !active.contains(&id)
                 && !being_asked.contains(&record.body.name)
-                && view.online(record.owner)
+                && view.online(Target::Machine(record.owner))
         })
         .map(|(_, record)| record.body.id)
         .collect()
@@ -531,7 +531,7 @@ enum Kind {
 /// Every workspace of the project the fleet shows that is not archived and has one of the
 /// run's build, resume or feedback names, in the order of the names.
 fn named_workspaces<'a>(
-    view: &'a FleetView,
+    view: &'a dyn FleetView,
     project: ProjectId,
     run: &RunId,
     scan: Scan,
@@ -561,7 +561,7 @@ fn named_workspaces<'a>(
 
 /// The record of the workspace `id` of the run, when the fleet shows it and it is not archived.
 fn find_workspace<'a>(
-    view: &'a FleetView,
+    view: &'a dyn FleetView,
     project: ProjectId,
     run: &RunId,
     scan: Scan,
@@ -575,7 +575,7 @@ fn find_workspace<'a>(
 
 /// The record of the resume workspace `round` recorded the answer of, when the fleet shows it.
 fn resume_record<'a>(
-    view: &'a FleetView,
+    view: &'a dyn FleetView,
     project: ProjectId,
     run: &RunId,
     round: &Round,
@@ -772,7 +772,7 @@ fn prepared(text: &str) -> Option<String> {
 
 /// Whether `machine` has been unreachable for 15 minutes.
 fn unreachable_long(ctx: &RunContext<'_>, machine: MachineId) -> bool {
-    ctx.view.unreachable_for(machine) >= UNREACHABLE_FOR
+    ctx.view.unreachable_for(Target::Machine(machine)) >= UNREACHABLE_FOR
 }
 
 fn skipped(run: &RunId, why: &str) -> Result<ResumeStep, RunError> {
@@ -1683,7 +1683,7 @@ fn carry_on(
         if placed.is_some() {
             return needs_no_machine();
         }
-        if ctx.view.online(record.owner) {
+        if ctx.view.online(Target::Machine(record.owner)) {
             return archive_old(ctx, run, Some(old), k, Records::Nothing);
         }
         return Ok(ResumeStep::Waiting(Wait::Archive));
@@ -1694,7 +1694,7 @@ fn carry_on(
             // Placement puts a resume on the fleet: a host is refused as the fleet worker
             // refuses one.
             let machine = worker::fleet_machine(target)?;
-            if round.gave_up.contains(&machine) && !ctx.view.online(machine) {
+            if round.gave_up.contains(&machine) && !ctx.view.online(Target::Machine(machine)) {
                 return Err(RunError::Invalid(format!(
                     "run {run} gave up on machine {machine} for resume {k}"
                 )));
@@ -2054,7 +2054,7 @@ fn moved_claim(
     if let Some(machine) = placed
         && moved.is_none()
         && (machine == claimed_on || gave_up.contains(&machine))
-        && !ctx.view.online(machine)
+        && !ctx.view.online(Target::Machine(machine))
     {
         return Err(RunError::Invalid(format!(
             "run {run} cannot move to machine {machine}, which it was or is unreachable on"
@@ -2142,7 +2142,8 @@ mod tests {
     use crate::factory::lifecycle::State;
     use crate::factory::messages::{self, LAUNCH_FAILED, ResumeFrom, SESSION_GONE};
     use crate::factory::worker::{
-        Call, CreateWorkspace, FleetView, FleetViewBuilder, HostCall, Lost, Target, WorkerError,
+        Call, CreateWorkspace, FleetView, FleetViewBuilder, HostCall, Lost, StoreView, Target,
+        WorkerError,
     };
     use crate::sessions::factory::BODY_PATH;
     use crate::sessions::turns::TurnText;
@@ -2287,7 +2288,7 @@ mod tests {
     /// The fleet with the build machine online, the run's build workspace on it and the build
     /// session in `state` (none: the fleet shows no such session).
     fn fleet(state: Option<SessionState>) -> FleetViewBuilder {
-        let builder = FleetView::builder()
+        let builder = StoreView::builder()
             .online(m1())
             .online(m2())
             .workspace(workspace_record(m1(), old(), BRANCH, None));
@@ -2298,19 +2299,19 @@ mod tests {
     }
 
     /// The session's process ended with no turn: an interruption.
-    fn failed() -> FleetView {
+    fn failed() -> StoreView {
         fleet(Some(SessionState::Failed)).build()
     }
 
     /// The session is gone: the fleet shows no session, and no record of its workspace.
-    fn gone() -> FleetView {
-        FleetView::builder().online(m1()).online(m2()).build()
+    fn gone() -> StoreView {
+        StoreView::builder().online(m1()).online(m2()).build()
     }
 
     /// The build machine has been unreachable for `span`, with its workspace and session as it
     /// left them.
-    fn cut_off(span: Duration) -> FleetView {
-        FleetView::builder()
+    fn cut_off(span: Duration) -> StoreView {
+        StoreView::builder()
             .online(m2())
             .workspace(workspace_record(m1(), old(), BRANCH, None))
             .session(session_record(session(), old(), SessionState::Working))
@@ -2319,13 +2320,13 @@ mod tests {
     }
 
     /// The earlier workspace is archived: no record shows.
-    fn archived() -> FleetView {
-        FleetView::builder().online(m1()).online(m2()).build()
+    fn archived() -> StoreView {
+        StoreView::builder().online(m1()).online(m2()).build()
     }
 
     /// The resume workspace shows on `m2`, with `setup` as its setup terminal.
     fn with_resume_workspace(name: &str, setup: Option<TerminalId>) -> FleetViewBuilder {
-        FleetView::builder()
+        StoreView::builder()
             .online(m1())
             .online(m2())
             .workspace(workspace_record(m2(), fresh(), name, setup))
@@ -2688,7 +2689,7 @@ mod tests {
         /// Interrupts the run's current session the way the fleet shows it: the session `thread`
         /// failed, in the workspace `workspace`.
         fn fail_the_session(rig: &mut Rig, thread: SessionId, workspace: WorkspaceId) {
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .online(m2())
                 .workspace(workspace_record(m2(), workspace, "w", None))
@@ -2721,7 +2722,7 @@ mod tests {
             rig.worker.on_create(Ok(made));
             placed_on(rig, run, m2());
             let name = format!("fac/8-1-r{k}");
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .online(m2())
                 .workspace(workspace_record(m2(), made, &name, None))
@@ -4103,7 +4104,7 @@ mod tests {
             let mut rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
@@ -4164,14 +4165,14 @@ mod tests {
             let mut rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
             rig.worker.on_create(Ok(fresh()));
             pass(&rig, &run);
             placed_on(&rig, &run, m2());
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(15 * 60))
                 .workspace(workspace_record(m2(), fresh(), "fac/8-1", None))
@@ -4194,18 +4195,18 @@ mod tests {
             let mut rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(15 * 60 - 1))
                 .build();
             assert!(is_skipped(&pass(&rig, &run)));
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(15 * 60))
                 .workspace(workspace_record(m1(), fresh(), "fac/8-1", None))
                 .build();
             assert!(is_skipped(&pass(&rig, &run)));
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
@@ -4216,7 +4217,7 @@ mod tests {
             assert!(placed(&rig.ctx(), &run, Target::Machine(m1())).is_err());
             assert!(create_calls(&rig).is_empty());
             // Online again, the machine is start's to ask.
-            rig.view = FleetView::builder().online(m1()).online(m2()).build();
+            rig.view = StoreView::builder().online(m1()).online(m2()).build();
             assert!(is_skipped(&pass(&rig, &run)));
         }
 
@@ -4227,7 +4228,7 @@ mod tests {
             let run = run_id(1);
             claimed_not_built(&rig, &run);
             rig.step(&run, &format!("workspace-created {OLD}"));
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(60 * 60))
                 .build();
@@ -4248,7 +4249,7 @@ mod tests {
                 },
             );
             rig.moved(&run, State::Ready, State::Triage);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(60 * 60))
                 .build();
@@ -4386,7 +4387,7 @@ mod tests {
                 (rig, run)
             }
 
-            fn orphan_list(rig: &Rig, run: &RunId, view: &FleetView) -> Vec<WorkspaceId> {
+            fn orphan_list(rig: &Rig, run: &RunId, view: &dyn FleetView) -> Vec<WorkspaceId> {
                 orphans(view, project_id(), run, &rig.events(run))
             }
 
@@ -4409,7 +4410,7 @@ mod tests {
             #[test]
             fn does_not_list_a_workspace_of_a_machine_that_is_offline() {
                 let (rig, run) = resumed_run();
-                let view = FleetView::builder()
+                let view = StoreView::builder()
                     .online(m2())
                     .unreachable(m1(), secs(60 * 60))
                     .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
@@ -4527,7 +4528,7 @@ mod tests {
                 rig.step(&run, &format!("workspace-requested {BRANCH}"));
                 rig.step(&run, &format!("claim-moved {}", m2()));
                 rig.step(&run, &format!("workspace-created {}", fresh()));
-                let view = FleetView::builder()
+                let view = StoreView::builder()
                     .online(m1())
                     .online(m2())
                     .workspace(workspace_record(m2(), fresh(), BRANCH, None))
@@ -4884,13 +4885,13 @@ mod tests {
             let (mut rig, run) = archived_and_waiting_for_a_machine();
             rig.worker.on_create(Ok(fresh()));
             placed_on(&rig, &run, m2());
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .online(m3())
                 .unreachable(m2(), secs(15 * 60 - 1))
                 .build();
             assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Workspace));
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .online(m3())
                 .unreachable(m2(), secs(15 * 60))
@@ -4915,7 +4916,7 @@ mod tests {
             assert!(matches!(&calls[1], Call::Create { target, request }
                 if *target == Target::Machine(m3()) && request.name == "fac/8-1-r1"));
             // When the given-up machine is heard from again its workspace is an orphan.
-            let view = FleetView::builder()
+            let view = StoreView::builder()
                 .online(m1())
                 .online(m2())
                 .online(m3())
@@ -4964,7 +4965,7 @@ mod tests {
             let mut rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
@@ -4988,7 +4989,7 @@ mod tests {
             let mut rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
@@ -4996,7 +4997,7 @@ mod tests {
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
             assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             assert!(resume_steps(&rig, &run).contains(&format!("claim-moved {}", m2())));
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .unreachable(m2(), secs(15 * 60))
@@ -5017,7 +5018,7 @@ mod tests {
             );
             assert!(interruptions(&rig, &run).is_empty());
             // The target that was given up made a workspace of the name: an orphan when heard.
-            let view = FleetView::builder()
+            let view = StoreView::builder()
                 .online(m2())
                 .online(m3())
                 .workspace(workspace_record(m2(), fresh(), "fac/8-1", None))
@@ -5121,7 +5122,7 @@ mod tests {
             let mut rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
@@ -5154,13 +5155,13 @@ mod tests {
         fn a_session_not_shown_on_a_machine_gone_for_15_minutes_is_an_interruption() {
             let (mut rig, run) = at_the_start();
             resumed(&mut rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .unreachable(m2(), secs(15 * 60 - 1))
                 .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
                 .build();
             assert!(is_skipped(&pass(&rig, &run)));
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .unreachable(m2(), secs(15 * 60))
                 .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
@@ -5177,7 +5178,7 @@ mod tests {
         fn a_resumed_session_on_a_machine_gone_for_15_minutes_is_an_interruption() {
             let (mut rig, run) = at_the_start();
             resumed(&mut rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .unreachable(m2(), secs(15 * 60))
                 .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
@@ -5228,7 +5229,7 @@ mod tests {
             let mut rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
@@ -5269,7 +5270,7 @@ mod tests {
             let run = run_id(1);
             claimed_not_built(&rig, &run);
             rig.step(&run, "launch-resuming feat/x");
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
@@ -5290,7 +5291,7 @@ mod tests {
             let run = run_id(1);
             claimed_not_built(&rig, &run);
             rig.step(&run, "launch-base feature/x");
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
@@ -5347,7 +5348,7 @@ mod tests {
             let rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            let view = FleetView::builder()
+            let view = StoreView::builder()
                 .online(m1())
                 .workspace(workspace_record(m1(), fresh(), BRANCH, None))
                 .build();
@@ -5387,7 +5388,7 @@ mod tests {
                     title: None,
                 },
             );
-            let view = FleetView::builder()
+            let view = StoreView::builder()
                 .online(m2())
                 .workspace(workspace_record(m2(), fresh(), "fac/8-1-r66", None))
                 .workspace(workspace_record(m2(), old(), "fac/8-1-r65", None))
@@ -5431,7 +5432,7 @@ mod tests {
                     title: None,
                 },
             );
-            let view = FleetView::builder()
+            let view = StoreView::builder()
                 .online(m2())
                 .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
                 .workspace(workspace_record(m2(), old(), "fac/8-1-r2", None))
@@ -5449,7 +5450,7 @@ mod tests {
             let (mut rig, run) = archived_and_waiting_for_a_machine();
             rig.step(&run, &format!("resume-machine 1 {}", m2()));
             rig.step(&run, "resume-requested 1 fac/8-1-r1");
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .online(m2())
                 .workspace(workspace_record(
@@ -5787,7 +5788,7 @@ mod tests {
             let (mut rig, run) = archived_and_waiting_for_a_machine();
             rig.worker.on_create(Ok(fresh()));
             placed_on(&rig, &run, m2());
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .unreachable(m2(), secs(15 * 60))
                 .build();
@@ -5818,14 +5819,14 @@ mod tests {
             let mut rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
             assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .unreachable(m2(), secs(15 * 60))
@@ -5836,7 +5837,7 @@ mod tests {
             ));
             assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
             // The target is back: placement may pick it again.
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
@@ -5856,21 +5857,21 @@ mod tests {
             let mut rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
             assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .unreachable(m2(), secs(15 * 60))
                 .build();
             assert!(matches!(pass(&rig, &run), ResumeStep::NeedsMachine(_)));
             // The claim's own machine is heard from again: `start` carries on there.
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .online(m3())
                 .unreachable(m2(), secs(15 * 60))
@@ -6016,7 +6017,7 @@ mod tests {
                 let mut rig = Rig::new();
                 let run = run_id(1);
                 claimed_not_built(&rig, &run);
-                rig.view = FleetView::builder().online(m1()).build();
+                rig.view = StoreView::builder().online(m1()).build();
                 rig.step(
                     &run,
                     &format!("stuck-stop {{\"code\":\"{code}\",\"stop\":{{\"reason\":\"x\"}}}}"),
@@ -6041,21 +6042,21 @@ mod tests {
             let mut rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
             assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .unreachable(m2(), secs(15 * 60))
                 .build();
             assert!(matches!(pass(&rig, &run), ResumeStep::NeedsMachine(_)));
             // m1 is back, then away for half a minute with a workspace of the name showing.
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(30))
                 .workspace(workspace_record(m1(), fresh3(), "fac/8-1", None))
@@ -6063,7 +6064,7 @@ mod tests {
             let before = event_count(&rig, &run);
             assert!(is_skipped(&pass(&rig, &run)));
             // Away for less than 15 minutes with no workspace showing: not moved either.
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(30))
                 .build();
@@ -6141,7 +6142,7 @@ mod tests {
                     .count()
             };
             let asked = ended(&rig);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .unreachable(m2(), secs(15 * 60))
                 .workspace(workspace_record(
@@ -6166,21 +6167,21 @@ mod tests {
             let mut rig = Rig::new();
             let run = run_id(1);
             claimed_not_built(&rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .build();
             rig.worker
                 .on_create(Err(WorkerError::Unreachable("timed out".into())));
             assert!(placed(&rig.ctx(), &run, Target::Machine(m2())).is_err());
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .unreachable(m2(), secs(15 * 60))
                 .build();
             assert!(matches!(pass(&rig, &run), ResumeStep::NeedsMachine(_)));
             // The target made the workspace before it went away.
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m3())
                 .unreachable(m1(), secs(15 * 60))
                 .unreachable(m2(), secs(15 * 60))
@@ -6225,7 +6226,7 @@ mod tests {
                     title: None,
                 },
             );
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .online(m2())
                 .workspace(workspace_record(m2(), fresh(), "fac/8-1-r65", None))
@@ -6274,7 +6275,7 @@ mod tests {
         fn a_session_whose_machine_is_away_a_minute_is_not_interrupted_by_the_claim_machine() {
             let (mut rig, run) = at_the_start();
             resumed(&mut rig, &run);
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .unreachable(m2(), secs(60))
                 .unreachable(m1(), secs(60 * 60))
                 .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
@@ -6352,7 +6353,7 @@ mod tests {
         #[test]
         fn a_closed_issue_after_a_lost_resume_start_on_a_machine_gone_asks_it_nothing() {
             let (mut rig, run) = a_start_answer_lost();
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m1())
                 .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
                 .unreachable(m2(), secs(15 * 60))
@@ -6896,8 +6897,8 @@ mod tests {
         /// The build machine unreachable for `span`, its session shown unreachable with its
         /// newest turn 1 and `prompts` prompts typed: 2 is a prompt after that turn, so the
         /// session may be at work; 1 is at rest.
-        fn away(span: Duration, prompts: u64) -> FleetView {
-            FleetView::builder()
+        fn away(span: Duration, prompts: u64) -> StoreView {
+            StoreView::builder()
                 .online(m2())
                 .workspace(workspace_record(m1(), old(), BRANCH, None))
                 .session(session_record(session(), old(), SessionState::Unreachable))
@@ -6906,7 +6907,7 @@ mod tests {
                 .build()
         }
 
-        fn at_work(span: Duration) -> FleetView {
+        fn at_work(span: Duration) -> StoreView {
             away(span, 2)
         }
 
@@ -7131,7 +7132,7 @@ mod tests {
             (rig, run)
         }
 
-        fn resumed_in(state: SessionState) -> FleetView {
+        fn resumed_in(state: SessionState) -> StoreView {
             with_resume_workspace("fac/8-1-r1", None)
                 .session(session_record(resumed_session(), fresh(), state))
                 .build()
@@ -7223,7 +7224,7 @@ mod tests {
             rig.step(&run, "turn-read 2");
             rig.sim.set_pull(12, pr_on(PR_BRANCH, false));
             let mut rig = rig;
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .workspace(workspace_record(m1(), old(), BRANCH, None))
                 .session(session_record(session(), old(), SessionState::Unreachable))
@@ -7297,7 +7298,7 @@ mod tests {
                 &format!("{GATE_REQUESTED}2 2 {HEAD} {BASE_TIP} {}", m2()),
             );
             assert!(gate_running(&rig.events(&run)));
-            rig.view = FleetView::builder()
+            rig.view = StoreView::builder()
                 .online(m2())
                 .workspace(workspace_record(m1(), old(), BRANCH, None))
                 .workspace(workspace_record(m2(), gate_workspace(), "fac/8-1-g2", None))

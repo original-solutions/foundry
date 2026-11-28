@@ -70,7 +70,7 @@ pub struct Slots {
 /// fuller in `reserved` for the rest of the pass; a refusal reserves nothing. The answer is
 /// always a [`Target::Machine`].
 pub fn place_run(
-    view: &FleetView,
+    view: &dyn FleetView,
     settings: &SharedSettings,
     login: &str,
     reserved: &mut Reserved,
@@ -84,7 +84,7 @@ pub fn place_run(
 /// no session. The load and disk limits still hold. Reserves nothing. The answer is always a
 /// [`Target::Machine`].
 pub fn place_gate(
-    view: &FleetView,
+    view: &dyn FleetView,
     settings: &SharedSettings,
     login: &str,
 ) -> Result<Target, Vec<String>> {
@@ -117,7 +117,7 @@ fn saturated(count: usize) -> u32 {
 /// The pick of [`placement::place`] among the machines that qualify, under `limits`, with the
 /// sessions `reserved` holds added to each machine's newest sample.
 fn pick(
-    view: &FleetView,
+    view: &dyn FleetView,
     settings: &SharedSettings,
     login: &str,
     reserved: &Reserved,
@@ -130,8 +130,8 @@ fn pick(
         let machine = sample.owner;
         // An offline machine is left to `place`, which says so: what it last said it holds may
         // be out of date.
-        let why = if view.online(machine) {
-            not_held(view.held(machine), login)
+        let why = if view.online(Target::Machine(machine)) {
+            not_held(view.held(Target::Machine(machine)), login)
         } else {
             None
         };
@@ -149,7 +149,7 @@ fn pick(
     let online = candidates
         .iter()
         .map(|s| s.owner)
-        .filter(|machine| view.online(*machine))
+        .filter(|machine| view.online(Target::Machine(*machine)))
         .collect();
     let reasons = match placement::place(&candidates, limits, &online) {
         Ok(machine) => return Ok(machine),
@@ -222,6 +222,7 @@ mod tests {
 
     use super::*;
     use crate::factory::lifecycle::state::State;
+    use crate::factory::worker::StoreView;
 
     const LOGIN: &str = "rawphp";
 
@@ -287,7 +288,7 @@ mod tests {
     fn a_machine_with_no_token_for_the_login_is_never_picked() {
         let (mac, vps, settings) = two();
         // The mac is the roomier, but holds a token only for another login.
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .sample(sample(vps, 2, 0.8))
             .held(mac, holds(&["someone-else"], true))
@@ -309,7 +310,7 @@ mod tests {
     #[test]
     fn the_reason_a_machine_with_no_token_is_passed_over_names_the_login() {
         let (mac, _, settings) = two();
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .held(mac, holds(&["someone-else"], true))
             .online(mac)
@@ -326,7 +327,7 @@ mod tests {
     #[test]
     fn a_login_is_matched_in_its_exact_case_as_the_token_is_looked_up() {
         let (mac, _, settings) = two();
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .held(mac, holds(&["RawPHP"], true))
             .online(mac)
@@ -343,7 +344,7 @@ mod tests {
         let (mac, vps, settings) = two();
         // The mac is on protocol 4: it has published no `MachineHeld`, so says nothing of what
         // it holds, though it is the roomier.
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .sample(sample(vps, 2, 0.8))
             .held(vps, holds(&[LOGIN], true))
@@ -360,7 +361,7 @@ mod tests {
             Ok(Target::Machine(vps))
         );
 
-        let alone = FleetView::builder()
+        let alone = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .online(mac)
             .build();
@@ -375,7 +376,7 @@ mod tests {
     #[test]
     fn a_machine_without_the_skill_is_never_picked() {
         let (mac, vps, settings) = two();
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .sample(sample(vps, 2, 0.8))
             .held(mac, holds(&[LOGIN], false))
@@ -397,7 +398,7 @@ mod tests {
     #[test]
     fn every_reason_a_machine_is_passed_over_is_given_in_one() {
         let (mac, _, settings) = two();
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .held(mac, holds(&[], false))
             .online(mac)
@@ -414,7 +415,7 @@ mod tests {
     #[test]
     fn an_offline_machine_is_never_picked() {
         let (mac, vps, settings) = two();
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .sample(sample(vps, 2, 0.8))
             .held(mac, holds(&[LOGIN], true))
@@ -431,7 +432,7 @@ mod tests {
             Ok(Target::Machine(vps))
         );
 
-        let alone = FleetView::builder()
+        let alone = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .held(mac, holds(&[LOGIN], true))
             .build();
@@ -445,7 +446,7 @@ mod tests {
     fn two_claims_in_one_pass_do_not_both_land_on_the_machine_with_one_free_session() {
         let (mac, vps, settings) = two();
         // The mac has the lower load but only one of its 4 sessions free.
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 3, 0.1))
             .sample(sample(vps, 0, 0.5))
             .held(mac, holds(&[LOGIN], true))
@@ -467,7 +468,7 @@ mod tests {
     #[test]
     fn a_second_claim_is_refused_when_the_one_free_session_was_taken_this_pass() {
         let (mac, _, settings) = two();
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 3, 0.1))
             .held(mac, holds(&[LOGIN], true))
             .online(mac)
@@ -491,7 +492,7 @@ mod tests {
     #[test]
     fn a_refused_claim_reserves_nothing() {
         let (mac, vps, settings) = two();
-        let full = FleetView::builder()
+        let full = StoreView::builder()
             .sample(sample(mac, 4, 0.1))
             .held(mac, holds(&[LOGIN], true))
             .online(mac)
@@ -500,7 +501,7 @@ mod tests {
         assert!(place_run(&full, &settings, LOGIN, &mut reserved).is_err());
         assert_eq!(reserved, Reserved::default());
 
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 3, 0.1))
             .sample(sample(vps, 0, 0.5))
             .held(mac, holds(&[LOGIN], true))
@@ -517,7 +518,7 @@ mod tests {
     #[test]
     fn a_gate_is_placed_on_a_machine_at_its_session_limit() {
         let (mac, _, settings) = two();
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 4, 0.1))
             .held(mac, holds(&[LOGIN], true))
             .online(mac)
@@ -538,7 +539,7 @@ mod tests {
         let (mac, vps, settings) = two();
         let mut low_disk = sample(vps, 5, 0.1);
         low_disk.body.free_disk = 1_000_000_000;
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 5, 1.5))
             .sample(low_disk)
             .held(mac, holds(&[LOGIN], true))
@@ -560,7 +561,7 @@ mod tests {
         let (mac, vps, settings) = two();
         let mut newer = sample(mac, 4, 0.1);
         newer.version = 9;
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .sample(newer)
             .sample(sample(vps, 0, 0.5))
@@ -578,7 +579,7 @@ mod tests {
         // The same samples with the newer one held first: the version decides, not the order.
         let mut newer = sample(mac, 4, 0.1);
         newer.version = 9;
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(newer)
             .sample(sample(mac, 0, 0.1))
             .sample(sample(vps, 0, 0.5))
@@ -600,7 +601,7 @@ mod tests {
         let mut removed = sample(mac, 0, 0.1);
         removed.version = 9;
         removed.deleted = true;
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .sample(removed)
             .sample(sample(vps, 0, 0.5))
@@ -619,7 +620,7 @@ mod tests {
     #[test]
     fn a_machine_the_settings_do_not_name_is_named_by_its_id() {
         let mac = MachineId::random();
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .held(mac, holds(&[], true))
             .online(mac)
@@ -636,7 +637,7 @@ mod tests {
         let mut reserved = Reserved::default();
         assert_eq!(
             place_run(
-                &FleetView::default(),
+                &StoreView::default(),
                 &SharedSettings::default(),
                 LOGIN,
                 &mut reserved
@@ -648,7 +649,7 @@ mod tests {
     #[test]
     fn a_machine_that_holds_the_login_among_others_is_picked() {
         let (mac, _, settings) = two();
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .held(mac, holds(&["someone-else", LOGIN], true))
             .online(mac)
@@ -667,7 +668,7 @@ mod tests {
     #[test]
     fn a_login_that_only_begins_with_the_projects_is_no_token_for_it() {
         let (mac, _, settings) = two();
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .held(mac, holds(&["rawphp-ci"], true))
             .online(mac)
@@ -682,7 +683,7 @@ mod tests {
     #[test]
     fn an_offline_machine_is_said_to_be_offline_whatever_it_last_said_it_holds() {
         let (mac, vps, settings) = two();
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.1))
             .sample(sample(vps, 0, 0.1))
             .held(mac, holds(&["someone-else"], false))
@@ -700,7 +701,7 @@ mod tests {
         let mac = MachineId(uuid::Uuid::from_u128(2));
         let vps = MachineId(uuid::Uuid::from_u128(1));
         let settings = settings(&[(mac, "mac"), (vps, "vps")]);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 4, 0.1))
             .sample(sample(vps, 0, 0.1))
             .held(mac, holds(&[LOGIN], true))
@@ -725,7 +726,7 @@ mod tests {
         // session no sample counts yet.
         let mut reserved = Reserved::default();
         reserved.hold(mac);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 3, 0.1))
             .sample(sample(vps, 0, 0.5))
             .held(mac, holds(&[LOGIN], true))
@@ -740,7 +741,7 @@ mod tests {
 
         let mut reserved = Reserved::default();
         reserved.hold(mac);
-        let alone = FleetView::builder()
+        let alone = StoreView::builder()
             .sample(sample(mac, 3, 0.1))
             .held(mac, holds(&[LOGIN], true))
             .online(mac)
@@ -754,7 +755,7 @@ mod tests {
     #[test]
     fn runs_held_and_placed_on_one_machine_add_up() {
         let (mac, vps, settings) = two();
-        let alone = FleetView::builder()
+        let alone = StoreView::builder()
             .sample(sample(mac, 1, 0.1))
             .held(mac, holds(&[LOGIN], true))
             .online(mac)
@@ -774,7 +775,7 @@ mod tests {
         );
 
         // Two claims placed in one pass add up the same way.
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 2, 0.1))
             .sample(sample(vps, 0, 0.5))
             .held(mac, holds(&[LOGIN], true))
@@ -804,7 +805,7 @@ mod tests {
         let mut reserved = Reserved::default();
         reserved.hold(mac);
         reserved.hold(mac);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .sample(sample(mac, 0, 0.5))
             .sample(sample(vps, 3, 0.1))
             .held(mac, holds(&[LOGIN], true))
