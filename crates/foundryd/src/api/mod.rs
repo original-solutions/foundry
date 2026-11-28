@@ -3,9 +3,13 @@
 //! - `GET /api/state`: the full synced state, as a [`UiMessage::State`].
 //! - `GET /api/events`, a WebSocket: a [`UiMessage::State`] first, then a
 //!   [`UiMessage::Record`] for each record that changes, deleted ones included, and a
-//!   [`UiMessage::Settings`] when the shared settings change. When a machine goes offline or
-//!   comes back, the whole state is sent again, so its sessions and terminals show as
-//!   unreachable or as they are. The store is read every [`EVENTS_EVERY`], so a record written
+//!   [`UiMessage::Settings`] when the shared settings change. The state carries what each
+//!   machine holds and the protocol each linked machine speaks; a [`UiMessage::Held`] follows a
+//!   change to a machine's held record. When a machine goes offline or comes back, or the
+//!   protocols change, the whole state is sent again, so its sessions and terminals show as
+//!   unreachable or as they are. A held record this build cannot read is left out, and the others
+//!   are sent; each state read warns of the machines left out, and the socket warns again only
+//!   when that set changes. The store is read every [`EVENTS_EVERY`], so a record written
 //!   several times between two reads is sent once, at its newest version. A record this build
 //!   cannot read, one a newer build wrote before a rollback, leaves out its owner's changes up
 //!   to it, with a warning, and the socket goes on.
@@ -115,6 +119,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use foundry_proto::factory::MachineHeld;
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::messages::{PROTOCOL, UiMessage};
 use foundry_proto::settings::{SettingValue, SharedSettings};
@@ -567,19 +572,79 @@ async fn on_store<T: Send + 'static>(
 
 // --- state and events ---
 
-/// The full state as [`UiMessage::State`], and the highest version it holds per owner.
+/// The held records as one read left them: the factory versions the rows were read at, the rows
+/// that could be read, and the machines whose row this build cannot read.
+type HeldRead = (
+    BTreeMap<MachineId, u64>,
+    BTreeMap<MachineId, MachineHeld>,
+    BTreeSet<MachineId>,
+);
+
+/// The factory versions, then the held records, in one lock, so a write between the two reads
+/// shows as a newer version at the next read. A row this build cannot read, one a newer build
+/// wrote before a rollback, is no reason to fail what the UI is sent, or to leave out the other
+/// machines': each machine's row is then read alone, and the machine of one that cannot be read
+/// is left out. Any other error is returned.
+fn read_helds(store: &mut Store) -> Result<HeldRead, StoreError> {
+    let versions = store.factory_versions()?;
+    match store.helds() {
+        Ok(helds) => Ok((versions, helds, BTreeSet::new())),
+        Err(StoreError::Json(_)) => {
+            let (mut helds, mut skipped) = (BTreeMap::new(), BTreeSet::new());
+            for &machine in versions.keys() {
+                match store.held(machine) {
+                    Ok(Some(held)) => {
+                        helds.insert(machine, held);
+                    }
+                    Ok(None) => {}
+                    Err(StoreError::Json(_)) => {
+                        skipped.insert(machine);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok((versions, helds, skipped))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Warns of the machines whose held record is not sent, by id: no row's content is named.
+fn warn_held_skipped(skipped: &BTreeSet<MachineId>) {
+    let machines: Vec<String> = skipped.iter().map(ToString::to_string).collect();
+    tracing::warn!(
+        "api: what these machines hold is not sent, it cannot be read: {}",
+        machines.join(", ")
+    );
+}
+
+/// What the state read of the held records: the factory versions they were read at, and the
+/// machines whose record could not be read.
+struct HeldSeen {
+    at: BTreeMap<MachineId, u64>,
+    skipped: BTreeSet<MachineId>,
+}
+
+/// The full state as [`UiMessage::State`], the highest version it holds per owner, and what it
+/// read of the held records. Held records this build cannot read are left out, with a warning.
 async fn full_state_for(
     api: &Api,
     online: &BTreeSet<MachineId>,
-) -> Result<(UiMessage, BTreeMap<MachineId, u64>), StoreError> {
+) -> Result<(UiMessage, BTreeMap<MachineId, u64>, HeldSeen), StoreError> {
     let (versions, records, settings) = api.peers.state_snapshot_for(online).await?;
+    let (at, held, skipped) = on_store(&api.store, read_helds).await?;
+    if !skipped.is_empty() {
+        warn_held_skipped(&skipped);
+    }
     let state = UiMessage::State {
         protocol: PROTOCOL,
         records,
         settings: shown(settings),
         online: Some(online.iter().copied().collect()),
+        held,
+        protocols: api.peers.protocols(),
     };
-    Ok((state, versions))
+    Ok((state, versions, HeldSeen { at, skipped }))
 }
 
 async fn state(State(api): State<Api>) -> Result<Json<UiMessage>, ApiError> {
@@ -612,12 +677,21 @@ async fn events(
 }
 
 /// What the events socket has sent: the highest version per owner, the settings' `seq`,
-/// which machines were online, and the factory status believed of each project, with the
+/// which machines were online, the protocols the links spoke, what each machine held, and the
+/// factory status believed of each project, with the
 /// factory versions it was read at.
 struct Sent {
     versions: BTreeMap<MachineId, u64>,
     seq: u64,
     online: BTreeSet<MachineId>,
+    protocols: BTreeMap<MachineId, u16>,
+    held: BTreeMap<MachineId, MachineHeld>,
+    /// The factory versions the held records were last read at: they are read again when the
+    /// versions differ.
+    held_at: BTreeMap<MachineId, u64>,
+    /// The machines whose held record cannot be read, and has been warned of: not warned of
+    /// again until the set changes.
+    held_skipped: BTreeSet<MachineId>,
     factory: Believed,
 }
 
@@ -775,7 +849,7 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
                 Some(Ok(_)) => continue,
             },
         }
-        if api.peers.online() != sent.online {
+        if api.peers.online() != sent.online || api.peers.protocols() != sent.protocols {
             match send_state(api, &mut socket).await? {
                 Some(again) => sent = again,
                 None => return Ok(()),
@@ -783,11 +857,20 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
             continue;
         }
         let seen = sent.seq;
-        let (held, settings) = on_store(&api.store, move |store| {
-            Ok((store.versions()?, store.settings_since(Some(seen))?))
+        let held_at = sent.held_at.clone();
+        let (versions, settings, helds) = on_store(&api.store, move |store| {
+            let versions = store.versions()?;
+            let settings = store.settings_since(Some(seen))?;
+            // The held records are read only when a factory record has been written since.
+            let helds = if store.factory_versions()? == held_at {
+                None
+            } else {
+                Some(read_helds(store)?)
+            };
+            Ok((versions, settings, helds))
         })
         .await?;
-        for (owner, version) in held {
+        for (owner, version) in versions {
             let from = sent.versions.get(&owner).copied().unwrap_or(0);
             if version <= from {
                 continue;
@@ -826,6 +909,31 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
                 return Ok(());
             }
         }
+        if let Some((at, helds, skipped)) = helds {
+            sent.held_at = at;
+            if skipped != sent.held_skipped {
+                if skipped.is_empty() {
+                    tracing::info!("api: what machines hold can be read again");
+                } else {
+                    warn_held_skipped(&skipped);
+                }
+                sent.held_skipped = skipped;
+            }
+            for (machine, held) in helds {
+                if sent.held.get(&machine) == Some(&held) {
+                    continue;
+                }
+                let message = UiMessage::Held {
+                    protocol: PROTOCOL,
+                    machine,
+                    held: held.clone(),
+                };
+                if !send(&mut socket, &message).await {
+                    return Ok(());
+                }
+                sent.held.insert(machine, held);
+            }
+        }
         match send_factory(api, &mut socket, &mut sent.factory, sent.seq, &sent.online).await? {
             Factory::Sent => {}
             Factory::Closed => return Ok(()),
@@ -841,10 +949,15 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
 /// covered, or `None` when the UI has gone.
 async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, StoreError> {
     let online = api.peers.online();
-    let (state, versions) = full_state_for(api, &online).await?;
-    let seq = match &state {
-        UiMessage::State { settings, .. } => settings.seq,
-        _ => 0,
+    let (state, versions, held_seen) = full_state_for(api, &online).await?;
+    let (seq, protocols, held) = match &state {
+        UiMessage::State {
+            settings,
+            protocols,
+            held,
+            ..
+        } => (settings.seq, protocols.clone(), held.clone()),
+        _ => Default::default(),
     };
     if !send(socket, &state).await {
         return Ok(None);
@@ -858,6 +971,10 @@ async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, S
         versions,
         seq,
         online,
+        protocols,
+        held,
+        held_at: held_seen.at,
+        held_skipped: held_seen.skipped,
         factory,
     }))
 }

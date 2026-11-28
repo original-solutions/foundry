@@ -414,11 +414,28 @@ pub struct ForeignClaim {
     pub state: String,
 }
 
-/// The GitHub logins a machine holds a token for, and whether it has the `factory-build` skill.
+/// The GitHub logins a machine holds a token for, whether it has the `factory-build` skill, its
+/// default login, and which gateway keys it holds. Names only: no value is in the record.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineHeld {
     pub logins: Vec<String>,
     pub skill: bool,
+    /// The login `github default` names, when it names one. None from a machine that predates it.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Which gateway keys are set. None from a machine that predates it, and when the names could
+    /// not be read.
+    #[serde(default)]
+    pub gateway: Option<GatewayKeys>,
+}
+
+/// Which gateway keys a machine holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayKeys {
+    /// The gateway key is set.
+    pub key: bool,
+    /// The gateway management key is set.
+    pub management: bool,
 }
 
 /// The newest turn of a factory session, written by its machine.
@@ -879,6 +896,11 @@ pub(crate) mod tests {
         MachineHeld {
             logins: vec!["tomkaczocha".into(), "rawphp".into()],
             skill: true,
+            default: Some("rawphp".into()),
+            gateway: Some(GatewayKeys {
+                key: true,
+                management: false,
+            }),
         }
     }
 
@@ -1033,6 +1055,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_held_record_from_before_the_default_and_the_gateway_parses_with_neither() {
+        let held: MachineHeld = serde_json::from_str(r#"{"logins":["a"],"skill":false}"#).unwrap();
+        assert_eq!(
+            held,
+            MachineHeld {
+                logins: vec!["a".into()],
+                skill: false,
+                default: None,
+                gateway: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_held_record_with_a_default_and_gateway_keys_round_trips() {
+        assert_round_trip(&held());
+        assert_round_trip(&MachineHeld::default());
+    }
+
+    #[test]
     fn held_up_and_not_holding_are_written_under_their_names() {
         assert_eq!(
             serde_json::to_value(HeldUpKind::NeedsInfo).unwrap(),
@@ -1079,6 +1121,7 @@ pub(crate) mod tests {
                     body: FactoryBody::Held(MachineHeld {
                         logins: vec!["rawphp".into()],
                         skill: false,
+                        ..Default::default()
                     }),
                 },
             ),

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::factory::{FactoryRecord, FactoryStatus};
+use crate::factory::{FactoryRecord, FactoryStatus, MachineHeld};
 use crate::ids::{MachineId, TerminalId};
 use crate::record::AnyRecord;
 use crate::settings::{Edit, EditId, Outcome, SharedSettings};
@@ -137,6 +137,12 @@ pub enum UiMessage {
         /// that predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         online: Option<Vec<MachineId>>,
+        /// What each machine holds, as the daemon has it.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        held: BTreeMap<MachineId, MachineHeld>,
+        /// The protocol each machine with an open link speaks, and the daemon itself.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        protocols: BTreeMap<MachineId, u16>,
     },
     /// One record changed.
     Record { protocol: u16, record: AnyRecord },
@@ -150,6 +156,12 @@ pub enum UiMessage {
         protocol: u16,
         status: FactoryStatus,
     },
+    /// What one machine holds changed.
+    Held {
+        protocol: u16,
+        machine: MachineId,
+        held: MachineHeld,
+    },
 }
 
 impl UiMessage {
@@ -158,7 +170,8 @@ impl UiMessage {
             Self::State { protocol, .. }
             | Self::Record { protocol, .. }
             | Self::Settings { protocol, .. }
-            | Self::FactoryStatus { protocol, .. } => *protocol,
+            | Self::FactoryStatus { protocol, .. }
+            | Self::Held { protocol, .. } => *protocol,
         }
     }
 }
@@ -167,7 +180,7 @@ impl UiMessage {
 mod tests {
     use super::*;
     use crate::factory::tests::{records as factory_records, status};
-    use crate::factory::{FactoryBody, FactoryRecord, MachineHeld};
+    use crate::factory::{FactoryBody, FactoryRecord, GatewayKeys, MachineHeld};
     use crate::record::tests::{machine_sample, session, terminal, workspace};
     use crate::settings::tests::settings;
     use crate::settings::{EditId, Outcome, SettingKey, Stamp};
@@ -351,12 +364,16 @@ mod tests {
                 records: records(),
                 settings: settings(),
                 online: Some(vec![MachineId::random(), MachineId::random()]),
+                held: BTreeMap::new(),
+                protocols: BTreeMap::new(),
             },
             UiMessage::State {
                 protocol: PROTOCOL,
                 records: records(),
                 settings: settings(),
                 online: None,
+                held: BTreeMap::new(),
+                protocols: BTreeMap::new(),
             },
             UiMessage::Record {
                 protocol: PROTOCOL,
@@ -369,6 +386,11 @@ mod tests {
             UiMessage::FactoryStatus {
                 protocol: PROTOCOL,
                 status: status(),
+            },
+            UiMessage::Held {
+                protocol: PROTOCOL,
+                machine: MachineId::random(),
+                held: crate::factory::tests::held(),
             },
         ]
     }
@@ -395,6 +417,8 @@ mod tests {
             records: vec![],
             settings: SharedSettings::default(),
             online: Some(vec![me]),
+            held: BTreeMap::new(),
+            protocols: BTreeMap::new(),
         };
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["online"], serde_json::json!([me]), "{json}");
@@ -408,6 +432,8 @@ mod tests {
                 records: vec![],
                 settings: SharedSettings::default(),
                 online: None,
+                held: BTreeMap::new(),
+                protocols: BTreeMap::new(),
             }
         );
 
@@ -416,9 +442,78 @@ mod tests {
             records: vec![],
             settings: SharedSettings::default(),
             online: None,
+            held: BTreeMap::new(),
+            protocols: BTreeMap::new(),
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(json.get("online").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_state_carries_held_and_protocols_and_parses_without_them() {
+        let (a, b) = (MachineId::random(), MachineId::random());
+        let state = UiMessage::State {
+            protocol: PROTOCOL,
+            records: vec![],
+            settings: SharedSettings::default(),
+            online: None,
+            held: [(a, MachineHeld::default())].into(),
+            protocols: [(a, 6), (b, 5)].into(),
+        };
+        assert_round_trip(&state);
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["protocols"][b.to_string()], 5, "{json}");
+        assert!(json["held"][a.to_string()].is_object(), "{json}");
+
+        let mut without = json.clone();
+        without.as_object_mut().unwrap().remove("held");
+        without.as_object_mut().unwrap().remove("protocols");
+        let UiMessage::State {
+            held, protocols, ..
+        } = serde_json::from_value(without).unwrap()
+        else {
+            panic!("not a state");
+        };
+        assert!(held.is_empty() && protocols.is_empty());
+
+        let empty = UiMessage::State {
+            protocol: PROTOCOL,
+            records: vec![],
+            settings: SharedSettings::default(),
+            online: None,
+            held: BTreeMap::new(),
+            protocols: BTreeMap::new(),
+        };
+        let json = serde_json::to_value(&empty).unwrap();
+        assert!(json.get("held").is_none() && json.get("protocols").is_none());
+    }
+
+    #[test]
+    fn a_held_message_is_the_wire_line_the_browser_reads() {
+        let machine = MachineId::random();
+        let line = format!(
+            r#"{{"type":"held","protocol":6,"machine":"{machine}","held":{{"logins":["os-factory"],"skill":true,"default":"os-factory","gateway":{{"key":true,"management":false}}}}}}"#
+        );
+        let message = UiMessage::Held {
+            protocol: 6,
+            machine,
+            held: MachineHeld {
+                logins: vec!["os-factory".into()],
+                skill: true,
+                default: Some("os-factory".into()),
+                gateway: Some(GatewayKeys {
+                    key: true,
+                    management: false,
+                }),
+            },
+        };
+        assert_eq!(serde_json::from_str::<UiMessage>(&line).unwrap(), message);
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            line,
+            "serialised as the line"
+        );
+        assert_eq!(message.protocol(), 6);
     }
 
     #[test]
@@ -497,6 +592,7 @@ mod tests {
                         body: FactoryBody::Held(MachineHeld {
                             logins: vec![],
                             skill: true,
+                            ..Default::default()
                         }),
                     }],
                 },
@@ -601,6 +697,8 @@ mod tests {
                     records: vec![record.clone()],
                     settings: SharedSettings::default(),
                     online: None,
+                    held: BTreeMap::new(),
+                    protocols: BTreeMap::new(),
                 },
             ),
             (

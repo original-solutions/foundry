@@ -919,6 +919,7 @@ fn write_held(daemon: &Daemon, token: bool, builds: bool) {
                 Vec::new()
             },
             skill: builds,
+            ..Default::default()
         }),
     };
     assert_eq!(

@@ -437,7 +437,9 @@ async fn until_seen(socket: &mut Socket, done: impl Fn(&[AnyRecord]) -> bool) ->
         match next_message(socket).await {
             UiMessage::Record { record, .. } => seen.push(record),
             UiMessage::State { records, .. } => seen.extend(records),
-            UiMessage::Settings { .. } | UiMessage::FactoryStatus { .. } => {}
+            UiMessage::Settings { .. }
+            | UiMessage::FactoryStatus { .. }
+            | UiMessage::Held { .. } => {}
         }
     }
     seen
@@ -741,6 +743,283 @@ async fn state_carries_the_machines_the_daemon_hears_this_one_included() {
         }
         other => panic!("the first message is not the state: {other:?}"),
     }
+}
+
+/// Writes `held` as `daemon`'s own record, at the next version.
+fn write_held(daemon: &Daemon, held: &foundry_proto::factory::MachineHeld) {
+    let mut store = daemon.store.lock().unwrap();
+    let version = store.own_next_factory_version().unwrap();
+    let record = foundry_proto::factory::FactoryRecord {
+        owner: daemon.me,
+        version,
+        body: foundry_proto::factory::FactoryBody::Held(held.clone()),
+    };
+    assert_eq!(
+        store.apply_factory(&record, daemon.me).unwrap(),
+        crate::store::Applied::Stored
+    );
+}
+
+fn holds(login: &str) -> foundry_proto::factory::MachineHeld {
+    foundry_proto::factory::MachineHeld {
+        logins: vec![login.into()],
+        skill: true,
+        default: Some(login.into()),
+        gateway: Some(foundry_proto::factory::GatewayKeys {
+            key: true,
+            management: false,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn the_first_events_frame_holds_what_each_machine_holds_and_the_protocols() {
+    let daemon = Daemon::new(TURN).await;
+    write_held(&daemon, &holds("os-factory"));
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url("/api/events"))
+        .await
+        .unwrap();
+    match next_message(&mut socket).await {
+        UiMessage::State {
+            held, protocols, ..
+        } => {
+            assert_eq!(held.get(&daemon.me), Some(&holds("os-factory")), "{held:?}");
+            assert_eq!(protocols.get(&daemon.me), Some(&PROTOCOL), "{protocols:?}");
+        }
+        other => panic!("the first message is not the state: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_held_change_arrives_as_one_held_frame() {
+    let daemon = Daemon::new(TURN).await;
+    let (mut socket, _) = daemon.events().await;
+
+    write_held(&daemon, &holds("os-factory"));
+    let frames = frames_within(&mut socket, 5 * EVENTS_EVERY).await;
+    let helds: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            UiMessage::Held {
+                protocol,
+                machine,
+                held,
+            } => Some((*protocol, *machine, held.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        helds,
+        [(PROTOCOL, daemon.me, holds("os-factory"))],
+        "{frames:?}"
+    );
+}
+
+/// Spoils the stored held row of `daemon`, as a newer build's would be after a rollback.
+fn spoil_held(daemon: &Daemon) {
+    spoil_held_of(daemon, daemon.me);
+}
+
+/// Spoils the stored held row of `machine`, and no other.
+fn spoil_held_of(daemon: &Daemon, machine: MachineId) {
+    let record = format!(
+        r#"{{"owner":"{machine}","version":1,"kind":"machine_held","body":{{"logins":5,"skill":true}}}}"#
+    );
+    let changed = rusqlite::Connection::open(daemon.data.path().join("foundry.db"))
+        .unwrap()
+        .execute(
+            "UPDATE factory_records SET record = ?1 WHERE kind = 'machine_held' AND id = ?2",
+            [record, machine.to_string()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+/// Writes `held` as `machine`'s record, at version 1, as a peer's arriving.
+fn write_held_of(daemon: &Daemon, machine: MachineId, held: &foundry_proto::factory::MachineHeld) {
+    let record = foundry_proto::factory::FactoryRecord {
+        owner: machine,
+        version: 1,
+        body: foundry_proto::factory::FactoryBody::Held(held.clone()),
+    };
+    daemon
+        .store
+        .lock()
+        .unwrap()
+        .apply_factory(&record, machine)
+        .unwrap();
+}
+
+fn held_frames(frames: &[UiMessage]) -> Vec<(MachineId, foundry_proto::factory::MachineHeld)> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            UiMessage::Held { machine, held, .. } => Some((*machine, held.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_state_holds_the_readable_records_when_another_cannot_be_read() {
+    let daemon = Daemon::new(TURN).await;
+    let other = MachineId::random();
+    write_held(&daemon, &holds("os-factory"));
+    write_held_of(&daemon, other, &holds("elsewhere"));
+    spoil_held(&daemon);
+
+    let reply = daemon.call("GET", "/api/state", None).await;
+
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    match serde_json::from_str::<UiMessage>(&reply.body).unwrap() {
+        UiMessage::State { held, .. } => {
+            assert_eq!(held, [(other, holds("elsewhere"))].into(), "{held:?}")
+        }
+        other => panic!("not the state: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn events_hold_the_readable_records_and_send_their_changes_while_another_cannot_be_read() {
+    let daemon = Daemon::new(TURN).await;
+    let other = MachineId::random();
+    write_held(&daemon, &holds("os-factory"));
+    write_held_of(&daemon, other, &holds("elsewhere"));
+    spoil_held(&daemon);
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url("/api/events"))
+        .await
+        .unwrap();
+    match next_message(&mut socket).await {
+        UiMessage::State { held, .. } => {
+            assert_eq!(held, [(other, holds("elsewhere"))].into(), "{held:?}")
+        }
+        other => panic!("the first message is not the state: {other:?}"),
+    }
+
+    let record = foundry_proto::factory::FactoryRecord {
+        owner: other,
+        version: 2,
+        body: foundry_proto::factory::FactoryBody::Held(holds("changed")),
+    };
+    daemon
+        .store
+        .lock()
+        .unwrap()
+        .apply_factory(&record, other)
+        .unwrap();
+    let frames = frames_within(&mut socket, 5 * EVENTS_EVERY).await;
+    assert_eq!(
+        held_frames(&frames),
+        [(other, holds("changed"))],
+        "{frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_state_answers_without_the_held_records_when_one_cannot_be_read() {
+    let daemon = Daemon::new(TURN).await;
+    write_held(&daemon, &holds("os-factory"));
+    spoil_held(&daemon);
+
+    let reply = daemon.call("GET", "/api/state", None).await;
+
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.json().get("held").is_none(), "{}", reply.body);
+    assert!(reply.json().get("protocols").is_some(), "{}", reply.body);
+}
+
+#[tokio::test]
+async fn events_go_on_while_a_held_record_cannot_be_read() {
+    let daemon = Daemon::new(TURN).await;
+    write_held(&daemon, &holds("os-factory"));
+    spoil_held(&daemon);
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url("/api/events"))
+        .await
+        .unwrap();
+    match next_message(&mut socket).await {
+        UiMessage::State { held, .. } => assert!(held.is_empty(), "{held:?}"),
+        other => panic!("the first message is not the state: {other:?}"),
+    }
+    // A factory record written elsewhere makes the socket look at the held rows again: the
+    // readable one is sent, the spoiled one is not.
+    let other = MachineId::random();
+    write_held_of(&daemon, other, &holds("elsewhere"));
+    let frames = frames_within(&mut socket, 3 * EVENTS_EVERY).await;
+    assert_eq!(
+        held_frames(&frames),
+        [(other, holds("elsewhere"))],
+        "{frames:?}"
+    );
+
+    let later = peer_session(other, 2, SessionState::Idle);
+    daemon.store.lock().unwrap().apply(&later, other).unwrap();
+    match next_message(&mut socket).await {
+        UiMessage::Record { record, .. } => assert_eq!(record, later),
+        other => panic!("the socket did not go on: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_held_the_state_carries_is_not_sent_again_as_a_held_frame() {
+    let daemon = Daemon::new(TURN).await;
+    write_held(&daemon, &holds("os-factory"));
+    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url("/api/events"))
+        .await
+        .unwrap();
+    match next_message(&mut socket).await {
+        UiMessage::State { held, .. } => assert_eq!(held.len(), 1),
+        other => panic!("the first message is not the state: {other:?}"),
+    }
+
+    // A factory record is written after the state, so the held records are read again: only the
+    // one the state did not carry is sent.
+    let other = MachineId::random();
+    write_held_of(&daemon, other, &holds("elsewhere"));
+    let frames = frames_within(&mut socket, 3 * EVENTS_EVERY).await;
+
+    assert_eq!(
+        held_frames(&frames),
+        [(other, holds("elsewhere"))],
+        "{frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_link_opening_sends_the_state_again_with_the_new_protocols() {
+    let daemon = Daemon::new(TURN).await;
+    let peer = daemon.add_machine();
+    let (mut socket, _) = daemon.events().await;
+
+    let (mine, theirs) = Conn::pair();
+    let peers = daemon.peers.clone();
+    tokio::spawn(async move { peers.accept(theirs).await });
+    let hello = PeerMessage::Hello {
+        protocol: 5,
+        machine: peer,
+        versions: Default::default(),
+        factory_versions: BTreeMap::new(),
+    };
+    mine.send
+        .send(serde_json::to_string(&hello).unwrap())
+        .await
+        .unwrap();
+    let protocols = tokio::time::timeout(WAIT, async {
+        loop {
+            if let UiMessage::State { protocols, .. } = next_message(&mut socket).await
+                && protocols.contains_key(&peer)
+            {
+                return protocols;
+            }
+        }
+    })
+    .await
+    .expect("the state comes again once the link is open");
+    assert_eq!(protocols.get(&peer), Some(&5), "{protocols:?}");
+    assert_eq!(protocols.get(&daemon.me), Some(&PROTOCOL), "{protocols:?}");
+    drop(mine);
 }
 
 #[tokio::test]
@@ -1952,6 +2231,7 @@ async fn events_send_a_change_once() {
                 "the workspace record was sent again at version {version}: {record:?}"
             ),
             UiMessage::Settings { .. } | UiMessage::FactoryStatus { .. } => {}
+            UiMessage::Held { .. } => panic!("a held record nobody changed was sent"),
             UiMessage::State { .. } => panic!("the state was sent again"),
         }
     }
@@ -2457,7 +2737,7 @@ async fn no_response_contains_a_secret() {
                 settings_frames += 1;
                 assert!(settings.projects.iter().any(|p| p.name == "late"));
             }
-            UiMessage::FactoryStatus { .. } => {}
+            UiMessage::FactoryStatus { .. } | UiMessage::Held { .. } => {}
         }
         said.push(text);
     }

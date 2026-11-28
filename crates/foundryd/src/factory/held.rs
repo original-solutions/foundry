@@ -1,17 +1,23 @@
-//! The GitHub logins and the skill this machine holds.
+//! The GitHub logins, the skill and the gateway keys this machine holds.
 //!
-//! Every [`CHECK_EVERY`] this machine reads the logins it holds a token for and whether the
-//! `factory-build` skill is installed for the service user, and writes a [`MachineHeld`] record
-//! when either differs from what it last wrote, the first check at once. The age between checks
-//! is read on the sleep-counting clock of [`crate::clock`]. Only the names of the secrets are
-//! listed here: no token is read, and none is ever logged.
+//! Every [`CHECK_EVERY`] this machine reads the logins it holds a token for, its default login,
+//! which gateway keys are set, and whether the `factory-build` skill is installed for the
+//! service user, and writes a [`MachineHeld`] record when any differs from what it last wrote,
+//! the first check at once, and again every [`REWRITE_EVERY`] when nothing differs. The age
+//! between checks and between writes is read on the sleep-counting clock of [`crate::clock`].
+//! Only the names of the secrets are listed, and the default login (which is no secret) is read:
+//! no token or key is read, and none is ever logged.
+//!
+//! A list of names that cannot be read at all fails the check: nothing is written and the old
+//! record stays. `gateway` is `None` only when the list for the gateway keys alone cannot be
+//! read.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use foundry_proto::factory::{FactoryBody, FactoryRecord, MachineHeld};
+use foundry_proto::factory::{FactoryBody, FactoryRecord, GatewayKeys, MachineHeld};
 use foundry_proto::ids::MachineId;
 
 use crate::clock::Clock;
@@ -32,6 +38,11 @@ enum HeldError {
 
 /// How often the logins and the skill are checked.
 pub const CHECK_EVERY: Duration = Duration::from_secs(5);
+
+/// How long a record that has not changed stands before it is written again, at a new version.
+/// A copy of it that an older build stored on a peer, re-serialised without the fields this build
+/// adds, is replaced by the next write, which nothing else would make while nothing changes.
+pub const REWRITE_EVERY: Duration = Duration::from_secs(10 * 60);
 
 /// How often the clock is read while waiting. It only paces the reads: the wait is measured on
 /// the clock.
@@ -70,20 +81,27 @@ pub(crate) async fn run_with(
     clock: Arc<dyn Clock>,
 ) {
     let mut written: Option<MachineHeld> = None;
+    // When the record was last written, on the clock.
+    let mut written_at = Duration::ZERO;
     // What the last failed check said, while checks keep failing.
     let mut failing: Option<String> = None;
     loop {
         let checked = clock.now();
+        let rewrite = checked.saturating_sub(written_at) >= REWRITE_EVERY;
+        // No `last` makes the check write whatever it finds.
         let (store, secrets, skill, last) = (
             store.clone(),
             secrets.clone(),
             skill.clone(),
-            written.clone(),
+            written.clone().filter(|_| !rewrite),
         );
         match tokio::task::spawn_blocking(move || check(&store, me, &*secrets, skill, last)).await {
             Ok(Ok(held)) => {
                 if failing.take().is_some() {
                     tracing::info!("what this machine holds can be read and written again");
+                }
+                if rewrite || written.as_ref() != Some(&held) {
+                    written_at = checked;
                 }
                 written = Some(held);
             }
@@ -124,9 +142,16 @@ fn check(
     skill: Option<PathBuf>,
     last: Option<MachineHeld>,
 ) -> Result<MachineHeld, HeldError> {
+    let logins = secrets::github_logins(secrets)?;
     let held = MachineHeld {
-        logins: secrets::github_logins(secrets)?,
+        logins,
         skill: skill.is_some_and(|path| path.exists()),
+        default: secrets::github_default(secrets),
+        // The list read again for the keys: when only this read fails, the keys are unknown.
+        gateway: secrets.names().ok().map(|names| GatewayKeys {
+            key: names.iter().any(|name| name == secrets::GATEWAY),
+            management: names.iter().any(|name| name == secrets::GATEWAY_MANAGEMENT),
+        }),
     };
     if last.as_ref() == Some(&held) {
         return Ok(held);
@@ -153,7 +178,7 @@ mod tests {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
-    use foundry_proto::factory::MachineHeld;
+    use foundry_proto::factory::{GatewayKeys, MachineHeld};
     use foundry_proto::ids::MachineId;
 
     use super::*;
@@ -279,7 +304,12 @@ mod tests {
             held(&rig),
             Some(MachineHeld {
                 logins: vec![],
-                skill: false
+                skill: false,
+                default: None,
+                gateway: Some(GatewayKeys {
+                    key: false,
+                    management: false
+                }),
             })
         );
     }
@@ -324,6 +354,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn run_writes_the_same_record_again_after_ten_minutes_and_not_before() {
+        let rig = rig();
+        let first = version_after(&rig, None).await;
+        let body = held(&rig);
+
+        pass(&rig, Duration::from_secs(599)).await;
+        let_a_check_run();
+        assert_eq!(version(&rig), first, "nothing changed, so nothing yet");
+
+        pass(&rig, CHECK_EVERY).await;
+        let second = version_after(&rig, first).await;
+        assert!(second > first, "{second:?} after {first:?}");
+        assert_eq!(held(&rig), body, "the same body, at a new version");
+
+        for _ in 0..2 {
+            pass(&rig, CHECK_EVERY).await;
+            let_a_check_run();
+        }
+        assert_eq!(
+            version(&rig),
+            second,
+            "a rewrite starts the ten minutes again"
+        );
+        pass(&rig, Duration::from_secs(580)).await;
+        let_a_check_run();
+        assert_eq!(version(&rig), second, "not before the next ten minutes");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn run_does_not_list_a_name_that_is_no_login() {
         let rig = rig();
         let first = version_after(&rig, None).await;
@@ -363,6 +422,71 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn run_writes_the_default_login_once_github_default_names_one() {
+        let rig = rig();
+        let first = version_after(&rig, None).await;
+        assert_eq!(held(&rig).unwrap().default, None);
+        set_from(
+            &*rig.secrets,
+            "github:octocat",
+            "ghp_held_eight\n".as_bytes(),
+        )
+        .unwrap();
+        rig.secrets.set(secrets::GITHUB_DEFAULT, "octocat").unwrap();
+
+        pass(&rig, CHECK_EVERY).await;
+        assert!(version_after(&rig, first).await > first);
+        let held = held(&rig).unwrap();
+        assert_eq!(held.default.as_deref(), Some("octocat"));
+        assert_eq!(held.logins, ["octocat"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_says_which_gateway_keys_are_set_and_logs_no_key() {
+        let logged = crate::test_log::Logged::everywhere();
+        let rig = rig();
+        let first = version_after(&rig, None).await;
+        assert_eq!(
+            held(&rig).unwrap().gateway,
+            Some(GatewayKeys {
+                key: false,
+                management: false
+            })
+        );
+        set_from(
+            &*rig.secrets,
+            "gateway-management",
+            "sk-mgmt-unique\n".as_bytes(),
+        )
+        .unwrap();
+
+        pass(&rig, CHECK_EVERY).await;
+        assert!(version_after(&rig, first).await > first);
+        assert_eq!(
+            held(&rig).unwrap().gateway,
+            Some(GatewayKeys {
+                key: false,
+                management: true
+            })
+        );
+        set_from(&*rig.secrets, "gateway", "sk-key-unique\n".as_bytes()).unwrap();
+        let second = version(&rig);
+        pass(&rig, CHECK_EVERY).await;
+        assert!(version_after(&rig, second).await > second);
+        assert_eq!(
+            held(&rig).unwrap().gateway,
+            Some(GatewayKeys {
+                key: true,
+                management: true
+            })
+        );
+        let text = logged.text();
+        for value in ["sk-mgmt-unique", "sk-key-unique"] {
+            assert!(!text.contains(value), "{text}");
+        }
+    }
+
     fn rig_without_a_task() -> (tempfile::TempDir, Mutex<Store>, FileSecrets, MachineId) {
         let dir = tempfile::tempdir().unwrap();
         let store = Mutex::new(Store::open(dir.path().join("foundry.db")).unwrap());
@@ -389,6 +513,49 @@ mod tests {
         let again = check(&store, me, &secrets, None, Some(first.clone())).unwrap();
         assert_eq!(again, first);
         assert_eq!(version_of(&store, me), version);
+    }
+
+    /// Lists the names on every first call and fails on every second, as a store that fails
+    /// between two reads does.
+    struct EverySecondListFails {
+        inner: FileSecrets,
+        lists: AtomicUsize,
+    }
+
+    impl Secrets for EverySecondListFails {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            self.inner.get(name)
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+            self.inner.set(name, value)
+        }
+        fn update(&self, name: &str, edit: crate::secrets::Edit<'_>) -> Result<(), SecretsError> {
+            self.inner.update(name, edit)
+        }
+        fn names(&self) -> Result<Vec<String>, SecretsError> {
+            if self.lists.fetch_add(1, Ordering::SeqCst) % 2 == 1 {
+                return Err(SecretsError::Unreadable {
+                    path: PathBuf::from("secrets.json"),
+                });
+            }
+            self.inner.names()
+        }
+    }
+
+    #[test]
+    fn check_leaves_gateway_none_when_only_the_gateway_names_read_fails() {
+        let (dir, store, _, me) = rig_without_a_task();
+        let secrets = EverySecondListFails {
+            inner: FileSecrets::new(dir.path().join("secrets.json")),
+            lists: AtomicUsize::new(0),
+        };
+        secrets.set("github:octocat", "ghp_held_nine").unwrap();
+
+        let held = check(&store, me, &secrets, None, None).unwrap();
+
+        assert_eq!(held.logins, ["octocat"]);
+        assert_eq!(held.gateway, None);
+        assert_eq!(store.lock().unwrap().held(me).unwrap(), Some(held));
     }
 
     #[test]
@@ -560,6 +727,7 @@ mod tests {
         let stale = MachineHeld {
             logins: vec!["old".into()],
             skill: true,
+            ..Default::default()
         };
         let applied = store
             .lock()

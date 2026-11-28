@@ -27,6 +27,7 @@
 //! by itself [`STOP_WITHIN`] after it asked, so an answer the link cannot take still stops B,
 //! and a [`Stop`] acts only once.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -174,6 +175,11 @@ pub enum CallError {
     Refused(String),
 }
 
+/// The newest protocol among one machine's open record links.
+fn newest(open: &BTreeMap<u64, super::Link>) -> Option<u16> {
+    open.values().map(|link| link.speak).max()
+}
+
 impl Peers {
     /// This machine's id.
     pub fn me(&self) -> MachineId {
@@ -258,9 +264,20 @@ impl Peers {
 
     /// The newest protocol an open record link to `machine` speaks, or `None` with no link open.
     fn speaks(&self, machine: MachineId) -> Option<u16> {
-        lock(&self.inner.links)
-            .get(&machine)
-            .and_then(|open| open.values().map(|link| link.speak).max())
+        lock(&self.inner.links).get(&machine).and_then(newest)
+    }
+
+    /// The protocol each machine with an open record link speaks (the newest, as [`speaks`]
+    /// reads it), and this machine at [`PROTOCOL`]. A machine with no link has no entry.
+    ///
+    /// [`speaks`]: Self::speaks
+    pub fn protocols(&self) -> BTreeMap<MachineId, u16> {
+        let mut protocols: BTreeMap<MachineId, u16> = lock(&self.inner.links)
+            .iter()
+            .filter_map(|(machine, open)| Some((*machine, newest(open)?)))
+            .collect();
+        protocols.insert(self.inner.me, PROTOCOL);
+        protocols
     }
 
     /// Waits until this machine holds `owner`'s records up to `version`, at most
@@ -473,6 +490,26 @@ mod tests {
             Arc::new(Opens(dialed.clone())),
         );
         (dir, peers, dialed)
+    }
+
+    #[tokio::test]
+    async fn protocols_gives_what_each_open_link_speaks_and_leaves_out_a_machine_with_none() {
+        let (me, five, six, none) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
+        let (_dir, peers, _dialed) = listing(me, five);
+        let (link, _unread) = mpsc::channel(4);
+        let _five = peers.inner.opened(five, 5, link.clone());
+        let _older = peers.inner.opened(six, 4, link.clone());
+        let _newer = peers.inner.opened(six, 6, link);
+        assert_eq!(
+            peers.protocols(),
+            [(me, PROTOCOL), (five, 5), (six, 6)].into()
+        );
+        assert!(!peers.protocols().contains_key(&none));
     }
 
     #[tokio::test]

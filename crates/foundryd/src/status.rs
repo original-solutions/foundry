@@ -448,6 +448,8 @@ mod tests {
             records: vec![sample(me, 1, 0.1, 0)],
             settings: settings(&[(me, "mac")]),
             online,
+            held: BTreeMap::new(),
+            protocols: BTreeMap::new(),
         };
 
         let heard = state_text(state(Some(vec![me]))).unwrap();

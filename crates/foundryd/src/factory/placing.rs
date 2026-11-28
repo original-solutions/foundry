@@ -247,6 +247,7 @@ mod tests {
         MachineHeld {
             logins: logins.iter().map(|l| (*l).to_owned()).collect(),
             skill,
+            ..Default::default()
         }
     }
 

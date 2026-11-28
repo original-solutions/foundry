@@ -2448,6 +2448,7 @@ mod tests {
                 MachineHeld {
                     logins: vec![LOGIN.into()],
                     skill: true,
+                    ..Default::default()
                 },
             )
             .build()
@@ -2738,6 +2739,7 @@ mod tests {
                         MachineHeld {
                             logins: vec![LOGIN.into()],
                             skill: true,
+                            ..Default::default()
                         },
                     )
                     .workspace(Record {
@@ -2915,6 +2917,7 @@ mod tests {
                     MachineHeld {
                         logins: vec![LOGIN.into()],
                         skill: true,
+                        ..Default::default()
                     },
                 )
                 .build();
@@ -3539,6 +3542,7 @@ mod tests {
                     MachineHeld {
                         logins: vec![LOGIN.into()],
                         skill: true,
+                        ..Default::default()
                     },
                 )
                 .workspace(Record {
@@ -6455,6 +6459,7 @@ mod tests {
                     MachineHeld {
                         logins: vec![LOGIN.into()],
                         skill: true,
+                        ..Default::default()
                     },
                 )
                 .workspace(Record {

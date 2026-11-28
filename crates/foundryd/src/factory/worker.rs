@@ -1332,6 +1332,7 @@ mod tests {
         let held = MachineHeld {
             logins: vec!["bot".into()],
             skill: false,
+            ..Default::default()
         };
         let view = StoreView::builder()
             .online(m)
@@ -1586,6 +1587,7 @@ mod tests {
             body: FactoryBody::Held(MachineHeld {
                 logins: vec!["bot".into()],
                 skill: true,
+                ..Default::default()
             }),
         };
         let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
@@ -1619,6 +1621,7 @@ mod tests {
                         body: FactoryBody::Held(MachineHeld {
                             logins: vec!["bot".into()],
                             skill: true,
+                            ..Default::default()
                         }),
                     },
                     m,
@@ -1755,6 +1758,7 @@ mod tests {
         let held = MachineHeld {
             logins: vec!["bot".into()],
             skill: true,
+            ..Default::default()
         };
         store
             .apply_factory(
@@ -1974,6 +1978,7 @@ mod tests {
         let held = MachineHeld {
             logins: vec!["bot".into()],
             skill: false,
+            ..Default::default()
         };
         store
             .apply_factory(
