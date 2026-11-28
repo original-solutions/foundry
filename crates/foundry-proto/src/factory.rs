@@ -360,6 +360,14 @@ pub struct HeldUp {
     /// before held-up runs named them.
     #[serde(default)]
     pub workspaces: Vec<WorkspaceId>,
+    /// The pull request the run reported, else the one it finished with. `None` in a status
+    /// from a peer built before held-up runs named it.
+    #[serde(default)]
+    pub pr_url: Option<String>,
+    /// The session the run launched last (at most one today). Empty in a status from a peer
+    /// built before held-up runs named it.
+    #[serde(default)]
+    pub sessions: Vec<SessionId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -839,12 +847,16 @@ pub(crate) mod tests {
                     kind: HeldUpKind::Stuck,
                     reason: "the gate failed".into(),
                     workspaces: vec![WorkspaceId::random()],
+                    pr_url: None,
+                    sessions: vec![],
                 },
                 HeldUp {
                     run: id.clone(),
                     kind: HeldUpKind::NeedsInfo,
                     reason: "1. Which login?".into(),
                     workspaces: vec![],
+                    pr_url: None,
+                    sessions: vec![],
                 },
             ],
             gate_infra: vec![other.clone()],
@@ -1242,5 +1254,24 @@ pub(crate) mod tests {
         let read: FactoryStatus = serde_json::from_value(json).unwrap();
         assert_eq!(read.held_up.len(), 2);
         assert!(read.held_up.iter().all(|held| held.workspaces.is_empty()));
+    }
+
+    /// A status from a peer built before held-up runs named a pull request and sessions still
+    /// parses, each held-up run with no pull request and no sessions.
+    #[test]
+    fn a_held_up_run_from_an_older_peer_has_no_pull_request_or_sessions() {
+        let mut json = serde_json::to_value(status()).unwrap();
+        for held in json["held_up"].as_array_mut().unwrap() {
+            let held = held.as_object_mut().unwrap();
+            held.remove("pr_url");
+            held.remove("sessions");
+        }
+        let read: FactoryStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(read.held_up.len(), 2);
+        assert!(
+            read.held_up
+                .iter()
+                .all(|held| held.pr_url.is_none() && held.sessions.is_empty())
+        );
     }
 }

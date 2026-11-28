@@ -31,6 +31,10 @@ export interface AttentionItem {
   todo: string;
   /** The terminal to open to act on it. */
   terminal: string | null;
+  /** The GitHub issue of the run it is about. */
+  issue_url: string | null;
+  /** The pull request the run reported. */
+  pr_url: string | null;
 }
 
 /** Each kind's name for one item, and for several after their count. */
