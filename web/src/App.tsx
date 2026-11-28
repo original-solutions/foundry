@@ -367,7 +367,7 @@ function Layout() {
                       onClose={close}
                       onJump={openJump}
                       onChanges={openChanges}
-                      alerts={<NotifyButton {...notify} />}
+                      alerts={<NotifyButton {...notify} onClick={close} />}
                       onKeys={() => setKeysOpen(true)}
                       onRail={rail ? undefined : flipRail}
                     />

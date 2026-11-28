@@ -63,7 +63,7 @@ const cards = () => screen.getByTestId("cards").textContent;
 
 describe("NotifyButton", () => {
   it("is a link to the Notifications page, with the bell, and opens no panel", async () => {
-    const { container } = await renderApp(<NotifyButton notify={{ cards: true, desktop: false, away: true }} desktop="ask" onChoose={() => {}} />);
+    const { container } = await renderApp(<NotifyButton notify={{ cards: true, desktop: false, away: true }} desktop="ask" />);
     const link = await screen.findByRole("link", { name: "Notifications" });
     expect(link.getAttribute("href")).toBe("/settings/notifications");
     expect(container.querySelector("svg")).not.toBeNull();
@@ -74,11 +74,11 @@ describe("NotifyButton", () => {
   });
 
   it("is filled while desktop alerts are on, and struck through when nothing is", async () => {
-    const { container, unmount } = await renderApp(<NotifyButton notify={{ cards: true, desktop: true, away: true }} desktop="allowed" onChoose={() => {}} />);
+    const { container, unmount } = await renderApp(<NotifyButton notify={{ cards: true, desktop: true, away: true }} desktop="allowed" />);
     await screen.findByRole("link", { name: "Notifications" });
     expect(container.querySelector("svg")?.getAttribute("fill")).toBe("currentColor");
     unmount();
-    const quiet = await renderApp(<NotifyButton notify={{ cards: false, desktop: false, away: false }} desktop="allowed" onChoose={() => {}} />);
+    const quiet = await renderApp(<NotifyButton notify={{ cards: false, desktop: false, away: false }} desktop="allowed" />);
     await screen.findByRole("link", { name: "Notifications" });
     expect(quiet.container.querySelector("svg path[d^='M2.5']")).not.toBeNull();
   });

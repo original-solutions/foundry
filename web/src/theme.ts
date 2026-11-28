@@ -29,9 +29,10 @@ let unkept: Theme | undefined;
 const listeners = new Set<() => void>();
 
 function current(): Theme {
+  // A pick storage would not keep is newer than whatever it still holds.
+  if (unkept) return unkept;
   const kept = readStored(KEY);
-  if (kept === "light" || kept === "dark") return kept;
-  return unkept ?? "dark";
+  return kept === "light" || kept === "dark" ? kept : "dark";
 }
 
 function subscribe(listener: () => void) {

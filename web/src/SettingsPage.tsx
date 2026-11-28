@@ -142,7 +142,8 @@ export function SettingsPage({ notify, machines, here, state }: PageProps) {
     projects: state.settings.projects,
     projectFactory: state.settings.project_factory ?? {},
     machines,
-    notify: notify.notify,
+    // Desktop alerts count as on only where the browser allows them, as their switch does.
+    notify: { ...notify.notify, desktop: notify.notify.desktop && notify.desktop === "allowed" },
     theme,
   });
   const props: PageProps = { state, machines, here, notify };

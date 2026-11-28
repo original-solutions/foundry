@@ -22,18 +22,21 @@ export function useLeaveGuard(dirty: boolean) {
  * 3 → 4 · Discard · Save 2 changes". Hidden while nothing changed. Save runs `onSave` and shows
  * each refusal it answers beside its change, or beside Save when it names none. `stale` names the
  * fields that changed elsewhere since they were edited: their rows say so, and Save reads "Look
- * again" and sends nothing until it has been pressed once more.
+ * again" and sends nothing until it has been pressed once more; a field that goes stale again, or another one, asks again.
  */
 export function ReviewBar({
   changes,
   onSave,
   onDiscard,
   stale,
+  onLook,
 }: {
   changes: Change[];
   onSave: () => Promise<Refusal[]>;
   onDiscard: () => void;
   stale: string[];
+  /** Told when Look again is pressed, so the page can take the new values as seen and stop marking them. */
+  onLook?: () => void;
 }) {
   const [refusals, setRefusals] = useState<Refusal[]>([]);
   const [saving, setSaving] = useState(false);
@@ -45,9 +48,11 @@ export function ReviewBar({
     setShown(shape);
     setRefusals([]);
   }
+  const staleNow = stale.join(",");
+  // A look is of the fields stale then: once none is, the next one to go stale needs its own.
+  if (staleNow === "" && looked !== "") setLooked("");
   if (changes.length === 0) return null;
 
-  const staleNow = stale.join(",");
   const needsLook = stale.length > 0 && looked !== staleNow;
   const named = new Set(changes.map((c) => c.key));
   const beside = refusals.filter((r) => r.key === undefined || !named.has(r.key));
@@ -56,6 +61,7 @@ export function ReviewBar({
   const save = async () => {
     if (needsLook) {
       setLooked(staleNow);
+      onLook?.();
       return;
     }
     setSaving(true);
