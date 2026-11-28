@@ -49,6 +49,14 @@ describe("byTodo", () => {
     expect(groups.map((group) => group.kind)).toEqual(["run_stuck", "gate_infra"]);
   });
 
+  it("keeps apart two groups whose kind and todo run together into the same text", () => {
+    const groups = byTodo([item("a:1", "a", { todo: "bc" }), item("ab:1", "ab", { todo: "c" })]);
+    expect(groups.map((group) => [group.kind, group.todo])).toEqual([
+      ["a", "bc"],
+      ["ab", "c"],
+    ]);
+  });
+
   it("gives a group the machine its items share, and none when they are on different machines", () => {
     const [same] = byTodo([item("run_stuck:r1", "run_stuck"), item("run_stuck:r2", "run_stuck")]);
     expect(same.machine_name).toBe("trilogy-mac");
