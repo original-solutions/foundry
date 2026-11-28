@@ -2661,6 +2661,56 @@ mod tests {
         );
     }
 
+    /// A gate's setup, `SETUP_LIMITED`, started in a real holder's terminal as `sh()` in
+    /// `workspaces/mod.rs` starts it, prints no job-control notice of its own shell, whichever
+    /// shell that is: macOS's `/bin/sh` is bash, which stands in for it where there is one.
+    #[tokio::test]
+    async fn a_setup_that_fails_leaves_the_commands_lines_and_no_shell_notice_in_the_tail() {
+        for shell in ["/bin/sh", "bash"] {
+            if shell == "bash"
+                && std::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(":")
+                    .output()
+                    .is_err()
+            {
+                continue;
+            }
+            let setup = Setup::new();
+            let (terminals, store) = setup.daemon();
+            let command =
+                "echo one; echo 'test tests::example ... FAILED'; echo to-stderr >&2; exit 100";
+            let argv = vec![
+                shell.to_string(),
+                "-c".into(),
+                crate::workspaces::setup_limited().into(),
+                "setup".into(),
+                "1800".into(),
+                command.into(),
+            ];
+            let id = terminals
+                .start(WorkspaceId::random(), setup.cwd.path(), &argv, &[])
+                .await
+                .unwrap();
+            until("the record to say exited", || {
+                held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+            })
+            .await;
+            let tail = terminals.tail(id, 64 * 1024).await.unwrap();
+            assert!(
+                tail.contains("test tests::example ... FAILED\n"),
+                "{shell}: {tail:?}"
+            );
+            assert!(tail.contains("to-stderr\n"), "{shell}: {tail:?}");
+            assert!(
+                tail.contains(&format!("setup failed: {command} exited 100\n")),
+                "{shell}: {tail:?}"
+            );
+            assert!(!tail.contains("Killed"), "{shell}: {tail:?}");
+            assert!(!tail.contains("sleep \"$limit\""), "{shell}: {tail:?}");
+        }
+    }
+
     #[tokio::test]
     async fn the_tail_of_a_terminal_that_is_not_live_is_unknown() {
         let setup = Setup::new();

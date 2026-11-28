@@ -872,8 +872,13 @@ mod tests {
         /// are, with its error output folded in as in a terminal, and the code it exits with.
         /// `stub` is shell code run before the script, in the script's own shell.
         fn run_setup(stub: &str, commands: &[&str]) -> (String, i32) {
+            run_setup_in("/bin/sh", stub, commands).unwrap()
+        }
+
+        /// [`run_setup`] under `shell`, or `None` when the machine has no such shell.
+        fn run_setup_in(shell: &str, stub: &str, commands: &[&str]) -> Option<(String, i32)> {
             let script = format!("exec 2>&1\n{stub}\n{}", crate::workspaces::setup_limited());
-            let ran = std::process::Command::new("/bin/sh")
+            let ran = match std::process::Command::new(shell)
                 .arg("-c")
                 .arg(script)
                 .arg("setup")
@@ -881,10 +886,81 @@ mod tests {
                 .args(commands)
                 .stdin(std::process::Stdio::null())
                 .output()
-                .unwrap();
+            {
+                Ok(ran) => ran,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(error) => panic!("{shell}: {error}"),
+            };
             let tail = String::from_utf8(ran.stdout).unwrap();
             let code = ran.status.code().unwrap();
-            (tail, code)
+            Some((tail, code))
+        }
+
+        /// The shells a test runs the setup under: `/bin/sh`, and `bash` where there is one,
+        /// which stands in for macOS's `/bin/sh`.
+        const SHELLS: [&str; 2] = ["/bin/sh", "bash"];
+
+        /// No job-control notice of the setup's own shell: a reaped watcher or command.
+        fn assert_no_notice(shell: &str, tail: &str) {
+            assert!(!tail.contains("Killed"), "{shell}: {tail:?}");
+            assert!(!tail.contains("sleep \"$limit\""), "{shell}: {tail:?}");
+        }
+
+        #[test]
+        fn the_real_setup_prints_only_the_commands_own_lines_and_its_own_for_a_failure() {
+            let command = "echo one; echo 'test tests::example ... FAILED'; echo to-stderr >&2; echo three; exit 100";
+            let commands = [command];
+            for shell in SHELLS {
+                let Some((tail, code)) = run_setup_in(shell, "", &commands) else {
+                    continue;
+                };
+                assert_eq!(code, 100, "{shell}: {tail:?}");
+                assert!(
+                    tail.contains("test tests::example ... FAILED\n"),
+                    "{shell}: {tail:?}"
+                );
+                assert!(tail.contains("to-stderr\n"), "{shell}: {tail:?}");
+                assert_no_notice(shell, &tail);
+                let GateResult::Failed {
+                    command: named,
+                    how,
+                    output,
+                } = result(TerminalState::Exited, Some(code), &tail, &strs(&commands))
+                else {
+                    panic!("{shell}: not a failure: {tail:?}");
+                };
+                assert_eq!(
+                    (named.as_deref(), how.as_str()),
+                    (Some(command), "exit code 100"),
+                    "{shell}: {tail:?}"
+                );
+                assert!(
+                    output.contains("test tests::example ... FAILED"),
+                    "{shell}: {output:?}"
+                );
+                assert!(output.contains("to-stderr"), "{shell}: {output:?}");
+                assert_no_notice(shell, &output);
+            }
+        }
+
+        #[test]
+        fn the_real_setup_prints_no_notice_of_its_own_for_a_command_past_its_limit() {
+            let commands = ["echo before; sleep 3187"];
+            for shell in SHELLS {
+                let Some((tail, code)) = run_setup_in(shell, "sleep() { :; }", &commands) else {
+                    continue;
+                };
+                assert_eq!(code, TIMED_OUT, "{shell}: {tail:?}");
+                assert!(
+                    tail.contains(&format!(
+                        "setup failed: {} ran past {} s and was stopped\n",
+                        commands[0],
+                        COMMAND_LIMIT.as_secs()
+                    )),
+                    "{shell}: {tail:?}"
+                );
+                assert_no_notice(shell, &tail);
+            }
         }
 
         #[test]
