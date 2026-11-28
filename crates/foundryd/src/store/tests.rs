@@ -1424,6 +1424,7 @@ fn held_body(logins: &[&str]) -> MachineHeld {
     MachineHeld {
         logins: logins.iter().map(|l| (*l).to_owned()).collect(),
         skill: true,
+        ..Default::default()
     }
 }
 

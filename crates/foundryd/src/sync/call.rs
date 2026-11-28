@@ -476,6 +476,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocols_gives_what_each_open_link_speaks_and_leaves_out_a_machine_with_none() {
+        let (me, five, six, none) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
+        let (_dir, peers, _dialed) = listing(me, five);
+        let (link, _unread) = mpsc::channel(4);
+        let _five = peers.inner.opened(five, 5, link.clone());
+        let _older = peers.inner.opened(six, 4, link.clone());
+        let _newer = peers.inner.opened(six, 6, link);
+        assert_eq!(
+            peers.protocols(),
+            [(me, PROTOCOL), (five, 5), (six, 6)].into()
+        );
+        assert!(!peers.protocols().contains_key(&none));
+    }
+
+    #[tokio::test]
     async fn an_install_is_never_sent_on_a_link_below_updates_since_and_a_workspace_call_still_is()
     {
         let (me, old) = (MachineId::random(), MachineId::random());

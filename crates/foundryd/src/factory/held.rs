@@ -153,7 +153,7 @@ mod tests {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
-    use foundry_proto::factory::MachineHeld;
+    use foundry_proto::factory::{GatewayKeys, MachineHeld};
     use foundry_proto::ids::MachineId;
 
     use super::*;
@@ -279,7 +279,12 @@ mod tests {
             held(&rig),
             Some(MachineHeld {
                 logins: vec![],
-                skill: false
+                skill: false,
+                default: None,
+                gateway: Some(GatewayKeys {
+                    key: false,
+                    management: false
+                }),
             })
         );
     }
@@ -360,6 +365,61 @@ mod tests {
             "ghp_held_four",
         ] {
             assert!(!text.contains(token), "{text}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_writes_the_default_login_once_github_default_names_one() {
+        let rig = rig();
+        let first = version_after(&rig, None).await;
+        assert_eq!(held(&rig).unwrap().default, None);
+        set_from(&*rig.secrets, "github:octocat", "ghp_held_eight\n".as_bytes()).unwrap();
+        rig.secrets.set(secrets::GITHUB_DEFAULT, "octocat").unwrap();
+
+        pass(&rig, CHECK_EVERY).await;
+        assert!(version_after(&rig, first).await > first);
+        let held = held(&rig).unwrap();
+        assert_eq!(held.default.as_deref(), Some("octocat"));
+        assert_eq!(held.logins, ["octocat"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_says_which_gateway_keys_are_set_and_logs_no_key() {
+        let logged = crate::test_log::Logged::everywhere();
+        let rig = rig();
+        let first = version_after(&rig, None).await;
+        assert_eq!(
+            held(&rig).unwrap().gateway,
+            Some(GatewayKeys {
+                key: false,
+                management: false
+            })
+        );
+        set_from(&*rig.secrets, "gateway-management", "sk-mgmt-unique\n".as_bytes()).unwrap();
+
+        pass(&rig, CHECK_EVERY).await;
+        assert!(version_after(&rig, first).await > first);
+        assert_eq!(
+            held(&rig).unwrap().gateway,
+            Some(GatewayKeys {
+                key: false,
+                management: true
+            })
+        );
+        set_from(&*rig.secrets, "gateway", "sk-key-unique\n".as_bytes()).unwrap();
+        let second = version(&rig);
+        pass(&rig, CHECK_EVERY).await;
+        assert!(version_after(&rig, second).await > second);
+        assert_eq!(
+            held(&rig).unwrap().gateway,
+            Some(GatewayKeys {
+                key: true,
+                management: true
+            })
+        );
+        let text = logged.text();
+        for value in ["sk-mgmt-unique", "sk-key-unique"] {
+            assert!(!text.contains(value), "{text}");
         }
     }
 
@@ -560,6 +620,7 @@ mod tests {
         let stale = MachineHeld {
             logins: vec!["old".into()],
             skill: true,
+            ..Default::default()
         };
         let applied = store
             .lock()

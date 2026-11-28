@@ -879,6 +879,11 @@ pub(crate) mod tests {
         MachineHeld {
             logins: vec!["tomkaczocha".into(), "rawphp".into()],
             skill: true,
+            default: Some("rawphp".into()),
+            gateway: Some(GatewayKeys {
+                key: true,
+                management: false,
+            }),
         }
     }
 
@@ -1033,6 +1038,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_held_record_from_before_the_default_and_the_gateway_parses_with_neither() {
+        let held: MachineHeld = serde_json::from_str(r#"{"logins":["a"],"skill":false}"#).unwrap();
+        assert_eq!(
+            held,
+            MachineHeld {
+                logins: vec!["a".into()],
+                skill: false,
+                default: None,
+                gateway: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_held_record_with_a_default_and_gateway_keys_round_trips() {
+        assert_round_trip(&held());
+        assert_round_trip(&MachineHeld::default());
+    }
+
+    #[test]
     fn held_up_and_not_holding_are_written_under_their_names() {
         assert_eq!(
             serde_json::to_value(HeldUpKind::NeedsInfo).unwrap(),
@@ -1079,6 +1104,7 @@ pub(crate) mod tests {
                     body: FactoryBody::Held(MachineHeld {
                         logins: vec!["rawphp".into()],
                         skill: false,
+                        ..Default::default()
                     }),
                 },
             ),

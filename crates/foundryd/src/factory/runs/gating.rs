@@ -3174,6 +3174,7 @@ mod tests {
                 MachineHeld {
                     logins: vec![LOGIN.into()],
                     skill: true,
+                    ..Default::default()
                 },
             )
     }
