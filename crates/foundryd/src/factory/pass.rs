@@ -5060,7 +5060,7 @@ mod tests {
             MachineId(uuid::Uuid::from_u128(0x3))
         }
 
-        /// A machine a round moves to after giving up `mover`.
+        /// A second machine a run's rounds move to: after giving up `mover`, or in a later round.
         fn other_mover() -> MachineId {
             MachineId(uuid::Uuid::from_u128(0x4))
         }
@@ -5231,6 +5231,39 @@ mod tests {
             assert_eq!(live.len(), 1, "{live:?}");
             assert_eq!(live[0].workspaces, vec![workspace_of(5, 1)]);
             assert_eq!(live[0].machine, builder_machine());
+        }
+
+        #[test]
+        fn a_live_run_resumed_then_given_feedback_names_every_workspace_oldest_first_and_the_newest_machine()
+         {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    vec![format!("workspace-created {}", workspace_of(5, 1))],
+                    resumed(5),
+                    vec![
+                        format!("feedback-machine 1 {}", other_mover()),
+                        format!("feedback-workspace 1 {}", round_workspace(5, 2)),
+                    ],
+                ]
+                .concat(),
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(
+                live[0].workspaces,
+                vec![
+                    workspace_of(5, 1),
+                    round_workspace(5, 1),
+                    round_workspace(5, 2)
+                ]
+            );
+            assert_eq!(live[0].machine, other_mover());
         }
 
         #[test]

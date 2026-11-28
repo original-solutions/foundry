@@ -309,8 +309,9 @@ pub struct Seen {
     pub workspace_requested: Option<String>,
     /// The id in the newest `workspace-created` step: the worker answered the create.
     pub workspace: Option<String>,
-    /// The workspaces the resume and feedback rounds were answered with, one per
-    /// `resume-workspace <k> <id>` or `feedback-workspace <n> <id>` step, in ledger order. Unlike
+    /// The workspaces the resume and feedback rounds were answered with, at most one per round:
+    /// the round's newest `resume-workspace <k> <id>` or `feedback-workspace <n> <id>` step since
+    /// its newest machine or machine-given-up step, ordered by those steps in the ledger. Unlike
     /// [`Seen::workspace`], which stays the build workspace, these are the ones a run moved to.
     pub round_workspaces: Vec<RoundWorkspace>,
     /// The moment in the first `approved <time>` step: when an instructor applied the label the run was approved on.
@@ -793,14 +794,21 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 if let Some(id) = step.strip_prefix(WORKSPACE_CREATED) {
                     seen.workspace = Some(id.to_owned());
                 }
+                // As in the round readers, a round holds one workspace: its machine step, its
+                // given-up step and a newer workspace step of it each drop the one it had.
                 for (machine, given_up, workspace) in ROUND_STEPS {
-                    if let Some((count, id)) = counted(step, machine) {
-                        round_machines.insert((machine, count), id.to_owned());
-                    } else if let Some((count, _)) = counted(step, given_up) {
-                        round_machines.remove(&(machine, count));
+                    let mut drop_round = |count: u32| {
                         seen.round_workspaces
                             .retain(|round| round.round != (machine, count));
+                    };
+                    if let Some((count, id)) = counted(step, machine) {
+                        drop_round(count);
+                        round_machines.insert((machine, count), id.to_owned());
+                    } else if let Some((count, _)) = counted(step, given_up) {
+                        drop_round(count);
+                        round_machines.remove(&(machine, count));
                     } else if let Some((count, id)) = counted(step, workspace) {
+                        drop_round(count);
                         seen.round_workspaces.push(RoundWorkspace {
                             workspace: id.to_owned(),
                             machine: round_machines.get(&(machine, count)).cloned(),
@@ -3101,6 +3109,73 @@ mod tests {
                     "resume-workspace 1 W3",
                 ]),
                 vec![("W3".to_owned(), None)]
+            );
+        }
+
+        #[test]
+        fn reads_the_round_workspaces_in_ledger_order_whatever_their_kind() {
+            assert_eq!(
+                rounds_of(&[
+                    "feedback-machine 1 B",
+                    "feedback-workspace 1 F1",
+                    "resume-machine 1 A",
+                    "resume-workspace 1 W1",
+                ]),
+                vec![
+                    ("F1".to_owned(), Some("B".to_owned())),
+                    ("W1".to_owned(), Some("A".to_owned())),
+                ]
+            );
+        }
+
+        #[test]
+        fn a_new_machine_step_of_a_round_drops_the_workspace_the_round_made_before_it() {
+            assert_eq!(
+                rounds_of(&[
+                    "resume-machine 1 A",
+                    "resume-workspace 1 W1",
+                    "resume-machine 1 B",
+                ]),
+                vec![]
+            );
+            assert_eq!(
+                rounds_of(&[
+                    "feedback-machine 1 A",
+                    "feedback-workspace 1 W1",
+                    "feedback-machine 1 B",
+                    "feedback-workspace 1 W2",
+                ]),
+                vec![("W2".to_owned(), Some("B".to_owned()))]
+            );
+            assert_eq!(
+                rounds_of(&[
+                    "resume-machine 1 A",
+                    "resume-workspace 1 W1",
+                    "resume-machine 2 B",
+                    "resume-workspace 2 W2",
+                ]),
+                vec![
+                    ("W1".to_owned(), Some("A".to_owned())),
+                    ("W2".to_owned(), Some("B".to_owned())),
+                ],
+                "a machine step of another round keeps this round's workspace"
+            );
+        }
+
+        #[test]
+        fn a_rounds_newer_workspace_step_takes_the_place_of_its_older_one() {
+            assert_eq!(
+                rounds_of(&[
+                    "resume-machine 1 A",
+                    "resume-workspace 1 W1",
+                    "feedback-machine 1 B",
+                    "feedback-workspace 1 F1",
+                    "resume-workspace 1 W2",
+                ]),
+                vec![
+                    ("F1".to_owned(), Some("B".to_owned())),
+                    ("W2".to_owned(), Some("A".to_owned())),
+                ]
             );
         }
 
