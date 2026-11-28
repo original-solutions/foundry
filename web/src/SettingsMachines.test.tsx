@@ -4,10 +4,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnyRecord, MachineSample, SharedSettings } from "./api";
 import { emptyState, fleet } from "./fleet";
 import { SettingsMachines } from "./SettingsMachines";
+import { forgetInstalls } from "./UpdateChecklist";
 import { ME, OTHER, sample, settings } from "./test-fixtures";
 import { json, mockFetch, pageProps, renderApp } from "./test-utils";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  forgetInstalls();
+});
 
 const laptopFirst = settings({
   machines: [
@@ -191,6 +195,17 @@ describe("SettingsMachines", () => {
       change(settings({ machines: [...laptopFirst.machines, { id: "m-3", name: "trilogy-mac", address: "100.64.0.3" }], priority: laptopFirst.priority }));
 
       expect((await screen.findByRole("status")).textContent).toBe("Trilogy-Mac joined");
+    });
+
+    it("says the machine joined when it lists itself under its own name at the address the typed name resolved to", async () => {
+      mockFetch(json(201, { ...added, address: "100.64.0.3" }));
+      const change = await live();
+
+      add("trilogy-mac.tail459612.ts.net");
+      await screen.findByText(added.command);
+      change(settings({ machines: [...laptopFirst.machines, { id: "m-3", name: "trilogy-mac", address: "100.64.0.3" }], priority: laptopFirst.priority }));
+
+      expect((await screen.findByRole("status")).textContent).toBe("trilogy-mac.tail459612.ts.net joined");
     });
   });
 });

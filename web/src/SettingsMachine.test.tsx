@@ -4,10 +4,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnyRecord, MachineSample, SharedSettings } from "./api";
 import { emptyState, fleet } from "./fleet";
 import { SettingsMachine } from "./SettingsMachine";
+import { forgetInstalls } from "./UpdateChecklist";
 import { ME, OTHER, sample, settings } from "./test-fixtures";
 import { json, mockFetch, pageProps, renderApp } from "./test-utils";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  forgetInstalls();
+});
 
 const limited = settings({
   machines: [
@@ -114,18 +118,53 @@ describe("SettingsMachine", () => {
   });
 
   it("keeps a refused change in the bar with the daemon's reason, and lets the saved one leave", async () => {
-    const calls = mockFetch(new Response(null, { status: 204 }), json(422, { error: "max_sessions must be at least 1" }));
+    const calls = mockFetch(json(409, { error: 'another machine is named "studio"' }), new Response(null, { status: 204 }));
+    await show(OTHER);
+
+    type("Name", "studio");
+    type("Max sessions", "6");
+    fireEvent.click(screen.getByRole("button", { name: "Save 2 changes" }));
+
+    await waitFor(() => expect(row("Name").textContent).toContain('another machine is named "studio"'));
+    expect(bar()?.textContent).toContain("1 change");
+    expect(bar()?.textContent).toContain("Name laptop → studio");
+    expect(bar()?.textContent).not.toContain("Max sessions");
+    expect(calls).toHaveLength(2);
+  });
+
+  it.each([
+    ["Max sessions", "0", "the maximum sessions is a whole number from 1 to 4294967295"],
+    ["Max sessions", "2.5", "the maximum sessions is a whole number from 1 to 4294967295"],
+    ["Max sessions", "", "the maximum sessions is a whole number from 1 to 4294967295"],
+    ["Max load per core", "0", "the maximum load per core is a number above 0"],
+    ["Min free disk (GB)", "-1", "the minimum free disk is a number of gigabytes, 0 or more"],
+  ])("checks %s %j against today's range before sending, and says why beside it", async (label, value, message) => {
+    const calls = mockFetch(new Response(null, { status: 204 }));
     await show(OTHER);
 
     type("Name", "desk");
-    type("Max sessions", "0");
+    type(label, value);
     fireEvent.click(screen.getByRole("button", { name: "Save 2 changes" }));
 
-    await waitFor(() => expect(row("Max sessions").textContent).toContain("max_sessions must be at least 1"));
-    expect(bar()?.textContent).toContain("1 change");
-    expect(bar()?.textContent).toContain("Max sessions 4 → 0");
-    expect(bar()?.textContent).not.toContain("Name laptop");
-    expect(calls).toHaveLength(2);
+    await waitFor(() => expect(row(label).textContent).toContain(message));
+    // The limits are not sent; the name, which passes, is.
+    expect(calls).toEqual([{ url: `/api/machines/${OTHER}/rename`, method: "POST", body: { name: "desk" } }]);
+  });
+
+  it("counts a name typed with spaces around the one it has as no change", async () => {
+    await show(OTHER);
+    type("Name", " laptop ");
+    expect(bar()).toBeNull();
+  });
+
+  it("locks the name, limits and Clear limits, and offers no Remove, for a machine the machine list does not hold", async () => {
+    const given = settings({ machines: [{ id: ME, name: "studio", address: "" }], priority: [ME] });
+    await show(OTHER, { given });
+    expect(screen.getByText(/does not hold this machine yet/)).toBeDefined();
+    expect(field("Name").disabled).toBe(true);
+    expect(field("Max sessions").disabled).toBe(true);
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Clear limits" }).disabled).toBe(true);
+    expect(screen.queryByRole("button", { name: "Remove from fleet" })).toBeNull();
   });
 
   it("keeps the shared section editable, and saving, while the machine is offline", async () => {
@@ -195,6 +234,31 @@ describe("SettingsMachine", () => {
   });
 
   describe("the update", () => {
+    const ready = (id: string) => [at(ME, 1, id === ME ? { version: "0.9.0", update_ready: "v0.9.1" } : {}), at(OTHER, 1, id === OTHER ? { version: "0.9.0", update_ready: "v0.9.1" } : {})];
+
+    /** Stubs `fetch` so each install waits until the test answers it. */
+    function pending() {
+      const out: { url: string; answer: (r: Response) => void; drop: (e: Error) => void }[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((url: string) => new Promise<Response>((answer, drop) => out.push({ url, answer, drop }))),
+      );
+      return out;
+    }
+
+    /** Shows machine pages over a fleet where both machines have v0.9.1 ready, and gives back how to open another machine's page. */
+    async function both(start: string) {
+      let open: (id: string) => void = () => {};
+      const machines = fleet([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })], limited, {}, [ME, OTHER]);
+      function Live() {
+        const [id, setId] = useState(start);
+        open = setId;
+        return <SettingsMachine {...pageProps({ state: { ...emptyState, synced: true, settings: limited }, machines, here: ME })} machineId={id} />;
+      }
+      await renderApp(<Live />);
+      return (id: string) => act(() => open(id));
+    }
+
     it("is absent while no release is ready on the machine", async () => {
       await show(OTHER, { records: [at(ME, 1), at(OTHER, 1, { version: "0.9.1" })] });
       expect(screen.queryByRole("heading", { name: "Update" })).toBeNull();
@@ -202,7 +266,7 @@ describe("SettingsMachine", () => {
 
     it("says the tag is ready, and Install sends it and shows Restarting on a 202", async () => {
       const calls = mockFetch(json(202, {}));
-      await show(OTHER, { records: [at(ME, 1), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })] });
+      await show(OTHER, { records: ready(OTHER) });
 
       expect(screen.getByText("v0.9.1 is ready")).toBeDefined();
       fireEvent.click(screen.getByRole("button", { name: "Install" }));
@@ -214,23 +278,80 @@ describe("SettingsMachine", () => {
 
     it("shows the checklist's text for a refusal, and Install again", async () => {
       mockFetch(json(503, { error: "laptop is offline" }));
-      await show(OTHER, { records: [at(ME, 1), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })] });
+      await show(OTHER, { records: ready(OTHER) });
       fireEvent.click(screen.getByRole("button", { name: "Install" }));
       await screen.findByText("Not sent: laptop is offline");
       expect(screen.getByRole("button", { name: "Install" })).toBeDefined();
     });
 
+    it("goes once the machine's release is no longer ready", async () => {
+      mockFetch(json(202, {}));
+      const view = await show(OTHER, { records: ready(OTHER) });
+      fireEvent.click(screen.getByRole("button", { name: "Install" }));
+      await screen.findByText(/^Restarting/);
+      const machines = fleet([at(ME, 1), at(OTHER, 2, { version: "0.9.1" })], limited, {}, [ME, OTHER]);
+      view.rerender(<></>);
+      view.unmount();
+      await renderApp(<SettingsMachine {...pageProps({ state: { ...emptyState, synced: true, settings: limited }, machines, here: ME })} machineId={OTHER} />);
+      expect(screen.queryByRole("heading", { name: "Update" })).toBeNull();
+    });
+
     it("says, before anything is sent, that the machine serving the page restarts", async () => {
       const calls = mockFetch();
-      await show(ME, { records: [at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" }), at(OTHER, 1)] });
+      await show(ME, { records: ready(ME) });
       const update = screen.getByRole("region", { name: "Update" });
       expect(within(update).getByText(/this machine serves this page: it restarts/i)).toBeDefined();
       expect(calls).toEqual([]);
     });
 
     it("says nothing of a restart on another machine's page", async () => {
-      await show(OTHER, { records: [at(ME, 1), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })] });
+      await show(OTHER, { records: ready(OTHER) });
       expect(within(screen.getByRole("region", { name: "Update" })).queryByText(/serves this page/i)).toBeNull();
+    });
+
+    for (const [how, end] of [
+      ["drops", (c: { answer: (r: Response) => void; drop: (e: Error) => void }) => c.drop(new TypeError("Failed to fetch"))],
+      ["answers 504", (c: { answer: (r: Response) => void; drop: (e: Error) => void }) => c.answer(json(504, { error: "the link went down" }))],
+    ] as const) {
+      it(`offers no Install again on the serving machine when its call ${how}, since it may be restarting`, async () => {
+        const out = pending();
+        await show(ME, { records: ready(ME) });
+        fireEvent.click(screen.getByRole("button", { name: "Install" }));
+        await act(async () => end(out[0]));
+        expect(await screen.findByText(/^Sent, outcome unknown/)).toBeDefined();
+        expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
+        expect(screen.getByText(/may be restarting/i)).toBeDefined();
+      });
+
+      it(`offers Install again on another machine when its call ${how}`, async () => {
+        const out = pending();
+        await show(OTHER, { records: ready(OTHER) });
+        fireEvent.click(screen.getByRole("button", { name: "Install" }));
+        await act(async () => end(out[0]));
+        expect(await screen.findByText(/^Sent, outcome unknown/)).toBeDefined();
+        expect(screen.getByRole("button", { name: "Install" })).toBeDefined();
+      });
+    }
+
+    it("shows another machine's page with none of the last machine's install", async () => {
+      mockFetch(json(202, {}));
+      const open = await both(OTHER);
+      fireEvent.click(screen.getByRole("button", { name: "Install" }));
+      await screen.findByText(/^Restarting/);
+      // The serving machine has the same release ready, and nothing was sent to it.
+      open(ME);
+      expect(screen.queryByText(/^Restarting/)).toBeNull();
+    });
+
+    it("offers no Install on the serving machine's page while an install to another machine is still out", async () => {
+      const out = pending();
+      const open = await both(OTHER);
+      fireEvent.click(screen.getByRole("button", { name: "Install" }));
+      open(ME);
+      expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
+      expect(screen.getByText(/still out/i)).toBeDefined();
+      await act(async () => out[0].answer(json(202, {})));
+      expect(await screen.findByRole("button", { name: "Install" })).toBeDefined();
     });
   });
 

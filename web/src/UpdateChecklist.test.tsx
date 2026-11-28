@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AnyRecord, MachineSample } from "./api";
 import { fleet } from "./fleet";
 import { ME, OTHER, sample, settings } from "./test-fixtures";
-import { UpdateChecklist } from "./UpdateChecklist";
+import { forgetInstalls, UpdateChecklist } from "./UpdateChecklist";
 
 /** Each install call the checklist made, answered when the test says. */
 const sent = vi.hoisted(() => ({
@@ -54,7 +54,10 @@ beforeEach(() => {
   sent.calls = [];
 });
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => {
+  vi.clearAllMocks();
+  forgetInstalls();
+});
 
 describe("UpdateChecklist", () => {
   it("says no machine has a release waiting, and offers no Install, while none has one", () => {
@@ -351,5 +354,56 @@ describe("UpdateChecklist", () => {
     fireEvent.click(within(dialog()).getByRole("button", { name: "Done" }));
     expect(within(dialog()).queryByRole("list", { name: "Installs" })).toBeNull();
     expect(within(dialog()).getByText("No machine has a release waiting.")).toBeDefined();
+  });
+
+  describe("across leaving the page", () => {
+    it("still offers no Install, and says the batch is out, when the page is left and opened again", async () => {
+      const first = show([at(ME, 1, { version: "0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+      first.unmount();
+      show([at(ME, 1, { version: "0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(true);
+      expect(within(dialog()).getByText(/still out/i)).toBeDefined();
+      act(() => sent.calls[0].answer({ status: 202, json: {} }));
+      await settle();
+      expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it("shows the rows of a batch sent before the page was left, until Done", async () => {
+      const first = show([at(ME, 1, { version: "0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+      first.unmount();
+      act(() => sent.calls[0].answer({ status: 202, json: {} }));
+      await settle();
+      show([at(ME, 1, { version: "0.9.1" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      expect(within(row("laptop")).getByText(/^Restarting/)).toBeDefined();
+    });
+
+    it("keeps the serving machine's restart hold when the page is left and opened again, until its sample is back", async () => {
+      const first = show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+      await settle();
+      act(() => sent.calls[0].answer({ status: 202, json: {} }));
+      await settle();
+      first.unmount();
+      const { update } = show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Done" }));
+      expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(true);
+      expect(within(dialog()).getByText(/this machine is restarting/i)).toBeDefined();
+      update([at(ME, 2, { version: "0.9.1" })]);
+      expect(within(dialog()).queryByText(/restarting/i)).toBeNull();
+    });
+
+    it("lifts the restart hold when the serving machine comes back past the tag while the page was left", async () => {
+      const first = show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Install" }));
+      await settle();
+      act(() => sent.calls[0].answer({ status: 202, json: {} }));
+      await settle();
+      first.unmount();
+      show([at(ME, 3, { version: "0.9.2", update_ready: "v0.9.3" })]);
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Done" }));
+      expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
+    });
   });
 });

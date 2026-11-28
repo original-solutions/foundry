@@ -45,7 +45,7 @@ describe("UpdateBadge", () => {
     expect(badge().textContent).not.toContain("2 machines");
   });
 
-  it("links to Settings → Machines, where the checklist is, and opens no dialog of its own", async () => {
+  it("links to Settings → Machines, where the checklist is, and holds no checklist itself", async () => {
     await show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
     expect(badge().getAttribute("href")).toBe("/settings/machines");
     expect(screen.queryByRole("dialog")).toBeNull();
