@@ -1,8 +1,9 @@
 //! The current screen and the last 10,000 lines of scrollback.
 //!
 //! The holder is not a terminal emulator. It keeps the tail of the raw bytes the PTY produced, cut
-//! at a line, and a client replays them into its own emulator (xterm.js) to rebuild the screen and
-//! history. Terminal modes set before the kept tail began are not replayed.
+//! at a line unless the rest of the cut line is longer than half the byte cap (see
+//! [`Scrollback::push`]), and a client replays them into its own emulator (xterm.js) to rebuild the
+//! screen and history. Terminal modes set before the kept tail began are not replayed.
 
 use std::collections::VecDeque;
 
@@ -215,8 +216,7 @@ mod tests {
         assert_eq!(scrollback.snapshot(), b"6789");
         // The 4 bytes held and the 6 skipped are behind the snapshot now.
         assert_eq!(scrollback.start(), 10);
-        // The cut line has no end in what is kept, so what is kept of it stays when its end
-        // comes.
+        // The rest of the cut line, `89\n`, is more than half the cap, so it stays.
         scrollback.push(b"\nx");
         assert_eq!(scrollback.snapshot(), b"89\nx");
         assert_eq!(scrollback.start(), 12);
@@ -238,7 +238,7 @@ mod tests {
         kept.extend_from_slice(b"FAILED\ndone\n");
         assert_eq!(scrollback.snapshot(), kept);
         assert_eq!(scrollback.start(), 6 + 40 + 6 + 6 - 32);
-        // A later cut into the same line keeps it too, now that its end is kept.
+        // A later cut into the same line keeps it too: its rest is still more than half the cap.
         scrollback.push(b"x\n");
         assert!(scrollback.snapshot().ends_with(b"FAILED\ndone\nx\n"));
         assert_eq!(scrollback.len(), 32);
@@ -252,6 +252,20 @@ mod tests {
         scrollback.push(b"aaaaaa\nbbbb\n");
         scrollback.push(b"cc\n");
         assert_eq!(scrollback.snapshot(), b"bbbb\ncc\n");
+    }
+
+    /// The rest of a cut line is dropped when it is half the cap, and kept when it is more.
+    #[test]
+    fn the_rest_of_a_cut_line_is_dropped_up_to_half_the_cap() {
+        let mut scrollback = Scrollback::with_limits(100, 8);
+        scrollback.push(b"aaaa\nbbb");
+        scrollback.push(b"c");
+        assert_eq!(scrollback.snapshot(), b"bbbc");
+
+        let mut scrollback = Scrollback::with_limits(100, 8);
+        scrollback.push(b"aaaaa\nbb");
+        scrollback.push(b"c");
+        assert_eq!(scrollback.snapshot(), b"aaaa\nbbc");
     }
 
     #[test]
