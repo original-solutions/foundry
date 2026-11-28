@@ -397,7 +397,7 @@ impl FleetView for StoreView {
         self.turns.get(&session)
     }
 
-    /// A [`Target::Host`] reads as offline: the store holds no host's heartbeat.
+    /// A [`Target::Host`] reads as offline: this source knows machines only, by id.
     fn online(&self, target: Target) -> bool {
         match target {
             Target::Machine(machine) => self.online.contains(&machine),
@@ -405,7 +405,7 @@ impl FleetView for StoreView {
         }
     }
 
-    /// A [`Target::Host`] is never unreachable: it reads as offline, with no span.
+    /// A [`Target::Host`] has no span, as this source knows machines only: zero.
     fn unreachable_for(&self, target: Target) -> Duration {
         let Target::Machine(machine) = target else {
             return Duration::ZERO;
@@ -420,7 +420,7 @@ impl FleetView for StoreView {
         &self.samples
     }
 
-    /// A [`Target::Host`] holds nothing in the store.
+    /// A [`Target::Host`] holds nothing: this source knows machines only, by id.
     fn held(&self, target: Target) -> Option<&MachineHeld> {
         match target {
             Target::Machine(machine) => self.held.get(&machine),
