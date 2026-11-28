@@ -305,6 +305,8 @@ interface WorkspaceProps {
  * A workspace in two columns: its project's face, with a spine hanging from it in its most urgent
  * terminal's fill (the board's card edge, so the two always match), and beside it everything else.
  * The face sits in the fold button with the name, drawn over its own column, so they are one stop.
+ * Unfolded, it is two lines above its sessions: the name with its actions and factory mark, then
+ * the standing line ending in the branch.
  */
 function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
@@ -312,11 +314,13 @@ function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, 
   const list = rows(workspace);
   const over = ended(workspace);
   const lead = byUrgency(list)[0];
+  const branch = branchOf(workspace);
   return (
     <div role="group" aria-label={workspace.name} className="group/ws relative grid grid-cols-[1.25rem_minmax(0,1fr)] gap-x-2">
       <span aria-hidden="true" data-spine="" className={`mx-auto mt-7 mb-[3px] w-0.5 rounded-full ${lead ? glyphFill[lead.glyph] : "bg-neutral-800"}`} />
       <div className="min-w-0">
-        <div className="flex items-center gap-2 rounded-md py-1 pr-1 pl-2 hover:bg-neutral-800/60">
+        {/* At least a 24px action tall, so the actions showing on hover do not move the list. */}
+        <div className="flex min-h-7 items-center gap-2 rounded-md py-0.5 pr-1 pl-2 hover:bg-neutral-800/60">
           <button
             type="button"
             aria-expanded={!folded}
@@ -331,42 +335,39 @@ function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, 
             <ProjectFace project={workspace.project} className="absolute top-1 left-0 size-5 text-[10px]" />
             <span className="truncate font-medium">{workspace.name}</span>
           </button>
-          {workspace.factory && <FactoryMark run={workspace.factory} />}
+          {!folded && (
+            <div className="flex shrink-0 items-center gap-0.5 pointer-fine:hidden pointer-fine:group-focus-within/ws:flex pointer-fine:group-hover/ws:flex">
+              {onChanges && (
+                <Action label="Changes" title={words.changes} onClick={() => onChanges(workspace.id)}>
+                  <path d="M8 2.5v6M5 5.5h6M5 12.5h6" />
+                </Action>
+              )}
+              {terminals && (
+                <Action label="New session" title="Start Claude Code in this workspace" onClick={() => terminals.onNewSession(workspace.id, workspace.name)}>
+                  <path d="M8 2.5l1.3 3.2 3.2 1.3-3.2 1.3L8 11.5 6.7 8.3 3.5 7l3.2-1.3z" />
+                </Action>
+              )}
+              <Action label="New shell" title="Open a shell in this workspace" onClick={() => shell.mutate()} disabled={shell.isPending}>
+                <path d="M3.5 4.5l3 3-3 3M8 11.5h4.5" />
+              </Action>
+              {terminals && over.length > 0 && (
+                <Action label={`Clear ${over.length} ended`} title="Clear the terminals that ended, with their final screens" onClick={() => terminals.clear(over)}>
+                  <path d="M11.5 2l-3 6M4 8h7l1 5.5H3zM6 10.5v3M9 10.5v3" />
+                </Action>
+              )}
+              {terminals && (
+                <Action label="Archive" title={words.archive} onClick={() => terminals.archive(workspace.id)}>
+                  <path d={ARCHIVE_ICON} />
+                </Action>
+              )}
+            </div>
+          )}
+          {workspace.factory && <FactoryMark run={workspace.factory} compact />}
           {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
         </div>
-        <StandingLine workspace={workspace} list={list} readable={readable} />
+        <StandingLine workspace={workspace} list={list} readable={readable} branch={folded || branch === workspace.name ? undefined : branch} />
         {!folded && (
           <>
-            <div className="flex items-center gap-2 pr-1 pl-2">
-              <span className="min-w-0 flex-1 truncate text-xs text-neutral-500">
-                {branchOf(workspace)}
-              </span>
-              <div className="flex shrink-0 items-center gap-0.5 pointer-fine:hidden pointer-fine:group-focus-within/ws:flex pointer-fine:group-hover/ws:flex">
-                {onChanges && (
-                  <Action label="Changes" title={words.changes} onClick={() => onChanges(workspace.id)}>
-                    <path d="M8 2.5v6M5 5.5h6M5 12.5h6" />
-                  </Action>
-                )}
-                {terminals && (
-                  <Action label="New session" title="Start Claude Code in this workspace" onClick={() => terminals.onNewSession(workspace.id, workspace.name)}>
-                    <path d="M8 2.5l1.3 3.2 3.2 1.3-3.2 1.3L8 11.5 6.7 8.3 3.5 7l3.2-1.3z" />
-                  </Action>
-                )}
-                <Action label="New shell" title="Open a shell in this workspace" onClick={() => shell.mutate()} disabled={shell.isPending}>
-                  <path d="M3.5 4.5l3 3-3 3M8 11.5h4.5" />
-                </Action>
-                {terminals && over.length > 0 && (
-                  <Action label={`Clear ${over.length} ended`} title="Clear the terminals that ended, with their final screens" onClick={() => terminals.clear(over)}>
-                    <path d="M11.5 2l-3 6M4 8h7l1 5.5H3zM6 10.5v3M9 10.5v3" />
-                  </Action>
-                )}
-                {terminals && (
-                  <Action label="Archive" title={words.archive} onClick={() => terminals.archive(workspace.id)}>
-                    <path d={ARCHIVE_ICON} />
-                  </Action>
-                )}
-              </div>
-            </div>
             {shell.error && (
               <p role="alert" className="pl-2 text-xs text-red-400">
                 {couldNot("start a shell", shell.error)}
@@ -393,9 +394,9 @@ function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, 
  * or opened a pull request), and every `CHECKS_EVERY` only while its pull request's checks run;
  * never on window focus or reconnect, since each read runs git and asks GitHub on the owner. Not
  * read while `readable` is off (its machine is offline). A read that fails or has not answered
- * leaves the project alone, and says nothing of why.
+ * leaves the project alone, and says nothing of why. `branch`, when given, ends the line.
  */
-function StandingLine({ workspace, list, readable }: { workspace: WorkspaceView; list: Row[]; readable: boolean }) {
+function StandingLine({ workspace, list, readable, branch }: { workspace: WorkspaceView; list: Row[]; readable: boolean; branch?: string }) {
   const [ref, onScreen] = useOnScreen<HTMLParagraphElement>();
   const enabled = readable && onScreen;
   const { data, isError } = useQuery({
@@ -412,8 +413,9 @@ function StandingLine({ workspace, list, readable }: { workspace: WorkspaceView;
 
   const working = list.some((r) => r.glyph === "starting" || r.glyph === "working");
   const stands = readable && data && !isError ? standing(data, working) : undefined;
+  const title = [workspace.project, stands?.text, branch].filter((part) => part !== undefined).join(" · ");
   return (
-    <p ref={ref} title={stands ? `${workspace.project} · ${stands.text}` : workspace.project} className="truncate pr-1 pl-2 text-xs text-neutral-500">
+    <p ref={ref} title={title} className="truncate pr-1 pl-2 text-xs text-neutral-500">
       <span>{workspace.project}</span>
       {stands && (
         <>
@@ -432,6 +434,12 @@ function StandingLine({ workspace, list, readable }: { workspace: WorkspaceView;
           ) : (
             <span className={toneText[stands.tone]}>{stands.text}</span>
           )}
+        </>
+      )}
+      {branch !== undefined && (
+        <>
+          <span className="text-neutral-600"> · </span>
+          <span className="font-mono text-[11px]">{branch}</span>
         </>
       )}
     </p>
