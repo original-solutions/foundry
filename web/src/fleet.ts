@@ -305,7 +305,8 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
 /**
  * The factory run a workspace belongs to: its id, its issue where the id names one, and where it
  * stands: held up for a person (`held`, with the daemon's `reason`), else live at `step` with the
- * gate's failed tries so far (`gateRetries`, when there are any).
+ * gate tries closed so far (`gateTries`, when there are any): the daemon's `gate_retries_used`,
+ * which counts a try that passed as well as one sent back.
  */
 export interface FactoryRun {
   run: string;
@@ -314,7 +315,7 @@ export interface FactoryRun {
   held?: HeldUp["kind"];
   reason?: string;
   step?: string;
-  gateRetries?: number;
+  gateTries?: number;
 }
 
 /**
@@ -331,7 +332,7 @@ export function factoryRuns(statuses: Record<string, FactoryStatus> | undefined)
   const named = new Map<string, FactoryRun>();
   for (const status of Object.values(statuses ?? {})) {
     const runs: { workspaces: string[]; stands: Omit<FactoryRun, "issue" | "url"> }[] = [
-      ...status.runs.map((r) => ({ workspaces: r.workspaces, stands: { run: r.run, step: r.step, ...(r.gate_retries_used > 0 && { gateRetries: r.gate_retries_used }) } })),
+      ...status.runs.map((r) => ({ workspaces: r.workspaces, stands: { run: r.run, step: r.step, ...(r.gate_retries_used > 0 && { gateTries: r.gate_retries_used }) } })),
       ...status.held_up.map((h) => ({ workspaces: h.workspaces ?? [], stands: { run: h.run, held: h.kind, reason: h.reason } })),
     ];
     for (const { workspaces, stands } of runs) {
@@ -477,7 +478,7 @@ const stepWords: Record<string, string> = { "pr-open": "PR open" };
 /**
  * Where factory run `run` stands, in the words every view shows on its workspace's terminals at
  * rest (`rows`): "Stuck · gate red: make check fails on main", "Needs info · …", "Building",
- * "Building · gate retry 1", "PR open". A held-up run's label carries its reason's first line, cut
+ * "Building · gate attempt 2", "PR open". A held-up run's label carries its reason's first line, cut
  * to fit `LABEL_ROOM`; `full` has all of it. Nothing for a run whose stage is not known.
  */
 export function runStage(run: FactoryRun): { label: string; full: string } | undefined {
@@ -490,7 +491,8 @@ export function runStage(run: FactoryRun): { label: string; full: string } | und
   }
   if (!run.step) return undefined;
   const step = stepWords[run.step] ?? `${run.step.charAt(0).toUpperCase()}${run.step.slice(1).replaceAll("-", " ")}`;
-  const label = run.gateRetries ? `${step} · gate retry ${run.gateRetries}` : step;
+  // The tries closed so far, passed or sent back, so a building run is on the next; past building the count says nothing.
+  const label = run.gateTries && run.step === "building" ? `${step} · gate attempt ${run.gateTries + 1}` : step;
   return { label, full: label };
 }
 

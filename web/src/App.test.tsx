@@ -1620,6 +1620,31 @@ describe("App", () => {
     expect(tab().getAttribute("data-changed")).toBeNull();
   });
 
+  it("marks an ended terminal's tab in a factory run's workspace once when the run's step moves, since its label says the stage", async () => {
+    const records = [...live.records, terminal(ME, "t3", "w1", "exited", { exit_code: 0 })];
+    const router = await open("/terminals/t3", { ...live, records });
+    const events = sockets("/api/events").at(-1)!;
+    const run = { run: "original-solutions__foundry__162__1", title: "t", step: "building", machine: ME, gate_retries_used: 0, minutes_used: 1, workspaces: ["w1"], sessions: ["s1"] };
+    const at = (step: string) => act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: { ...heldStatus(2), runs: [{ ...run, step }] } })));
+    at("building");
+    const ended = () => screen.getByRole("tab", { name: /^shell 2/ });
+    await waitFor(() => expect(ended().getAttribute("title")).toBe("fix login / shell 2: Building"));
+    fireEvent.click(screen.getByRole("tab", { name: /^sonnet/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+    expect(ended().getAttribute("data-changed")).toBeNull();
+
+    at("pr-open");
+    expect(ended().getAttribute("data-changed")).toBe("true");
+    expect(within(ended()).getByText("PR open")).toBeDefined();
+    fireEvent.click(ended());
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t3"));
+    fireEvent.click(screen.getByRole("tab", { name: /^sonnet/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+    // The same status again is no news.
+    at("pr-open");
+    expect(ended().getAttribute("data-changed")).toBeNull();
+  });
+
   it("slides in a card when a session you are not looking at finishes its turn, and its Open goes there", async () => {
     const router = await open("/terminals/t2", live);
     const events = sockets("/api/events").at(-1)!;

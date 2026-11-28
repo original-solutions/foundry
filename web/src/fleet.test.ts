@@ -659,15 +659,25 @@ describe("a factory run's stage", () => {
     expect([ended.label, ended.fullLabel]).toEqual(["Stuck · make check fails on main", undefined]);
   });
 
+  it("cuts a reason with no word break in its second half at the room itself", () => {
+    const stage = runStage({ run, held: "stuck", reason: "npm ERR! /Users/ci/work/foundry/web/node_modules/vite" })!;
+    expect(stage.label).toBe("Stuck · npm ERR! /Users/ci/work…");
+    expect(stage.label).toHaveLength(32);
+    expect(stage.full).toBe("Stuck · npm ERR! /Users/ci/work/foundry/web/node_modules/vite");
+  });
+
   it("says needs info with the reason's first line, and a run held up with no reason by its kind alone", () => {
     const info = factoryStatus("p1", {}, { [run]: { kind: "needs_info", workspaces: ["w1"], reason: "Which API version?\nThe issue names two." } });
     expect(runStage(factoryRuns(info)(workspaceIn(info))!)).toEqual({ label: "Needs info · Which API version?", full: "Needs info · Which API version?\nThe issue names two." });
     expect(runStage({ run, held: "stuck", reason: " " })).toEqual({ label: "Stuck", full: "Stuck" });
   });
 
-  it("says a live run's step in words, with the gate's failed tries while it builds", () => {
+  it("says a live run's step in words, with the gate attempt it is on while it builds", () => {
     expect(runStage({ run, step: "building" })?.label).toBe("Building");
-    expect(runStage({ run, step: "building", gateRetries: 2 })?.label).toBe("Building · gate retry 2");
+    // Two gate tries closed, failed or passed alike: it builds towards the third.
+    expect(runStage({ run, step: "building", gateTries: 2 })?.label).toBe("Building · gate attempt 3");
+    // Past building the count says nothing about the gate: a run whose gate passed first time has one.
+    expect(runStage({ run, step: "pr-open", gateTries: 1 })?.label).toBe("PR open");
     expect(runStage({ run, step: "pr-open" })?.label).toBe("PR open");
     expect(runStage({ run, step: "claimed" })?.label).toBe("Claimed");
     expect(runStage({ run, step: "triage" })?.label).toBe("Triage");
@@ -676,11 +686,11 @@ describe("a factory run's stage", () => {
     expect(runStage({ run })).toBeUndefined();
   });
 
-  it("carries a live run's step and gate retries from its status, and names its stage on its terminals that ended", () => {
+  it("carries a live run's step and gate tries from its status, and names its stage on its terminals that ended", () => {
     const statuses = factoryStatus("p1", { [run]: ["w1"] });
     statuses.p1.runs[0].gate_retries_used = 1;
-    expect(workspaceIn(statuses).factory).toMatchObject({ step: "building", gateRetries: 1 });
-    const building = "Building · gate retry 1";
+    expect(workspaceIn(statuses).factory).toMatchObject({ step: "building", gateTries: 1 });
+    const building = "Building · gate attempt 2";
     // A ready session or an open shell keeps its own state: the factory moves it, and its turn ending is news.
     expect(labels(statuses).map(([, label]) => label)).toEqual([building, "Working", "Needs you", "Ready", building, building, "Open"]);
   });

@@ -21,7 +21,7 @@ export interface Command {
 
 /** Somewhere the jump palette goes: an open terminal, a new shell in a workspace, a new workspace, or a view or action of the app. */
 export type Destination =
-  | { kind: "terminal"; key: string; terminal: string; title: string; subtitle?: string; label: string; glyph: Glyph; machine: string; words: string }
+  | { kind: "terminal"; key: string; terminal: string; title: string; subtitle?: string; label: string; fullLabel?: string; glyph: Glyph; machine: string; words: string }
   | { kind: "shell"; key: string; workspace: string; title: string; machine: string; words: string }
   | { kind: "workspace"; key: string; name: string; title: string; machine: string; words: string }
   | { kind: "command"; key: string; command: Command; title: string; machine: string; words: string };
@@ -33,10 +33,10 @@ export function destinations(machines: MachineView[], commands: Command[] = []):
   for (const machine of machines) {
     for (const w of machine.workspaces) {
       const where = `${w.name} ${w.project} ${branchOf(w)} ${machine.name}`;
-      const add = (terminal: string, name: string, label: string, glyph: Glyph, subtitle?: string) =>
-        open.push({ kind: "terminal", key: terminal, terminal, title: `${w.name} / ${name}`, subtitle, label, glyph, machine: machine.name, words: `${where} ${name} ${label} ${subtitle ?? ""}` });
-      // As the sidebar lists them, so a factory run's quiet session reads alike here.
-      for (const r of rows(w)) add(r.terminal, r.name, r.label, r.glyph, r.title);
+      const add = (terminal: string, name: string, label: string, glyph: Glyph, subtitle?: string, fullLabel?: string) =>
+        open.push({ kind: "terminal", key: terminal, terminal, title: `${w.name} / ${name}`, subtitle, label, ...(fullLabel && { fullLabel }), glyph, machine: machine.name, words: `${where} ${name} ${label} ${subtitle ?? ""}` });
+      // As the sidebar lists them, so a factory run's quiet session reads alike here, with a held-up run's whole reason for the tooltip.
+      for (const r of rows(w)) add(r.terminal, r.name, r.label, r.glyph, r.title, r.fullLabel);
       const title = `New shell in ${w.name}`;
       shells.push({ kind: "shell", key: `new-shell:${w.id}`, workspace: w.id, title, machine: machine.name, words: `${title} ${where}` });
     }

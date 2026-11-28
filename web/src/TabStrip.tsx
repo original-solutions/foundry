@@ -64,7 +64,7 @@ export function TabStrip({ workspace, machine, active, changed, apart = false }:
                   aria-selected={current}
                   data-changed={fresh ? "true" : undefined}
                   onDoubleClick={rename}
-                  title={`${workspace.name} / ${row.title ?? row.name}: ${row.label}`}
+                  title={`${workspace.name} / ${row.title ?? row.name}: ${row.fullLabel ?? row.label}`}
                   className={`flex h-7 min-w-0 max-w-[60vw] shrink-0 items-center gap-2 rounded-md px-2 text-xs md:max-w-72 ${
                     current ? "bg-neutral-800 text-neutral-100 ring-1 ring-neutral-700" : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
                   }`}

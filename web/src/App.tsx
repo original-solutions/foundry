@@ -247,7 +247,8 @@ function Layout() {
     if (landed) void navigate({ to: "/terminals/$terminalId", params: { terminalId: landed } });
   }, [landed, navigate]);
 
-  // Any workspace's terminals, so each side of a split marks its own tabs.
+  // Any workspace's terminals, so each side of a split marks its own tabs. A factory run's ended
+  // terminals say its stage, so a step change marks their tabs once: chosen, not missed.
   const changed = new Set(
     machines.flatMap((m) => m.workspaces.flatMap((w) => rows(w).flatMap((t) => (seen[t.terminal] !== undefined && seen[t.terminal] !== t.label ? [t.terminal] : [])))),
   );

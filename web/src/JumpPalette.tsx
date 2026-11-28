@@ -326,7 +326,11 @@ function Panel({
                       {d.kind === "terminal" && d.subtitle && <span className="block truncate text-xs text-neutral-500">{d.subtitle}</span>}
                       {d.kind === "command" && !wide && <span className="block truncate text-xs text-neutral-500">{d.command.about}</span>}
                     </span>
-                    {d.kind === "terminal" && <span className="shrink-0 text-xs text-neutral-400">{d.label}</span>}
+                    {d.kind === "terminal" && (
+                      <span title={d.fullLabel} className="shrink-0 text-xs text-neutral-400">
+                        {d.label}
+                      </span>
+                    )}
                     {d.kind === "command" && d.command.hint && (
                       <span className={`shrink-0 text-xs ${d.command.hint === "Here" ? "text-neutral-200" : "text-neutral-400"}`}>{d.command.hint}</span>
                     )}
