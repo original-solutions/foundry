@@ -42,20 +42,18 @@
 //! a tick that wrote an object ends with `git gc --auto` (see [`Lease::collect`]).
 
 use std::fmt;
-use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 
 use foundry_proto::ids::{MachineId, ProjectId};
-use nix::sys::signal::{Signal, killpg};
-use nix::unistd::Pid;
 use uuid::Uuid;
 
 use crate::clock::Clock;
+use crate::factory::process::{drain, kill_group};
 use crate::factory::worker::{Guard, LeaseLost};
 use crate::git_auth::GitAuth;
 
@@ -907,8 +905,8 @@ impl Lease {
             Ok(child) => child,
             Err(_) => return ended(Outcome::NotStarted),
         };
-        let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
+        let stdout = drain(child.stdout.take(), OUTPUT_LIMIT);
+        let stderr = drain(child.stderr.take(), OUTPUT_LIMIT);
         // The leader's exit does not end the call: a descendant may still hold the pipes.
         let mut status = None;
         loop {
@@ -938,7 +936,7 @@ impl Lease {
             }
             thread::sleep(POLL);
         }
-        let stdout = stdout.join().unwrap_or_default();
+        let (stdout, _) = stdout.join().unwrap_or_default();
         let _ = stderr.join();
         ended(Outcome::Exit {
             code: status.and_then(|status| status.code()),
@@ -1017,39 +1015,6 @@ fn pushed(outcome: &Outcome) -> Pushed {
         (_, Some('!')) => Pushed::Refused,
         _ => Pushed::Failed,
     }
-}
-
-/// Kills the child's process group and reaps the child. The leader may already be reaped when
-/// a descendant still holds a pipe; its id still names the group while any member is alive.
-fn kill_group(child: &mut Child) {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// Reads `pipe` to its end on a thread of its own, keeping at most [`OUTPUT_LIMIT`] bytes.
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut kept = Vec::new();
-        let Some(mut pipe) = pipe else {
-            return kept;
-        };
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            match pipe.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let room = OUTPUT_LIMIT.saturating_sub(kept.len());
-                    kept.extend_from_slice(&buf[..n.min(room)]);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-        kept
-    })
 }
 
 /// The guard of one [`Lease`]: it passes only while less than 120 seconds have passed since

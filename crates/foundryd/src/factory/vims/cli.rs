@@ -8,21 +8,20 @@
 //! `vims` and the fake alike.
 
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 
-use nix::sys::signal::{Signal, killpg};
-use nix::unistd::Pid;
 use serde_json::Value;
 
 use super::answer::{self, OpState};
 use super::{Call, Refusal, Vims, VimsError, one_line};
 use crate::clock::Clock;
+use crate::factory::process::{drain, kill_group};
 
 /// How long one `vims` call may run before it is killed.
 pub const LIMIT: Duration = Duration::from_secs(30);
@@ -290,8 +289,8 @@ impl VimsCli {
                 let _ = pipe.write_all(&bytes);
             });
         }
-        let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
+        let stdout = drain(child.stdout.take(), OUTPUT_LIMIT);
+        let stderr = drain(child.stderr.take(), OUTPUT_LIMIT);
         let mut status = None;
         loop {
             if status.is_none() {
@@ -334,42 +333,6 @@ impl Vims for VimsCli {
     fn call(&self, call: &Call) -> Result<String, VimsError> {
         finish(call, self.run(call))
     }
-}
-
-/// Kills the child's process group and reaps the child.
-// This and `drain` repeat `factory::github::gh` and `factory::lease`; #382 shares them.
-fn kill_group(child: &mut Child) {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// Reads `pipe` to its end on a thread of its own, keeping at most [`OUTPUT_LIMIT`] bytes, and
-/// says whether there was more.
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<(Vec<u8>, bool)> {
-    thread::spawn(move || {
-        let mut kept = Vec::new();
-        let mut over = false;
-        let Some(mut pipe) = pipe else {
-            return (kept, over);
-        };
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            match pipe.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let room = OUTPUT_LIMIT.saturating_sub(kept.len());
-                    kept.extend_from_slice(&buf[..n.min(room)]);
-                    over |= n > room;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-        (kept, over)
-    })
 }
 
 #[cfg(test)]
