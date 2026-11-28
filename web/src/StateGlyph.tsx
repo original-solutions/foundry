@@ -1,4 +1,5 @@
 import type { Glyph } from "./labels";
+import type { Row } from "./fleet";
 
 /**
  * Each glyph's shape on a 3 by 3 dot grid, row by row: `#` lit, `.` dim. Every shape differs,
@@ -82,5 +83,17 @@ export function StateGlyph({ glyph, still = false }: { glyph: Glyph; still?: boo
         );
       })}
     </svg>
+  );
+}
+
+/**
+ * A terminal's state in words: its `label`, with the uncut words on hover when the label cuts
+ * them (a factory run's reason), and no tooltip that only says the label again.
+ */
+export function StateLabel({ of, className }: { of: Pick<Row, "label" | "fullLabel">; className?: string }) {
+  return (
+    <span title={of.fullLabel === of.label ? undefined : of.fullLabel} className={className}>
+      {of.label}
+    </span>
   );
 }

@@ -388,8 +388,8 @@ export interface Located {
   /** A session's name, else its first prompt. */
   title?: string;
   label: string;
-  /** The label uncut, when it cuts its factory run's reason short: for a tooltip. */
-  fullLabel?: string;
+  /** The label uncut: all of a factory run's reason where `label` cuts it, else `label`. */
+  fullLabel: string;
   glyph: Glyph;
 }
 
@@ -397,7 +397,7 @@ export function locate(machines: MachineView[], id: string): Located | undefined
   for (const machine of machines) {
     for (const workspace of machine.workspaces) {
       const row = rows(workspace).find((r) => r.terminal === id);
-      if (row) return { machine, workspace, session: row.session, name: row.name, title: row.title, label: row.label, ...(row.fullLabel && { fullLabel: row.fullLabel }), glyph: row.glyph };
+      if (row) return { machine, workspace, session: row.session, name: row.name, title: row.title, label: row.label, fullLabel: row.fullLabel, glyph: row.glyph };
     }
   }
   return undefined;
@@ -426,8 +426,8 @@ export interface Row {
   /** What Claude said when its last turn ended, only once the session rests: idle or finished. */
   said?: string;
   label: string;
-  /** The label uncut, when it cuts its factory run's reason short: for a tooltip. */
-  fullLabel?: string;
+  /** The label uncut: all of a factory run's reason where `label` cuts it, else `label`. Shown on hover by `StateLabel`. */
+  fullLabel: string;
   glyph: Glyph;
 }
 
@@ -448,7 +448,7 @@ export function rows(workspace: WorkspaceView): Row[] {
   const run = workspace.factory;
   const stage = run && runStage(run);
   const told = (label: string, glyph: Glyph): Pick<Row, "label" | "fullLabel"> =>
-    run && stage && atRest(glyph, run) ? { label: stage.label, ...(stage.full !== stage.label && { fullLabel: stage.full }) } : { label };
+    run && stage && atRest(glyph, run) ? { label: stage.label, fullLabel: stage.full } : { label, fullLabel: label };
   return [
     ...workspace.sessions.map((s) => {
       const glyph = sessionGlyph[s.state];

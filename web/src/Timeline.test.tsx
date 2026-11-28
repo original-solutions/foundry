@@ -202,6 +202,27 @@ describe("Timeline", () => {
     expect(client.getQueryCache().findAll({ queryKey: ["trail", "s1"] })).toHaveLength(1);
   });
 
+  it("reads an ended session's trail again only when the session moves, not when its factory run's step does", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const client = new QueryClient();
+    const at = (step: string) => {
+      const statuses = factoryStatus("p1", { o__r__162__1: ["w1"] });
+      statuses.p1.runs[0].step = step;
+      return (
+        <QueryClientProvider client={client}>
+          <Timeline machines={withFactory(fleet(withS1("finished"), listed()), statuses)} traced={traced} onSteps={vi.fn()} />
+        </QueryClientProvider>
+      );
+    };
+    const view = render(at("building"));
+    await waitFor(() => expect(readsOf("s1")).toBe(1));
+    expect(within(lane(/^opus .*fix login/)).getByText("Building")).toBeDefined();
+    view.rerender(at("pr-open"));
+    expect(within(lane(/^opus .*fix login/)).getByText("PR open")).toBeDefined();
+    await wait(60_000);
+    expect(readsOf("s1")).toBe(1);
+  });
+
   it("keeps reading a working session after a failed read, at the back-off, and stops on a 404", async () => {
     refuse = { s1: 500 };
     await watch("working");

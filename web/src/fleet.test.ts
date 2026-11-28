@@ -470,13 +470,13 @@ describe("locate", () => {
 
   it("lists a workspace's terminals as rows, sessions first, each with its session, name, label and glyph", () => {
     expect(rows(machines[0].workspaces[0])).toEqual([
-      { terminal: "t1", session: "s1", name: "sonnet", label: "Needs you", glyph: "waiting" },
-      { terminal: "sh1", name: "shell", label: "Failed · exit 2", glyph: "failed" },
+      { terminal: "t1", session: "s1", name: "sonnet", label: "Needs you", fullLabel: "Needs you", glyph: "waiting" },
+      { terminal: "sh1", name: "shell", label: "Failed · exit 2", fullLabel: "Failed · exit 2", glyph: "failed" },
     ]);
   });
 
   it("orders rows by what needs a person first: waiting, stuck, failed, working, then the rest", () => {
-    const row = (terminal: string, glyph: Glyph) => ({ terminal, name: terminal, label: "", glyph });
+    const row = (terminal: string, glyph: Glyph) => ({ terminal, name: terminal, label: "", fullLabel: "", glyph });
     const all = ["done", "ready", "working", "away", "failed", "starting", "stuck", "waiting"].map((g) => row(g, g as Glyph));
     expect(byUrgency(all).map((r) => r.glyph)).toEqual(["waiting", "stuck", "failed", "working", "starting", "ready", "done", "away"]);
   });
@@ -650,13 +650,13 @@ describe("a factory run's stage", () => {
       ["sh3", short],
     ]);
     expect(rows(workspaceIn(statuses))[0].fullLabel).toBe(`Stuck · ${reason}`);
-    expect(rows(workspaceIn(statuses))[1].fullLabel).toBeUndefined();
+    expect(rows(workspaceIn(statuses))[1].fullLabel).toBe("Working");
   });
 
-  it("puts nothing beside a label that already says the whole reason", () => {
+  it("gives a label that already says the whole reason as its own uncut words", () => {
     const statuses = factoryStatus("p1", {}, { [run]: { kind: "stuck", workspaces: ["w1"], reason: "make check fails on main" } });
     const [ended] = rows(workspaceIn(statuses));
-    expect([ended.label, ended.fullLabel]).toEqual(["Stuck · make check fails on main", undefined]);
+    expect([ended.label, ended.fullLabel]).toEqual(["Stuck · make check fails on main", "Stuck · make check fails on main"]);
   });
 
   it("cuts a reason with no word break in its second half at the room itself", () => {
@@ -696,7 +696,9 @@ describe("a factory run's stage", () => {
   });
 
   it("leaves a workspace no run tends with its terminals' own labels", () => {
-    expect(rows(fleet(records(), settings())[0].workspaces[0]).map((r) => r.label)).toEqual(["Ended", "Working", "Needs you", "Ready", "Ended", "Failed · exit 2", "Open"]);
+    const own = rows(fleet(records(), settings())[0].workspaces[0]);
+    expect(own.map((r) => r.label)).toEqual(["Ended", "Working", "Needs you", "Ready", "Ended", "Failed · exit 2", "Open"]);
+    expect(own.every((r) => r.fullLabel === r.label)).toBe(true);
   });
 });
 

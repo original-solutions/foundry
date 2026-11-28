@@ -8,7 +8,7 @@ import { rows, type MachineView, type WorkspaceView } from "./fleet";
 import { couldNot, plural, words, type Glyph } from "./labels";
 import { button, dangerButton, Modal, primaryButton } from "./Modal";
 import { Named } from "./Now";
-import { glyphText, StateGlyph } from "./StateGlyph";
+import { glyphText, StateGlyph, StateLabel } from "./StateGlyph";
 
 /** The commits shown before the older ones are counted. */
 const SHOWN = 5;
@@ -159,9 +159,7 @@ export function ArchiveDialog({
                 <li key={r.terminal} className={`flex min-w-0 items-center gap-2.5 ${r.glyph === "done" || r.glyph === "away" ? "text-neutral-500" : "text-neutral-200"}`}>
                   <StateGlyph glyph={r.glyph} />
                   <Named name={r.name} title={r.title} />
-                  <span title={r.fullLabel} className={`shrink-0 text-xs ${glyphText[r.glyph]}`}>
-                    {r.label}
-                  </span>
+                  <StateLabel of={r} className={`shrink-0 text-xs ${glyphText[r.glyph]}`} />
                   {cut[r.glyph] && <span className="shrink-0 rounded bg-amber-400/15 px-1.5 text-[11px] text-amber-300">{cut[r.glyph]}</span>}
                 </li>
               ))}

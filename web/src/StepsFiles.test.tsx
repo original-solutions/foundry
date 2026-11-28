@@ -3,6 +3,7 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Changes, Mark } from "./api";
 import { GLANCE_EVERY } from "./ChangesPanel";
+import type { Glyph } from "./labels";
 import { StepsFiles } from "./StepsFiles";
 import { json, renderApp } from "./test-utils";
 
@@ -19,13 +20,13 @@ const changes: Changes = {
 
 /** The files view of a session in `w1`, with a button that changes the session's state, as a hook would. */
 function Moving() {
-  const [label, setLabel] = useState("Working");
+  const [glyph, setGlyph] = useState<Glyph>("working");
   return (
     <>
-      <button type="button" onClick={() => setLabel((now) => (now === "Working" ? "Needs you" : "Working"))}>
+      <button type="button" onClick={() => setGlyph((now) => (now === "working" ? "waiting" : "working"))}>
         change state
       </button>
-      <StepsFiles trail={trail} workspace="w1" label={label} />
+      <StepsFiles trail={trail} workspace="w1" glyph={glyph} />
     </>
   );
 }

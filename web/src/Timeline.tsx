@@ -5,7 +5,7 @@ import { rows, type MachineView } from "./fleet";
 import { addsSteps, busy, plural, type Glyph } from "./labels";
 import { Named } from "./Now";
 import { pollEvery } from "./poll";
-import { glyphText, StateGlyph } from "./StateGlyph";
+import { glyphText, StateGlyph, StateLabel } from "./StateGlyph";
 import { STEPS_EVERY, useNow } from "./StepsPanel";
 import { bars, heading, layers, placed, RANGES, sum, ticks, waits, type Bar, type Wait } from "./spans";
 import { ago, kindOf, tally, took } from "./trail";
@@ -39,8 +39,8 @@ interface Lane {
   workspace: string;
   glyph: Glyph;
   label: string;
-  /** The label uncut, when it cuts its factory run's reason short. */
-  fullLabel?: string;
+  /** The label uncut: all of a factory run's reason where `label` cuts it, else `label`. */
+  fullLabel: string;
   bars: Bar[];
   /** When its turns in the window stood waiting on you. */
   waits: Wait[];
@@ -88,7 +88,7 @@ export function Timeline({ machines, traced, onSteps }: { machines: MachineView[
       refetchInterval: pollEvery(STEPS_EVERY, addsSteps.includes(s.glyph)),
     })),
   });
-  useRereadOnChange(sessions.map((s) => `${s.session}=${s.label}`).join("\n"));
+  useRereadOnChange(sessions.map((s) => `${s.session}=${s.glyph}`).join("\n"));
   const from = now - range.ms;
   const lanes: Lane[] = sessions
     .map((s, i) => {
@@ -191,17 +191,18 @@ export function Timeline({ machines, traced, onSteps }: { machines: MachineView[
 }
 
 /**
- * Reads a session's trail again when its state changes (a hook arrived), given as `id=label`
- * lines; a session seen for the first time is read by its query already.
+ * Reads a session's trail again when its state changes (a hook arrived), given as `id=glyph`
+ * lines: the session's own state, not its label, which can say its factory run's stage. A
+ * session seen for the first time is read by its query already.
  */
 export function useRereadOnChange(states: string) {
   const client = useQueryClient();
   const last = useRef(new Map<string, string>());
   useEffect(() => {
     const next = new Map(states ? states.split("\n").map((line) => line.split("=", 2) as [string, string]) : []);
-    for (const [id, label] of next) {
+    for (const [id, state] of next) {
       const before = last.current.get(id);
-      if (before !== undefined && before !== label) void client.invalidateQueries({ queryKey: ["trail", id], exact: true });
+      if (before !== undefined && before !== state) void client.invalidateQueries({ queryKey: ["trail", id], exact: true });
     }
     last.current = next;
   }, [states, client]);
@@ -231,7 +232,7 @@ function LaneRow({
       <button
         type="button"
         onClick={() => onSteps(lane.terminal)}
-        title={`${named}: ${lane.fullLabel ?? lane.label}`}
+        title={`${named}: ${lane.fullLabel}`}
         className="flex min-w-0 items-center gap-2 py-1.5 pr-3 pl-4 text-left text-sm text-neutral-200"
       >
         <StateGlyph glyph={lane.glyph} />
@@ -240,10 +241,7 @@ function LaneRow({
             <Named name={lane.name} title={lane.title} />
           </span>
           <span className="block truncate text-[11px] text-neutral-500">
-            {lane.workspace} ·{" "}
-            <span title={lane.fullLabel} className={glyphText[lane.glyph]}>
-              {lane.label}
-            </span>
+            {lane.workspace} · <StateLabel of={lane} className={glyphText[lane.glyph]} />
             {waitingNow && <span className={glyphText[lane.glyph]}>{` for ${took(now - waitingNow.start)}`}</span>}
           </span>
         </span>

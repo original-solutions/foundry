@@ -11,7 +11,7 @@ import { loadUnfolded, saveUnfolded } from "./fold";
 import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { FactoryIcon, FactoryMark } from "./FactoryMark";
 import { MachineName } from "./Machines";
-import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
+import { glyphFill, glyphText, StateGlyph, StateLabel } from "./StateGlyph";
 import { ended } from "./ends";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { SessionNameField, useRenaming } from "./SessionName";
@@ -553,8 +553,8 @@ function Strip({ list, workspace, selected, onNavigate, tab }: { list: Row[]; wo
           <Link
             to="/terminals/$terminalId"
             params={{ terminalId: row.terminal }}
-            aria-label={`${row.name} ${row.fullLabel ?? row.label}`}
-            title={`${row.name}: ${row.fullLabel ?? row.label}`}
+            aria-label={`${row.name} ${row.fullLabel}`}
+            title={`${row.name}: ${row.fullLabel}`}
             aria-current={row.terminal === selected ? "true" : undefined}
             onClick={onNavigate}
             data-stop={row.terminal}
@@ -622,9 +622,7 @@ function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspa
           <span className="flex min-w-0 flex-1 items-baseline gap-2 leading-5">
             {/* Busy: the step takes the title's place on the line; the title stays for screen readers and the tooltip. */}
             <Named name={row.name} title={row.title} step={row.now} />{" "}
-            <span title={row.fullLabel} className={`shrink-0 text-xs ${ended ? "" : glyphText[row.glyph]}`}>
-              {row.label}
-            </span>
+            <StateLabel of={row} className={`shrink-0 text-xs ${ended ? "" : glyphText[row.glyph]}`} />
           </span>
         </Link>
       </TerminalMenu>

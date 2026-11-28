@@ -16,7 +16,7 @@ import type { Project } from "./api";
 import { FactoryMark } from "./FactoryMark";
 import { Composer, useCreateWorkspace } from "./Composer";
 import { plural, words, type Glyph } from "./labels";
-import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
+import { glyphFill, glyphText, StateGlyph, StateLabel } from "./StateGlyph";
 import { Named, Now } from "./Now";
 import { reply } from "./reply";
 import { Said } from "./Said";
@@ -397,9 +397,7 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
                 <span className="min-w-0 flex-1">
                   <span className="flex items-baseline gap-2 leading-5">
                     <Named name={row.name} title={row.title} />
-                    <span title={row.fullLabel} className={`shrink-0 text-xs ${glyphText[row.glyph]}`}>
-                      {row.label}
-                    </span>
+                    <StateLabel of={row} className={`shrink-0 text-xs ${glyphText[row.glyph]}`} />
                   </span>
                   {row.now && <Now step={row.now} />}
                 </span>

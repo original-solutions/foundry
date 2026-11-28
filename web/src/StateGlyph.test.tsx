@@ -1,7 +1,7 @@
 import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { Glyph } from "./labels";
-import { glyphFill, glyphText, shapes, StateGlyph } from "./StateGlyph";
+import { glyphFill, glyphText, shapes, StateGlyph, StateLabel } from "./StateGlyph";
 
 const glyphs: Glyph[] = ["starting", "working", "waiting", "ready", "done", "failed", "stuck", "away"];
 
@@ -53,5 +53,20 @@ describe("StateGlyph", () => {
     }
     const { container } = render(<StateGlyph glyph="ready" />);
     expect(container.querySelector("svg")?.getAttribute("class")).toContain("text-neutral-");
+  });
+});
+
+describe("StateLabel", () => {
+  it("shows the label, with the uncut words on hover only when the label cuts them", () => {
+    const { container } = render(
+      <>
+        <StateLabel of={{ label: "Stuck · gate red: make check…", fullLabel: "Stuck · gate red: make check fails on main" }} className="text-xs" />
+        <StateLabel of={{ label: "Working", fullLabel: "Working" }} />
+      </>,
+    );
+    const [cut, whole] = [...container.querySelectorAll("span")];
+    expect([cut.textContent, cut.getAttribute("title"), cut.className]).toEqual(["Stuck · gate red: make check…", "Stuck · gate red: make check fails on main", "text-xs"]);
+    // No tooltip that only says the label again.
+    expect([whole.textContent, whole.getAttribute("title")]).toEqual(["Working", null]);
   });
 });

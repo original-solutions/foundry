@@ -34,7 +34,7 @@ export function NextUp({ next, others, open }: { next: Needing; others: number; 
   const answered = open === "answered";
   const count = `${others} ${open === "needing" ? "more " : ""}${others === 1 ? "needs" : "need"} you`;
   // A factory run's whole reason: the strip has the room, and cuts it itself.
-  const asks = next.now?.text ?? next.fullLabel ?? next.label;
+  const asks = next.now?.text ?? next.fullLabel;
   return (
     <Link
       // A new element when it fills, so its glow plays once then.
