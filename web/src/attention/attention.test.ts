@@ -55,6 +55,14 @@ describe("byTodo", () => {
       ["a", "bc"],
       ["ab", "c"],
     ]);
+    expect(new Set(groups.map((group) => group.key)).size).toBe(2);
+  });
+
+  it("gives each group a key of its kind and todo, the same for the same pair", () => {
+    const [one, two] = byTodo([item("run_stuck:r1", "run_stuck", { todo: "same" }), item("gate_infra:r2", "gate_infra", { todo: "same" })]);
+    expect(one.key).not.toBe(two.key);
+    const [again] = byTodo([item("run_stuck:r9", "run_stuck", { todo: "same" })]);
+    expect(again.key).toBe(one.key);
   });
 
   it("gives a group the machine its items share, and none when they are on different machines", () => {

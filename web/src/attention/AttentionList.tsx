@@ -60,9 +60,9 @@ function Items({ items, folded }: { items: AttentionItem[]; folded: boolean }) {
         <ul className="max-h-[50vh] divide-y divide-neutral-800 overflow-y-auto border-t border-neutral-800">
           {byTodo(items).map((group) =>
             group.items.length === 1 ? (
-              <Single key={JSON.stringify([group.kind, group.todo])} item={group.items[0]} settling={settling} />
+              <Single key={group.key} item={group.items[0]} settling={settling} />
             ) : (
-              <Group key={JSON.stringify([group.kind, group.todo])} group={group} settling={settling} />
+              <Group key={group.key} group={group} settling={settling} />
             ),
           )}
         </ul>

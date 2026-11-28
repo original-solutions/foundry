@@ -65,6 +65,8 @@ export function heading(kind: string, count: number): string {
 
 /** The items of one kind that say the same thing to do, as one card. */
 export interface AttentionGroup {
+  /** Its kind and todo as one string, apart for every pair: the card's React key. */
+  key: string;
   kind: string;
   items: AttentionItem[];
   /** What to do, which every item of the group says. Never null from `byTodo`; nullable so a card can still say each item's own. */
@@ -84,7 +86,7 @@ export function byTodo(items: AttentionItem[]): AttentionGroup[] {
     const key = JSON.stringify([item.kind, item.todo]);
     const group = groups.get(key);
     if (group) group.items.push(item);
-    else groups.set(key, { kind: item.kind, items: [item], todo: item.todo, machine_name: null });
+    else groups.set(key, { key, kind: item.kind, items: [item], todo: item.todo, machine_name: null });
   }
   return [...groups.values()].map((group) => ({ ...group, machine_name: shared(group.items.map((item) => item.machine_name)) }));
 }

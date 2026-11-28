@@ -703,7 +703,7 @@ fn issue(run: &RunId) -> String {
 
 /// What to do about a run that stopped for `reason`, read before [`redact`]: a time limit leaves
 /// a branch the next attempt continues from while the issue text is unedited, and a session that
-/// waits for a person can be answered where it waits.
+/// waits for a person can be answered where it waits. Issue #398 gives each text word for word.
 fn run_stuck_todo(reason: &str) -> &'static str {
     if reason.starts_with(TIME_LIMIT) {
         "Check how far the run's branch got. To continue from it, move the issue to \
@@ -1874,11 +1874,17 @@ mod tests {
 
     #[test]
     fn a_run_stuck_on_a_waiting_session_says_to_open_the_session() {
-        assert_eq!(
-            stuck_todo(crate::factory::runs::building::SESSION_WAITING),
-            "Open the session to see what it is waiting for. Answer it there to finish by hand, \
-             or fix the cause and move the issue out of factory:stuck"
-        );
+        use crate::factory::runs::{Stop, building::SESSION_WAITING, recorded_reason};
+        let todo = "Open the session to see what it is waiting for. Answer it there to finish by \
+                    hand, or fix the cause and move the issue out of factory:stuck";
+        assert_eq!(stuck_todo(SESSION_WAITING), todo);
+        // The reason as the waiting path records it, with the session's question after it.
+        let asked = recorded_reason(&Stop {
+            reason: SESSION_WAITING.into(),
+            session_text: Some("Which login should I use?".into()),
+            ..Stop::default()
+        });
+        assert_eq!(stuck_todo(&asked), todo);
     }
 
     #[test]
