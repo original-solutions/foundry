@@ -221,6 +221,80 @@ describe("AttentionList", () => {
     expect(await screen.findByText("lease_lost")).toBeTruthy();
   });
 
+  const stuck = (issue: number): AttentionItem => ({
+    id: `run_stuck:tc__people-hub__${issue}__1`,
+    kind: "run_stuck",
+    machine: "m1",
+    machine_name: "trilogy-mac",
+    what: `The factory's run of tc/people-hub#${issue} is stuck: make check fails on main\nReportingEdgeTest > totals ${issue}`,
+    todo: "Read the factory's last comment on the issue, fix the cause, then move the issue out of factory:stuck",
+    terminal: null,
+  });
+
+  it("collapses items of one kind into one card that counts them and says their shared todo once", async () => {
+    const items = [stuck(1), stuck(2), stuck(3)];
+    lists = [[offline, ...items]];
+    await renderApp(<AttentionList />);
+    const list = await screen.findByRole("region", { name: "Needs attention" });
+    expect(within(list).getByRole("button", { name: /4 need attention/ })).toBeTruthy();
+    const card = within(list).getByRole("listitem", { name: "3 runs stuck" });
+    expect(within(card).getAllByText(items[0].todo)).toHaveLength(1);
+    expect(within(card).getAllByText("trilogy-mac")).toHaveLength(1);
+    for (const item of items) {
+      expect(within(card).getByRole("button", { name: item.what.split("\n")[0] })).toBeTruthy();
+      expect(within(card).queryByText(/ReportingEdgeTest/)).toBeNull();
+    }
+    expect(within(list).getByText(offline.what)).toBeTruthy();
+    expect(within(list).getByText("Machine offline")).toBeTruthy();
+  });
+
+  it("shows a grouped item's full what when its line is opened", async () => {
+    lists = [[stuck(1), stuck(2)]];
+    await renderApp(<AttentionList />);
+    const line = await screen.findByRole("button", { name: stuck(2).what.split("\n")[0] });
+    expect(line.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(line);
+    expect(line.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText(/ReportingEdgeTest > totals 2/)).toBeTruthy();
+    expect(screen.queryByText(/ReportingEdgeTest > totals 1/)).toBeNull();
+  });
+
+  it("says each grouped item's own todo and machine when they differ", async () => {
+    const one = { ...stuck(1), id: "foreign_claim:p__1", kind: "foreign_claim", what: "Issue #1 is claimed", todo: "Move it out of factory:ready" };
+    const two = { ...one, id: "foreign_claim:p__2", what: "Issue #2 is claimed", todo: "Move it out of factory:building", machine: "m3", machine_name: "build-box" };
+    lists = [[one, two]];
+    await renderApp(<AttentionList />);
+    const card = await screen.findByRole("listitem", { name: "2 foreign claims" });
+    expect(within(card).getByText("trilogy-mac")).toBeTruthy();
+    expect(within(card).getByText("build-box")).toBeTruthy();
+    expect(within(card).queryByText(one.todo)).toBeNull();
+    fireEvent.click(within(card).getByRole("button", { name: two.what }));
+    expect(within(card).getByText(two.todo)).toBeTruthy();
+    expect(within(card).queryByText(one.todo)).toBeNull();
+  });
+
+  it("keeps each grouped item's terminal and close button", async () => {
+    const other = { ...setupFailed, id: "setup_failed:w2", what: "The setup of /fix-login on trilogy-mac failed", terminal: "t8" };
+    lists = [[setupFailed, other], [other]];
+    await renderApp(<AttentionList />);
+    const card = await screen.findByRole("listitem", { name: "2 setups failed" });
+    expect(within(card).getAllByRole("link", { name: "Open terminal" }).map((link) => link.getAttribute("href"))).toEqual([
+      "/terminals/t9",
+      "/terminals/t8",
+    ]);
+    fireEvent.click(within(card).getAllByRole("button", { name: "Close terminal" })[0]);
+    await waitFor(() => expect(requests).toContainEqual({ url: "/api/terminals/t9/close", method: "POST" }));
+  });
+
+  it("names a run stuck item", async () => {
+    const one = { ...stuck(1), what: "The factory's run of tc/people-hub#1 is stuck: make check fails on main" };
+    lists = [[one]];
+    await renderApp(<AttentionList />);
+    expect(await screen.findByText("Run stuck")).toBeTruthy();
+    expect(screen.getByText(one.what)).toBeTruthy();
+    expect(screen.getByText(one.todo)).toBeTruthy();
+  });
+
   it("names a placement waiting item", async () => {
     lists = [[{ ...offline, id: "placement_waiting:r1", kind: "placement_waiting", terminal: null }]];
     await renderApp(<AttentionList />);

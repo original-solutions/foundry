@@ -11,7 +11,12 @@ export type AttentionKind =
   | "disk_low"
   | "placement_waiting"
   | "setting_overwritten"
-  | "update_refused";
+  | "update_refused"
+  | "run_stuck"
+  | "run_needs_info"
+  | "factory_idle"
+  | "foreign_claim"
+  | "gate_infra";
 
 /** One thing that needs a person, as `GET /api/attention` gives it. */
 export interface AttentionItem {
@@ -28,18 +33,61 @@ export interface AttentionItem {
   terminal: string | null;
 }
 
-export const kindLabel: Record<AttentionKind, string> = {
-  machine_offline: "Machine offline",
-  session_stuck: "Session stuck",
-  session_waiting: "Waiting for you",
-  session_failed: "Session failed",
-  setup_failed: "Setup failed",
-  gateway_unhealthy: "Gateway unhealthy",
-  disk_low: "Disk low",
-  placement_waiting: "Placement waiting",
-  setting_overwritten: "Setting overwritten",
-  update_refused: "Update refused",
+/** Each kind's name for one item, and for several after their count. */
+const kindName: Record<AttentionKind, [one: string, several: string]> = {
+  machine_offline: ["Machine offline", "machines offline"],
+  session_stuck: ["Session stuck", "sessions stuck"],
+  session_waiting: ["Waiting for you", "sessions waiting for you"],
+  session_failed: ["Session failed", "sessions failed"],
+  setup_failed: ["Setup failed", "setups failed"],
+  gateway_unhealthy: ["Gateway unhealthy", "gateways unhealthy"],
+  disk_low: ["Disk low", "machines low on disk"],
+  placement_waiting: ["Placement waiting", "placements waiting"],
+  setting_overwritten: ["Setting overwritten", "settings overwritten"],
+  update_refused: ["Update refused", "updates refused"],
+  run_stuck: ["Run stuck", "runs stuck"],
+  run_needs_info: ["Run needs info", "runs need info"],
+  factory_idle: ["Factory idle", "factories idle"],
+  foreign_claim: ["Foreign claim", "foreign claims"],
+  gate_infra: ["Gate could not run", "gates could not run"],
 };
+
+/** A card's heading for `count` items of `kind`: "Run stuck", "16 runs stuck", or the raw kind when this build has no name for it. */
+export function heading(kind: string, count: number): string {
+  const name = kindName[kind as AttentionKind] as [string, string] | undefined;
+  if (count === 1) return name?.[0] ?? kind;
+  return `${count} ${name?.[1] ?? kind}`;
+}
+
+/** The items of one kind, as one card. */
+export interface AttentionGroup {
+  kind: string;
+  items: AttentionItem[];
+  /** What to do, when every item says the same; null when they differ. */
+  todo: string | null;
+  /** The machine every item is on; null when they are on different machines. */
+  machine_name: string | null;
+}
+
+/**
+ * The items grouped by kind, in the order each kind first comes. Grouping is by kind only: two
+ * items of a kind are alike in what to do, whatever their free text says caused them.
+ */
+export function byKind(items: AttentionItem[]): AttentionGroup[] {
+  const groups = new Map<string, AttentionItem[]>();
+  for (const item of items) groups.set(item.kind, [...(groups.get(item.kind) ?? []), item]);
+  return [...groups].map(([kind, items]) => ({
+    kind,
+    items,
+    todo: shared(items.map((item) => item.todo)),
+    machine_name: shared(items.map((item) => item.machine_name)),
+  }));
+}
+
+const shared = (values: string[]) => (values.every((value) => value === values[0]) ? values[0] : null);
+
+/** The text up to its first line break. */
+export const firstLine = (text: string) => text.split("\n", 1)[0];
 
 /**
  * A session's question, stall or failure. The page already leads to each from its state (the strip
