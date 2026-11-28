@@ -3752,6 +3752,9 @@ mod tests {
             let before = rig.ledger.read(&run).unwrap().len();
             let report = rig.pass();
             assert_eq!(report.failed, None, "{report:?}");
+            // The gate in flight is polled, as the gate's: the resume step is not asked.
+            let said = said_of(&report, &run);
+            assert_eq!(said, vec!["gate: NotReady".to_string()], "{report:?}");
             assert_eq!(interruptions(&rig, &run), 0);
             assert_eq!(seen(&rig, &run).state, Some(State::Building));
             assert!(gating::gate_running(&rig.ledger.read(&run).unwrap()));
