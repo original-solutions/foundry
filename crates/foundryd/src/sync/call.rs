@@ -27,6 +27,7 @@
 //! by itself [`STOP_WITHIN`] after it asked, so an answer the link cannot take still stops B,
 //! and a [`Stop`] acts only once.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -261,6 +262,21 @@ impl Peers {
         lock(&self.inner.links)
             .get(&machine)
             .and_then(|open| open.values().map(|link| link.speak).max())
+    }
+
+    /// The protocol each machine with an open record link speaks (the newest, as [`speaks`]
+    /// reads it), and this machine at [`PROTOCOL`]. A machine with no link has no entry.
+    ///
+    /// [`speaks`]: Self::speaks
+    pub fn protocols(&self) -> BTreeMap<MachineId, u16> {
+        let mut protocols: BTreeMap<MachineId, u16> = lock(&self.inner.links)
+            .iter()
+            .filter_map(|(machine, open)| {
+                Some((*machine, open.values().map(|link| link.speak).max()?))
+            })
+            .collect();
+        protocols.insert(self.inner.me, PROTOCOL);
+        protocols
     }
 
     /// Waits until this machine holds `owner`'s records up to `version`, at most

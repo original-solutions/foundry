@@ -414,11 +414,28 @@ pub struct ForeignClaim {
     pub state: String,
 }
 
-/// The GitHub logins a machine holds a token for, and whether it has the `factory-build` skill.
+/// The GitHub logins a machine holds a token for, whether it has the `factory-build` skill, its
+/// default login, and which gateway keys it holds. Names only: no value is in the record.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineHeld {
     pub logins: Vec<String>,
     pub skill: bool,
+    /// The login `github default` names, when it names one. None from a machine that predates it.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Which gateway keys are set. None from a machine that predates it, and when the names could
+    /// not be read.
+    #[serde(default)]
+    pub gateway: Option<GatewayKeys>,
+}
+
+/// Which gateway keys a machine holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayKeys {
+    /// The gateway key is set.
+    pub key: bool,
+    /// The gateway management key is set.
+    pub management: bool,
 }
 
 /// The newest turn of a factory session, written by its machine.

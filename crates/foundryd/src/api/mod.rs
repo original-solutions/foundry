@@ -115,6 +115,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use foundry_proto::factory::MachineHeld;
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::messages::{PROTOCOL, UiMessage};
 use foundry_proto::settings::{SettingValue, SharedSettings};
@@ -573,11 +574,14 @@ async fn full_state_for(
     online: &BTreeSet<MachineId>,
 ) -> Result<(UiMessage, BTreeMap<MachineId, u64>), StoreError> {
     let (versions, records, settings) = api.peers.state_snapshot_for(online).await?;
+    let held = on_store(&api.store, |store| store.helds()).await?;
     let state = UiMessage::State {
         protocol: PROTOCOL,
         records,
         settings: shown(settings),
         online: Some(online.iter().copied().collect()),
+        held,
+        protocols: api.peers.protocols(),
     };
     Ok((state, versions))
 }
@@ -612,12 +616,15 @@ async fn events(
 }
 
 /// What the events socket has sent: the highest version per owner, the settings' `seq`,
-/// which machines were online, and the factory status believed of each project, with the
+/// which machines were online, the protocols the links spoke, what each machine held, and the
+/// factory status believed of each project, with the
 /// factory versions it was read at.
 struct Sent {
     versions: BTreeMap<MachineId, u64>,
     seq: u64,
     online: BTreeSet<MachineId>,
+    protocols: BTreeMap<MachineId, u16>,
+    held: BTreeMap<MachineId, MachineHeld>,
     factory: Believed,
 }
 
@@ -775,7 +782,7 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
                 Some(Ok(_)) => continue,
             },
         }
-        if api.peers.online() != sent.online {
+        if api.peers.online() != sent.online || api.peers.protocols() != sent.protocols {
             match send_state(api, &mut socket).await? {
                 Some(again) => sent = again,
                 None => return Ok(()),
@@ -783,11 +790,15 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
             continue;
         }
         let seen = sent.seq;
-        let (held, settings) = on_store(&api.store, move |store| {
-            Ok((store.versions()?, store.settings_since(Some(seen))?))
+        let (versions, settings, helds) = on_store(&api.store, move |store| {
+            Ok((
+                store.versions()?,
+                store.settings_since(Some(seen))?,
+                store.helds()?,
+            ))
         })
         .await?;
-        for (owner, version) in held {
+        for (owner, version) in versions {
             let from = sent.versions.get(&owner).copied().unwrap_or(0);
             if version <= from {
                 continue;
@@ -826,6 +837,20 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
                 return Ok(());
             }
         }
+        for (machine, held) in helds {
+            if sent.held.get(&machine) == Some(&held) {
+                continue;
+            }
+            let message = UiMessage::Held {
+                protocol: PROTOCOL,
+                machine,
+                held: held.clone(),
+            };
+            if !send(&mut socket, &message).await {
+                return Ok(());
+            }
+            sent.held.insert(machine, held);
+        }
         match send_factory(api, &mut socket, &mut sent.factory, sent.seq, &sent.online).await? {
             Factory::Sent => {}
             Factory::Closed => return Ok(()),
@@ -842,9 +867,14 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
 async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, StoreError> {
     let online = api.peers.online();
     let (state, versions) = full_state_for(api, &online).await?;
-    let seq = match &state {
-        UiMessage::State { settings, .. } => settings.seq,
-        _ => 0,
+    let (seq, protocols, held) = match &state {
+        UiMessage::State {
+            settings,
+            protocols,
+            held,
+            ..
+        } => (settings.seq, protocols.clone(), held.clone()),
+        _ => Default::default(),
     };
     if !send(socket, &state).await {
         return Ok(None);
@@ -858,6 +888,8 @@ async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, S
         versions,
         seq,
         online,
+        protocols,
+        held,
         factory,
     }))
 }

@@ -49,8 +49,6 @@ fn state_text(message: UiMessage) -> Option<String> {
             records,
             settings,
             online,
-            held: BTreeMap::new(),
-            protocols: BTreeMap::new(),
             ..
         } => Some(render(&records, &settings, online.as_deref())),
         _ => None,

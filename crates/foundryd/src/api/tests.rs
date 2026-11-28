@@ -837,10 +837,10 @@ async fn a_link_opening_sends_the_state_again_with_the_new_protocols() {
         .unwrap();
     let protocols = tokio::time::timeout(WAIT, async {
         loop {
-            if let UiMessage::State { protocols, .. } = next_message(&mut socket).await {
-                if protocols.contains_key(&peer) {
-                    return protocols;
-                }
+            if let UiMessage::State { protocols, .. } = next_message(&mut socket).await
+                && protocols.contains_key(&peer)
+            {
+                return protocols;
             }
         }
     })
@@ -2566,7 +2566,7 @@ async fn no_response_contains_a_secret() {
                 settings_frames += 1;
                 assert!(settings.projects.iter().any(|p| p.name == "late"));
             }
-            UiMessage::FactoryStatus { .. } => {}
+            UiMessage::FactoryStatus { .. } | UiMessage::Held { .. } => {}
         }
         said.push(text);
     }

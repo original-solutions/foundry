@@ -1,17 +1,18 @@
-//! The GitHub logins and the skill this machine holds.
+//! The GitHub logins, the skill and the gateway keys this machine holds.
 //!
-//! Every [`CHECK_EVERY`] this machine reads the logins it holds a token for and whether the
-//! `factory-build` skill is installed for the service user, and writes a [`MachineHeld`] record
-//! when either differs from what it last wrote, the first check at once. The age between checks
-//! is read on the sleep-counting clock of [`crate::clock`]. Only the names of the secrets are
-//! listed here: no token is read, and none is ever logged.
+//! Every [`CHECK_EVERY`] this machine reads the logins it holds a token for, its default login,
+//! which gateway keys are set, and whether the `factory-build` skill is installed for the
+//! service user, and writes a [`MachineHeld`] record when any differs from what it last wrote,
+//! the first check at once. The age between checks is read on the sleep-counting clock of
+//! [`crate::clock`]. Only the names of the secrets are listed, and the default login (which is no
+//! secret) is read: no token or key is read, and none is ever logged.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use foundry_proto::factory::{FactoryBody, FactoryRecord, MachineHeld};
+use foundry_proto::factory::{FactoryBody, FactoryRecord, GatewayKeys, MachineHeld};
 use foundry_proto::ids::MachineId;
 
 use crate::clock::Clock;
@@ -124,9 +125,16 @@ fn check(
     skill: Option<PathBuf>,
     last: Option<MachineHeld>,
 ) -> Result<MachineHeld, HeldError> {
+    let logins = secrets::github_logins(secrets)?;
     let held = MachineHeld {
-        logins: secrets::github_logins(secrets)?,
+        logins,
         skill: skill.is_some_and(|path| path.exists()),
+        default: secrets::github_default(secrets),
+        // A list that cannot be read says nothing of the keys.
+        gateway: secrets.names().ok().map(|names| GatewayKeys {
+            key: names.iter().any(|name| name == secrets::GATEWAY),
+            management: names.iter().any(|name| name == secrets::GATEWAY_MANAGEMENT),
+        }),
     };
     if last.as_ref() == Some(&held) {
         return Ok(held);
@@ -373,7 +381,12 @@ mod tests {
         let rig = rig();
         let first = version_after(&rig, None).await;
         assert_eq!(held(&rig).unwrap().default, None);
-        set_from(&*rig.secrets, "github:octocat", "ghp_held_eight\n".as_bytes()).unwrap();
+        set_from(
+            &*rig.secrets,
+            "github:octocat",
+            "ghp_held_eight\n".as_bytes(),
+        )
+        .unwrap();
         rig.secrets.set(secrets::GITHUB_DEFAULT, "octocat").unwrap();
 
         pass(&rig, CHECK_EVERY).await;
@@ -395,7 +408,12 @@ mod tests {
                 management: false
             })
         );
-        set_from(&*rig.secrets, "gateway-management", "sk-mgmt-unique\n".as_bytes()).unwrap();
+        set_from(
+            &*rig.secrets,
+            "gateway-management",
+            "sk-mgmt-unique\n".as_bytes(),
+        )
+        .unwrap();
 
         pass(&rig, CHECK_EVERY).await;
         assert!(version_after(&rig, first).await > first);

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::factory::{FactoryRecord, FactoryStatus};
+use crate::factory::{FactoryRecord, FactoryStatus, MachineHeld};
 use crate::ids::{MachineId, TerminalId};
 use crate::record::AnyRecord;
 use crate::settings::{Edit, EditId, Outcome, SharedSettings};
@@ -137,6 +137,12 @@ pub enum UiMessage {
         /// that predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         online: Option<Vec<MachineId>>,
+        /// What each machine holds, as the daemon has it.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        held: BTreeMap<MachineId, MachineHeld>,
+        /// The protocol each machine with an open link speaks, and the daemon itself.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        protocols: BTreeMap<MachineId, u16>,
     },
     /// One record changed.
     Record { protocol: u16, record: AnyRecord },
@@ -150,6 +156,12 @@ pub enum UiMessage {
         protocol: u16,
         status: FactoryStatus,
     },
+    /// What one machine holds changed.
+    Held {
+        protocol: u16,
+        machine: MachineId,
+        held: MachineHeld,
+    },
 }
 
 impl UiMessage {
@@ -158,7 +170,8 @@ impl UiMessage {
             Self::State { protocol, .. }
             | Self::Record { protocol, .. }
             | Self::Settings { protocol, .. }
-            | Self::FactoryStatus { protocol, .. } => *protocol,
+            | Self::FactoryStatus { protocol, .. }
+            | Self::Held { protocol, .. } => *protocol,
         }
     }
 }
