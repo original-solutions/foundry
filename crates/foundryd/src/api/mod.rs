@@ -7,8 +7,9 @@
 //!   machine holds and the protocol each linked machine speaks; a [`UiMessage::Held`] follows a
 //!   change to a machine's held record. When a machine goes offline or comes back, or the
 //!   protocols change, the whole state is sent again, so its sessions and terminals show as
-//!   unreachable or as they are. A held record this build cannot read is left out, with one
-//!   warning while it stays unreadable. The store is read every [`EVENTS_EVERY`], so a record written
+//!   unreachable or as they are. A held record this build cannot read is left out, and the others
+//!   are sent; each state read warns of the machines left out, and the socket warns again only
+//!   when that set changes. The store is read every [`EVENTS_EVERY`], so a record written
 //!   several times between two reads is sent once, at its newest version. A record this build
 //!   cannot read, one a newer build wrote before a rollback, leaves out its owner's changes up
 //!   to it, with a warning, and the socket goes on.
@@ -571,31 +572,57 @@ async fn on_store<T: Send + 'static>(
 
 // --- state and events ---
 
-/// The held records as one read left them: the factory versions the rows were read at, and the
-/// rows, or the error of a row this build cannot read.
+/// The held records as one read left them: the factory versions the rows were read at, the rows
+/// that could be read, and the machines whose row this build cannot read.
 type HeldRead = (
     BTreeMap<MachineId, u64>,
-    Result<BTreeMap<MachineId, MachineHeld>, StoreError>,
+    BTreeMap<MachineId, MachineHeld>,
+    BTreeSet<MachineId>,
 );
 
 /// The factory versions, then the held records, in one lock, so a write between the two reads
 /// shows as a newer version at the next read. A row this build cannot read, one a newer build
-/// wrote before a rollback, is no reason to fail what the UI is sent: it is left in the result.
-/// Any other error is returned.
+/// wrote before a rollback, is no reason to fail what the UI is sent, or to leave out the other
+/// machines': each machine's row is then read alone, and the machine of one that cannot be read
+/// is left out. Any other error is returned.
 fn read_helds(store: &mut Store) -> Result<HeldRead, StoreError> {
     let versions = store.factory_versions()?;
     match store.helds() {
-        Ok(helds) => Ok((versions, Ok(helds))),
-        Err(error @ StoreError::Json(_)) => Ok((versions, Err(error))),
+        Ok(helds) => Ok((versions, helds, BTreeSet::new())),
+        Err(StoreError::Json(_)) => {
+            let (mut helds, mut skipped) = (BTreeMap::new(), BTreeSet::new());
+            for &machine in versions.keys() {
+                match store.held(machine) {
+                    Ok(Some(held)) => {
+                        helds.insert(machine, held);
+                    }
+                    Ok(None) => {}
+                    Err(StoreError::Json(_)) => {
+                        skipped.insert(machine);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok((versions, helds, skipped))
+        }
         Err(error) => Err(error),
     }
 }
 
-/// What the state read of the held records: the factory versions they were read at, and whether
-/// a row could not be read.
+/// Warns of the machines whose held record is not sent, by id: no row's content is named.
+fn warn_held_skipped(skipped: &BTreeSet<MachineId>) {
+    let machines: Vec<String> = skipped.iter().map(ToString::to_string).collect();
+    tracing::warn!(
+        "api: what these machines hold is not sent, it cannot be read: {}",
+        machines.join(", ")
+    );
+}
+
+/// What the state read of the held records: the factory versions they were read at, and the
+/// machines whose record could not be read.
 struct HeldSeen {
     at: BTreeMap<MachineId, u64>,
-    unreadable: bool,
+    skipped: BTreeSet<MachineId>,
 }
 
 /// The full state as [`UiMessage::State`], the highest version it holds per owner, and what it
@@ -605,15 +632,10 @@ async fn full_state_for(
     online: &BTreeSet<MachineId>,
 ) -> Result<(UiMessage, BTreeMap<MachineId, u64>, HeldSeen), StoreError> {
     let (versions, records, settings) = api.peers.state_snapshot_for(online).await?;
-    let (at, held) = on_store(&api.store, read_helds).await?;
-    let unreadable = held.is_err();
-    let held = held.unwrap_or_else(|error| {
-        tracing::warn!(
-            "api: what machines hold is not sent: {}",
-            redact(&error.to_string())
-        );
-        BTreeMap::new()
-    });
+    let (at, held, skipped) = on_store(&api.store, read_helds).await?;
+    if !skipped.is_empty() {
+        warn_held_skipped(&skipped);
+    }
     let state = UiMessage::State {
         protocol: PROTOCOL,
         records,
@@ -622,7 +644,7 @@ async fn full_state_for(
         held,
         protocols: api.peers.protocols(),
     };
-    Ok((state, versions, HeldSeen { at, unreadable }))
+    Ok((state, versions, HeldSeen { at, skipped }))
 }
 
 async fn state(State(api): State<Api>) -> Result<Json<UiMessage>, ApiError> {
@@ -667,8 +689,9 @@ struct Sent {
     /// The factory versions the held records were last read at: they are read again when the
     /// versions differ.
     held_at: BTreeMap<MachineId, u64>,
-    /// A held record cannot be read, and has been warned of: not warned of again until it can.
-    held_unreadable: bool,
+    /// The machines whose held record cannot be read, and has been warned of: not warned of
+    /// again until the set changes.
+    held_skipped: BTreeSet<MachineId>,
     factory: Believed,
 }
 
@@ -886,25 +909,16 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
                 return Ok(());
             }
         }
-        if let Some((at, helds)) = helds {
+        if let Some((at, helds, skipped)) = helds {
             sent.held_at = at;
-            let helds = match helds {
-                Ok(helds) => {
-                    if std::mem::take(&mut sent.held_unreadable) {
-                        tracing::info!("api: what machines hold can be read again");
-                    }
-                    helds
+            if skipped != sent.held_skipped {
+                if skipped.is_empty() {
+                    tracing::info!("api: what machines hold can be read again");
+                } else {
+                    warn_held_skipped(&skipped);
                 }
-                Err(error) => {
-                    if !std::mem::replace(&mut sent.held_unreadable, true) {
-                        tracing::warn!(
-                            "api: what machines hold is not sent: {}",
-                            redact(&error.to_string())
-                        );
-                    }
-                    BTreeMap::new()
-                }
-            };
+                sent.held_skipped = skipped;
+            }
             for (machine, held) in helds {
                 if sent.held.get(&machine) == Some(&held) {
                     continue;
@@ -960,7 +974,7 @@ async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, S
         protocols,
         held,
         held_at: held_seen.at,
-        held_unreadable: held_seen.unreadable,
+        held_skipped: held_seen.skipped,
         factory,
     }))
 }
