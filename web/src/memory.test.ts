@@ -12,12 +12,12 @@ const records = [sample(ME, 3), workspace(ME, "w1", "fix login"), terminal(ME, "
 describe("memory", () => {
   it("keeps the fleet the daemon last sent in this browser, with when, and gives it back", () => {
     expect(recall()).toBeUndefined();
-    keep({ records, settings: settings(), synced: true }, 1_000);
+    keep({ records, settings: settings(), synced: true, held: {}, protocols: {} }, 1_000);
     expect(recall()).toEqual({ at: 1_000, records, settings: settings() });
   });
 
   it("keeps nothing before the first full state, when an empty list does not mean an empty fleet", () => {
-    keep({ records: [], settings: settings(), synced: false }, 1_000);
+    keep({ records: [], settings: settings(), synced: false, held: {}, protocols: {} }, 1_000);
     expect(localStorage.getItem(MEMORY_KEY)).toBeNull();
   });
 
@@ -37,7 +37,7 @@ describe("memory", () => {
     vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
       throw new Error("SecurityError");
     });
-    expect(() => keep({ records, settings: settings(), synced: true }, 1)).not.toThrow();
+    expect(() => keep({ records, settings: settings(), synced: true, held: {}, protocols: {} }, 1)).not.toThrow();
     expect(recall()).toBeUndefined();
   });
 });

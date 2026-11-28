@@ -344,15 +344,13 @@ describe("Factory", () => {
       expect(within(project).getByText("Nothing finished yet")).toBeDefined();
     });
 
-    it("folds the settings into one line until asked", async () => {
+    it("holds the settings as one line that links to Settings → Factory, with no form", async () => {
       await show(overview(), { p1: holding });
       expect(screen.queryByRole("form", { name: "Factory settings" })).toBeNull();
       expect(screen.getByText("opus · high effort · 2 runs at once · 3 gates at once · looks every 30s · feedback every 300s")).toBeDefined();
-      const open = screen.getByRole("button", { name: "Settings for every project" });
-      expect(open.getAttribute("aria-expanded")).toBe("false");
-      fireEvent.click(open);
-      expect(open.getAttribute("aria-expanded")).toBe("true");
-      expect(screen.getByRole("form", { name: "Factory settings" })).toBeDefined();
+      const link = screen.getByRole("link", { name: /Settings for every project/ });
+      expect(link.getAttribute("href")).toBe("/settings/factory");
+      expect(screen.queryByRole("button", { name: "Settings for every project" })).toBeNull();
     });
 
     it("says when claims are paused, for every project or for one", async () => {

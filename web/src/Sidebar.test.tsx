@@ -55,6 +55,13 @@ afterEach(() => {
 });
 
 describe("Sidebar", () => {
+  it("puts a gear link to Settings beside the theme button in the header", async () => {
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    const gear = screen.getByRole("link", { name: "Settings" });
+    expect(gear.getAttribute("href")).toBe("/settings");
+    expect(gear.parentElement).toBe(screen.getByRole("button", { name: /theme/ }).parentElement);
+  });
+
   it("marks each workspace with its project's face, so a long list reads by project", async () => {
     await renderApp(<Sidebar machines={machines()} {...props} />);
     const face = within(screen.getByRole("group", { name: "fix login" })).getByText("DE");

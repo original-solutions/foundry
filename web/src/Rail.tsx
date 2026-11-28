@@ -9,7 +9,7 @@ import { needing } from "./needing";
 import { railKey } from "./collapsed";
 import { PanelIcon } from "./Sidebar";
 import { loadDocked, saveDocked, SessionList } from "./SessionList";
-import { ThemeButton } from "./ThemeButton";
+import { SettingsLink, ThemeButton } from "./ThemeButton";
 
 interface Props {
   machines: MachineView[];
@@ -100,6 +100,7 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
           </RailButton>
           {alerts}
           <ThemeButton />
+          <SettingsLink />
         </div>
       </nav>
       {open && <SessionList machines={machines} selected={selected} docked={docked} onDock={dock} onPick={() => !docked && setOpen(false)} />}
