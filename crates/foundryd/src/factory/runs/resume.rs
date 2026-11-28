@@ -4848,6 +4848,32 @@ mod tests {
             assert!(create_calls(&rig).is_empty());
         }
 
+        /// A claim that must move, placed at a host, is refused as the fleet worker refuses a
+        /// host, naming its kind, before the move is recorded or anything is asked.
+        #[test]
+        fn a_moved_claim_placed_at_a_host_is_refused_naming_the_kind_and_records_nothing() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            claimed_not_built(&rig, &run);
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .build();
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::NeedsMachine(Placing::MovedClaim { .. })
+            ));
+            let before = resume_steps(&rig, &run);
+            let host = Target::Host(foundry_proto::factory::HostKind::Vims);
+            let Err(RunError::Worker(WorkerError::Failed(said))) = placed(&rig.ctx(), &run, host)
+            else {
+                panic!("a host is refused");
+            };
+            assert!(said.contains("vims"), "{said}");
+            assert_eq!(resume_steps(&rig, &run), before);
+            assert!(create_calls(&rig).is_empty());
+        }
+
         #[test]
         fn a_claims_target_unreachable_for_15_minutes_before_its_create_is_given_up() {
             let mut rig = Rig::new();
