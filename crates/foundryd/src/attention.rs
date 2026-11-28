@@ -1759,6 +1759,8 @@ mod tests {
             kind,
             reason: reason.into(),
             workspaces: vec![],
+            pr_url: None,
+            sessions: vec![],
         }
     }
 
@@ -1834,6 +1836,154 @@ mod tests {
         assert_eq!(world.of(Kind::RunNeedsInfo).len(), 1);
         world.status(world.peer, holding(project, 3, 8));
         assert!(world.of(Kind::RunNeedsInfo).is_empty());
+    }
+
+    /// A status with one stuck run of issue 12 that reports `pr_url` and ran in `sessions`.
+    fn stuck_with(world: &mut World, pr_url: Option<&str>, sessions: Vec<SessionId>) {
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        let mut held = held_up(12, HeldUpKind::Stuck, "no");
+        held.pr_url = pr_url.map(str::to_owned);
+        held.sessions = sessions;
+        status.held_up.push(held);
+        world.status(world.peer, status);
+    }
+
+    #[test]
+    fn a_run_stuck_or_needing_info_links_its_issue() {
+        let mut world = World::new();
+        stuck_with(&mut world, None, vec![]);
+        let items = world.of(Kind::RunStuck);
+        assert_eq!(
+            items[0].issue_url.as_deref(),
+            Some("https://github.com/o/foundry/issues/12")
+        );
+        assert_eq!(items[0].pr_url, None);
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status
+            .held_up
+            .push(held_up(14, HeldUpKind::NeedsInfo, "which login"));
+        world.status(world.peer, status);
+        assert_eq!(
+            world.of(Kind::RunNeedsInfo)[0].issue_url.as_deref(),
+            Some("https://github.com/o/foundry/issues/14")
+        );
+    }
+
+    #[test]
+    fn a_run_stuck_links_the_pull_request_it_reported() {
+        let mut world = World::new();
+        let url = "https://github.com/o/foundry/pull/40";
+        stuck_with(&mut world, Some(url), vec![]);
+        assert_eq!(world.of(Kind::RunStuck)[0].pr_url.as_deref(), Some(url));
+    }
+
+    #[test]
+    fn a_run_stuck_with_no_pull_request_links_none() {
+        let mut world = World::new();
+        stuck_with(&mut world, None, vec![]);
+        assert_eq!(world.of(Kind::RunStuck)[0].pr_url, None);
+    }
+
+    #[test]
+    fn a_pull_request_url_not_on_github_is_not_linked() {
+        for url in [
+            "https://evil.example/pull/1",
+            "javascript:alert(1)",
+            "http://github.com/o/r/pull/1",
+        ] {
+            let mut world = World::new();
+            stuck_with(&mut world, Some(url), vec![]);
+            assert_eq!(world.of(Kind::RunStuck)[0].pr_url, None, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_run_stuck_opens_the_terminal_of_its_session_while_it_is_open() {
+        let mut world = World::new();
+        let peer = world.peer;
+        let session = world.session(peer, SessionState::Working);
+        stuck_with(&mut world, None, vec![session.id]);
+        assert_eq!(world.of(Kind::RunStuck)[0].terminal, Some(session.terminal));
+    }
+
+    #[test]
+    fn a_run_stuck_takes_the_first_session_that_has_an_open_terminal() {
+        let mut world = World::new();
+        let peer = world.peer;
+        let gone = SessionId::random();
+        let closed = world.session(peer, SessionState::Working);
+        world.terminal(peer, closed.terminal, closed.workspace, None, true);
+        let open = world.session(peer, SessionState::Working);
+        stuck_with(&mut world, None, vec![gone, closed.id, open.id]);
+        assert_eq!(world.of(Kind::RunStuck)[0].terminal, Some(open.terminal));
+    }
+
+    #[test]
+    fn a_run_stuck_has_no_terminal_when_its_session_record_is_missing_or_deleted_or_closed() {
+        let mut world = World::new();
+        stuck_with(&mut world, None, vec![SessionId::random()]);
+        assert_eq!(world.of(Kind::RunStuck)[0].terminal, None);
+
+        let mut world = World::new();
+        let peer = world.peer;
+        let session = world.session(peer, SessionState::Working);
+        world.terminal(peer, session.terminal, session.workspace, None, true);
+        stuck_with(&mut world, None, vec![session.id]);
+        assert_eq!(world.of(Kind::RunStuck)[0].terminal, None);
+
+        let mut world = World::new();
+        let peer = world.peer;
+        let session = world.session(peer, SessionState::Working);
+        world.put_session(peer, session.clone(), true);
+        stuck_with(&mut world, None, vec![session.id]);
+        assert_eq!(world.of(Kind::RunStuck)[0].terminal, None);
+    }
+
+    #[test]
+    fn a_run_needing_info_opens_its_terminal_and_links_its_pull_request() {
+        let mut world = World::new();
+        let peer = world.peer;
+        let session = world.session(peer, SessionState::Working);
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        let mut held = held_up(14, HeldUpKind::NeedsInfo, "which login");
+        held.pr_url = Some("https://github.com/o/foundry/pull/9".into());
+        held.sessions = vec![session.id];
+        status.held_up.push(held);
+        world.status(peer, status);
+        let item = &world.of(Kind::RunNeedsInfo)[0];
+        assert_eq!(item.terminal, Some(session.terminal));
+        assert_eq!(
+            item.pr_url.as_deref(),
+            Some("https://github.com/o/foundry/pull/9")
+        );
+    }
+
+    #[test]
+    fn a_gate_infra_item_links_its_issue_and_other_kinds_link_nothing() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.gate_infra.push(run(30));
+        world.status(world.peer, status);
+        let item = &world.of(Kind::GateInfra)[0];
+        assert_eq!(
+            item.issue_url.as_deref(),
+            Some("https://github.com/o/foundry/issues/30")
+        );
+        assert_eq!(item.pr_url, None);
+        let mut world = World::new();
+        world.online.remove(&world.peer);
+        let item = &world.of(Kind::MachineOffline)[0];
+        assert_eq!((&item.issue_url, &item.pr_url), (&None, &None));
+        let json = serde_json::to_value(item).unwrap();
+        assert!(
+            json["issue_url"].is_null() && json["pr_url"].is_null(),
+            "{json}"
+        );
     }
 
     // factory idle

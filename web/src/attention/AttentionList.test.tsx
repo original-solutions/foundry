@@ -12,6 +12,8 @@ const waiting: AttentionItem = {
   what: "A session in fix login on trilogy-mac is waiting for you",
   todo: "Open its terminal and answer it",
   terminal: "t1",
+  issue_url: null,
+  pr_url: null,
 };
 
 const offline: AttentionItem = {
@@ -22,6 +24,8 @@ const offline: AttentionItem = {
   what: "build-box has not been heard from for 15 seconds",
   todo: "Check that it is on, on the tailnet and running foundryd",
   terminal: null,
+  issue_url: null,
+  pr_url: null,
 };
 
 const overwritten: AttentionItem = {
@@ -32,6 +36,8 @@ const overwritten: AttentionItem = {
   what: "Two sides of a split both edited the project foundry; the edit made on this-mac was replaced",
   todo: "Check it holds what you want, then dismiss this",
   terminal: null,
+  issue_url: null,
+  pr_url: null,
 };
 
 const setupFailed: AttentionItem = {
@@ -42,6 +48,8 @@ const setupFailed: AttentionItem = {
   what: "The setup of /factory-build on trilogy-mac failed (exit code 101)",
   todo: "Read its setup terminal, fix the workspace by hand, then close that terminal",
   terminal: "t9",
+  issue_url: null,
+  pr_url: null,
 };
 
 type Request = { url: string; method: string };
@@ -229,6 +237,46 @@ describe("AttentionList", () => {
     what: `The factory's run of tc/people-hub#${issue} is stuck: make check fails on main\nReportingEdgeTest > totals ${issue}`,
     todo: "Read the factory's last comment on the issue, fix the cause, then move the issue out of factory:stuck",
     terminal: null,
+    issue_url: null,
+    pr_url: null,
+  });
+
+  const issue = (n: number) => `https://github.com/tc/people-hub/issues/${n}`;
+  const pull = (n: number) => `https://github.com/tc/people-hub/pull/${n}`;
+
+  it("links a run stuck item to its issue, its pull request and its terminal, in that order", async () => {
+    lists = [[{ ...stuck(7), issue_url: issue(7), pr_url: pull(70), terminal: "t7" }]];
+    await renderApp(<AttentionList />);
+    const links = await screen.findAllByRole("link");
+    expect(links.map((link) => link.textContent)).toEqual(["Issue", "Pull request", "Open terminal"]);
+    expect(links[0].getAttribute("href")).toBe(issue(7));
+    expect(links[1].getAttribute("href")).toBe(pull(70));
+    expect(links[2].getAttribute("href")).toBe("/terminals/t7");
+    for (const link of links.slice(0, 2)) {
+      expect(link.getAttribute("target")).toBe("_blank");
+      expect(link.getAttribute("rel")).toBe("noreferrer");
+    }
+  });
+
+  it("shows only the Issue link when the item has no pull request or terminal", async () => {
+    lists = [[{ ...stuck(7), issue_url: issue(7) }]];
+    await renderApp(<AttentionList />);
+    expect((await screen.findByRole("link", { name: "Issue" })).getAttribute("href")).toBe(issue(7));
+    expect(screen.queryByRole("link", { name: "Pull request" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "Open terminal" })).toBeNull();
+  });
+
+  it("shows each grouped run's own links", async () => {
+    lists = [
+      [
+        { ...stuck(1), issue_url: issue(1), pr_url: pull(10) },
+        { ...stuck(2), issue_url: issue(2) },
+      ],
+    ];
+    await renderApp(<AttentionList />);
+    const card = await screen.findByRole("listitem", { name: "2 runs stuck" });
+    expect(within(card).getAllByRole("link", { name: "Issue" }).map((link) => link.getAttribute("href"))).toEqual([issue(1), issue(2)]);
+    expect(within(card).getAllByRole("link", { name: "Pull request" }).map((link) => link.getAttribute("href"))).toEqual([pull(10)]);
   });
 
   it("collapses items of one kind into one card that counts them and says their shared todo once", async () => {

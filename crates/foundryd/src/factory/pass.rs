@@ -5246,6 +5246,8 @@ mod tests {
                     kind: HeldUpKind::Stuck,
                     reason: "the gate failed 3 times".into(),
                     workspaces: vec![workspace_of(5, 1)],
+                    pr_url: None,
+                    sessions: vec![],
                 }]
             );
         }
@@ -5263,6 +5265,8 @@ mod tests {
                     kind: HeldUpKind::NeedsInfo,
                     reason: "Which login?".into(),
                     workspaces: vec![workspace_of(5, 1)],
+                    pr_url: None,
+                    sessions: vec![],
                 }]
             );
         }
@@ -5285,6 +5289,8 @@ mod tests {
                     kind: HeldUpKind::Stuck,
                     reason: "the gate failed 3 times".into(),
                     workspaces: vec![],
+                    pr_url: None,
+                    sessions: vec![],
                 }]
             );
         }
@@ -5312,6 +5318,123 @@ mod tests {
             assert_eq!(held.len(), 1, "{held:?}");
             assert_eq!(held[0].run, run);
             assert_eq!(held[0].workspaces, vec![workspace_of(5, 1)]);
+        }
+
+        const PR: &str = "https://github.com/o/foundry/pull/40";
+        const FINISHED_PR: &str = "https://github.com/o/foundry/pull/41";
+
+        fn thread_of(issue: u64) -> SessionId {
+            SessionId(uuid::Uuid::from_u128(0xd000 + u128::from(issue)))
+        }
+
+        /// A stuck run of `issue` that launched [`thread_of`] and, when `opened`, reported
+        /// [`PR`]; when `finished` it ended with `finished_pr` on its `finished` event.
+        fn stuck_run_reporting(
+            rig: &Rig,
+            issue: u64,
+            opened: bool,
+            finished: Option<Option<&str>>,
+        ) -> RunId {
+            let run = rig.run_in(issue, 1, State::Building);
+            let cause = Cause::new(CauseStep::Start, "test");
+            let mut events = vec![
+                Event::StepChanged {
+                    step: format!("workspace-created {}", workspace_of(issue, 1)),
+                },
+                Event::SessionLaunched {
+                    thread_id: thread_of(issue).to_string(),
+                    worktree: None,
+                    branch: Some(format!("fac/{issue}-1")),
+                    model_instance: None,
+                    model: None,
+                    model_options: None,
+                    resumed_from: None,
+                    base: Some("main".into()),
+                    title: None,
+                },
+            ];
+            if opened {
+                events.push(Event::PrOpened {
+                    pr: 40,
+                    url: PR.into(),
+                });
+            }
+            events.push(Event::StateChanged {
+                from: State::Building,
+                to: State::Stuck,
+            });
+            if let Some(pr_url) = finished {
+                events.push(Event::Stuck {
+                    reason: "no".into(),
+                    branch: None,
+                    commits_ahead: None,
+                });
+                events.push(Event::Finished {
+                    outcome: Outcome::Stuck,
+                    total_ms: 0,
+                    gate_attempts: 0,
+                    review_cycles: None,
+                    pr_url: pr_url.map(str::to_owned),
+                    pr_end: None,
+                });
+            }
+            for event in events {
+                rig.ledger.write(&run, &event, &cause).unwrap();
+            }
+            run
+        }
+
+        fn held_of(rig: &mut Rig, issue: u64) -> HeldUp {
+            rig.hub.issue(issue, &["factory:stuck"]);
+            rig.pass();
+            let held = rig.status().held_up;
+            assert_eq!(held.len(), 1, "{held:?}");
+            held.into_iter().next().unwrap()
+        }
+
+        #[test]
+        fn a_live_stuck_run_names_its_pull_request_and_session() {
+            let mut rig = Rig::new();
+            stuck_run_reporting(&rig, 5, true, None);
+            let held = held_of(&mut rig, 5);
+            assert_eq!(held.pr_url.as_deref(), Some(PR));
+            assert_eq!(held.sessions, vec![thread_of(5)]);
+        }
+
+        #[test]
+        fn a_live_stuck_run_that_reported_no_pull_request_names_none() {
+            let mut rig = Rig::new();
+            stuck_run_reporting(&rig, 5, false, None);
+            let held = held_of(&mut rig, 5);
+            assert_eq!(held.pr_url, None);
+            assert_eq!(held.sessions, vec![thread_of(5)]);
+        }
+
+        #[test]
+        fn a_finished_stuck_run_names_its_pull_request_and_session() {
+            let mut rig = Rig::new();
+            stuck_run_reporting(&rig, 5, true, Some(Some(FINISHED_PR)));
+            let held = held_of(&mut rig, 5);
+            assert_eq!(held.pr_url.as_deref(), Some(PR), "the events win");
+            assert_eq!(held.sessions, vec![thread_of(5)]);
+        }
+
+        #[test]
+        fn a_finished_stuck_run_with_no_reported_pull_request_falls_back_to_its_finished_one() {
+            let mut rig = Rig::new();
+            stuck_run_reporting(&rig, 5, false, Some(Some(FINISHED_PR)));
+            let held = held_of(&mut rig, 5);
+            assert_eq!(held.pr_url.as_deref(), Some(FINISHED_PR));
+            assert_eq!(held.sessions, vec![thread_of(5)]);
+        }
+
+        #[test]
+        fn a_finished_stuck_run_with_no_pull_request_at_all_names_none() {
+            let mut rig = Rig::new();
+            stuck_run_reporting(&rig, 5, false, Some(None));
+            let held = held_of(&mut rig, 5);
+            assert_eq!(held.pr_url, None);
+            assert_eq!(held.sessions, vec![thread_of(5)]);
         }
 
         /// A machine the builder's runs move to in a round.
@@ -5718,6 +5841,8 @@ mod tests {
                     kind: HeldUpKind::Stuck,
                     reason: "the gate failed 3 times".into(),
                     workspaces: vec![workspace_of(300, 1)],
+                    pr_url: None,
+                    sessions: vec![],
                 }]
             );
         }

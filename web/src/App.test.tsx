@@ -187,6 +187,8 @@ describe("App", () => {
     what: "this-mac has 2 GB of disk free",
     todo: "Free some disk, or archive workspaces you are done with",
     terminal: null,
+    issue_url: null,
+    pr_url: null,
   };
   const held = {
     id: "r1",
