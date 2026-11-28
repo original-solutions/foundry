@@ -6,11 +6,18 @@ use std::io::Read;
 use std::process::Child;
 use std::thread::{self, JoinHandle};
 
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+
 /// Kills the child's process group and reaps the child. The leader may already be reaped when
 /// a descendant still holds a pipe; its id still names the group while any member is alive,
 /// which an unfinished reader means unless the holder left the group.
 pub fn kill_group(child: &mut Child) {
-    let _ = child;
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Reads `pipe` to its end on a thread of its own, keeping at most `limit` bytes, and says
@@ -19,8 +26,27 @@ pub fn drain<R: Read + Send + 'static>(
     pipe: Option<R>,
     limit: usize,
 ) -> JoinHandle<(Vec<u8>, bool)> {
-    let _ = (pipe, limit);
-    thread::spawn(|| (Vec::new(), false))
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut over = false;
+        let Some(mut pipe) = pipe else {
+            return (kept, over);
+        };
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = limit.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                    over |= n > room;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        (kept, over)
+    })
 }
 
 #[cfg(test)]
@@ -34,8 +60,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use nix::sys::signal::{Signal, kill, killpg};
-    use nix::unistd::Pid;
+    use nix::sys::signal::kill;
 
     use super::*;
 
