@@ -6981,10 +6981,11 @@ mod tests {
             assert_eq!(rig.worker.calls(), vec![archived_call()]);
         }
 
-        /// A gate in flight on a machine that is not gone is still at work there: it is left
-        /// to the gate's own rules, holding its slot, and the run is interrupted all the same.
+        /// A gate in flight on a machine that is not gone may still run its commands there,
+        /// and nothing reads it while the run is the resume's: it is marked could not run, as
+        /// the interruption stopped it, and archived by force, so it holds no slot unread.
         #[test]
-        fn a_gate_in_flight_on_a_machine_that_is_not_gone_is_left_to_the_gates_own_rules() {
+        fn a_gate_in_flight_on_a_machine_that_is_not_gone_is_stopped_and_could_not_run() {
             let (mut rig, run) = reported();
             rig.step(
                 &run,
@@ -6993,14 +6994,27 @@ mod tests {
             rig.step(&run, &format!("gate-created 1 {}", gate_workspace()));
             rig.view = at_work(UNREACHABLE_FOR);
             pass_one(&rig, &run);
-            assert_eq!(interruptions(&rig, &run).len(), 1);
-            assert!(gate_running(&rig.events(&run)));
-            assert!(
-                !rig.steps(&run)
-                    .iter()
-                    .any(|step| step.starts_with(GATE_COULD_NOT_RUN))
+            let events = rig.events(&run);
+            assert!(!gate_running(&events));
+            let expected = format!("{GATE_COULD_NOT_RUN}1 1 1 1 {GATE_CUT_OFF}");
+            let could_not_run = events
+                .iter()
+                .position(|e| step_text(e) == Some(expected.as_str()))
+                .expect("the gate could not run");
+            let interrupted = events
+                .iter()
+                .position(|e| e.event == "session_interrupted")
+                .expect("the interruption");
+            assert!(could_not_run < interrupted);
+            assert_eq!(
+                rig.worker.calls(),
+                vec![
+                    Call::Archive {
+                        workspace: gate_workspace()
+                    },
+                    archived_call()
+                ]
             );
-            assert_eq!(rig.worker.calls(), vec![archived_call()]);
         }
 
         /// The gate's failures to run are counted for the attempt in flight, as the gate counts
@@ -7082,6 +7096,40 @@ mod tests {
                 ResumeStep::Archiving { resumes: 2, .. }
             ));
             assert_eq!(interruptions(&rig, &run).len(), 2);
+        }
+
+        /// The resumed session's `FACTORY-DONE` for the same pull request writes no second
+        /// `pr_opened` (building writes it once per hand-off), only the turn read: once a turn
+        /// of the resumed session is read, the run is the gate's again.
+        #[test]
+        fn a_resumed_session_whose_turn_is_read_is_the_gates() {
+            let (mut rig, run) = resumed_after_cut_off();
+            rig.step(&run, "turn-read 1");
+            rig.view = resumed_in(SessionState::Failed);
+            assert!(!takes_from_the_gate(&rig.ctx(), &rig.events(&run)));
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+        }
+
+        /// A stuck path this step began for a cut-off run (its resumes used) stays this step's
+        /// to finish once the fleet no longer shows the session cut off.
+        #[test]
+        fn a_stuck_path_begun_for_a_cut_off_run_stays_the_resume_steps() {
+            let (mut rig, run) = reported();
+            rig.config.limits.interruption_resumes = 0;
+            rig.view = at_work(UNREACHABLE_FOR);
+            rig.sim.fail("could not finish this issue", 1);
+            assert!(advance(&rig.ctx(), &run).is_err());
+            assert!(interruptions(&rig, &run).is_empty());
+            rig.view = archived();
+            assert!(takes_from_the_gate(&rig.ctx(), &rig.events(&run)));
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Stuck {
+                    reason: MACHINE_UNREACHABLE.into()
+                }
+            );
         }
 
         /// Once the resumed session reports its pull request again, the gate has the run.
