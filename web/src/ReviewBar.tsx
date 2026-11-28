@@ -22,7 +22,7 @@ export function useLeaveGuard(dirty: boolean) {
  * 3 → 4 · Discard · Save 2 changes". Hidden while nothing changed. Save runs `onSave` and shows
  * each refusal it answers beside its change, or beside Save when it names none. `stale` names the
  * fields that changed elsewhere since they were edited: their rows say so, and Save reads "Look
- * again" and sends nothing until it has been pressed once more; a field that goes stale again, or another one, asks again.
+ * again" and sends nothing until it has been pressed once more. With `onLook`, which lets the page stop marking what was looked at, a field that goes stale again, or another one, asks again; without it the look holds while the same fields are stale.
  */
 export function ReviewBar({
   changes,
