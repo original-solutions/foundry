@@ -2161,6 +2161,22 @@ describe("App", () => {
     expect(calls).toEqual([]);
   });
 
+  it("renames a session from the rail's sessions list in its tab, the sidebar's row being hidden", async () => {
+    const calls = mockActions();
+    await open("/", live);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+
+    fireEvent.contextMenu(within(screen.getByRole("region", { name: "Sessions" })).getByRole("link", { name: /^fix login \/ sonnet/ }));
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Rename" }));
+
+    const tabs = await screen.findByRole("tablist", { name: "Terminals in fix login" });
+    expect(await within(tabs).findByRole("textbox", { name: "Session name" })).toBeDefined();
+    // The floating list closed as the terminal opened, so it does not cover the tab being renamed.
+    expect(screen.queryByRole("region", { name: "Sessions" })).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
   it("opens a workspace's changes at a file its terminal names, on ⌘-click", async () => {
     const login = { path: "src/login.ts", from: null, status: "modified", added: 1, removed: 0, uncommitted: true, patch: "@@ -1 +1,2 @@\n a\n+b" };
     const named = { base: "main", commits: [], files: [{ ...login, path: "README.md" }, login] };

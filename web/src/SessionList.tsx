@@ -152,8 +152,9 @@ export function SessionList({ machines, selected, docked, focus, onDock, onPick 
 function SessionRow({ row, workspace, machine, current, onPick }: { row: Row; workspace: WorkspaceView; machine?: string; current: boolean; onPick: () => void }) {
   const name = `${workspace.name} / ${row.name}: ${row.label}`;
   const quiet = row.glyph === "done" || row.glyph === "away";
+  // No place for the menu: its Rename opens the terminal and edits the name in its tab, since the sidebar's row is not shown beside the rail.
   return (
-    <TerminalMenu id={row.terminal} place="row">
+    <TerminalMenu id={row.terminal}>
       <Link
         to="/terminals/$terminalId"
         params={{ terminalId: row.terminal }}

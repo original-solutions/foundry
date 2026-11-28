@@ -199,7 +199,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
         {machines.map((machine) => {
           const ids = machine.workspaces.map((w) => w.id);
           const allFolded = ids.length > 0 && ids.every((id) => !unfolded.has(id));
-          // Each workspace's own Clear N ended for the whole machine, failed shells too (the PR's design), though the Sessions list files those under Needs you.
+          // Each workspace's own Clear N ended for the whole machine, so failed shells count too, though the Sessions list files them under Needs you.
           const over = machine.workspaces.flatMap(ended);
           return (
             <section key={machine.id} aria-label={machine.name} className="space-y-2">

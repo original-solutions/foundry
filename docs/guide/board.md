@@ -168,9 +168,9 @@ On the rail, from the top:
 - **Jump to** and **New task**.
 - At the bottom, **Expand sidebar**, the bell, the theme switch and **Settings**.
 
-**Sessions** opens every session and shell of the fleet as one list, grouped **Needs you**, **Working**, **Ready**, **Ended** and **Unreachable**, with empty groups left out. **Needs you** holds exactly what the board's Needs you lane holds. Each row shows its state, its workspace, the factory issue when it is a factory run's, the terminal's name with what it is doing or its title, and its machine when there is more than one. A row is a link to its terminal, and right-clicking it opens the terminal's menu. **Ended** has a **Clear N** button that clears the terminals in it.
+**Sessions** opens every session and shell of the fleet as one list, grouped **Needs you**, **Working**, **Ready**, **Ended** and **Unreachable**, with empty groups left out. **Needs you** holds exactly what the board's Needs you lane holds. Each row shows its state, its workspace, the factory issue when it is a factory run's, the terminal's name with what it is doing or its title, and its machine when there is more than one. A row is a link to its terminal, and right-clicking it opens the terminal's menu, whose **Rename** opens the terminal and edits the name in its tab. **Ended** has a **Clear N** button that clears the terminals in it.
 
-The list floats over the terminal. Picking a session, `Esc` or a click in the main pane closes it. **Dock beside the rail** keeps it open as a column instead, and picking a session leaves it open; **Undock** floats it again. Whether it is docked is kept in this browser.
+The list floats over the terminal. Picking a session or opening one from a row's menu, `Esc`, or a click in the main pane closes it. **Dock beside the rail** keeps it open as a column instead, and picking a session leaves it open; **Undock** floats it again. Whether it is docked is kept in this browser.
 
 Opened from its button, the list starts on the terminal you are in, or on its first row. `Up`, `Down`, `Home` and `End` move through it.
 
