@@ -2156,6 +2156,23 @@ mod tests {
             assert!(rig.ledger.issue_runs(REPO, ISSUE).unwrap().is_empty());
         }
 
+        /// A claim judges `postponed` on its own live fetch, not on the pass's listing, which
+        /// can be older: a ready, open, unassigned, approved issue labelled `Postponed` is
+        /// skipped with the pass's words, and nothing is written.
+        #[test]
+        fn a_ready_issue_postponed_on_its_live_fetch_is_skipped_with_nothing_written() {
+            let rig = Rig::new();
+            rig.sim.set_labels(&["factory:ready", "Postponed"]);
+            assert_eq!(
+                claim_it(&rig).unwrap(),
+                ClaimOutcome::Skipped {
+                    reason: "labelled postponed, so it is not claimed".into()
+                }
+            );
+            assert!(rig.sim.writes().is_empty());
+            assert!(rig.ledger.issue_runs(REPO, ISSUE).unwrap().is_empty());
+        }
+
         /// The runner's case "a claim that finds an assignee is skipped and makes no run": the
         /// issue is read for its assignees before anything is written.
         #[test]
