@@ -164,6 +164,11 @@ printf 'setup passed\n'"#;
 /// stderr, which would land in the failure's output. So the script's own stderr goes to
 /// `/dev/null` for good, after fd 3 keeps the terminal's, which `mktemp` and each command get
 /// back; fd 3 is closed in the command so it does not leak into it.
+///
+/// That drops every message of the setup shell's own, not only the job notices: the notice that a
+/// command died of a signal (`Segmentation fault`, an OOM kill) goes too, and so do errors from
+/// `ps` and `awk` in `tree`. A command's signal death is still seen in its exit code, on the
+/// `setup failed: <command> exited <code>` line the gate parses.
 const SETUP_LIMITED: &str = r#"limit=$1
 shift
 tree() {
