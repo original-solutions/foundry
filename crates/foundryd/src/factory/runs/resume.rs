@@ -63,11 +63,13 @@
 //!   [`takes_from_the_gate`] says (#367): a session with its pull request reported and no
 //!   recorded pass, shown unreachable and not at rest (`gating::at_rest`) on a machine
 //!   unreachable for 15 minutes, may be at work there and is an interruption as any other.
-//!   The pass calls [`advance`] for it before it polls a gate in flight, and the resume that
-//!   interruption owes, or a stuck path it began, stays this step's. A gate in flight is
-//!   marked could not run (`gate-could-not-run`) before the interruption is recorded, since
-//!   the gate does not read it while the session may be at work. A session at rest when last
-//!   seen stays the gate's (#294).
+//!   The pass calls [`advance`] for it before it polls a gate in flight. The resume that
+//!   interruption owes, the resumed session until it reports again (its first message asked
+//!   again, its end an interruption of its own), and a stuck path it began stay this step's.
+//!   A gate in flight on a machine gone for `gate::MACHINE_GONE_AFTER` is marked could not run
+//!   (`gate-could-not-run`) before the interruption is recorded, as the gate would mark it if
+//!   it read it while the session may be at work; one on a machine that is not gone is left to
+//!   the gate's own rules. A session at rest when last seen stays the gate's (#294).
 //!
 //! Where it differs from the runner:
 //!
@@ -341,10 +343,6 @@ pub const CLAIM_MOVED: &str = "claim-moved ";
 /// The step written when the machine a claim moved to was unreachable for 15 minutes before its
 /// workspace was answered: `claim-moved-given-up <id>`.
 pub const CLAIM_GIVEN_UP: &str = "claim-moved-given-up ";
-
-/// Why a gate in flight could not run when the interruption of its run's session cut it off
-/// on a machine that is not gone: the words of a `gate-could-not-run` step.
-pub const GATE_CUT_OFF: &str = "the build session was interrupted";
 
 /// The step written before a turn probe's first `Failed` answer is acted on:
 /// `resume-turn-failing <session> <turn> <generation> <ms>`, with the lease generation and the
@@ -874,8 +872,10 @@ fn pass(ctx: &RunContext<'_>, run: &RunId, placed: Option<Target>) -> Result<Res
         return skipped(run, "needs no machine");
     }
     // The gate has the pull request the session reported, unless the session may be at work
-    // on a machine cut off for 15 minutes: that is an interruption all the same (#367).
-    let with_the_gate = seen.pr_reported || (seen.pass.is_some() && seen.last_pr.is_some());
+    // on a machine cut off for 15 minutes: that is an interruption all the same (#367). A
+    // session resumed since the report has reported nothing yet, so it is this step's too.
+    let with_the_gate = (seen.pr_reported && !interrupted_since_report(&events))
+        || (seen.pass.is_some() && seen.last_pr.is_some());
     let ended = if !with_the_gate || cut_off_at_work(ctx, &seen) {
         ended(ctx, run, &events, &seen)?
     } else {
@@ -893,20 +893,36 @@ fn pass(ctx: &RunContext<'_>, run: &RunId, placed: Option<Target>) -> Result<Res
 }
 
 /// Whether this step has a run whose pull request is reported, which the gate holds otherwise
-/// (#367): its session may be at work on a machine unreachable for 15 minutes, the resume of
-/// such an interruption is owed, or a stuck path this step began is to be finished. The pass
-/// calls [`advance`] for it, and polls no gate in flight first, since one is not read while
-/// the session may be at work. It reads no worker and writes nothing.
+/// (#367): its session may be at work on a machine unreachable for 15 minutes, it was
+/// interrupted since the report (the resume is owed, or the resumed session has not reported
+/// again, so its first message and its end are this step's, as for a run with no pull request
+/// reported), or a stuck path this step began is to be finished. The pass calls [`advance`]
+/// for it, and polls no gate in flight first, since one is not read while the session may be
+/// at work. It reads no worker and writes nothing.
 pub fn takes_from_the_gate(ctx: &RunContext<'_>, events: &[RunEvent]) -> bool {
     let seen = read_progress(events);
-    let owed = seen.interruption.as_ref().is_some_and(|interruption| {
-        !interruption.sent && !interruption.relaunch && !interruption.rate_limited
-    });
     let own_stuck = seen.stuck_stop.as_deref().is_some_and(|raw| {
         serde_json::from_str::<StuckStop>(raw)
             .is_ok_and(|decision| OWN_STUCK_CODES.contains(&decision.code.as_str()))
     });
-    owed || own_stuck || cut_off_at_work(ctx, &seen)
+    let resumed = seen.pr_reported && seen.pass.is_none() && interrupted_since_report(events);
+    resumed || own_stuck || cut_off_at_work(ctx, &seen)
+}
+
+/// Whether a resume's `session_interrupted` line follows the newest `pr_opened`: the session
+/// that reported the pull request was interrupted, and none has reported it since. The run's
+/// `pr_reported` stays set through it, as `progress` reads the ledger.
+fn interrupted_since_report(events: &[RunEvent]) -> bool {
+    let newest = |found: &dyn Fn(&RunEvent) -> bool| events.iter().rposition(found);
+    let interrupted = newest(&|event| {
+        event.event == names::SESSION_INTERRUPTED
+            && event.data.get("relaunch") != Some(&Value::Bool(true))
+    });
+    let reported = newest(&|event| event.event == names::PR_OPENED);
+    match (interrupted, reported) {
+        (Some(interrupted), Some(reported)) => interrupted > reported,
+        _ => false,
+    }
 }
 
 /// Whether the session of a run whose pull request is reported and has no recorded pass may be
@@ -940,13 +956,15 @@ fn session_owner(ctx: &RunContext<'_>, seen: &Seen) -> Option<MachineId> {
         .or_else(|| seen.machine.as_deref().and_then(parse_machine))
 }
 
-/// A gate in flight when the session of a run whose pull request is reported is interrupted
-/// is marked could not run before the interruption is recorded, with the gate's own words for
-/// a machine gone for `gate::MACHINE_GONE_AFTER` (else [`GATE_CUT_OFF`]) and the gate's count
-/// of failures to run for its attempt. The gate is not read while the session may be at work,
-/// so it would hold its slot and the pass behind it. Its workspace is the gate's to archive or
-/// leave before another is placed, by the gate's own rules, and a fifth failure to run is the
-/// gate's stuck. A pass cut short after the step decides the interruption again.
+/// A gate in flight when the session of a run whose pull request is reported is interrupted,
+/// on a machine gone for `gate::MACHINE_GONE_AFTER`, is marked could not run before the
+/// interruption is recorded: the gate's own rule for such a gate, with its words and its count
+/// of failures to run for the attempt, which the gate does not apply itself while the session
+/// may be at work, since it reads no gate then. Its slot is freed, its workspace is the gate's
+/// to archive or leave before another is placed, and a fifth failure to run is the gate's
+/// stuck. A gate on a machine that is not gone may still be running its commands there: it is
+/// left to the gate's own rules and keeps its slot. A pass cut short after the step decides
+/// the interruption again.
 fn gate_cut_off(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent]) -> Result<(), RunError> {
     if !gating::gate_running(events) {
         return Ok(());
@@ -966,7 +984,13 @@ fn gate_cut_off(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent]) -> Resul
     ) else {
         return Err(RunError::Invalid(format!("the gate step {placed:?}")));
     };
-    let machine = part.nth(2).and_then(parse_machine);
+    let Some(reason) = part
+        .nth(2)
+        .and_then(parse_machine)
+        .and_then(|machine| gate::could_not_run(None, ctx.view.unreachable_for(machine), None))
+    else {
+        return Ok(());
+    };
     let failures = events
         .iter()
         .filter_map(step_text)
@@ -977,9 +1001,6 @@ fn gate_cut_off(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent]) -> Resul
         .unwrap_or(u32::MAX)
         .saturating_add(1);
     let wait = gate::backoff(failures).map_or_else(|| "-".to_owned(), |wait| wait.to_string());
-    let reason = machine
-        .and_then(|machine| gate::could_not_run(None, ctx.view.unreachable_for(machine), None))
-        .unwrap_or_else(|| GATE_CUT_OFF.to_owned());
     ctx.held()?;
     ctx.record_step(
         run,
