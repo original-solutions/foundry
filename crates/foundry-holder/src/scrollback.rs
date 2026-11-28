@@ -203,9 +203,39 @@ mod tests {
         assert_eq!(scrollback.snapshot(), b"6789");
         // The 4 bytes held and the 6 skipped are behind the snapshot now.
         assert_eq!(scrollback.start(), 10);
+        // The cut line has no end in what is kept, so what is kept of it stays when its end
+        // comes.
         scrollback.push(b"\nx");
-        assert_eq!(scrollback.snapshot(), b"x");
-        assert_eq!(scrollback.start(), 15);
+        assert_eq!(scrollback.snapshot(), b"89\nx");
+        assert_eq!(scrollback.start(), 12);
+    }
+
+    /// A line longer than what is kept is kept from the cut on: the newline that ends it does
+    /// not take it away. A test runner that draws its progress with cursor moves writes
+    /// megabytes with no newline, and the end of that line is what a failed setup's tail shows.
+    #[test]
+    fn a_line_longer_than_the_cap_keeps_its_end_when_a_newline_ends_it() {
+        let mut scrollback = Scrollback::with_limits(100, 32);
+        scrollback.push(b"first\n");
+        for _ in 0..10 {
+            scrollback.push(b"....");
+        }
+        scrollback.push(b"FAILED");
+        scrollback.push(b"\ndone\n");
+        let mut kept = b".".repeat(20);
+        kept.extend_from_slice(b"FAILED\ndone\n");
+        assert_eq!(scrollback.snapshot(), kept);
+        assert_eq!(scrollback.start(), 6 + 40 + 6 + 6 - 32);
+    }
+
+    /// A cut whose line ends within what is kept still drops the rest of that line, so the
+    /// snapshot starts on a line.
+    #[test]
+    fn a_cut_line_that_ends_within_what_is_kept_is_dropped_whole() {
+        let mut scrollback = Scrollback::with_limits(100, 12);
+        scrollback.push(b"aaaaaa\nbbbb\n");
+        scrollback.push(b"cc\n");
+        assert_eq!(scrollback.snapshot(), b"bbbb\ncc\n");
     }
 
     #[test]

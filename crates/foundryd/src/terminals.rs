@@ -2711,6 +2711,46 @@ mod tests {
         }
     }
 
+    /// A failed setup's tail keeps the end of a command's output that is longer than the
+    /// holder keeps and has no newline, as `cargo nextest run` writes on a terminal: it draws
+    /// every line with cursor moves, megabytes of them, and names the failed tests at the end.
+    #[tokio::test]
+    async fn a_setup_whose_command_writes_more_than_the_holder_keeps_on_one_line_keeps_its_end() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        // The name is put together as it is printed, so the `$` and `setup failed:` lines,
+        // which repeat the command, do not hold it.
+        let command = "head -c 9000000 /dev/zero | tr '\\0' ' '; \
+                       printf 'test tests::exa%sple ... FAILED' m; \
+                       printf '\\nerror: test run failed\\n'; exit 100";
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".into(),
+            crate::workspaces::setup_limited().into(),
+            "setup".into(),
+            "1800".into(),
+            command.into(),
+        ];
+        let id = terminals
+            .start(WorkspaceId::random(), setup.cwd.path(), &argv, &[])
+            .await
+            .unwrap();
+        until("the record to say exited", || {
+            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+        })
+        .await;
+        let tail = terminals.tail(id, 64 * 1024).await.unwrap();
+        let end = format!(
+            "test tests::example ... FAILED\nerror: test run failed\n\
+             setup failed: {command} exited 100\n"
+        );
+        assert!(
+            tail.ends_with(&end),
+            "{:?}",
+            &tail[tail.len().saturating_sub(300)..]
+        );
+    }
+
     #[tokio::test]
     async fn the_tail_of_a_terminal_that_is_not_live_is_unknown() {
         let setup = Setup::new();
