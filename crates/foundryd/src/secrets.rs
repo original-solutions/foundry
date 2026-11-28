@@ -132,6 +132,10 @@ pub const GATEWAY: &str = "gateway";
 /// The secret the gateway's management key is held under.
 pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
 
+/// The secret the machine's Vims access token is held under. The factory passes it to `vims`
+/// in the child's environment only (`factory::vims`).
+pub const VIMS: &str = "vims";
+
 /// The prefix of the secret a GitHub token is held under: `github:<login>`.
 pub const GITHUB_PREFIX: &str = "github:";
 
@@ -192,9 +196,10 @@ pub fn github_default(secrets: &dyn Secrets) -> Option<String> {
     }
 }
 
-/// `text` with the gateway keys and every `github:*` token this store holds now hidden as `***`
-/// (whatever follows `github:`, a login or not), read at this call so a token set after the
-/// daemon started is hidden too, and then the passwords of URLs as [`redact`] hides them. When
+/// `text` with the gateway keys, the Vims token and every `github:*` token this store holds now
+/// hidden as `***` (whatever follows `github:`, a login or not), read at this call so a token
+/// set after the daemon started is hidden too, and then the passwords of URLs as [`redact`]
+/// hides them. When
 /// the store cannot be read, none of `text` is shown: [`HIDDEN_UNREADABLE`] is given instead.
 ///
 /// A held value of at least [`SPLIT_MIN`] characters is hidden also when gaps sit inside it,
@@ -535,6 +540,7 @@ fn known_values(secrets: &dyn Secrets) -> Result<Vec<String>, SecretsError> {
             !value.is_empty()
                 && (name == GATEWAY
                     || name == GATEWAY_MANAGEMENT
+                    || name == VIMS
                     || name.starts_with(GITHUB_PREFIX))
         })
         .map(|(_, value)| value)
@@ -650,8 +656,8 @@ fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsErro
 #[derive(Debug, thiserror::Error)]
 pub enum SetError {
     #[error(
-        "the name is not a secret to set here; the names are {GATEWAY}, {GATEWAY_MANAGEMENT} and \
-         {GITHUB_PREFIX}<login>, where a login is {LOGIN_RULE}"
+        "the name is not a secret to set here; the names are {GATEWAY}, {GATEWAY_MANAGEMENT}, \
+         {VIMS} and {GITHUB_PREFIX}<login>, where a login is {LOGIN_RULE}"
     )]
     // No field: the refused name may be a token pasted in place of a login, so it is never quoted.
     UnknownName,
@@ -720,16 +726,16 @@ pub fn github_default_command(login: &str) -> ExitCode {
 }
 
 /// Stores the first line of `input` as the secret `name`, without its line ending. Only the
-/// gateway secrets and `github:<login>` tokens can be set: the name is checked before `input` is
-/// read, so any other name leaves the store untouched, and the machine's own identity and key
-/// table stay out of reach.
+/// gateway secrets, the Vims token and `github:<login>` tokens can be set: the name is checked
+/// before `input` is read, so any other name leaves the store untouched, and the machine's own
+/// identity and key table stay out of reach.
 pub fn set_from(
     secrets: &dyn Secrets,
     name: &str,
     mut input: impl BufRead,
 ) -> Result<(), SetError> {
     let github = name.strip_prefix(GITHUB_PREFIX).is_some_and(is_login);
-    if name != GATEWAY && name != GATEWAY_MANAGEMENT && !github {
+    if name != GATEWAY && name != GATEWAY_MANAGEMENT && name != VIMS && !github {
         return Err(SetError::UnknownName);
     }
     let mut line = String::new();
@@ -1794,7 +1800,14 @@ mod tests {
     #[test]
     fn set_from_refuses_any_other_name_and_stores_nothing() {
         let (_dir, secrets) = file();
-        for name in ["machine", "machine-keys", "other"] {
+        for name in [
+            "machine",
+            "machine-keys",
+            "other",
+            "Vims",
+            "vims:me",
+            "vims-token",
+        ] {
             let error = set_from(&secrets, name, "x\n".as_bytes()).unwrap_err();
             let text = error.to_string();
             assert!(!text.contains(name), "{text}");
@@ -1814,6 +1827,21 @@ mod tests {
         let secrets = MemorySecrets::default();
         let input = io::BufReader::new(Unreadable);
         assert!(set_from(&secrets, "machine", input).is_err());
+    }
+
+    #[test]
+    fn set_from_stores_the_vims_token() {
+        let (_dir, secrets) = file();
+        set_from(&secrets, VIMS, "vims_tok\n".as_bytes()).unwrap();
+        assert_eq!(VIMS, "vims");
+        assert_eq!(stored(&secrets, "vims").as_deref(), Some("vims_tok"));
+    }
+
+    #[test]
+    fn the_refusal_of_an_unknown_name_names_vims() {
+        let (_dir, secrets) = file();
+        let error = set_from(&secrets, "other", "x\n".as_bytes()).unwrap_err();
+        assert!(error.to_string().contains(", vims and github:"), "{error}");
     }
 
     #[test]
@@ -1951,6 +1979,13 @@ mod tests {
         secrets.set("github:zed", "ghp_abcdef").unwrap();
         let text = "a gw-key-1 b gm-key-2 c ghp_abc d ghp_abcdef e";
         assert_eq!(hide_known(text, &secrets), "a *** b *** c *** d *** e");
+    }
+
+    #[test]
+    fn hide_known_hides_the_vims_token() {
+        let (_dir, secrets) = file();
+        secrets.set(VIMS, "vims-key-3").unwrap();
+        assert_eq!(hide_known("a vims-key-3 b", &secrets), "a *** b");
     }
 
     #[test]
