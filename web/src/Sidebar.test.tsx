@@ -261,21 +261,25 @@ describe("Sidebar", () => {
     // The title is read before the step, and the step shares the line with the name and the label.
     expect(hidden.compareDocumentPosition(step) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(step.className).toContain("font-mono");
-    // The step gives way to fit (its box and the box around it may shrink below their text), and the label never does.
-    expect(step.className).toMatch(/(^| )min-w-0( |$)/);
-    expect(step.parentElement!.className).toMatch(/(^| )min-w-0( |$)/);
+    // The step is cut to fit (it and every box around it up to the line may shrink below their text), and the label never gives way.
+    expect(step.className).toMatch(/(^| )truncate( |$)/);
+    const line = working.querySelector(".leading-5")!;
+    for (const box of [step, step.parentElement!, line]) expect(box.className).toMatch(/(^| )min-w-0( |$)/);
     const label = within(working).getByText("Working");
     expect(label.className).toMatch(/(^| )shrink-0( |$)/);
-    const line = working.querySelector(".leading-5")!;
+    expect(label.className).toMatch(/(^| )text-sky-400( |$)/);
     expect(line.contains(step)).toBe(true);
     expect(line.contains(label)).toBe(true);
-    for (const box of [line, step.parentElement!]) expect(box.className).not.toMatch(/(^| )flex-(col|wrap)( |$)/);
+    for (const box of [line, step.parentElement!]) {
+      expect(box.className).toMatch(/(^| )flex( |$)/);
+      expect(box.className).not.toMatch(/(^| )flex-(col|wrap)( |$)/);
+    }
     expect(within(working).getByText("opus 1").className).toMatch(/(^| )text-neutral-500( |$)/);
   });
 
   it("shows a busy session with no title yet by its name and step alone", async () => {
     const records = [workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "working")];
-    const briefs = { s1: { title: undefined, now: { kind: "tool" as const, tool: "Bash", text: "$ cargo test" } } };
+    const briefs = { s1: { title: null, now: { kind: "tool" as const, tool: "Bash", text: "$ cargo test" } } };
     await renderApp(<Sidebar machines={fleet(records, settings(), briefs)} {...props} />);
     unfold("fix login");
 
