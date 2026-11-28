@@ -143,7 +143,9 @@ export function ArchiveDialog({
                 <li key={r.terminal} className={`flex min-w-0 items-center gap-2.5 ${r.glyph === "done" || r.glyph === "away" ? "text-neutral-500" : "text-neutral-200"}`}>
                   <StateGlyph glyph={r.glyph} />
                   <Named name={r.name} title={r.title} />
-                  <span className={`shrink-0 text-xs ${glyphText[r.glyph]}`}>{r.label}</span>
+                  <span title={r.fullLabel} className={`shrink-0 text-xs ${glyphText[r.glyph]}`}>
+                    {r.label}
+                  </span>
                   {cut[r.glyph] && <span className="shrink-0 rounded bg-amber-400/15 px-1.5 text-[11px] text-amber-300">{cut[r.glyph]}</span>}
                 </li>
               ))}

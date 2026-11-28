@@ -388,6 +388,8 @@ export interface Located {
   /** A session's name, else its first prompt. */
   title?: string;
   label: string;
+  /** The label uncut, when it cuts its factory run's reason short: for a tooltip. */
+  fullLabel?: string;
   glyph: Glyph;
 }
 
@@ -395,7 +397,7 @@ export function locate(machines: MachineView[], id: string): Located | undefined
   for (const machine of machines) {
     for (const workspace of machine.workspaces) {
       const row = rows(workspace).find((r) => r.terminal === id);
-      if (row) return { machine, workspace, session: row.session, name: row.name, title: row.title, label: row.label, glyph: row.glyph };
+      if (row) return { machine, workspace, session: row.session, name: row.name, title: row.title, label: row.label, ...(row.fullLabel && { fullLabel: row.fullLabel }), glyph: row.glyph };
     }
   }
   return undefined;

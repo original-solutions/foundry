@@ -2,9 +2,9 @@ import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Changes } from "./api";
 import { ArchiveDialog } from "./Archive";
-import { fleet, type WorkspaceView } from "./fleet";
+import { fleet, withFactory, type WorkspaceView } from "./fleet";
 import { dangerButton, primaryButton } from "./Modal";
-import { ME, OTHER, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, ME, OTHER, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, renderApp, type Call } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -96,6 +96,16 @@ describe("ArchiveDialog", () => {
       expect.stringMatching(/shell.*Ended/),
     ]);
     expect(posts(calls)).toEqual([]);
+  });
+
+  it("says a held-up factory run's stage on its ended terminals, with the whole reason on hover", async () => {
+    stub(() => json(200, changes));
+    const reason = "gate red: make check fails on main, see the gate log";
+    const records = [workspace(ME, "w1", "fix login"), terminal(ME, "t3", "w1", "exited", { exit_code: 0 })];
+    const view = withFactory(fleet(records, settings()), factoryStatus("p1", {}, { "o__r__1027__2": { kind: "stuck", workspaces: ["w1"], reason } }))[0].workspaces[0];
+    await renderApp(<ArchiveDialog workspace={view} machine={studio} here={ME} onClose={vi.fn()} onArchived={vi.fn()} />);
+    const stops = within(await screen.findByRole("dialog", { name: "Archive fix login?" })).getByRole("region", { name: "Stops" });
+    expect(within(stops).getByText("Stuck · gate red: make check…").getAttribute("title")).toBe(`Stuck · ${reason}`);
   });
 
   it("says so when every change is committed, and when there is nothing to keep", async () => {

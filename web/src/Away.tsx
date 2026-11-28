@@ -114,7 +114,7 @@ function Line({ m, turns, steps, onOpen }: { m: Moved; turns: number; steps: Mar
   return (
     <button
       type="button"
-      aria-label={`Open ${row.name} in ${m.workspace}: ${row.label}`}
+      aria-label={`Open ${row.name} in ${m.workspace}: ${row.fullLabel ?? row.label}`}
       onClick={onOpen}
       className={`flex w-full flex-col gap-0.5 rounded-lg px-2.5 py-2 text-left hover:bg-neutral-800/70 focus-visible:outline-2 focus-visible:outline-sky-400 ${m.needs ? "bg-amber-400/5" : ""}`}
     >
@@ -123,7 +123,9 @@ function Line({ m, turns, steps, onOpen }: { m: Moved; turns: number; steps: Mar
         <span className="flex min-w-0 flex-1">
           <Named name={row.name} title={row.title} />
         </span>
-        <span className={`shrink-0 text-xs ${glyphText[row.glyph]}`}>{row.label}</span>
+        <span title={row.fullLabel} className={`shrink-0 text-xs ${glyphText[row.glyph]}`}>
+          {row.label}
+        </span>
       </span>
       <span className="flex gap-1.5 pl-5 text-[11px] text-neutral-500">
         <span className="truncate">{m.workspace}</span>

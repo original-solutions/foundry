@@ -55,7 +55,7 @@ export function Peek({ at, machines }: { at: Destination | undefined; machines: 
     const session = found.workspace.sessions.find((s) => s.terminal === at.terminal);
     return (
       <Shell label={`Preview of ${at.title}`}>
-        <Head glyph={found.glyph} label={found.label} name={found.name} workspace={found.workspace} machine={found.machine.name} many={machines.length > 1} />
+        <Head glyph={found.glyph} label={found.label} fullLabel={found.fullLabel} name={found.name} workspace={found.workspace} machine={found.machine.name} many={machines.length > 1} />
         {session ? (
           <>
             {session.title && <Said heading="Asked">“{session.title}”</Said>}
@@ -99,7 +99,9 @@ export function Peek({ at, machines }: { at: Destination | undefined; machines: 
                     {r.name}
                     {r.title && <span className="text-neutral-500"> {r.title}</span>}
                   </span>
-                  <span className={glyphText[r.glyph]}>{r.label}</span>
+                  <span title={r.fullLabel} className={glyphText[r.glyph]}>
+                    {r.label}
+                  </span>
                 </li>
               ))}
             </ul>
@@ -154,13 +156,30 @@ function Shell({ label, children }: { label?: string; children: React.ReactNode 
   );
 }
 
-function Head({ glyph, label, name, workspace, machine, many }: { glyph?: Glyph; label?: string; name: string; workspace: WorkspaceView; machine: string; many: boolean }) {
+function Head({
+  glyph,
+  label,
+  fullLabel,
+  name,
+  workspace,
+  machine,
+  many,
+}: {
+  glyph?: Glyph;
+  label?: string;
+  /** The label uncut, when it cuts a factory run's reason short. */
+  fullLabel?: string;
+  name: string;
+  workspace: WorkspaceView;
+  machine: string;
+  many: boolean;
+}) {
   return (
     <header className="space-y-1">
       {glyph && label && (
         <p className={`flex items-center gap-2 text-xs font-medium ${glyphText[glyph]}`}>
           <StateGlyph glyph={glyph} />
-          {label}
+          <span title={fullLabel}>{label}</span>
         </p>
       )}
       <h3 className="text-base font-semibold text-neutral-50">
