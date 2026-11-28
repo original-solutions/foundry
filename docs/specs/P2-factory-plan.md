@@ -35,7 +35,7 @@ Paths in this plan that start with `src/` are in that checkout. Clone it outside
 - Sizes from the spec: output in an event 64 KB, output in a comment its last 20,000 characters, a message body 64 KB, a typed line under 800 characters.
 - For each ported module, the runner's tests become Rust tests with the same cases and names, written first and failing before the code lands. Where this plan is silent on a rule of the lifecycle, the runner at `8ed9bef` decides.
 - No test calls GitHub and no test spends model calls, except the one contract test, ignored unless `FOUNDRY_CONTRACT=1`.
-- The gate is `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `npm --prefix web run check`.
+- The gate is the one in `AGENTS.md`.
 - Edit only the files your issue names. The scaffold registers every module and declares every dependency.
 
 ## Review focus

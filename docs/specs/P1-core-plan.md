@@ -20,7 +20,7 @@
 - Every model call goes through the gateway: `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` are set on every session.
 - Secrets never reach a log or an API response.
 - Timings from the spec: load every 5 seconds, offline after 15 seconds, stuck after 10 minutes, coordinator takeover within 15 seconds, scrollback 10,000 lines.
-- No production change without a failing test first. The gate is `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `npm --prefix web run check`.
+- No production change without a failing test first. The gate is the one in `AGENTS.md`.
 - No test spends model calls, except the one contract test, which is ignored unless `FOUNDRY_CONTRACT=1`.
 - No `unsafe` without a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks = "deny"`).
 

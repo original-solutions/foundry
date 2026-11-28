@@ -1,10 +1,11 @@
 # Runs the provision and gate commands on Linux, split into jobs that run at the same time. The
 # factory gates on macOS. The commands mirror factory.provision and factory.gate in .dw/config.yml:
-# change both together. Every job starts with factory.provision (.github/actions/setup).
+# change both together. Every job starts with factory.provision (.github/actions/setup), except its
+# cargo-nextest install: the jobs that run nextest take the same version from install-action.
 #
 #   lint     cargo fmt --all --check, cargo clippy
-#   test     cargo test --workspace, as cargo-nextest split over eight runners; the doc tests,
-#            which nextest does not run, are in the e2e job
+#   test     cargo nextest run --workspace, split over eight runners; the doc tests
+#            (cargo test --workspace --doc), which nextest does not run, are in the e2e job
 #   web      npm --prefix web run check
 #
 # Three things are CI only and not in factory.gate:
