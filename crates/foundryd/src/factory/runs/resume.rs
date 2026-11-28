@@ -407,6 +407,10 @@ pub enum Wait {
     Workspace,
     /// The setup terminal is running, or its exit is not known.
     Setup,
+    /// The forced archive of a gate in flight, which the interruption of its run's session
+    /// stops, was answered "unreachable": waited out by the gate's rule before the
+    /// interruption is recorded (#367).
+    Gate,
 }
 
 /// What the pass places a run for.
@@ -6934,7 +6938,9 @@ mod tests {
     mod a_reported_pull_request_cut_off_at_work {
         use super::*;
         use crate::factory::gate::{self, MACHINE_GONE_AFTER};
-        use crate::factory::runs::gating::{GATE_COULD_NOT_RUN, gate_running};
+        use crate::factory::runs::gating::{
+            ARCHIVE_TRIES, GATE_COULD_NOT_RUN, GATE_LEFT, gate_running,
+        };
         use crate::factory::runs::progress::GATE_REQUESTED;
 
         const HEAD: &str = "1111111111111111111111111111111111111111";
@@ -7384,22 +7390,196 @@ mod tests {
             );
         }
 
-        /// A gate archive the worker refuses is no error: the interruption is recorded in the
-        /// same pass, and the gate archives a gate that could not run before it places another.
-        #[test]
-        fn a_gate_archive_that_fails_does_not_hold_the_interruption() {
-            let (mut rig, run) = reported();
+        /// A gate placed on `m2`, which is online, and created there: in flight.
+        fn gate_on_m2(rig: &Rig, run: &RunId) {
             rig.step(
-                &run,
+                run,
                 &format!("{GATE_REQUESTED}1 1 {HEAD} {BASE_TIP} {}", m2()),
             );
-            rig.step(&run, &format!("gate-created 1 {}", gate_workspace()));
+            rig.step(run, &format!("gate-created 1 {}", gate_workspace()));
+            assert!(gate_running(&rig.events(run)));
+        }
+
+        fn could_not_runs(rig: &Rig, run: &RunId) -> usize {
+            rig.steps(run)
+                .iter()
+                .filter(|step| step.starts_with(GATE_COULD_NOT_RUN))
+                .count()
+        }
+
+        fn gate_archives(rig: &Rig) -> usize {
+            rig.worker
+                .calls()
+                .iter()
+                .filter(|call| {
+                    **call
+                        == Call::Archive {
+                            workspace: gate_workspace(),
+                        }
+                })
+                .count()
+        }
+
+        /// A gate archive the worker refuses holds the interruption, by the gate's own rule for
+        /// a refused archive: an error asked again next pass, the gate's slot still held, since
+        /// its commands may still run. After `ARCHIVE_TRIES` refusals the gate is recorded
+        /// left, could not run, and the interruption is recorded.
+        #[test]
+        fn a_refused_gate_archive_keeps_its_slot_until_the_gate_is_left() {
+            let (mut rig, run) = reported();
+            gate_on_m2(&rig, &run);
             rig.view = at_work(UNREACHABLE_FOR);
+            for _ in 1..ARCHIVE_TRIES {
+                rig.worker
+                    .on_archive(Err(WorkerError::Failed("refused".into())));
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert!(interruptions(&rig, &run).is_empty());
+                assert_eq!(could_not_runs(&rig, &run), 0);
+                assert!(gate_running(&rig.events(&run)));
+            }
             rig.worker
                 .on_archive(Err(WorkerError::Failed("refused".into())));
             pass_one(&rig, &run);
             assert_eq!(interruptions(&rig, &run).len(), 1);
+            assert_eq!(could_not_runs(&rig, &run), 1);
             assert!(!gate_running(&rig.events(&run)));
+            assert!(
+                rig.steps(&run)
+                    .iter()
+                    .any(|step| step.starts_with(&format!("{GATE_LEFT}1 "))),
+                "{:?}",
+                rig.steps(&run)
+            );
+        }
+
+        /// An "unreachable" answer to the gate's archive is waited out by the gate's rule, its
+        /// slot held and the interruption not recorded, until it has been answered for
+        /// `MACHINE_GONE_AFTER`: then the gate is recorded left and could not run.
+        #[test]
+        fn an_unreachable_gate_archive_is_waited_out_with_its_slot_held() {
+            let (mut rig, run) = reported();
+            gate_on_m2(&rig, &run);
+            rig.view = at_work(UNREACHABLE_FOR);
+            rig.worker
+                .on_archive(Err(WorkerError::Unreachable("down".into())));
+            assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Gate));
+            assert!(interruptions(&rig, &run).is_empty());
+            assert_eq!(could_not_runs(&rig, &run), 0);
+            assert!(gate_running(&rig.events(&run)));
+            rig.clock.advance(MACHINE_GONE_AFTER);
+            rig.worker
+                .on_archive(Err(WorkerError::Unreachable("down".into())));
+            pass_one(&rig, &run);
+            assert_eq!(interruptions(&rig, &run).len(), 1);
+            assert_eq!(could_not_runs(&rig, &run), 1);
+            assert!(!gate_running(&rig.events(&run)));
+        }
+
+        /// A pass cut short by a lost lease at any point of the cut-off is finished by the
+        /// next: the gate's workspace is archived before its slot is freed, it could not run
+        /// once, the interruption is recorded once, and a gate archive that was answered is not
+        /// asked again.
+        #[test]
+        fn a_pass_cut_short_anywhere_in_the_cut_off_is_finished_once() {
+            for held in 0.. {
+                let (mut rig, run) = reported();
+                gate_on_m2(&rig, &run);
+                rig.view = at_work(UNREACHABLE_FOR);
+                rig.guard = Box::new(HeldFor::new(held));
+                if advance(&rig.ctx(), &run).is_ok() {
+                    assert!(held > 0, "the lease was never lost");
+                    break;
+                }
+                let freed = !gate_running(&rig.events(&run));
+                let archived = gate_archives(&rig);
+                assert!(
+                    !freed || archived == 1,
+                    "cut at {held}: the gate's slot was freed before its workspace was archived"
+                );
+                rig.guard = Box::new(crate::factory::worker::AlwaysHeld(1));
+                advance(&rig.ctx(), &run).unwrap();
+                assert_eq!(could_not_runs(&rig, &run), 1, "cut at {held}");
+                assert_eq!(interruptions(&rig, &run).len(), 1, "cut at {held}");
+                assert!(!gate_running(&rig.events(&run)), "cut at {held}");
+                if freed {
+                    assert_eq!(gate_archives(&rig), 1, "cut at {held}");
+                } else {
+                    assert!(gate_archives(&rig) >= 1, "cut at {held}");
+                }
+            }
+        }
+
+        /// A pass that stopped after the gate's workspace was archived and before its failure to
+        /// run was written (the ledger write failed: no lease check lies between them) leaves
+        /// a gate archived with neither a verdict nor a failure to run. The next pass writes
+        /// the failure to run, and asks nothing more of the gate's machine.
+        #[test]
+        fn a_gate_archived_by_a_pass_cut_short_could_not_run_in_the_next() {
+            let (mut rig, run) = reported();
+            gate_on_m2(&rig, &run);
+            rig.step(&run, "gate-archiving 1");
+            rig.step(&run, "gate-archived 1");
+            assert!(!gate_running(&rig.events(&run)));
+            rig.view = at_work(UNREACHABLE_FOR);
+            pass_one(&rig, &run);
+            assert!(
+                rig.steps(&run)
+                    .contains(&format!("{GATE_COULD_NOT_RUN}1 1 1 1 {GATE_CUT_OFF}")),
+                "{:?}",
+                rig.steps(&run)
+            );
+            assert_eq!(gate_archives(&rig), 0);
+        }
+
+        /// A gate whose verdict is recorded is no longer in flight: the gate settles it when the
+        /// run is its own again, and the interruption writes no failure to run over it.
+        #[test]
+        fn a_gate_with_its_verdict_recorded_is_left_to_the_gate() {
+            let (mut rig, run) = reported();
+            gate_on_m2(&rig, &run);
+            rig.step(&run, "gate-ended 1 0");
+            rig.view = at_work(UNREACHABLE_FOR);
+            pass_one(&rig, &run);
+            assert_eq!(could_not_runs(&rig, &run), 0);
+            assert_eq!(gate_archives(&rig), 0);
+            assert_eq!(interruptions(&rig, &run).len(), 1);
+        }
+
+        /// The fifth failure to run is the gate's stuck, by the gate's rule: the run goes stuck
+        /// with the gate's words, no interruption is recorded and no resume is spent.
+        #[test]
+        fn a_fifth_failure_to_run_is_the_gates_stuck_and_spends_no_resume() {
+            let (mut rig, run) = reported();
+            let gone = gate::could_not_run(None, MACHINE_GONE_AFTER, None).unwrap();
+            for k in 1..=4 {
+                rig.step(
+                    &run,
+                    &format!("{GATE_REQUESTED}1 {k} {HEAD} {BASE_TIP} {}", m1()),
+                );
+                let wait = gate::backoff(k).unwrap();
+                rig.step(
+                    &run,
+                    &format!("{GATE_COULD_NOT_RUN}1 {k} {k} {wait} {gone}"),
+                );
+            }
+            rig.step(
+                &run,
+                &format!("{GATE_REQUESTED}1 5 {HEAD} {BASE_TIP} {}", m2()),
+            );
+            rig.step(&run, &format!("gate-created 5 {}", gate_workspace()));
+            assert!(gate_running(&rig.events(&run)));
+            rig.view = at_work(UNREACHABLE_FOR);
+            let step = pass(&rig, &run);
+            assert!(matches!(step, ResumeStep::Stuck { .. }), "{step:?}");
+            assert!(
+                rig.steps(&run)
+                    .contains(&format!("{GATE_COULD_NOT_RUN}1 5 5 - {GATE_CUT_OFF}")),
+                "{:?}",
+                rig.steps(&run)
+            );
+            assert!(interruptions(&rig, &run).is_empty());
+            assert_eq!(rig.ctx().seen(&run).unwrap().state, Some(State::Stuck));
+            assert!(create_calls(&rig).is_empty());
         }
 
         /// A stuck path this step began for a cut-off run (its resumes used) stays this step's
