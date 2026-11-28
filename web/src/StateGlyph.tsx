@@ -87,13 +87,19 @@ export function StateGlyph({ glyph, still = false }: { glyph: Glyph; still?: boo
 }
 
 /**
- * A terminal's state in words: its `label`, with the uncut words on hover when the label cuts
- * them (a factory run's reason), and no tooltip that only says the label again.
+ * A terminal's state in words: its `label`. When its uncut words say more (a factory run's whole
+ * reason, or a failed terminal's own state beside the run's stage), they are the tooltip and what
+ * a screen reader reads, so a name built from the row's text says them; never a copy that only
+ * says the label again.
  */
 export function StateLabel({ of, className }: { of: Pick<Row, "label" | "fullLabel">; className?: string }) {
+  if (of.fullLabel === of.label) return <span className={className}>{of.label}</span>;
   return (
-    <span title={of.fullLabel === of.label ? undefined : of.fullLabel} className={className}>
-      {of.label}
+    <span className={className}>
+      <span title={of.fullLabel} aria-hidden="true">
+        {of.label}
+      </span>
+      <span className="sr-only">{of.fullLabel}</span>
     </span>
   );
 }

@@ -439,7 +439,8 @@ const rests: Glyph[] = ["ready", "done"];
  * stage instead: one that has ended, and in a held-up run one that waits for its next prompt too,
  * since none comes until you act. So "Ended" never stands for a run that is stuck. A terminal that
  * works, asks or is quiet keeps its own state, as does a live run's ready one: the factory moves it.
- * A failed one says the stage too, its red glyph saying it failed: decided in #394, not missed.
+ * A failed one shows the stage too, as decided in #394; its uncut words (`fullLabel`, which a
+ * screen reader, the tooltip and the jump palette's search read) still lead with its own state.
  */
 const atRest = (glyph: Glyph, run: FactoryRun): boolean => glyph === "done" || glyph === "failed" || (glyph === "ready" && run.held !== undefined);
 
@@ -448,7 +449,7 @@ export function rows(workspace: WorkspaceView): Row[] {
   const run = workspace.factory;
   const stage = run && runStage(run);
   const told = (label: string, glyph: Glyph): Pick<Row, "label" | "fullLabel"> =>
-    run && stage && atRest(glyph, run) ? { label: stage.label, fullLabel: stage.full } : { label, fullLabel: label };
+    run && stage && atRest(glyph, run) ? { label: stage.label, fullLabel: glyph === "failed" ? `${label} — ${stage.full}` : stage.full } : { label, fullLabel: label };
   return [
     ...workspace.sessions.map((s) => {
       const glyph = sessionGlyph[s.state];

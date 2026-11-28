@@ -57,16 +57,23 @@ describe("StateGlyph", () => {
 });
 
 describe("StateLabel", () => {
-  it("shows the label, with the uncut words on hover only when the label cuts them", () => {
+  it("shows the label, and gives the uncut words to the tooltip and a screen reader only when they say more", () => {
     const { container } = render(
       <>
-        <StateLabel of={{ label: "Stuck · gate red: make check…", fullLabel: "Stuck · gate red: make check fails on main" }} className="text-xs" />
-        <StateLabel of={{ label: "Working", fullLabel: "Working" }} />
+        <p>
+          <StateLabel of={{ label: "Stuck · gate red: make check…", fullLabel: "Stuck · gate red: make check fails on main" }} className="text-xs" />
+        </p>
+        <p>
+          <StateLabel of={{ label: "Working", fullLabel: "Working" }} />
+        </p>
       </>,
     );
-    const [cut, whole] = [...container.querySelectorAll("span")];
-    expect([cut.textContent, cut.getAttribute("title"), cut.className]).toEqual(["Stuck · gate red: make check…", "Stuck · gate red: make check fails on main", "text-xs"]);
-    // No tooltip that only says the label again.
-    expect([whole.textContent, whole.getAttribute("title")]).toEqual(["Working", null]);
+    const [cut, whole] = [...container.querySelectorAll("p")].map((p) => p.firstElementChild!);
+    expect(cut.className).toBe("text-xs");
+    const shown = cut.querySelector('[aria-hidden="true"]')!;
+    expect([shown.textContent, shown.getAttribute("title")]).toEqual(["Stuck · gate red: make check…", "Stuck · gate red: make check fails on main"]);
+    expect(cut.querySelector(".sr-only")!.textContent).toBe("Stuck · gate red: make check fails on main");
+    // No tooltip or hidden copy that only says the label again.
+    expect([whole.outerHTML]).toEqual(['<span>Working</span>']);
   });
 });

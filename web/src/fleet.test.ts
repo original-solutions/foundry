@@ -650,6 +650,8 @@ describe("a factory run's stage", () => {
       ["sh3", short],
     ]);
     expect(rows(workspaceIn(statuses))[0].fullLabel).toBe(`Stuck · ${reason}`);
+    // A failed one keeps its own state in its uncut words, for a screen reader and the tooltip.
+    expect(rows(workspaceIn(statuses))[5].fullLabel).toBe(`Failed · exit 2 — Stuck · ${reason}`);
     expect(rows(workspaceIn(statuses))[1].fullLabel).toBe("Working");
   });
 
@@ -693,6 +695,7 @@ describe("a factory run's stage", () => {
     const building = "Building · gate attempt 2";
     // A ready session or an open shell keeps its own state: the factory moves it, and its turn ending is news.
     expect(labels(statuses).map(([, label]) => label)).toEqual([building, "Working", "Needs you", "Ready", building, building, "Open"]);
+    expect(rows(workspaceIn(statuses)).map((r) => r.fullLabel)).toEqual([building, "Working", "Needs you", "Ready", building, `Failed · exit 2 — ${building}`, "Open"]);
   });
 
   it("leaves a workspace no run tends with its terminals' own labels", () => {

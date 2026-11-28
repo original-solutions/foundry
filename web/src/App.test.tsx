@@ -2111,7 +2111,7 @@ describe("App", () => {
     fireEvent.change(input, { target: { value: "login sonnet" } });
     fireEvent.keyDown(input, { key: "Tab" });
     expect(within(palette).getByRole("listbox", { name: "Actions for fix login / sonnet" })).toBeDefined();
-    expect(within(palette).getByText(cut, { selector: ".ml-auto" }).getAttribute("title")).toBe(`Stuck · ${reason}`);
+    expect(within(palette).getByText(cut, { selector: ".ml-auto > span" }).getAttribute("title")).toBe(`Stuck · ${reason}`);
     fireEvent.keyDown(input, { key: "Escape" });
     fireEvent.keyDown(input, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull());

@@ -664,6 +664,28 @@ describe("Sidebar and the factory", () => {
     expect(within(run).queryByText("Ended")).toBeNull();
   });
 
+  it("still tells a screen reader that a shell failed when its label says the run's stage, live or held up", async () => {
+    const reason = "gate red: make check fails on main, see the gate log";
+    const records = [sample(ME, 1), workspace(ME, "w1", "fac/214-1"), terminal(ME, "sh1", "w1", "exited", { exit_code: 2 }), workspace(ME, "w2", "fac/1027-2"), terminal(ME, "sh2", "w2", "exited", { exit_code: 2 })];
+    const statuses = factoryStatus("p1", { o__r__214__1: ["w1"] }, { o__r__1027__2: { kind: "stuck", workspaces: ["w2"], reason } });
+    statuses.p1.runs[0].gate_retries_used = 2;
+    const machines = withFactory(fleet(records, settings({ machines: [{ id: ME, name: "studio", address: "" }] })), statuses);
+    await renderApp(<Sidebar machines={machines} {...props} />);
+    const live = screen.getByRole("group", { name: "fac/214-1" });
+    const held = screen.getByRole("group", { name: "fac/1027-2" });
+    // Folded: the strip's glyph.
+    expect(within(live).getByRole("link", { name: "shell Failed · exit 2 — Building · gate attempt 3" })).toBeDefined();
+    expect(within(held).getByRole("link", { name: `shell Failed · exit 2 — Stuck · ${reason}` })).toBeDefined();
+    // Unfolded: the row, whose label shows the run's stage alone.
+    unfold("fac/214-1");
+    unfold("fac/1027-2");
+    const row = within(live).getByRole("link", { name: /^shell/ });
+    expect(row.textContent).toContain("Building · gate attempt 3");
+    expect(within(live).getByRole("link", { name: "shell Failed · exit 2 — Building · gate attempt 3" })).toBe(row);
+    expect(within(row).getByText("Building · gate attempt 3").getAttribute("title")).toBe("Failed · exit 2 — Building · gate attempt 3");
+    expect(within(held).getByRole("link", { name: `shell Failed · exit 2 — Stuck · ${reason}` })).toBeDefined();
+  });
+
   it("leaves the mark in full where it is not compact, as the board and its list show it", () => {
     render(<FactoryMark run={{ run: "original-solutions__foundry__162__1", issue: 162, url: "https://github.com/original-solutions/foundry/issues/162" }} />);
     const mark = screen.getByRole("link", { name: "factory #162" });
