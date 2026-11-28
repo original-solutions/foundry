@@ -1829,6 +1829,53 @@ mod tests {
         assert!(world.of(Kind::RunNeedsInfo).is_empty());
     }
 
+    /// The todo of the run-stuck item a run of issue 12 stuck for `reason` raises.
+    fn stuck_todo(reason: &str) -> String {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.held_up.push(held_up(12, HeldUpKind::Stuck, reason));
+        world.status(world.peer, status);
+        let items = world.of(Kind::RunStuck);
+        assert_eq!(items.len(), 1, "{items:?}");
+        items[0].todo.clone()
+    }
+
+    #[test]
+    fn a_run_stuck_at_its_time_limit_says_to_continue_from_its_branch() {
+        let todo = "Check how far the run's branch got. To continue from it, move the issue to \
+                    factory:ready without editing the issue text";
+        assert_eq!(stuck_todo(crate::factory::messages::TIME_LIMIT), todo);
+        assert_eq!(
+            stuck_todo(
+                "the run passed its time limit (180 min worked; last session activity 2 min \
+                 before the stop)"
+            ),
+            todo
+        );
+    }
+
+    #[test]
+    fn a_run_stuck_on_a_waiting_session_says_to_open_the_session() {
+        assert_eq!(
+            stuck_todo(crate::factory::runs::building::SESSION_WAITING),
+            "Open the session to see what it is waiting for. Answer it there to finish by hand, \
+             or fix the cause and move the issue out of factory:stuck"
+        );
+    }
+
+    #[test]
+    fn a_run_stuck_for_any_other_reason_says_to_read_the_last_comment() {
+        let todo = "Read the factory's last comment on the issue, fix the cause, then move the \
+                    issue out of factory:stuck";
+        assert_eq!(stuck_todo("the gate failed 3 times"), todo);
+        // Only a reason that starts with one names it.
+        assert_eq!(
+            stuck_todo("the gate failed: the run passed its time limit"),
+            todo
+        );
+    }
+
     #[test]
     fn an_issue_that_leaves_stuck_clears_run_stuck() {
         let mut world = World::new();
