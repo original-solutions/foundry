@@ -6865,14 +6865,14 @@ mod tests {
             WorkspaceId(uuid::Uuid::from_u128(0x6a7))
         }
 
-        /// A building run whose session read turn 1 and reported its pull request, which is
-        /// open on its own branch.
+        /// A building run whose session reported its pull request in turn 1, which is open on
+        /// its own branch: `pr_opened`, then the turn read, as building writes them.
         fn reported() -> (Rig, RunId) {
             let rig = Rig::new();
             let run = run_id(1);
             building(&rig, &run);
-            rig.step(&run, "turn-read 1");
             pr_opened(&rig, &run);
+            rig.step(&run, "turn-read 1");
             rig.sim.set_pull(12, pr_on(PR_BRANCH, false));
             (rig, run)
         }
@@ -7200,8 +7200,8 @@ mod tests {
             rig.step(&run, "result-line-reminding 1");
             rig.step(&run, "turn-read 1");
             rig.step(&run, "result-line-reminded");
-            rig.step(&run, "turn-read 2");
             pr_opened(&rig, &run);
+            rig.step(&run, "turn-read 2");
             rig.sim.set_pull(12, pr_on(PR_BRANCH, false));
             let mut rig = rig;
             rig.view = FleetView::builder()
