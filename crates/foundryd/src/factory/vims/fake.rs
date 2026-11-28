@@ -17,7 +17,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use serde_json::{Value, json};
 
 use super::cli::{Outcome, finish};
-use super::{Call, Vims, VimsError};
+use super::{Call, KEY_FLAG, Vims, VimsError};
 
 /// What the fake answers one call with.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,7 +168,7 @@ impl State {
         let argv = call.argv();
         let key = argv
             .iter()
-            .position(|arg| arg == "--idempotency-key")
+            .position(|arg| arg == KEY_FLAG)
             .and_then(|at| argv.get(at + 1));
         let found: Vec<Value> = key
             .and_then(|key| self.taken.get(key))

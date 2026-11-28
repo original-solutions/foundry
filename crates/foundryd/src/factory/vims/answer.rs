@@ -42,7 +42,7 @@ pub enum OpState {
 
 impl OpState {
     // Guessed spellings: P2c names none of these states.
-    fn read(status: &str) -> Self {
+    pub(super) fn read(status: &str) -> Self {
         let status = status.to_ascii_lowercase();
         match status.as_str() {
             "queued" | "pending" | "accepted" | "running" | "started" | "in_progress" => {
@@ -144,14 +144,15 @@ impl Change {
     }
 
     /// As [`Change::read`], for a change whose answer may be the thing it made, such as a
-    /// grant: an answer that is no error and names neither an operation nor a workspace is
-    /// the change made. Guessed: P2c records no grant's answer.
+    /// grant: an answer that is no error, names neither an operation nor a workspace, and has
+    /// no state, a done state, or a state no operation has beside its own id, is the change
+    /// made. Guessed: P2c records no grant's answer.
     pub(super) fn read_made(stdout: &str) -> Option<Self> {
         Self::read_or(stdout, Some(Change::Done))
     }
 
-    /// The change `stdout` answers, or `otherwise` for an answer that is no error and names
-    /// neither an operation nor a workspace.
+    /// The change `stdout` answers, or `otherwise` for an answer that is no error, names
+    /// neither an operation nor a workspace, and whose state says the change is made.
     fn read_or(stdout: &str, otherwise: Option<Self>) -> Option<Self> {
         if stdout.trim().is_empty() {
             return Some(Change::Done);
@@ -190,9 +191,16 @@ impl Change {
         if workspace {
             return Workspace::from_value(&value).map(Change::Workspace);
         }
-        // An answer whose own state says it failed is never the change made.
-        let said_failed = matches!(state, Some(OpState::Failed | OpState::Cancelled));
-        if failed || said_failed {
+        // The change is made only by an answer that is no error and whose state, if it has one,
+        // says it is done, or is a state no operation has on the thing's own id. A failed or
+        // cancelled state is never the change made, and work under way, or a state nothing
+        // names on no id, may not have happened yet.
+        let made_state = match &state {
+            None | Some(OpState::Finished) => true,
+            Some(OpState::Other(_)) => id.is_some(),
+            Some(OpState::Running | OpState::Failed | OpState::Cancelled) => false,
+        };
+        if failed || !made_state {
             None
         } else {
             otherwise
@@ -458,6 +466,8 @@ impl GithubLinks {
         };
         for item in list.into_iter().flatten() {
             if let Some(login) = text(item, &[&["login"], &["user", "login"], &["githubLogin"]]) {
+                // An entry's owner that cannot be read makes the answer unreadable: kept as no
+                // owner, it would answer for every owner.
                 let owner = text(
                     item,
                     &[
@@ -467,8 +477,11 @@ impl GithubLinks {
                         &["organization"],
                         &["account"],
                     ],
-                );
-                links.push(GithubLink { owner, login });
+                )?;
+                links.push(GithubLink {
+                    owner: Some(owner),
+                    login,
+                });
             }
         }
         if links.is_empty()
@@ -525,7 +538,7 @@ fn first<'a>(value: &'a Value, paths: &[&[&str]]) -> Option<&'a Value> {
 }
 
 /// The first of `paths` that leads to a string that is not empty.
-fn text(value: &Value, paths: &[&[&str]]) -> Option<String> {
+pub(super) fn text(value: &Value, paths: &[&[&str]]) -> Option<String> {
     paths.iter().find_map(|path| {
         path.iter()
             .try_fold(value, |value, field| value.get(field))

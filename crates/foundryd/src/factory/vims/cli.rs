@@ -20,6 +20,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use serde_json::Value;
 
+use super::answer::{self, OpState};
 use super::{Call, Refusal, Vims, VimsError, one_line};
 use crate::clock::Clock;
 
@@ -83,8 +84,12 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
             stdout,
             stderr,
         } => {
-            let coded = coded(&stdout).or_else(|| coded(&stderr));
-            if let Some(refusal) = coded.as_ref().filter(|coded| coded.is_vims_s()) {
+            // Stdout can carry the command's own output, so only its JSON answer, whole or on
+            // its last line, is read for a code there; stderr is read for one in plain text too.
+            let coded = coded(&stdout, false).or_else(|| coded(&stderr, true));
+            if let Some((refusal, false)) = coded.as_ref()
+                && refusal.is_vims_s()
+            {
                 return Err(VimsError::Refused {
                     command,
                     refusal: refusal.clone(),
@@ -101,7 +106,7 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
             Err(VimsError::Unknown {
                 command,
                 reason: reason.trim_end_matches([':', ' ']).to_owned(),
-                code: coded.map(|coded| coded.code),
+                code: coded.map(|(coded, _)| coded.code),
             })
         }
     }
@@ -117,34 +122,41 @@ fn quoted(text: &str) -> String {
     format!("{cut}{}", one_line(&text[start..]))
 }
 
-/// The code and message of the failure `text` reports, when it names one: JSON with
-/// `error.code` (or `code`, or an `error` that is a code), or a line that starts with a code,
-/// such as `Error: PRECONDITION_FAILED: …`. The checks saw the codes and not the shape they came
-/// in, so both are guesses. Whether the code is a refusal of Vims's is
+/// The code and message of the failure `text` reports, when it names one, and whether the
+/// answer names an operation: JSON with `error.code` (or `code`, or an `error` that is a code),
+/// or, when `plain`, a line that starts with a code, such as `Error: PRECONDITION_FAILED: …`.
+/// The checks saw the codes and not the shape they came in, so both are guesses. A code beside
+/// an operation (an `operation`, its id, or a state other than failed) is that operation's, so
+/// Vims took the call and it is no refusal. Whether any other code is a refusal of Vims's is
 /// [`Refusal::is_vims_s`]'s to say.
-fn coded(text: &str) -> Option<Refusal> {
+fn coded(text: &str, plain: bool) -> Option<(Refusal, bool)> {
     let text = text.trim();
     let json = serde_json::from_str::<Value>(text).ok().or_else(|| {
-        text.lines()
-            .rev()
-            .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        let mut lines = text.lines().rev();
+        if plain {
+            lines.find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        } else {
+            lines
+                .next()
+                .and_then(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        }
     });
     if let Some(value) = json.filter(Value::is_object) {
-        let field = |path: &[&str]| {
-            path.iter()
-                .try_fold(&value, |value, name| value.get(name))
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(str::to_owned)
-        };
         let code = [&["error", "code"][..], &["code"], &["error"]]
             .into_iter()
-            .filter_map(&field)
+            .filter_map(|path| answer::text(&value, &[path]))
             .find(|code| is_code(code))?;
-        let message = field(&["error", "message"])
-            .or_else(|| field(&["message"]))
-            .unwrap_or_default();
-        return Some(Refusal::new(code, message));
+        let message =
+            answer::text(&value, &[&["error", "message"], &["message"]]).unwrap_or_default();
+        // Guessed, as `Change::read` guesses them: an operation's id and state.
+        let operation = value.get("operation").is_some_and(Value::is_object)
+            || answer::text(&value, &[&["id"], &["operationId"], &["operation_id"]]).is_some()
+            || answer::text(&value, &[&["status"], &["state"]])
+                .is_some_and(|state| OpState::read(&state) != OpState::Failed);
+        return Some((Refusal::new(code, message), operation));
+    }
+    if !plain {
+        return None;
     }
     text.lines().find_map(|line| {
         let line = line.trim();
@@ -154,7 +166,7 @@ fn coded(text: &str) -> Option<Refusal> {
             .unwrap_or(line);
         let (code, message) = line.split_once(':').unwrap_or((line, ""));
         // In free text a code is a word with an `_` in it, so a capitalised word is not one.
-        (is_code(code) && code.contains('_')).then(|| Refusal::new(code, message.trim()))
+        (is_code(code) && code.contains('_')).then(|| (Refusal::new(code, message.trim()), false))
     })
 }
 
@@ -725,6 +737,69 @@ mod tests {
             .unwrap_err();
         assert_no_token(&error);
         assert!(error.to_string().contains("no ***"), "{error}");
+    }
+
+    #[test]
+    fn a_call_that_succeeds_and_prints_the_token_has_it_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fake_vims(dir.path(), "echo \"out $FOUNDRY_VIMS_TOKEN\"\nexit 0");
+        let vims = vims_at(&program, Arc::new(SystemClock));
+        let answer = vims.call(&Call::new("show").arg("wsp_1")).unwrap();
+        assert!(!answer.contains(TOKEN), "{answer}");
+        assert!(answer.contains("out ***"), "{answer}");
+        let logs = vims.operation_logs("op_1").unwrap();
+        assert!(!logs.contains(TOKEN), "{logs}");
+        assert!(logs.contains("out ***"), "{logs}");
+    }
+
+    #[test]
+    fn a_failure_that_names_an_operation_is_no_refusal_and_keeps_its_code() {
+        let dir = tempfile::tempdir().unwrap();
+        for answer in [
+            r#"{"id":"op_5","status":"failed","error":{"code":"PRECONDITION_FAILED"}}"#,
+            r#"{"operationId":"op_5","error":{"code":"NOT_FOUND"}}"#,
+            r#"{"operation":{"id":"op_5"},"error":{"code":"NOT_FOUND"}}"#,
+            r#"{"status":"running","error":{"code":"PRECONDITION_FAILED"}}"#,
+        ] {
+            let program = fake_vims(dir.path(), &format!("echo '{answer}'\nexit 1"));
+            let error = vims_at(&program, Arc::new(SystemClock))
+                .call(&exec_call())
+                .unwrap_err();
+            assert!(
+                matches!(error, VimsError::Unknown { code: Some(_), .. }),
+                "{answer}: {error:?}"
+            );
+        }
+        // An answer's own failed state names no operation, so its code is still Vims's refusal.
+        let program = fake_vims(
+            dir.path(),
+            "echo '{\"status\":\"error\",\"error\":{\"code\":\"PRECONDITION_FAILED\"}}'\nexit 1",
+        );
+        let error = vims_at(&program, Arc::new(SystemClock))
+            .call(&exec_call())
+            .unwrap_err();
+        assert_eq!(
+            error.refusal().map(|refusal| refusal.code.as_str()),
+            Some("PRECONDITION_FAILED")
+        );
+    }
+
+    #[test]
+    fn a_code_in_a_command_s_own_output_on_stdout_is_no_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        for script in [
+            "echo 'Error: NOT_FOUND: fixture missing'\nexit 1",
+            "echo '{\"error\":{\"code\":\"NOT_FOUND\"}}'\necho 'the command went on'\nexit 1",
+        ] {
+            let program = fake_vims(dir.path(), script);
+            let error = vims_at(&program, Arc::new(SystemClock))
+                .call(&exec_call())
+                .unwrap_err();
+            assert!(
+                matches!(error, VimsError::Unknown { .. }),
+                "{script}: {error:?}"
+            );
+        }
     }
 
     #[test]

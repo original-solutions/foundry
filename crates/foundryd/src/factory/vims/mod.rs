@@ -27,6 +27,9 @@ pub use cli::{LIMIT, Outcome, TOKEN_REF, TOKEN_VAR, VimsCli};
 pub use fake::{FakeVims, Reply};
 pub use keys::{Role, Step, key};
 
+/// The flag that carries a call's idempotency key, and that `operation list` filters by.
+pub(super) const KEY_FLAG: &str = "--idempotency-key";
+
 /// One `vims` call: its command, its arguments, its idempotency key, the argv it runs after
 /// `--`, and the bytes for its standard input. Every call answers in JSON.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,7 +102,7 @@ impl Call {
         let mut argv: Vec<String> = self.command.split(' ').map(str::to_owned).collect();
         argv.extend(self.args.iter().cloned());
         if let Some(key) = &self.key {
-            argv.push("--idempotency-key".into());
+            argv.push(KEY_FLAG.into());
             argv.push(key.clone());
         }
         argv.push("--json".into());
@@ -343,9 +346,7 @@ pub trait Vims: Send + Sync {
     /// `vims operation list` of the operations a key made: none for a key Vims never took.
     fn operations_by_key(&self, key: &str) -> Result<Vec<Operation>, VimsError> {
         // Guessed: the list is filtered by the same flag that carries a key.
-        let call = Call::new("operation list")
-            .arg("--idempotency-key")
-            .arg(key);
+        let call = Call::new("operation list").arg(KEY_FLAG).arg(key);
         read(
             &call,
             self.call(&call)?,
@@ -1021,6 +1022,44 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_answered_with_a_state_under_way_or_unknown_and_no_id_cannot_be_read() {
+        for answer in [
+            r#"{"status":"active"}"#,
+            r#"{"status":"pending"}"#,
+            r#"{"state":"queued"}"#,
+            r#"{"status":"running","turn":"fetch"}"#,
+        ] {
+            let fake = FakeVims::new();
+            fake.on("workspace turn-grant put", Reply::ok(answer))
+                .on("workspace turn-grant rm", Reply::ok(answer));
+            assert!(
+                matches!(
+                    fake.grant("wsp_1", "fetch", "conn_gh", "30m", "k1"),
+                    Err(VimsError::Unknown { .. })
+                ),
+                "{answer}"
+            );
+            assert!(
+                matches!(
+                    fake.ungrant("wsp_1", "fetch", "conn_gh", "k2"),
+                    Err(VimsError::Unknown { .. })
+                ),
+                "{answer}"
+            );
+        }
+        let fake = FakeVims::new();
+        fake.on(
+            "workspace turn-grant put",
+            Reply::ok(r#"{"status":"succeeded"}"#),
+        );
+        assert_eq!(
+            fake.grant("wsp_1", "fetch", "conn_gh", "30m", "k1")
+                .unwrap(),
+            Change::Done
+        );
+    }
+
+    #[test]
     fn a_grant_answered_with_its_own_id_is_made_and_one_with_a_state_is_an_operation() {
         let fake = FakeVims::new();
         fake.on(
@@ -1187,6 +1226,20 @@ mod tests {
         let links = fake.github().unwrap();
         assert_eq!(links.login_for("Trilogy-Care"), Some("tomkaczocha"));
         assert_eq!(links.login_for("rawphp"), None);
+    }
+
+    #[test]
+    fn a_github_entry_whose_owner_cannot_be_read_makes_the_answer_unreadable() {
+        for answer in [
+            r#"{"installations":[{"account":{"id":42,"name":"Trilogy-Care"},"login":"bot"}]}"#,
+            r#"[{"login":"bot","target":"Trilogy-Care"}]"#,
+            r#"{"installations":[{"account":{"login":"Trilogy-Care"},"login":"tomkaczocha"},{"account":{"slug":"rawphp"},"login":"bot"}]}"#,
+        ] {
+            let fake = FakeVims::new();
+            fake.on("github", Reply::ok(answer));
+            let error = fake.github().unwrap_err();
+            assert!(matches!(error, VimsError::Unknown { .. }), "{answer}");
+        }
     }
 
     #[test]
