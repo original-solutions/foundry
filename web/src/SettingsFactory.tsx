@@ -84,7 +84,7 @@ function Form({ saved: overview }: { saved: FactorySettings }) {
    * overview held for each edited field when it was last edited or looked at, to tell that it
    * moved since. Together, so a save settles both in one step.
    */
-  const [draft, setDraft] = useState<{ edits: Partial<Texts>; from: Partial<Texts> }>({ edits: {}, from: {} });
+  const [draft, setDraft] = useState<{ edits: Partial<Texts>; from: Partial<Texts>; sending?: Partial<Texts> }>({ edits: {}, from: {} });
   const { edits, from } = draft;
   const [refusals, setRefusals] = useState<Refusal[]>([]);
   // A model or effort the daemon could not show (its secret store is unreadable) is kept as last read or sent.
@@ -107,8 +107,9 @@ function Form({ saved: overview }: { saved: FactorySettings }) {
   const set = <K extends keyof Texts>(key: K, value: Texts[K]) => {
     setRefusals((r) => r.filter((x) => x.key !== key));
     // Put back to what the overview holds, it is untouched again and follows it.
+    // A field being sent is kept even then: what the save makes the overview decides whether it is a change.
     const same = diff(now, { ...now, [key]: value }, defs).length === 0;
-    setDraft((d) => (same ? { edits: without(d.edits, key), from: without(d.from, key) } : { edits: { ...d.edits, [key]: value }, from: { ...d.from, [key]: now[key] } }));
+    setDraft((d) => (same && !(key in (d.sending ?? {})) ? { ...d, edits: without(d.edits, key), from: without(d.from, key) } : { ...d, edits: { ...d.edits, [key]: value }, from: { ...d.from, [key]: now[key] } }));
   };
 
   const discard = () => {
@@ -137,10 +138,12 @@ function Form({ saved: overview }: { saved: FactorySettings }) {
     // The check's message begins with the name of the field it refuses.
     if (wrong !== null) return refuse([{ key: defs.find((d) => wrong.startsWith(`${d.key} `))?.key, message: wrong }]);
     const sent = { ...edits };
+    setDraft((d) => ({ ...d, sending: sent }));
     try {
       const answer = await saveFactorySettings(next);
       // A word the daemon could not show is kept as it was sent.
       const settings = { ...answer, model: answer.model === HIDDEN ? next.model : answer.model, effort: answer.effort === HIDDEN ? next.effort : answer.effort };
+      // Set here too: a re-read that hides the word can land before the overview shows the one just sent.
       setKnown({ model: settings.model, effort: settings.effort });
       client.setQueryData<FactoryOverview>(factoryKey, (old) => old && { ...old, settings });
       const answered = texts(settings);
@@ -154,6 +157,7 @@ function Form({ saved: overview }: { saved: FactorySettings }) {
       void client.invalidateQueries({ queryKey: factoryKey });
       return refuse([]);
     } catch (e) {
+      setDraft((d) => ({ edits: d.edits, from: d.from }));
       return refuse([{ message: e instanceof Error ? e.message : "The settings were not saved." }]);
     }
   };
