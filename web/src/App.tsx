@@ -83,7 +83,7 @@ import { SettingsPage } from "./SettingsPage";
  *
  * The Factory view (`/factory`, from the rail's factory link) is headed by the line: how many
  * issues stand ready, building, held up and finished across the projects that are on, with the
- * fleet's factory settings folded to one line under it. Each project has its switch, login and
+ * fleet's factory settings as one line under it, which links to Settings → Factory. Each project has its switch, login and
  * pause, its lease holder and generation or why it is idle, and its issues in the line's four
  * stations side by side: the ready queue, live runs with a Stop that asks first, runs held up, and
  * the last finished. It takes the place of the board.
@@ -110,12 +110,20 @@ import { SettingsPage } from "./SettingsPage";
  * The browser tab shows the fleet's state in its title and icon. A session you are not looking at
  * that finishes its turn or needs you is told once: as a card at the top right while you are at
  * the page, or as a desktop alert while you are not; coming back after a while, a catch-up card
- * heads the same stack. The sidebar's bell sets all three in one place; a screen reader hears the
+ * heads the same stack. The sidebar's bell links to Settings → Notifications, where all three are set; a screen reader hears the
  * news whatever it is set to. While any terminal needs you, a strip heads the page, in its flow above
- * the board, the machines, the factory or an open terminal's header: how many need you and the next
+ * the board, the machines, the factory, Settings or an open terminal's header: how many need you and the next
  * one, which it (or Cmd+J from anywhere) opens, in the board's order. Beside it, folded, what else
  * needs a person (a session's own question, stall or failure is the strip's) and the creates waiting
  * for a machine, so none of them lies over a control, folded or open; the steps column keeps its own height.
+ *
+ * Settings (`/settings`, `/settings/$category`, `/settings/machines/$machine`) takes the place of the
+ * board: categories on the left in two groups, Fleet (Factory, Projects, Machines) and This browser
+ * (Notifications, Appearance, Keyboard), each with a line of its current values, and the chosen
+ * category's page on the right. Changes to shared settings collect in a review bar and are saved
+ * together; a browser setting saves as it changes. A gear beside the theme button in the sidebar and
+ * the rail, Cmd+, (Ctrl+, off macOS) outside a field or the terminal, and the jump palette's
+ * "Settings" and "Settings: {category}" entries all open it.
  *
  * ? (outside a field or the terminal) or the sidebar's Keyboard button lists every key the app
  * answers. The sidebar's list is one Tab stop that the arrows walk.
