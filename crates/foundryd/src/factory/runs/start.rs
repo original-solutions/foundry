@@ -67,6 +67,7 @@ use crate::factory::lifecycle::{
     Action, Event as LifecycleEvent, InvalidTransition, State, transition,
 };
 use crate::factory::messages::{self, CUT_SHORT_COMMENT, Message, ResumeFrom};
+use crate::factory::pass::POSTPONED;
 use crate::factory::text;
 use crate::factory::worker::{CreateWorkspace, Target, WorkerError};
 use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
@@ -155,6 +156,16 @@ pub fn claim(ctx: &RunContext<'_>, issue: u64, target: Target) -> Result<ClaimOu
     if detail.state != Some(State::Ready) {
         return Ok(ClaimOutcome::Skipped {
             reason: format!("issue #{issue} is not factory:ready"),
+        });
+    }
+    // Judged on the live fetch, not the pass's listing, which can be older.
+    if detail
+        .labels
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(POSTPONED))
+    {
+        return Ok(ClaimOutcome::Skipped {
+            reason: "labelled postponed, so it is not claimed".into(),
         });
     }
     if !detail.assignees.is_empty() {
