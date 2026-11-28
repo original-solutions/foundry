@@ -3,14 +3,30 @@ import { createMemoryHistory, createRootRoute, createRoute, createRouter, Router
 import { render } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { expect, vi } from "vitest";
+import { emptyState } from "./fleet";
 import { buttonShape, fieldLook } from "./Modal";
+import type { PageProps } from "./SettingsPage";
 
-/** Renders `ui` inside a query client and a router that knows the terminal route, so links resolve. Gives back the query client too. */
+/** The props every settings page takes: a synced empty fleet, no machines, and the default notify choices. Each can be replaced. */
+export function pageProps(over: Partial<PageProps> = {}): PageProps {
+  return {
+    state: { ...emptyState, synced: true },
+    machines: [],
+    here: undefined,
+    notify: { notify: { cards: true, desktop: false, away: true }, desktop: "ask", onChoose: () => {} },
+    ...over,
+  };
+}
+
+/** Renders `ui` inside a query client and a router that knows the terminal and settings routes, so links resolve. Gives back the query client too. */
 export async function renderApp(ui: ReactNode) {
   const root = createRootRoute({ component: () => <>{ui}</> });
   const terminal = createRoute({ getParentRoute: () => root, path: "/terminals/$terminalId" });
+  const settings = createRoute({ getParentRoute: () => root, path: "/settings" });
+  const category = createRoute({ getParentRoute: () => root, path: "/settings/$category" });
+  const machine = createRoute({ getParentRoute: () => root, path: "/settings/machines/$machine" });
   const router = createRouter({
-    routeTree: root.addChildren([terminal]),
+    routeTree: root.addChildren([terminal, settings, category, machine]),
     history: createMemoryHistory({ initialEntries: ["/"] }),
   });
   await router.load();

@@ -111,7 +111,7 @@ The timeline only has turns from after this machine's daemon started.
 The sidebar is the same fleet as a list. It sits at the left on a wide screen. From the top:
 
 - **Foundry** goes to the board.
-- The buttons in the header are, in order, **Collapse sidebar**, a theme switch, the bell for notifications, **Jump to** and **New task**. **Collapse sidebar** shows only on a wide screen.
+- The buttons in the header are, in order, **Collapse sidebar**, a theme switch, **Settings** (a gear), the bell for notifications, **Jump to** and **New task**. **Collapse sidebar** shows only on a wide screen. `Cmd+,` (`Ctrl+,` on Windows and Linux) opens Settings too, except in a text field or a terminal.
 - Each machine has a status dot, its name, and its status. Click the name to open the Machines view. Under it, a load bar and one line of numbers, such as "2.88/core · 8.1 GB mem · 59.8 GB disk · 4 sessions". Point at the line for fuller numbers. The bar turns amber at 0.7 load per core and red at 1.
 - Under a machine, its workspaces. **Fold all** at the right of the machine line folds every workspace, and then reads **Unfold all**.
 - **Keyboard** at the bottom lists every key the app answers. `?` opens it too.
@@ -166,7 +166,7 @@ On the rail, from the top:
 - **Expand sidebar**, **Jump to** and **New task**.
 - A dot per machine for its status. Click it to open the Machines view.
 - A column for each workspace, headed by its project's face, then its glyphs. Point at the face for the workspace and project names. The workspace you are in is outlined. A glyph is a link to its terminal, and pointing at it names the workspace, terminal and state. A column shows six at most, then "+N".
-- The bell and the theme switch at the bottom.
+- The bell, the theme switch and **Settings** at the bottom.
 
 `Up`, `Down`, `Home` and `End` move along the rail's glyphs.
 
@@ -184,8 +184,8 @@ Type a few words. A row matches when it holds every word, in any of its workspac
 - `Shift+Enter`, or `Shift` and a click, opens it beside the terminal you already have open, in a split. See [Two terminals side by side](sessions.md#two-terminals-side-by-side).
 - `Tab` lists what you can do with the picked terminal, as its right-click menu does. Type to narrow that list and press `Enter` to do the picked one. `Esc`, `Shift+Tab` or `Backspace` in an empty box goes back.
 - On a wide screen, a preview beside the list shows what the highlighted session was asked, its last turn, what Claude said and what its workspace changed. For a session on another machine it says which machine keeps them.
-- With nothing typed, the views sit in a row over the list: **Board**, **Timeline**, **Machines** and **Factory**, the one you are on marked. Pick one to go there, from a terminal or a phone too.
-- **Do** lists the app's actions, each with the key that does it from anywhere: **New task**, **Next that needs you** (with how many need you), **Collapse sidebar** or **Expand sidebar** on a wide screen, and **Keyboard shortcuts**. They come after the sessions and shells.
+- With nothing typed, the views sit in a row over the list: **Board**, **Timeline**, **Machines**, **Factory** and **Settings**, the one you are on marked. Pick one to go there, from a terminal or a phone too.
+- **Do** lists the app's actions, each with the key that does it from anywhere: **New task**, **Next that needs you** (with how many need you), **Collapse sidebar** or **Expand sidebar** on a wide screen, and **Keyboard shortcuts**. After them, **Settings: Factory**, **Settings: Notifications** and the like open each page of Settings. They come after the sessions and shells.
 - After the actions come **New shell in** each workspace. Pick one to open a shell there.
 - Once you type, the views and actions that match come first, so `mach` then `Enter` opens the machines view and `keys` the list of keys.
 - The last row, **New task "your words"**, opens the New task dialog with what you typed. If nothing matches, the palette says "Nothing matches" and that `Enter` makes it a task for Claude.
@@ -196,12 +196,10 @@ Type a few words. A row matches when it holds every word, in any of its workspac
 
 You do not have to watch the board. Foundry tells you once when a session finishes its turn, and once when one needs you. A session needs you when it is waiting for you, stuck after ten minutes with no output, or failed. A session in a live factory run never needs you, since the factory tends it. It raises no toast or alert when it waits, is stuck or failed, the tab does not count it, and the **While you were away** card shows it as the board does. You are still told when it finishes its turn. If its run is then held up, a session in it that already waits, is stuck or failed needs you, and you are told then. You get no toast for a terminal that is on screen.
 
-**Notifications**, the bell in the sidebar header and at the foot of the rail, chooses how the news reaches you.
-
-![The Notifications panel with three switches](images/board-notifications.png)
+The bell in the sidebar header and at the foot of the rail opens **Settings → Notifications**, where you choose how the news reaches you. A change there takes effect at once.
 
 - **Cards in the page.** On by default. While you are at Foundry, a toast slides in at the top right, with what Claude said or is doing.
-- **Desktop alerts.** Off by default. When Foundry is in the background, you get a desktop alert instead of a toast. Turning it on asks your browser for permission. A click on the alert opens that session. Returning to the page clears the alerts. If your browser blocks them, the switch is disabled and says to allow notifications in the site settings.
+- **Desktop alerts.** Off by default. When Foundry is in the background, you get a desktop alert instead of a toast. Turning it on asks your browser for permission. A click on the alert opens that session. Returning to the page clears the alerts. If your browser blocks them, the switch is disabled and says to allow notifications in the site settings. **Browser permission**, under the switch, says what your browser allows: allowed, blocked, not asked yet or not supported.
 - **Catch-up when you come back.** On by default. After two minutes away, a card says what each session did meanwhile.
 
 The three choices are kept in this browser. The bell is filled when desktop alerts are on, and crossed out when all three are off.
@@ -230,13 +228,15 @@ A session that asks you something, is stuck or failed leads from the amber strip
 
 Some things need a person and are not a session's question. They gather in a card at the top of the page, folded to a count such as "1 needs attention", beside the strip. It takes its own room above the board, the machines, the factory or an open terminal, so it never covers a button. Click the header to unfold it, and again to fold it.
 
-Each item has a title, the machine it is about, what happened, and what to do. Items with a terminal have **Open terminal**. The titles are Machine offline, Setup failed, Gateway unhealthy, Disk low, Placement waiting, Setting overwritten and Update refused. [The factory](factory.md) adds five more, which show as a raw id instead of a title: `run_stuck` (a run is stuck), `run_needs_info` (a run asked questions on its issue), `gate_infra` (a run's gate could not run at all), `foreign_claim` (an issue is in a factory label under a claim that is not Foundry's) and `factory_idle` (a project's factory is on but idle, or has gone 10 minutes without word from the machine that holds it). They clear themselves when the cause is gone. Only **Setting overwritten** has a **Dismiss** button. **Setup failed** has **Close terminal**: its setup terminal has already exited, so closing it clears the item and stops nothing. Like **Clear**, it does not ask first, and the setup output goes with the terminal, so read it before you close.
+Each item has a title, the machine it is about, what happened, and what to do. Items with a terminal have **Open terminal**. The titles are Machine offline, Setup failed, Gateway unhealthy, Disk low, Placement waiting, Setting overwritten and Update refused. [The factory](factory.md) adds five more: Run stuck (a run is stuck), Run needs info (a run asked questions on its issue), Gate could not run (a run's gate could not run at all), Foreign claim (an issue is in a factory label under a claim that is not Foundry's) and Factory idle (a project's factory is on but idle, or has gone 10 minutes without word from the machine that holds it). They clear themselves when the cause is gone. An item of a kind this version of Foundry has no title for shows its raw kind instead. Only **Setting overwritten** has a **Dismiss** button. **Setup failed** has **Close terminal**: its setup terminal has already exited, so closing it clears the item and stops nothing. Like **Clear**, it does not ask first, and the setup output goes with the terminal, so read it before you close.
+
+Items of one kind share a card. Its title counts them, as in "16 runs stuck", and it says what to do once, and the machine once when they are all on one. Each item then gets a line with the first line of what happened. Hover over a line to read all of it, or click it to open it there, with its own todo when the items' todos differ. A line keeps its own **Open terminal**, **Dismiss** or **Close terminal**. The folded count still counts items, not cards.
 
 A second card under it, "N waiting for a machine", lists the tasks you asked Foundry to place that no machine can take yet. [Let Foundry choose a machine](machines.md#let-foundry-choose-a-machine) explains it.
 
 ## Theme
 
-The sun or moon button in the sidebar header, at the foot of the rail, and on the connection error page switches between dark and light. Dark is the default. The choice is kept in this browser.
+The sun or moon button in the sidebar header, at the foot of the rail, and on the connection error page switches between dark and light. **Settings → Appearance** sets the same choice, and each shows a change made in the other at once. Dark is the default. The choice is kept in this browser.
 
 ## When the connection drops
 

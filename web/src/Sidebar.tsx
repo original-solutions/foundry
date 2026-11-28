@@ -17,7 +17,7 @@ import { SessionNameField, useRenaming } from "./SessionName";
 import { SparkIcon } from "./FirstPrompt";
 import { Mark } from "./Mark";
 import { ProjectFace } from "./ProjectFace";
-import { ThemeButton } from "./ThemeButton";
+import { SettingsLink, ThemeButton } from "./ThemeButton";
 import { railKey } from "./collapsed";
 import { pollEvery } from "./poll";
 import { CHECKS_EVERY, checksPending, SHIPPING_STALE, shippingQuery, standing, toneText, useReadOnChange } from "./Shipping";
@@ -164,6 +164,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
             </button>
           )}
           <ThemeButton />
+          <SettingsLink onClick={onNavigate} />
           {alerts}
           {onJump && (
             <button type="button" aria-label="Jump to" title={`Jump to (${jumpKey})`} onClick={onJump} className="rounded p-1 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200">

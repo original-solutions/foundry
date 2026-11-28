@@ -73,3 +73,23 @@ test("the Factory view on a daemon with no factory project shows each project's 
   await expect(page.getByRole("region", { name: "e2e-machine" })).toBeVisible();
   await expect(page.getByRole("link", { name: /^factory #/ })).toHaveCount(0);
 });
+
+test("open Settings with the keyboard, change Runs at once, review it, save it, and see it in the nav", async ({ page }) => {
+  await page.goto(`${process.env.FOUNDRY_E2E_URL}/`);
+  await expect(page.getByRole("region", { name: "e2e-machine" })).toBeVisible();
+
+  // ⌘, on a Mac, Ctrl+, elsewhere.
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+," : "Control+,");
+  await expect(page).toHaveURL(/\/settings$/);
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await expect(nav).toContainText("3 runs at once");
+
+  // The row is "Runs at once"; its control keeps the name today's form gave it.
+  await page.getByLabel("Max runs").fill("4");
+  const bar = page.getByRole("region", { name: "Unsaved changes" });
+  await expect(bar).toContainText("Runs at once 3 → 4");
+  await bar.getByRole("button", { name: "Save 1 change" }).click();
+
+  await expect(nav).toContainText("4 runs at once");
+  await expect(bar).toHaveCount(0);
+});
