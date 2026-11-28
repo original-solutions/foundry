@@ -1,11 +1,11 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named } from "./Now";
 import { startShell } from "./api";
-import { archiveOf } from "./Archive";
+import { useArchive, useLeaving } from "./Archive";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
 import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
@@ -299,16 +299,16 @@ function sweepable(machine: MachineView): string[] {
 /**
  * A machine's sweep, under its numbers: clear every terminal that ended (`over`), and archive every
  * workspace left with no terminals (`empty`). Archiving is not forced, so the daemon keeps any
- * workspace with work it would lose, and the line says how many it kept. Each archive is the same
- * mutation a single one is (`archiveOf`), so every view sees it under way; one that fails leaves
+ * workspace with work it would lose, and the line says how many it kept. Each archive runs as a
+ * single one does (`useArchive`), so every view sees it under way; one that fails leaves
  * the others to finish, and the line says how many could not be archived and why. While the fleet
  * shown is not the daemon's live word (`stale`), both wait: what it lists as ended or empty may not be.
  */
 function Tidy({ over, empty, clear, stale = false }: { over: string[]; empty: string[]; clear: (ids: string[]) => void; stale?: boolean }) {
-  const client = useQueryClient();
+  const one = useArchive();
   const archive = useMutation({
     mutationFn: async (ids: string[]) => {
-      const results = await Promise.allSettled(ids.map((id) => client.getMutationCache().build(client, archiveOf(id)).execute(false)));
+      const results = await Promise.allSettled(ids.map((id) => one.start(id, false)));
       const failed = results.flatMap((r) => (r.status === "rejected" ? [r.reason as unknown] : []));
       return { of: ids.length, kept: results.filter((r) => r.status === "fulfilled" && r.value !== null).length, failed: failed.length, why: failed[0] };
     },
@@ -479,11 +479,13 @@ function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, 
  * or opened a pull request), and every `CHECKS_EVERY` only while its pull request's checks run;
  * never on window focus or reconnect, since each read runs git and asks GitHub on the owner. Not
  * read while `readable` is off (its machine is offline). A read that fails or has not answered
- * leaves the project alone, and says nothing of why. `branch`, when given, ends the line.
+ * leaves the project alone, and says nothing of why. `branch`, when given, ends the line. While the
+ * workspace is being archived, the line says so in place of where it stands, and reads nothing.
  */
 function StandingLine({ workspace, list, readable, branch }: { workspace: WorkspaceView; list: Row[]; readable: boolean; branch?: string }) {
   const [ref, onScreen] = useOnScreen<HTMLParagraphElement>();
-  const enabled = readable && onScreen;
+  const leaving = useLeaving(workspace.id);
+  const enabled = readable && onScreen && !leaving;
   const { data, isError } = useQuery({
     ...shippingQuery(workspace.id),
     enabled,
@@ -497,11 +499,17 @@ function StandingLine({ workspace, list, readable, branch }: { workspace: Worksp
   useReadOnChange(workspace.id, list.map((r) => `${r.terminal}:${r.glyph}`).join(" "));
 
   const working = list.some((r) => r.glyph === "starting" || r.glyph === "working");
-  const stands = readable && data && !isError ? standing(data, working) : undefined;
-  const title = [workspace.project, stands?.text, branch].filter((part) => part !== undefined).join(" · ");
+  const stands = !leaving && readable && data && !isError ? standing(data, working) : undefined;
+  const title = [workspace.project, leaving ? "Archiving…" : stands?.text, branch].filter((part) => part !== undefined).join(" · ");
   return (
     <p ref={ref} title={title} className="truncate pr-1 pl-2 text-xs text-neutral-500">
       <span>{workspace.project}</span>
+      {leaving && (
+        <>
+          <span className="text-neutral-600"> · </span>
+          <span>Archiving…</span>
+        </>
+      )}
       {stands && (
         <>
           <span className="text-neutral-600"> · </span>
