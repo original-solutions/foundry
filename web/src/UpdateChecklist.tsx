@@ -4,10 +4,10 @@ import type { MachineView } from "./fleet";
 import { button, primaryButton } from "./Modal";
 
 /** What became of one install call: not sent yet (the serving machine's, while others are out), out, answered, or dropped. */
-export type Call = { kind: "queued" } | { kind: "out" } | { kind: "answered"; status: number; json: Record<string, unknown> } | { kind: "dropped" };
+type Call = { kind: "queued" } | { kind: "out" } | { kind: "answered"; status: number; json: Record<string, unknown> } | { kind: "dropped" };
 
 /** A machine an install was sent to, with the tag it sent and what became of the call. */
-export interface Row {
+interface Row {
   id: string;
   name: string;
   tag: string;
@@ -70,7 +70,7 @@ export function rowSays(row: Row, machine: MachineView | undefined): { text: str
 }
 
 /** Whether a call ended with no answer that says what happened: the install may have run. */
-export const mayHaveRun = (call: Call) => call.kind === "dropped" || (call.kind === "answered" && call.status === 504);
+const mayHaveRun = (call: Call) => call.kind === "dropped" || (call.kind === "answered" && call.status === 504);
 
 /**
  * The installs this page sent since it loaded, shared by the checklist and every machine's page,

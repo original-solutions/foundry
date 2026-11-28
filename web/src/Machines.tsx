@@ -92,7 +92,7 @@ export function Machines({ machines, history, here, connected, onCreate }: Props
           <MachineCard
             key={machine.id}
             machine={machine}
-            order={order}
+            orderOf={order.length}
             points={history[machine.id]?.points ?? []}
             heard={history[machine.id]?.heard}
             here={machine.id === here}
@@ -109,7 +109,7 @@ export function Machines({ machines, history, here, connected, onCreate }: Props
 
 function MachineCard({
   machine,
-  order,
+  orderOf,
   points,
   heard,
   here,
@@ -119,7 +119,7 @@ function MachineCard({
   onCreate,
 }: {
   machine: MachineView;
-  order: string[];
+  orderOf: number;
   points: Point[];
   heard?: number;
   here: boolean;
@@ -169,9 +169,9 @@ function MachineCard({
         {sample?.update_ready && <span className="text-sky-300"> · {sample.update_ready} waiting</span>}
       </p>
       <p className="px-4 pt-1.5 text-xs text-neutral-400">{machine.limits ? limitsText(machine.limits) : "No limits"}</p>
-      {machine.rank !== undefined && order.length >= 2 && (
+      {machine.rank !== undefined && orderOf >= 2 && (
         <p className="px-4 pt-1.5 text-xs text-neutral-400">
-          Coordinator order {machine.rank + 1} of {order.length}
+          Coordinator order {machine.rank + 1} of {orderOf}
         </p>
       )}
       <RoomLine name={machine.name} room={room} several={several} onCreate={onCreate} />
