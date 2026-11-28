@@ -2,9 +2,9 @@
 //!
 //! [`Worker`] is the seam between a run and the fleet: it makes workspaces, starts and talks to
 //! sessions, and reads their turns. [`Guard`] says whether the factory may still act at all.
-//! [`FleetView`] is what a run reads of the fleet in one pass, taken from the store.
-//! [`FakeWorker`] and [`FleetView::builder`] stand in for both in tests, so a run is tested
-//! with no daemon.
+//! [`FleetView`] is what a run reads of the fleet in one pass, and [`StoreView`] its source,
+//! taken from the store. [`FakeWorker`] and [`StoreView::builder`] stand in for both in tests,
+//! so a run is tested with no daemon.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -196,11 +196,11 @@ impl Guard for Lost {
     }
 }
 
-/// The fleet as one pass of the factory sees it: a snapshot, so a pass reads no store twice.
-/// Sessions and terminals are held as stored; the offline rule of [`as_seen`] is applied when
-/// one is read.
+/// The store's source of [`FleetView`]: a snapshot of the fleet taken once a pass, so a pass
+/// reads no store twice. Sessions and terminals are held as stored; the offline rule of
+/// [`as_seen`] is applied when one is read.
 #[derive(Clone, Debug, Default)]
-pub struct FleetView {
+pub struct StoreView {
     workspaces: Vec<Record<Workspace>>,
     sessions: Vec<Record<Session>>,
     terminals: BTreeMap<TerminalId, Record<Terminal>>,
@@ -211,7 +211,7 @@ pub struct FleetView {
     held: BTreeMap<MachineId, MachineHeld>,
 }
 
-impl FleetView {
+impl StoreView {
     /// Reads the snapshot from `store`. `online` is the machines heard from, as P1's
     /// `Peers::online` gives them, and `unreachable` how long each offline machine has been
     /// unreachable, measured by the caller on the sleep-counting clock of [`crate::clock`].
@@ -232,8 +232,8 @@ impl FleetView {
         store: &Store,
         online: BTreeSet<MachineId>,
         unreachable: BTreeMap<MachineId, Duration>,
-    ) -> Result<FleetView, StoreError> {
-        let mut builder = FleetView::builder();
+    ) -> Result<StoreView, StoreError> {
+        let mut builder = StoreView::builder();
         builder.view.online = online;
         builder.view.unreachable = unreachable;
         let versions = store.versions()?;
@@ -279,71 +279,6 @@ impl FleetView {
         FleetViewBuilder::default()
     }
 
-    /// The workspace of `project` named `name` that is not archived. The first in the order
-    /// held: by owner machine id, then version, for [`FleetView::read`], and the order given
-    /// for the builder. A run may have workspaces of one name on two machines, after a
-    /// relaunch on another machine: the caller then reads [`FleetView::workspaces_named`].
-    pub fn workspace_named(&self, project: ProjectId, name: &str) -> Option<&Record<Workspace>> {
-        self.workspaces_named(project, name).into_iter().next()
-    }
-
-    /// Every workspace of `project` named `name` that is not archived, in the order held.
-    pub fn workspaces_named(&self, project: ProjectId, name: &str) -> Vec<&Record<Workspace>> {
-        self.workspaces
-            .iter()
-            .filter(|r| !r.deleted && r.body.project == project && r.body.name == name)
-            .collect()
-    }
-
-    /// The session of `workspace` to read, as seen: ranked on the records as stored, then the
-    /// chosen one put through the offline rule of [`as_seen`], so its state is
-    /// [`SessionState::Unreachable`] while its owner is offline, as [`FleetView::session_state`]
-    /// gives. The rank is a session with a turn, then a live one before an ended one, then the
-    /// highest version; an ended session is still answered when it is the best there is.
-    ///
-    /// A factory session is known only by its turn record ([`FleetView::session_turn`]), which
-    /// its machine first writes after the session's first hook and which syncs apart from the
-    /// session record. Until the view holds it, a factory session ranks like any other session
-    /// of the workspace, so a person's P1 session there can be answered instead. A caller that
-    /// holds the id `start_session` returned (kept in the run's events) reads that session by
-    /// id with [`FleetView::session_state`] and [`FleetView::session_turn`]; this is for
-    /// finding a workspace's session when no id is known.
-    pub fn session_of(&self, workspace: WorkspaceId) -> Option<Record<Session>> {
-        let chosen = self
-            .sessions
-            .iter()
-            .filter(|r| !r.deleted && r.body.workspace == workspace)
-            .max_by_key(|r| {
-                let ended = matches!(r.body.state, SessionState::Finished | SessionState::Failed);
-                (self.turns.contains_key(&r.body.id), !ended, r.version)
-            })?;
-        Some(self.seen_session(chosen))
-    }
-
-    /// The state of `session`, as its owner's record shows it: [`SessionState::Unreachable`]
-    /// while its owner is offline. `None` for one unknown or deleted.
-    pub fn session_state(&self, session: SessionId) -> Option<SessionState> {
-        let record = self
-            .sessions
-            .iter()
-            .find(|r| !r.deleted && r.body.id == session)?;
-        Some(self.seen_session(record).body.state)
-    }
-
-    /// The state and exit code of `terminal`. `None` for one unknown. A terminal whose owner
-    /// is offline is unreachable, and a deleted one has exited, as P1 treats it.
-    pub fn terminal(&self, terminal: TerminalId) -> Option<(TerminalState, Option<i32>)> {
-        let seen = self.seen_terminal(self.terminals.get(&terminal)?);
-        let code = seen.body.exit_code;
-        if seen.body.state == TerminalState::Unreachable {
-            Some((TerminalState::Unreachable, code))
-        } else if seen.deleted {
-            Some((TerminalState::Exited, code))
-        } else {
-            Some((seen.body.state, code))
-        }
-    }
-
     /// `record` put through the offline rule of [`as_seen`].
     fn seen_session(&self, record: &Record<Session>) -> Record<Session> {
         match as_seen(AnyRecord::Session(record.clone()), &self.online) {
@@ -359,41 +294,145 @@ impl FleetView {
             _ => unreachable!("as_seen keeps the kind of a record"),
         }
     }
+}
+
+/// The fleet as one pass of the factory sees it. A run reads it through this trait, so a host
+/// can give its own answers; [`StoreView`] is the fleet's source taken from the store.
+pub trait FleetView: Send + Sync {
+    /// The workspace of `project` named `name` that is not archived. The first in the order
+    /// held. A run may have workspaces of one name on two machines, after a
+    /// relaunch on another machine: the caller then reads [`FleetView::workspaces_named`].
+    fn workspace_named(&self, project: ProjectId, name: &str) -> Option<&Record<Workspace>> {
+        self.workspaces_named(project, name).into_iter().next()
+    }
+
+    /// Every workspace of `project` named `name` that is not archived, in the order held.
+    fn workspaces_named(&self, project: ProjectId, name: &str) -> Vec<&Record<Workspace>>;
+
+    /// The session of `workspace` to read, as seen: its state is
+    /// [`SessionState::Unreachable`] while its owner is offline, as [`FleetView::session_state`]
+    /// gives. The rank is a session with a turn, then a live one before an ended one, then the
+    /// highest version; an ended session is still answered when it is the best there is.
+    ///
+    /// A caller that holds the id `start_session` returned (kept in the run's events) reads
+    /// that session by id with [`FleetView::session_state`] and [`FleetView::session_turn`];
+    /// this is for finding a workspace's session when no id is known.
+    fn session_of(&self, workspace: WorkspaceId) -> Option<Record<Session>>;
+
+    /// The state of `session`, as its owner's record shows it: [`SessionState::Unreachable`]
+    /// while its owner is offline. `None` for one unknown or deleted.
+    fn session_state(&self, session: SessionId) -> Option<SessionState>;
+
+    /// The state and exit code of `terminal`. `None` for one unknown. A terminal whose owner
+    /// is offline is unreachable, and a deleted one has exited, as P1 treats it.
+    fn terminal(&self, terminal: TerminalId) -> Option<(TerminalState, Option<i32>)>;
 
     /// The newest turn of `session`, when it is a factory session.
-    pub fn session_turn(&self, session: SessionId) -> Option<&SessionTurn> {
+    fn session_turn(&self, session: SessionId) -> Option<&SessionTurn>;
+
+    /// Whether `target` has been heard from.
+    fn online(&self, target: Target) -> bool;
+
+    /// How long `target` has been unreachable: zero while it is online, and zero when no span
+    /// was given.
+    fn unreachable_for(&self, target: Target) -> Duration;
+
+    /// Every machine sample held.
+    fn samples(&self) -> &[Record<MachineSample>];
+
+    /// The logins `target` holds tokens for, when it has said.
+    fn held(&self, target: Target) -> Option<&MachineHeld>;
+}
+
+impl FleetView for StoreView {
+    /// The order held is by owner machine id, then version, for [`StoreView::read`], and the
+    /// order given for the builder.
+    fn workspaces_named(&self, project: ProjectId, name: &str) -> Vec<&Record<Workspace>> {
+        self.workspaces
+            .iter()
+            .filter(|r| !r.deleted && r.body.project == project && r.body.name == name)
+            .collect()
+    }
+
+    /// Ranked on the records as stored, then the chosen one put through the offline rule of
+    /// [`as_seen`].
+    ///
+    /// A factory session is known only by its turn record, which its machine first writes
+    /// after the session's first hook and which syncs apart from the session record. Until
+    /// the store's snapshot holds it, a factory session ranks like any other session of the
+    /// workspace, so a person's P1 session there can be answered instead.
+    fn session_of(&self, workspace: WorkspaceId) -> Option<Record<Session>> {
+        let chosen = self
+            .sessions
+            .iter()
+            .filter(|r| !r.deleted && r.body.workspace == workspace)
+            .max_by_key(|r| {
+                let ended = matches!(r.body.state, SessionState::Finished | SessionState::Failed);
+                (self.turns.contains_key(&r.body.id), !ended, r.version)
+            })?;
+        Some(self.seen_session(chosen))
+    }
+
+    fn session_state(&self, session: SessionId) -> Option<SessionState> {
+        let record = self
+            .sessions
+            .iter()
+            .find(|r| !r.deleted && r.body.id == session)?;
+        Some(self.seen_session(record).body.state)
+    }
+
+    fn terminal(&self, terminal: TerminalId) -> Option<(TerminalState, Option<i32>)> {
+        let seen = self.seen_terminal(self.terminals.get(&terminal)?);
+        let code = seen.body.exit_code;
+        if seen.body.state == TerminalState::Unreachable {
+            Some((TerminalState::Unreachable, code))
+        } else if seen.deleted {
+            Some((TerminalState::Exited, code))
+        } else {
+            Some((seen.body.state, code))
+        }
+    }
+
+    fn session_turn(&self, session: SessionId) -> Option<&SessionTurn> {
         self.turns.get(&session)
     }
 
-    /// Whether `machine` has been heard from.
-    pub fn online(&self, machine: MachineId) -> bool {
-        self.online.contains(&machine)
+    /// A [`Target::Host`] reads as offline: this source knows machines only, by id.
+    fn online(&self, target: Target) -> bool {
+        match target {
+            Target::Machine(machine) => self.online.contains(&machine),
+            Target::Host(_) => false,
+        }
     }
 
-    /// How long `machine` has been unreachable: zero while it is online, and zero when no span
-    /// was given.
-    pub fn unreachable_for(&self, machine: MachineId) -> Duration {
+    /// A [`Target::Host`] has no span, as this source knows machines only: zero.
+    fn unreachable_for(&self, target: Target) -> Duration {
+        let Target::Machine(machine) = target else {
+            return Duration::ZERO;
+        };
         if self.online.contains(&machine) {
             return Duration::ZERO;
         }
         self.unreachable.get(&machine).copied().unwrap_or_default()
     }
 
-    /// Every machine sample held.
-    pub fn samples(&self) -> &[Record<MachineSample>] {
+    fn samples(&self) -> &[Record<MachineSample>] {
         &self.samples
     }
 
-    /// The logins `machine` holds tokens for, when it has said.
-    pub fn held(&self, machine: MachineId) -> Option<&MachineHeld> {
-        self.held.get(&machine)
+    /// A [`Target::Host`] holds nothing: this source knows machines only, by id.
+    fn held(&self, target: Target) -> Option<&MachineHeld> {
+        match target {
+            Target::Machine(machine) => self.held.get(&machine),
+            Target::Host(_) => None,
+        }
     }
 }
 
-/// Builds a [`FleetView`] from records given directly.
+/// Builds a [`StoreView`] from records given directly.
 #[derive(Debug, Default)]
 pub struct FleetViewBuilder {
-    view: FleetView,
+    view: StoreView,
 }
 
 impl FleetViewBuilder {
@@ -446,7 +485,7 @@ impl FleetViewBuilder {
     }
 
     /// The view. Its records are held as stored; the offline rule applies when one is read.
-    pub fn build(self) -> FleetView {
+    pub fn build(self) -> StoreView {
         self.view
     }
 }
@@ -1288,9 +1327,50 @@ mod tests {
     }
 
     #[test]
+    fn a_host_target_reads_as_offline_never_unreachable_and_holding_nothing() {
+        let m = machine(1);
+        let held = MachineHeld {
+            logins: vec!["bot".into()],
+            skill: false,
+        };
+        let view = StoreView::builder()
+            .online(m)
+            .unreachable(machine(2), Duration::from_secs(90))
+            .held(m, held.clone())
+            .held(machine(2), held.clone())
+            .build();
+        let host = Target::Host(HostKind::Vims);
+        assert!(!view.online(host));
+        assert_eq!(view.unreachable_for(host), Duration::ZERO);
+        assert!(view.held(host).is_none());
+        assert!(view.online(Target::Machine(m)));
+        assert_eq!(
+            view.unreachable_for(Target::Machine(machine(2))),
+            Duration::from_secs(90)
+        );
+        assert_eq!(view.held(Target::Machine(m)), Some(&held));
+    }
+
+    #[test]
+    fn the_view_answers_workspace_named_as_a_dyn_fleet_view() {
+        let m = machine(1);
+        let view = StoreView::builder()
+            .workspace(workspace_record(m, 1, true, 10, 1, "run"))
+            .workspace(workspace_record(m, 2, false, 11, 1, "run"))
+            .build();
+        let dynamic: &dyn FleetView = &view;
+        assert_eq!(
+            dynamic.workspace_named(project(1), "run").unwrap().body.id,
+            WorkspaceId(id(11))
+        );
+        assert_eq!(dynamic.workspaces_named(project(1), "run").len(), 1);
+        assert!(dynamic.workspace_named(project(2), "run").is_none());
+    }
+
+    #[test]
     fn workspace_named_ignores_an_archived_workspace() {
         let m = machine(1);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .workspace(workspace_record(m, 1, true, 10, 1, "run"))
             .workspace(workspace_record(m, 2, false, 11, 1, "run"))
             .workspace(workspace_record(m, 3, false, 12, 2, "run"))
@@ -1303,7 +1383,7 @@ mod tests {
         );
         assert!(view.workspace_named(project(3), "run").is_none());
 
-        let only_archived = FleetView::builder()
+        let only_archived = StoreView::builder()
             .workspace(workspace_record(m, 1, true, 10, 1, "run"))
             .build();
         assert!(only_archived.workspace_named(project(1), "run").is_none());
@@ -1317,7 +1397,7 @@ mod tests {
         let made = fake
             .create(Target::Machine(m), request("run", "r1"))
             .unwrap();
-        let view = FleetView::read(&store, BTreeSet::from([m]), BTreeMap::new()).unwrap();
+        let view = StoreView::read(&store, BTreeSet::from([m]), BTreeMap::new()).unwrap();
         assert!(view.workspace_named(project(1), "run").is_none());
 
         let record = Record {
@@ -1334,7 +1414,7 @@ mod tests {
             },
         };
         store.apply(&AnyRecord::Workspace(record), m).unwrap();
-        let view = FleetView::read(&store, BTreeSet::from([m]), BTreeMap::new()).unwrap();
+        let view = StoreView::read(&store, BTreeSet::from([m]), BTreeMap::new()).unwrap();
         assert_eq!(
             view.workspace_named(project(1), "run").unwrap().body.id,
             made
@@ -1358,7 +1438,7 @@ mod tests {
             )
             .unwrap();
         let online = BTreeSet::from([a, b]);
-        assert!(FleetView::read(&store, online.clone(), BTreeMap::new()).is_ok());
+        assert!(StoreView::read(&store, online.clone(), BTreeMap::new()).is_ok());
 
         // A newer build on b left a row before a rollback. The factory acts on the view, so a
         // view without b's records would be a half-applied pass: the read fails instead.
@@ -1376,7 +1456,7 @@ mod tests {
         .unwrap();
         let logged = Logged::default();
         let _capture = logged.capture();
-        assert!(FleetView::read(&store, online, BTreeMap::new()).is_err());
+        assert!(StoreView::read(&store, online, BTreeMap::new()).is_err());
         // The row stays until this machine runs a build that reads it, so every pass fails
         // until then: the warning names the owner whose records stop the pass.
         let warnings = logged.warnings();
@@ -1417,7 +1497,7 @@ mod tests {
         .unwrap();
         let logged = Logged::default();
         let _capture = logged.capture();
-        assert!(FleetView::read(&store, BTreeSet::from([a]), BTreeMap::new()).is_err());
+        assert!(StoreView::read(&store, BTreeSet::from([a]), BTreeMap::new()).is_err());
         let warnings = logged.warnings();
         assert!(
             warnings.iter().any(|w| w.contains(&a.to_string())),
@@ -1450,7 +1530,7 @@ mod tests {
         .unwrap();
         let logged = Logged::default();
         let _capture = logged.capture();
-        assert!(FleetView::read(&store, BTreeSet::from([a]), BTreeMap::new()).is_err());
+        assert!(StoreView::read(&store, BTreeSet::from([a]), BTreeMap::new()).is_err());
         let warnings = logged.warnings();
         assert!(
             warnings
@@ -1484,7 +1564,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let view = FleetView::read(&store, BTreeSet::from([a]), BTreeMap::new()).unwrap();
+        let view = StoreView::read(&store, BTreeSet::from([a]), BTreeMap::new()).unwrap();
         assert_eq!(view.session_turn(SessionId(id(20))), None);
     }
 
@@ -1521,8 +1601,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let view = FleetView::read(&store, BTreeSet::from([a]), BTreeMap::new()).unwrap();
-        assert!(view.held(a).is_none());
+        let view = StoreView::read(&store, BTreeSet::from([a]), BTreeMap::new()).unwrap();
+        assert!(view.held(Target::Machine(a)).is_none());
     }
 
     /// The factory queries one `read` makes, for a fleet of `sessions` live sessions spread
@@ -1567,7 +1647,7 @@ mod tests {
         }
         let before = Store::factory_queries();
         let view =
-            FleetView::read(&store, machines.into_iter().collect(), BTreeMap::new()).unwrap();
+            StoreView::read(&store, machines.into_iter().collect(), BTreeMap::new()).unwrap();
         let queries = Store::factory_queries() - before;
         for n in 0..sessions {
             assert_eq!(
@@ -1576,7 +1656,7 @@ mod tests {
             );
         }
         for m in machines {
-            assert!(view.held(m).is_some());
+            assert!(view.held(Target::Machine(m)).is_some());
         }
         queries
     }
@@ -1687,7 +1767,7 @@ mod tests {
             )
             .unwrap();
 
-        let view = FleetView::read(
+        let view = StoreView::read(
             &store,
             BTreeSet::from([m]),
             BTreeMap::from([(gone, Duration::from_secs(90))]),
@@ -1706,11 +1786,11 @@ mod tests {
             Some((TerminalState::Running, None))
         );
         assert_eq!(view.session_turn(SessionId(id(20))), Some(&turn));
-        assert_eq!(view.held(m), Some(&held));
-        assert_eq!(view.held(gone), None);
+        assert_eq!(view.held(Target::Machine(m)), Some(&held));
+        assert_eq!(view.held(Target::Machine(gone)), None);
         assert_eq!(view.samples().len(), 1);
-        assert!(view.online(m));
-        assert!(!view.online(gone));
+        assert!(view.online(Target::Machine(m)));
+        assert!(!view.online(Target::Machine(gone)));
         assert_eq!(
             view.session_state(SessionId(id(21))),
             Some(SessionState::Unreachable)
@@ -1719,13 +1799,16 @@ mod tests {
             view.terminal(TerminalId(id(30))),
             Some((TerminalState::Unreachable, None))
         );
-        assert_eq!(view.unreachable_for(gone), Duration::from_secs(90));
+        assert_eq!(
+            view.unreachable_for(Target::Machine(gone)),
+            Duration::from_secs(90)
+        );
     }
 
     #[test]
     fn session_of_prefers_a_factory_session_and_ignores_deleted_ones() {
         let m = machine(1);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .online(m)
             .session(session_record(m, 5, false, 20, 10, SessionState::Idle))
             .session(session_record(m, 3, false, 21, 10, SessionState::Idle))
@@ -1736,7 +1819,7 @@ mod tests {
         assert_eq!(found.body.id, SessionId(id(21)));
         assert_eq!(view.session_state(SessionId(id(22))), None);
 
-        let plain = FleetView::builder()
+        let plain = StoreView::builder()
             .session(session_record(m, 6, false, 23, 10, SessionState::Idle))
             .session(session_record(m, 5, false, 20, 10, SessionState::Idle))
             .session(session_record(m, 9, true, 22, 10, SessionState::Idle))
@@ -1751,7 +1834,7 @@ mod tests {
     #[test]
     fn session_of_ranks_a_factory_session_above_a_live_one_without_a_turn() {
         let m = machine(1);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .online(m)
             .session(session_record(m, 5, false, 20, 10, SessionState::Finished))
             .session(session_record(m, 3, false, 21, 10, SessionState::Idle))
@@ -1761,7 +1844,7 @@ mod tests {
             view.session_of(WorkspaceId(id(10))).unwrap().body.id,
             SessionId(id(20))
         );
-        let only_ended = FleetView::builder()
+        let only_ended = StoreView::builder()
             .online(m)
             .session(session_record(m, 5, false, 20, 10, SessionState::Finished))
             .build();
@@ -1776,7 +1859,7 @@ mod tests {
         let m = machine(1);
         for online in [true, false] {
             for ended in [SessionState::Finished, SessionState::Failed] {
-                let mut builder = FleetView::builder();
+                let mut builder = StoreView::builder();
                 if online {
                     builder = builder.online(m);
                 }
@@ -1798,7 +1881,7 @@ mod tests {
     #[test]
     fn session_of_shows_an_offline_owners_session_as_unreachable() {
         let m = machine(1);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .session(session_record(m, 5, false, 20, 10, SessionState::Working))
             .turn(turn_of(20, 10))
             .build();
@@ -1808,7 +1891,7 @@ mod tests {
             Some(found.body.state),
             view.session_state(SessionId(id(20)))
         );
-        let online = FleetView::builder()
+        let online = StoreView::builder()
             .online(m)
             .session(session_record(m, 5, false, 20, 10, SessionState::Working))
             .build();
@@ -1823,7 +1906,7 @@ mod tests {
         // Every session of a workspace is written by the workspace's machine, so their versions
         // compare. Session 20 is the factory's, with no turn yet; 23 is a person's.
         let m = machine(1);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .online(m)
             .session(session_record(m, 5, false, 20, 10, SessionState::Idle))
             .session(session_record(m, 6, false, 23, 10, SessionState::Idle))
@@ -1850,7 +1933,7 @@ mod tests {
     #[test]
     fn session_of_ranks_a_factory_session_first_with_its_owner_offline() {
         let m = machine(1);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .session(session_record(m, 5, false, 20, 10, SessionState::Finished))
             .session(session_record(m, 3, false, 21, 10, SessionState::Idle))
             .turn(turn_of(20, 10))
@@ -1864,7 +1947,7 @@ mod tests {
     #[test]
     fn workspaces_named_gives_every_live_workspace_of_the_name() {
         let (a, b) = (machine(1), machine(2));
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .workspace(workspace_record(a, 1, false, 10, 1, "run"))
             .workspace(workspace_record(b, 1, false, 11, 1, "run"))
             .workspace(workspace_record(b, 2, true, 12, 1, "run"))
@@ -1902,8 +1985,8 @@ mod tests {
                 m,
             )
             .unwrap();
-        let view = FleetView::read(&store, BTreeSet::new(), BTreeMap::new()).unwrap();
-        assert_eq!(view.held(m), Some(&held));
+        let view = StoreView::read(&store, BTreeSet::new(), BTreeMap::new()).unwrap();
+        assert_eq!(view.held(Target::Machine(m)), Some(&held));
     }
 
     #[test]
@@ -1926,14 +2009,14 @@ mod tests {
                 m,
             )
             .unwrap();
-        let view = FleetView::read(&store, BTreeSet::from([m]), BTreeMap::new()).unwrap();
+        let view = StoreView::read(&store, BTreeSet::from([m]), BTreeMap::new()).unwrap();
         assert_eq!(view.session_turn(SessionId(id(20))), None);
     }
 
     #[test]
     fn online_added_after_the_records_still_applies() {
         let (a, b) = (machine(1), machine(2));
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .session(session_record(a, 1, false, 20, 10, SessionState::Idle))
             .terminal(terminal_record(a, false, 30, TerminalState::Running, None))
             .session(session_record(b, 1, false, 21, 10, SessionState::Idle))
@@ -1956,7 +2039,7 @@ mod tests {
     #[test]
     fn a_deleted_terminal_reads_as_exited_with_its_code() {
         let m = machine(1);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .online(m)
             .terminal(terminal_record(
                 m,
@@ -1976,7 +2059,7 @@ mod tests {
     #[test]
     fn a_deleted_terminal_of_an_offline_owner_reads_as_unreachable_with_its_code() {
         let m = machine(1);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .terminal(terminal_record(
                 m,
                 true,
@@ -1996,14 +2079,17 @@ mod tests {
         let a = machine(1);
         let b = machine(2);
         let c = machine(3);
-        let view = FleetView::builder()
+        let view = StoreView::builder()
             .online(a)
             .unreachable(a, Duration::from_secs(5))
             .unreachable(b, Duration::from_secs(40))
             .build();
-        assert_eq!(view.unreachable_for(a), Duration::ZERO);
-        assert_eq!(view.unreachable_for(b), Duration::from_secs(40));
-        assert_eq!(view.unreachable_for(c), Duration::ZERO);
+        assert_eq!(view.unreachable_for(Target::Machine(a)), Duration::ZERO);
+        assert_eq!(
+            view.unreachable_for(Target::Machine(b)),
+            Duration::from_secs(40)
+        );
+        assert_eq!(view.unreachable_for(Target::Machine(c)), Duration::ZERO);
     }
 
     #[test]

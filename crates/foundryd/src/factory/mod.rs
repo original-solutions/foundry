@@ -852,7 +852,7 @@ fn one_pass<H: Host>(
         .map_or(default, |f| Duration::from_secs(u64::from(f.poll_seconds)));
     let online = shared.host.online();
     let unreachable = lock(&shared.offline).update(&settings, &online, shared.clock.now());
-    let view = match worker::FleetView::read(&lock(&shared.store), online, unreachable) {
+    let view = match worker::StoreView::read(&lock(&shared.store), online, unreachable) {
         Ok(view) => view,
         Err(error) => return Err((poll, format!("the fleet could not be read: {error}"))),
     };
@@ -922,7 +922,7 @@ fn not_begun<H: Host>(
         repo: watched.repo.clone(),
         login: watched.login.clone(),
     };
-    let (view, settings) = (worker::FleetView::default(), SharedSettings::default());
+    let (view, settings) = (worker::StoreView::default(), SharedSettings::default());
     let world = pass::World {
         project: &project,
         lease: &lease_state,
