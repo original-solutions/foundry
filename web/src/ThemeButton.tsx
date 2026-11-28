@@ -1,18 +1,15 @@
-import { useState, type MouseEvent } from "react";
+import { Link } from "@tanstack/react-router";
+import type { MouseEvent } from "react";
 import { flushSync } from "react-dom";
-import { applyTheme, saveTheme, storedTheme, type Theme } from "./theme";
+import { setTheme, useTheme, type Theme } from "./theme";
 
 /** Flips between the dark and light themes. The new theme spreads out from the button as a circle. */
 export function ThemeButton({ className = "" }: { className?: string }) {
-  const [theme, setTheme] = useState<Theme>(storedTheme);
+  const theme = useTheme();
   const next: Theme = theme === "dark" ? "light" : "dark";
 
   const flip = (event: MouseEvent<HTMLButtonElement>) => {
-    const swap = () => {
-      flushSync(() => setTheme(next));
-      applyTheme(next);
-      saveTheme(next);
-    };
+    const swap = () => flushSync(() => setTheme(next));
     const still = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     if (!document.startViewTransition || still) {
       swap();
@@ -47,5 +44,24 @@ export function ThemeButton({ className = "" }: { className?: string }) {
         </svg>
       )}
     </button>
+  );
+}
+
+/** The gear: Settings' icon, in the palette and the link beside the theme button. */
+export function GearIcon({ className = "size-4" }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+      <circle cx="8" cy="8" r="2.2" />
+      <path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M3.4 12.6l1.3-1.3M11.3 4.7l1.3-1.3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+/** A gear that links to Settings, beside the theme button in the sidebar's header and at the rail's foot. */
+export function SettingsLink({ onClick }: { onClick?: () => void }) {
+  return (
+    <Link to="/settings" aria-label="Settings" title="Settings" onClick={onClick} className="rounded p-1 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200">
+      <GearIcon />
+    </Link>
   );
 }

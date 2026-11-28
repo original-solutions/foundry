@@ -1,9 +1,11 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import tailwindTheme from "tailwindcss/theme.css?raw";
 import appCss from "./index.css?raw";
 import { ThemeButton } from "./ThemeButton";
-import { applyTheme, flippedShade, storedTheme } from "./theme";
+import { SettingsAppearance } from "./SettingsAppearance";
+import { applyTheme, flippedShade, setTheme, storedTheme, useTheme } from "./theme";
+import { pageProps } from "./test-utils";
 
 const sources = import.meta.glob(["./**/*.tsx", "./**/*.ts", "!./**/*.test.*"], { query: "?raw", import: "default", eager: true }) as Record<string, string>;
 
@@ -92,5 +94,62 @@ describe("the theme choice", () => {
     render(<ThemeButton />);
     fireEvent.click(screen.getByRole("button", { name: "Switch to light theme" }));
     expect(document.documentElement.dataset.theme).toBe("light");
+  });
+});
+
+describe("the shared theme state", () => {
+  // An earlier test leaves this page holding a theme the blocked storage would not keep.
+  beforeEach(() => setTheme("dark"));
+
+  it("shows a change made in one place in the other at once", () => {
+    function Both() {
+      return (
+        <>
+          <ThemeButton />
+          <SettingsAppearance {...pageProps()} />
+        </>
+      );
+    }
+    render(<Both />);
+    const dark = () => screen.getByRole("radio", { name: "Dark" });
+    const light = () => screen.getByRole("radio", { name: "Light" });
+    expect(dark().getAttribute("aria-checked")).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch to light theme" }));
+    expect(light().getAttribute("aria-checked")).toBe("true");
+    expect(document.documentElement.dataset.theme).toBe("light");
+
+    fireEvent.click(dark());
+    expect(screen.getByRole("button", { name: "Switch to light theme" })).toBeDefined();
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(localStorage.getItem("foundry.theme")).toBe("dark");
+  });
+
+  it("setTheme applies, keeps and tells every user of useTheme", () => {
+    function Shows() {
+      return <output data-testid="theme">{useTheme()}</output>;
+    }
+    render(<Shows />);
+    expect(screen.getByTestId("theme").textContent).toBe("dark");
+    act(() => setTheme("light"));
+    expect(screen.getByTestId("theme").textContent).toBe("light");
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(storedTheme()).toBe("light");
+  });
+
+  it("shows the pick of this page when storage is full but still readable", () => {
+    function Shows() {
+      return <output data-testid="theme">{useTheme()}</output>;
+    }
+    localStorage.setItem("foundry.theme", "dark");
+    render(<Shows />);
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("full");
+    });
+    act(() => setTheme("light"));
+    expect(screen.getByTestId("theme").textContent).toBe("light");
+    expect(document.documentElement.dataset.theme).toBe("light");
+    act(() => setTheme("dark"));
+    expect(screen.getByTestId("theme").textContent).toBe("dark");
   });
 });

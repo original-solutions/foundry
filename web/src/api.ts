@@ -74,8 +74,34 @@ export interface Project {
   repo: string;
 }
 
+/** Whether each of a machine's gateway keys is set. Never a value. */
+export interface GatewayKeys {
+  key: boolean;
+  management: boolean;
+}
+/** What a machine reports it keeps in its own secret store: the GitHub logins it holds, the skill and the gateway key flags. */
+export interface MachineHeld {
+  logins: string[];
+  skill: boolean;
+  /** The machine's default GitHub login. Missing or null from a peer built before it was reported. */
+  default?: string | null;
+  /** Missing or null from a peer built before it was reported. */
+  gateway?: GatewayKeys | null;
+}
+
 export type UiMessage =
-  | { type: "state"; protocol: number; records: AnyRecord[]; settings: SharedSettings; online?: string[] }
+  | {
+      type: "state";
+      protocol: number;
+      records: AnyRecord[];
+      settings: SharedSettings;
+      online?: string[];
+      /** What each machine holds, by machine id. */
+      held?: Record<string, MachineHeld>;
+      /** The protocol each open link speaks, by machine id; this machine's own is the daemon's. */
+      protocols?: Record<string, number>;
+    }
+  | { type: "held"; protocol: number; machine: string; held: MachineHeld }
   | { type: "record"; protocol: number; record: AnyRecord }
   | { type: "settings"; protocol: number; settings: SharedSettings }
   | { type: "factory_status"; protocol: number; status: FactoryStatus };

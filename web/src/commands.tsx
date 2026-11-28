@@ -7,12 +7,15 @@ import type { Command } from "./jump";
 import type { Needing } from "./needing";
 import { nextKey } from "./NextUp";
 import { FactoryIcon } from "./FactoryMark";
+import { categories } from "./settingsNav";
+import { settingsKey } from "./shortcut";
 import { PanelIcon } from "./Sidebar";
 import { StateGlyph } from "./StateGlyph";
+import { GearIcon } from "./ThemeButton";
 
 interface Options {
-  /** What is on screen now, so its view says "Here": a terminal, the home (the board or the timeline), the machines or the factory. */
-  screen: "terminal" | "home" | "machines" | "factory";
+  /** What is on screen now, so its view says "Here": a terminal, the home (the board or the timeline), the machines, the factory or Settings. */
+  screen: "terminal" | "home" | "machines" | "factory" | "settings";
   /** The terminal that needs you next, and how many others do, when any does. */
   next?: { next: Needing; others: number };
   onNext: (terminal: string) => void;
@@ -77,6 +80,17 @@ export function useCommands({ screen, next, onNext, onCreate, onKeys, sidebar }:
       icon: <FactoryIcon className="size-3.5" />,
       run: () => void navigate({ to: "/factory" }),
     },
+    {
+      key: "settings",
+      title: "Settings",
+      group: "Go to",
+      about: "The factory's, the fleet's and this browser's settings, by category.",
+      also: "preferences options configure",
+      hint: here("settings"),
+      keys: settingsKey,
+      icon: <GearIcon className="size-3.5" />,
+      run: () => void navigate({ to: "/settings" }),
+    },
   ];
   const needs = next ? next.others : 0;
   const actions: Command[] = [
@@ -129,7 +143,17 @@ export function useCommands({ screen, next, onNext, onCreate, onKeys, sidebar }:
       run: onKeys,
     },
   ];
-  return [...views, ...actions];
+  // After the actions, so a word that names one finds it first.
+  const pages: Command[] = categories.map(({ category, label }) => ({
+    key: `settings-${category}`,
+    title: `Settings: ${label}`,
+    group: "Do",
+    about: `Open the ${label} page of Settings.`,
+    also: "preferences options configure",
+    icon: <GearIcon className="size-3.5" />,
+    run: () => void navigate({ to: "/settings/$category", params: { category } }),
+  }));
+  return [...views, ...actions, ...pages];
 }
 
 function KeyIcon() {

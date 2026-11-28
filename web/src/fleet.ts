@@ -1,4 +1,4 @@
-import type { AnyRecord, FactoryStatus, HeldUp, ProjectFactory, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
+import type { AnyRecord, FactoryStatus, HeldUp, MachineHeld, ProjectFactory, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
 import { issueUrl, parseRun } from "./factory";
 import { busy, needsYou, plural, sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, urgency, type Glyph } from "./labels";
 
@@ -11,12 +11,18 @@ export interface FleetState {
   online?: string[];
   /** The last status the socket sent for each project's factory, by project id. */
   factory?: Record<string, FactoryStatus>;
+  /** What each machine reports it holds, by machine id. Empty before the daemon sends it. */
+  held: Record<string, MachineHeld>;
+  /** The protocol each machine's open link speaks, by machine id. Empty before the daemon sends it. */
+  protocols: Record<string, number>;
 }
 
 export const emptyState: FleetState = {
   records: [],
   settings: { seq: 0, machines: [], priority: [], projects: [], limits: {} },
   synced: false,
+  held: {},
+  protocols: {},
 };
 
 /** A machine sample is one per owner; every other record is one per kind and body id. */
@@ -28,7 +34,17 @@ export function apply(state: FleetState, message: UiMessage): FleetState {
     case "state":
       // The daemon sends the whole state again when a project's status is no longer believed, then
       // each status still believed, so what was held is dropped here.
-      return { records: message.records, settings: message.settings, synced: true, online: message.online, factory: {} };
+      return {
+        records: message.records,
+        settings: message.settings,
+        synced: true,
+        online: message.online,
+        factory: {},
+        held: message.held ?? {},
+        protocols: message.protocols ?? {},
+      };
+    case "held":
+      return { ...state, held: { ...state.held, [message.machine]: message.held } };
     case "factory_status":
       return { ...state, factory: { ...state.factory, [message.status.project]: message.status } };
     case "settings":
