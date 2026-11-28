@@ -65,6 +65,12 @@ describe("SettingsMachines", () => {
       expect(within(entry("laptop")).getByRole("link", { name: "laptop" }).getAttribute("href")).toBe(`/settings/machines/${OTHER}`);
     });
 
+    it("leaves a machine the settings do not list out of the order", async () => {
+      const given = settings({ machines: [{ id: ME, name: "studio", address: "" }], priority: [ME] });
+      await show(given);
+      expect(names()).toEqual(["studio"]);
+    });
+
     it("marks the machine that holds the coordinator role, not the first of the order", async () => {
       await show(laptopFirst, [ME]);
       expect(within(entry("studio")).getByText("Coordinator")).toBeDefined();
