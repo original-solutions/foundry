@@ -267,7 +267,6 @@ pub struct ChecksTimedOut {
     pub missing: bool,
 }
 
-/// A run's progress, read from its events.
 /// A workspace a resume or feedback round was answered with, and the machine that round named
 /// for it when the answer came.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -277,9 +276,12 @@ pub struct RoundWorkspace {
     /// The newest `resume-machine <k> <id>` or `feedback-machine <n> <id>` of that round before
     /// the step, unless a `-machine-given-up` step dropped it; `None` for none.
     pub machine: Option<String>,
+    /// The round it belongs to: the machine step prefix of its kind, and its count.
+    round: (&'static str, u32),
 }
 
 /// The machine, machine-given-up and workspace step prefixes of the resume and the feedback rounds.
+/// Keep in step with `resume::read_round` and the feedback round reader.
 const ROUND_STEPS: [(&str, &str, &str); 2] = [
     (
         super::resume::MACHINE,
@@ -293,6 +295,7 @@ const ROUND_STEPS: [(&str, &str, &str); 2] = [
     ),
 ];
 
+/// A run's progress, read from its events.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Seen {
     pub claimed: bool,
@@ -791,18 +794,17 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                     seen.workspace = Some(id.to_owned());
                 }
                 for (machine, given_up, workspace) in ROUND_STEPS {
-                    let counted = |prefix: &str| -> Option<(u32, String)> {
-                        let (count, tail) = step.strip_prefix(prefix)?.split_once(' ')?;
-                        Some((canonical(count)?, tail.to_owned()))
-                    };
-                    if let Some((count, id)) = counted(machine) {
-                        round_machines.insert((machine, count), id);
-                    } else if let Some((count, _)) = counted(given_up) {
+                    if let Some((count, id)) = counted(step, machine) {
+                        round_machines.insert((machine, count), id.to_owned());
+                    } else if let Some((count, _)) = counted(step, given_up) {
                         round_machines.remove(&(machine, count));
-                    } else if let Some((count, id)) = counted(workspace) {
+                        seen.round_workspaces
+                            .retain(|round| round.round != (machine, count));
+                    } else if let Some((count, id)) = counted(step, workspace) {
                         seen.round_workspaces.push(RoundWorkspace {
-                            workspace: id,
+                            workspace: id.to_owned(),
                             machine: round_machines.get(&(machine, count)).cloned(),
+                            round: (machine, count),
                         });
                     }
                 }
@@ -1480,6 +1482,13 @@ pub(super) fn step_text(event: &RunEvent) -> Option<&str> {
         return None;
     }
     event.data.get("step").and_then(Value::as_str)
+}
+
+/// The canonical count and the rest of `step` after `prefix`, or `None` for a step of another
+/// kind or a count that is not canonical.
+fn counted<'a>(step: &'a str, prefix: &str) -> Option<(u32, &'a str)> {
+    let (count, tail) = step.strip_prefix(prefix)?.split_once(' ')?;
+    Some((canonical(count)?, tail))
 }
 
 /// What follows `prefix` and the count `n` in `step`, or `None` for a step of another kind or

@@ -1769,7 +1769,6 @@ impl PassResults {
     }
 }
 
-/// A machine id as the ledger writes one.
 /// The workspaces a run's progress names, oldest first: the build workspace, then each resume and
 /// feedback round's, none twice.
 fn workspaces_of(seen: &super::runs::progress::Seen) -> Vec<WorkspaceId> {
@@ -1793,23 +1792,21 @@ fn workspaces_of(seen: &super::runs::progress::Seen) -> Vec<WorkspaceId> {
 /// workspace is the newest listed; otherwise the claim's. `None` when neither parses.
 fn live_machine_of(seen: &super::runs::progress::Seen) -> Option<MachineId> {
     let newest = workspaces_of(seen).pop();
+    let build = seen
+        .workspace
+        .as_deref()
+        .and_then(|w| w.parse().ok().map(WorkspaceId));
     let from_round = seen
         .round_workspaces
         .iter()
         .rev()
         .find(|round| round.workspace.parse().ok().map(WorkspaceId) == newest)
-        .filter(|_| {
-            newest.is_some()
-                && seen
-                    .workspace
-                    .as_deref()
-                    .and_then(|w| w.parse().ok().map(WorkspaceId))
-                    != newest
-        })
+        .filter(|_| build != newest)
         .and_then(|round| round.machine.as_deref().and_then(machine_id));
     from_round.or_else(|| seen.machine.as_deref().and_then(machine_id))
 }
 
+/// A machine id as the ledger writes one.
 fn machine_id(text: &str) -> Option<MachineId> {
     uuid::Uuid::parse_str(text).ok().map(MachineId)
 }
