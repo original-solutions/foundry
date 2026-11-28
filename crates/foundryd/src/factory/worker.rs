@@ -323,8 +323,8 @@ pub trait FleetView: Send + Sync {
     /// while its owner is offline. `None` for one unknown or deleted.
     fn session_state(&self, session: SessionId) -> Option<SessionState>;
 
-    /// The state and exit code of `terminal`. `None` for one unknown or deleted. A terminal
-    /// whose owner is offline is unreachable, and a deleted one has exited, as P1 treats it.
+    /// The state and exit code of `terminal`. `None` for one unknown. A terminal whose owner
+    /// is offline is unreachable, and a deleted one has exited, as P1 treats it.
     fn terminal(&self, terminal: TerminalId) -> Option<(TerminalState, Option<i32>)>;
 
     /// The newest turn of `session`, when it is a factory session.
