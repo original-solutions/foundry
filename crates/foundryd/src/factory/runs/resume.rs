@@ -1582,10 +1582,10 @@ fn carry_on(
     let target = match (round.target, placed) {
         (Some(target), _) => target,
         (None, Some(target)) => {
-            if let Some(machine) = target.machine()
-                && round.gave_up.contains(&machine)
-                && !ctx.view.online(machine)
-            {
+            // Placement puts a resume on the fleet: a host is refused as the fleet worker
+            // refuses one.
+            let machine = worker::fleet_machine(target)?;
+            if round.gave_up.contains(&machine) && !ctx.view.online(machine) {
                 return Err(RunError::Invalid(format!(
                     "run {run} gave up on machine {machine} for resume {k}"
                 )));
@@ -1602,10 +1602,7 @@ fn carry_on(
     };
     // A machine that stays away for 15 minutes before the session started is given up: nothing
     // ran, so no resume is spent, and what it made is for [`orphans`] when it is heard from.
-    if target
-        .machine()
-        .is_some_and(|machine| unreachable_long(ctx, machine))
-    {
+    if unreachable_long(ctx, worker::fleet_machine(target)?) {
         note(
             ctx,
             run,
@@ -4820,6 +4817,35 @@ mod tests {
                 orphans(&view, project_id(), &run, &rig.events(&run)),
                 vec![fresh()]
             );
+        }
+
+        /// A resume placed at a host is refused as the fleet worker refuses a host, naming its
+        /// kind, before anything is recorded or asked.
+        #[test]
+        fn a_resume_placed_at_a_host_is_refused_naming_the_kind_and_records_nothing() {
+            let (rig, run) = archived_and_waiting_for_a_machine();
+            let before = resume_steps(&rig, &run);
+            let host = Target::Host(foundry_proto::factory::HostKind::Vims);
+            let Err(RunError::Worker(WorkerError::Failed(said))) = placed(&rig.ctx(), &run, host)
+            else {
+                panic!("a host is refused");
+            };
+            assert!(said.contains("vims"), "{said}");
+            assert_eq!(resume_steps(&rig, &run), before);
+            assert!(create_calls(&rig).is_empty());
+        }
+
+        /// A resume whose recorded target is a host is refused the same way, before the
+        /// machine's 15 minutes are judged.
+        #[test]
+        fn a_resume_recorded_at_a_host_is_refused_naming_the_kind() {
+            let (rig, run) = archived_and_waiting_for_a_machine();
+            rig.step(&run, "resume-machine 1 vims");
+            let Err(RunError::Worker(WorkerError::Failed(said))) = advance(&rig.ctx(), &run) else {
+                panic!("a host is refused");
+            };
+            assert!(said.contains("vims"), "{said}");
+            assert!(create_calls(&rig).is_empty());
         }
 
         #[test]

@@ -65,16 +65,6 @@ pub enum Target {
     Host(HostKind),
 }
 
-impl Target {
-    /// The machine this names, if it names one.
-    pub fn machine(&self) -> Option<MachineId> {
-        match self {
-            Self::Machine(machine) => Some(*machine),
-            Self::Host(_) => None,
-        }
-    }
-}
-
 impl fmt::Display for Target {
     /// A machine's id as [`MachineId`] shows it, and a host's kind as [`HostKind`] shows it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -101,7 +91,8 @@ impl FromStr for Target {
 }
 
 /// The machine of the fleet a call is for. A worker that runs only on the fleet refuses a host
-/// with [`WorkerError::Failed`], naming its kind.
+/// with [`WorkerError::Failed`], naming its kind, and so does every path that needs a machine of
+/// the fleet.
 pub fn fleet_machine(target: Target) -> Result<MachineId, WorkerError> {
     match target {
         Target::Machine(machine) => Ok(machine),
@@ -985,8 +976,6 @@ mod tests {
         assert_eq!(id.parse::<Target>(), Ok(Target::Machine(m)));
         assert_eq!(Target::Host(HostKind::Vims).to_string(), "vims");
         assert_eq!("vims".parse::<Target>(), Ok(Target::Host(HostKind::Vims)));
-        assert_eq!(Target::Machine(m).machine(), Some(m));
-        assert_eq!(Target::Host(HostKind::Vims).machine(), None);
     }
 
     #[test]

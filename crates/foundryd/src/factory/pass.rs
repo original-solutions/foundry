@@ -167,7 +167,7 @@ use super::runs::start::{self, ClaimOutcome, StartStep};
 use super::runs::stop::{self, ReconcileStep, StopStep};
 use super::runs::{RunContext, RunError, RunProject, RunSettings, run_config};
 use super::status::{self, PassResults};
-use super::worker::{FleetView, Guard, Target, Worker};
+use super::worker::{FleetView, Guard, Target, Worker, fleet_machine};
 use crate::clock::Clock;
 use crate::store::{Applied, Store, StoreError};
 
@@ -1431,11 +1431,17 @@ impl<'a, 'w> Pass<'a, 'w> {
                     self.report.claimed.push(run.clone());
                     // Its machine is reserved now, whatever the ledger shows of it later.
                     self.counted.insert(run.clone());
-                    if let Some(machine) = target.machine() {
-                        book.place(ticket, machine);
-                    }
+                    // Placement answers a machine of the fleet: a host is refused as the fleet
+                    // worker refuses one.
                     let ctx = self.ctx(self.config);
-                    let said = match start::advance(&ctx, &run) {
+                    let started =
+                        fleet_machine(target)
+                            .map_err(RunError::from)
+                            .and_then(|machine| {
+                                book.place(ticket, machine);
+                                start::advance(&ctx, &run)
+                            });
+                    let said = match started {
                         Ok(step) => match step {
                             StartStep::Started { .. } => "claimed, session started".to_owned(),
                             other => format!("claimed on {target}: {other:?}"),

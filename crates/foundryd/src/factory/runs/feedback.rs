@@ -312,7 +312,7 @@ use crate::factory::messages::{
 };
 use crate::factory::placing::{self, Reserved, Slots};
 use crate::factory::text;
-use crate::factory::worker::{CreateWorkspace, Target, WorkerError};
+use crate::factory::worker::{CreateWorkspace, Target, WorkerError, fleet_machine};
 use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
 use crate::workspaces::{Checkout, FactoryTag, Setup};
 
@@ -1706,10 +1706,7 @@ fn carry_on(
         }
     }
     // A machine that stays away for 15 minutes before the session started is given up.
-    if target
-        .machine()
-        .is_some_and(|machine| unreachable_long(ctx, machine))
-    {
+    if unreachable_long(ctx, fleet_machine(target)?) {
         note(
             ctx,
             run,
@@ -4134,6 +4131,27 @@ mod tests {
 
     mod feedback_carrying_a_round_on {
         use super::*;
+
+        /// A round whose recorded target is a host is refused as the fleet worker refuses a
+        /// host, naming its kind, before the machine's 15 minutes are judged.
+        #[test]
+        fn a_round_recorded_at_a_host_is_refused_naming_the_kind() {
+            let world = World::reviewed();
+            assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+            world.rig.step(&world.run, "feedback-machine 1 vims");
+            let Err(RunError::Worker(WorkerError::Failed(said))) = world.try_go() else {
+                panic!("a host is refused");
+            };
+            assert!(said.contains("vims"), "{said}");
+            assert!(
+                !world
+                    .rig
+                    .worker
+                    .calls()
+                    .iter()
+                    .any(|call| matches!(call, Call::Create { .. }))
+            );
+        }
 
         #[test]
         fn building_and_resume_leave_a_round_being_set_up_alone() {

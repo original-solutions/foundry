@@ -831,14 +831,20 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
     }
     let comments = ctx.tracker.issue_comments(repo, issue)?;
     let target = match newest_claim(&comments, &ctx.project.login) {
+        // A claim at a host is another factory's, as the pass reads it (`found_claim`): this
+        // build makes no workspace on a host. #360 lifts this.
+        Some(Claim::Foreign { .. })
+        | Some(Claim::Foundry {
+            target: Target::Host(_),
+            ..
+        }) => {
+            return skipped("the issue's newest claim is another factory's".into());
+        }
         Some(Claim::Foundry { run: named, target }) if named == *run => target,
         Some(Claim::Foundry { run: named, .. }) => {
             return skipped(format!(
                 "the issue's newest claim names run {named}, not {run}"
             ));
-        }
-        Some(Claim::Foreign { .. }) => {
-            return skipped("the issue's newest claim is another factory's".into());
         }
         None => return skipped(format!("no claim comment names run {run}")),
     };
@@ -3092,6 +3098,32 @@ mod tests {
                 assert!(matches!(step, StartStep::Skipped { .. }));
                 assert!(calls(&rig).is_empty());
                 assert!(rig.sim.writes().is_empty());
+            }
+
+            /// Foundry's claim of this run at a host is left alone as another factory's, as the
+            /// pass leaves it: this build makes no workspace on a host.
+            #[test]
+            fn a_claim_at_a_host_is_left_alone_as_another_factorys() {
+                let rig = Rig::new();
+                rig.sim.set_labels(&["factory:triage"]);
+                rig.sim.set_assignees(&[LOGIN]);
+                rig.sim.comment_as(
+                    LOGIN,
+                    &crate::factory::github::claim_comment(
+                        &run_id(1),
+                        &Target::Host(foundry_proto::factory::HostKind::Vims),
+                    ),
+                );
+                let step = pass(&rig, &run_id(1));
+                assert_eq!(
+                    step,
+                    StartStep::Skipped {
+                        reason: "the issue's newest claim is another factory's".into()
+                    }
+                );
+                assert!(calls(&rig).is_empty());
+                assert!(rig.sim.writes().is_empty());
+                assert!(rig.ledger.read(&run_id(1)).unwrap().is_empty());
             }
 
             /// The runner's case "never claims an issue put back to ready: that is the claim

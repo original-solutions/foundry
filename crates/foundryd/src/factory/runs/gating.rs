@@ -329,7 +329,7 @@ use crate::factory::messages::{
 };
 use crate::factory::placing::{self, Slots};
 use crate::factory::text::{is_commit_id, sanitize};
-use crate::factory::worker::{Target, WorkerError};
+use crate::factory::worker::{Target, WorkerError, fleet_machine};
 use crate::sessions::factory::BODY_PATH;
 
 /// The step written once the worker has answered the create: `gate-created <k> <workspace id>`.
@@ -1733,7 +1733,9 @@ impl Gate<'_, '_> {
             }
             None => {
                 // The workspace's record has not reached the view, or is gone from it.
-                let machine = target.machine().ok_or_else(bad_machine)?;
+                // The fleet shows only its machines: a host is refused as the fleet worker
+                // refuses one.
+                let machine = fleet_machine(target)?;
                 let gone = gate::could_not_run(None, ctx.view.unreachable_for(machine), None);
                 return self.unseen(&req, machine, gone);
             }
@@ -8441,6 +8443,19 @@ mod tests {
                 assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: left });
             }
             assert_eq!(go(&rig, &run), GateStep::Running);
+        }
+
+        /// A gate recorded at a host, which the fleet cannot show, is refused as the fleet
+        /// worker refuses a host, naming its kind.
+        #[test]
+        fn a_gate_recorded_at_a_host_is_refused_naming_the_kind() {
+            let (rig, run, _hub) = built();
+            rig.step(&run, &format!("{GATE_REQUESTED}1 1 {HEAD} {BASE_TIP} vims"));
+            rig.step(&run, &format!("{GATE_CREATED}1 {}", gate_ws(1).0));
+            let Err(RunError::Worker(WorkerError::Failed(said))) = try_go(&rig, &run) else {
+                panic!("a gate at a host is refused");
+            };
+            assert!(said.contains("vims"), "{said}");
         }
     }
 
