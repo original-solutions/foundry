@@ -1744,6 +1744,29 @@ describe("App", () => {
     await waitFor(() => expect(calls.map((c) => c.url)).toEqual(["/api/workspaces/w4/archive"]));
   });
 
+  it("leaves a workspace of a project whose factory is on out of the sweep until the project's factory status is known", async () => {
+    const calls = mockActions(new Response(null, { status: 204 }), new Response(null, { status: 204 }));
+    await open("/terminals/t1", {
+      ...live,
+      records: [...live.records, workspace(ME, "w2", "fac 162"), workspace(ME, "w3", "fix signup", { project: "p2" })],
+      settings: settings({
+        projects: [
+          { id: "p1", name: "demo", repo: "/tmp/demo.git" },
+          { id: "p2", name: "other", repo: "/tmp/other.git" },
+        ],
+        project_factory: { p1: { on: true, login: "bot", paused: false } },
+      }),
+    });
+    const sidebar = screen.getByRole("navigation");
+    expect(within(sidebar).getByRole("button", { name: "Archive 1 empty" })).toBeDefined();
+
+    // Once p1's status says no run holds w2, it is empty like any other.
+    act(() => sockets("/api/events").at(-1)!.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: factoryStatus("p1", {}).p1 })));
+    expect(await within(sidebar).findByRole("button", { name: "Archive 2 empty" })).toBeDefined();
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Archive 2 empty" }));
+    await waitFor(() => expect(calls.map((c) => c.url).sort()).toEqual(["/api/workspaces/w2/archive", "/api/workspaces/w3/archive"]));
+  });
+
   it("sweeps only its own machine: another machine's ended terminals and empty workspaces stay", async () => {
     const calls = mockActions(...Array.from({ length: 4 }, () => new Response(null, { status: 204 })));
     await open("/terminals/t1", {

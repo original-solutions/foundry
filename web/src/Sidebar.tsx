@@ -167,7 +167,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
             <button
               type="button"
               aria-label="Collapse sidebar"
-              title={`Collapse to a rail of states, for a wider terminal (${railKey})`}
+              title={`Collapse to a rail, for a wider terminal (${railKey})`}
               onClick={onRail}
               className="hidden rounded p-1 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 md:block"
             >
@@ -286,10 +286,11 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
 
 /**
  * The workspaces of `machine` its sweep archives: those with no terminals left that no factory run
- * holds. A run's workspace can be empty between its sessions, and the factory still builds in it.
+ * holds. A run's workspace can be empty between its sessions, and the factory still builds in it;
+ * while its project's status is not known yet (`statusUnknown`), whether a run holds it is not known either.
  */
 function sweepable(machine: MachineView): string[] {
-  return machine.workspaces.filter((w) => rows(w).length === 0 && !w.factory).map((w) => w.id);
+  return machine.workspaces.filter((w) => rows(w).length === 0 && !w.factory && !w.statusUnknown).map((w) => w.id);
 }
 
 /**
