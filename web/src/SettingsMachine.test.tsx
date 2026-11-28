@@ -264,6 +264,58 @@ describe("SettingsMachine", () => {
     expect(calls).toEqual([{ url: `/api/machines/${ME}/limits`, method: "POST", body: { max_sessions: 4, max_load_per_core: 1.05, min_free_disk_gb: 20 } }]);
   });
 
+  it("shows a refused Clear limits on the limit rows when the rename went through", async () => {
+    mockFetch(new Response(null, { status: 204 }), json(503, { error: "the coordinator is not reachable" }));
+    await show(OTHER);
+    type("Name", "desk");
+    fireEvent.click(screen.getByRole("button", { name: "Clear limits" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save 2 changes" }));
+    await waitFor(() => expect(row("Max sessions").textContent).toContain("the coordinator is not reachable"));
+    expect(bar()?.textContent).toContain("1 change");
+  });
+
+  it("saves a rename and Clear limits together with one request each", async () => {
+    const calls = mockFetch(new Response(null, { status: 204 }), new Response(null, { status: 204 }));
+    await show(OTHER);
+    type("Name", "desk");
+    fireEvent.click(screen.getByRole("button", { name: "Clear limits" }));
+    expect(bar()?.textContent).toContain("2 changes");
+    expect(bar()?.textContent).toContain("Name laptop → desk");
+    expect(bar()?.textContent).toMatch(/Limits .* → none/);
+    fireEvent.click(screen.getByRole("button", { name: "Save 2 changes" }));
+    await waitFor(() => expect(bar()).toBeNull());
+    expect(calls).toEqual([
+      { url: `/api/machines/${OTHER}/rename`, method: "POST", body: { name: "desk" } },
+      { url: `/api/machines/${OTHER}/limits/clear`, method: "POST", body: undefined },
+    ]);
+  });
+
+  it("asks for a fresh look, sending nothing, when the limits changed elsewhere under a Clear limits", async () => {
+    const calls = mockFetch(new Response(null, { status: 204 }));
+    const change = await live();
+    fireEvent.click(screen.getByRole("button", { name: "Clear limits" }));
+    change({ limits: { [OTHER]: { max_sessions: 9, max_load_per_core: 1.5, min_free_disk: 20_000_000_000 } } });
+    expect(bar()?.textContent).toContain("changed elsewhere");
+    fireEvent.click(screen.getByRole("button", { name: "Look again" }));
+    expect(calls).toEqual([]);
+  });
+
+  it("keeps typing made while a save is out, and still counts it one change", async () => {
+    const out: { url: string; answer: (r: Response) => void }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => new Promise<Response>((answer) => out.push({ url, answer }))),
+    );
+    await show(OTHER);
+    type("Name", "desk");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(out).toHaveLength(1));
+    type("Name", "desk2");
+    await act(async () => out[0].answer(new Response(null, { status: 204 })));
+    expect(field("Name").value).toBe("desk2");
+    expect(bar()?.textContent).toContain("1 change");
+  });
+
   describe("the update", () => {
     const ready = (id: string) => [at(ME, 1, id === ME ? { version: "0.9.0", update_ready: "v0.9.1" } : {}), at(OTHER, 1, id === OTHER ? { version: "0.9.0", update_ready: "v0.9.1" } : {})];
 
