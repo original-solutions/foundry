@@ -867,6 +867,25 @@ mod tests {
     }
 
     #[test]
+    fn an_operation_list_the_reader_cannot_read_in_full_is_no_empty_list() {
+        // An empty list says Vims never took the key, so a list read in part, or in a shape
+        // not guessed, must not read as one.
+        for answer in [
+            r#"[{"id":"op_1"},{"opId":"op_7","status":"queued"}]"#,
+            r#"{"results":[{"id":"op_7"}]}"#,
+            r#"{"operations":{}}"#,
+            "{}",
+        ] {
+            let fake = FakeVims::new();
+            fake.on("operation list", Reply::ok(answer));
+            assert!(
+                matches!(fake.operations_by_key("k"), Err(VimsError::Unknown { .. })),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
     fn operation_logs_are_read_as_text_or_from_json() {
         let fake = FakeVims::new();
         fake.on("operation logs", Reply::ok(r#"{"logs":"one\ntwo\n"}"#))
