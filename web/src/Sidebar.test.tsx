@@ -1,12 +1,13 @@
 import { focusManager, useQueryClient } from "@tanstack/react-query";
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { FactoryMark } from "./FactoryMark";
 import { fleet, withFactory } from "./fleet";
 import { Sidebar } from "./Sidebar";
 import { CHECKS_EVERY } from "./Shipping";
 import { TerminalActions } from "./TerminalMenu";
-import { factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, factoryStatuses, ME, onCommit, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, mockFetch, renderApp } from "./test-utils";
 import type { PullRequest, SessionState, Shipping } from "./api";
 
@@ -106,7 +107,7 @@ describe("Sidebar", () => {
     unfold("fix login");
     expect(button.getAttribute("aria-expanded")).toBe("true");
     expect(button.getAttribute("title")).toBe("Fold");
-    // The name, the standing line, the branch line and the sessions share the content column.
+    // The name, the standing line with its branch, and the sessions share the content column.
     const content = button.closest<HTMLElement>(".min-w-0:not(button)")!;
     expect(content.contains(within(group).getByText(/fix-login/))).toBe(true);
     const sessions = within(group).getAllByRole("listitem")[0].parentElement!;
@@ -319,6 +320,32 @@ describe("Sidebar", () => {
     expect(title.className).toMatch(/(^| )min-w-0( |$)/);
   });
 
+  it("puts an unfolded workspace's actions in its header row, between the name and the factory mark, shown on hover or focus on a fine pointer", async () => {
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    const group = screen.getByRole("group", { name: "fix login" });
+    const name = within(group).getByRole("button", { name: "fix login" });
+    const header = name.parentElement!;
+    expect(within(header).queryByRole("button", { name: "New shell" })).toBeNull();
+
+    unfold("fix login");
+    const shell = within(header).getByRole("button", { name: "New shell" });
+    const actions = shell.parentElement!;
+    expect(actions.parentElement).toBe(header);
+    expect([...header.children].indexOf(actions)).toBe([...header.children].indexOf(name) + 1);
+    for (const rule of ["pointer-fine:hidden", "pointer-fine:group-focus-within/ws:flex", "pointer-fine:group-hover/ws:flex", "shrink-0"]) {
+      expect(actions.className.split(" ")).toContain(rule);
+    }
+    // The name gives way first.
+    expect(name.className.split(" ")).toEqual(expect.arrayContaining(["min-w-0", "flex-1"]));
+    // The row keeps room for a 24px action whether the actions show or not, so a hover does not move the list:
+    // 28px tall less 2px of padding above and below.
+    expect(header.className.split(" ")).toEqual(expect.arrayContaining(["min-h-7", "py-0.5"]));
+    expect(shell.className.split(" ")).toContain("size-6");
+    // No line of its own for the actions any more: the header row, the standing line, the sessions.
+    const content = header.parentElement!;
+    expect([...content.children].map((e) => e.tagName)).toEqual(["DIV", "P", "UL"]);
+  });
+
   it("starts a shell in the workspace from New shell", async () => {
     const calls = mockFetch(json(201, { id: "t9" }));
     await renderApp(<Sidebar machines={machines()} {...props} />);
@@ -337,7 +364,12 @@ describe("Sidebar", () => {
     const group = screen.getByRole("group", { name: "fix login" });
     fireEvent.click(within(group).getByRole("button", { name: "New shell" }));
 
-    expect((await within(group).findByRole("alert")).textContent).toBe("Could not start a shell: at the terminal limit.");
+    const alert = await within(group).findByRole("alert");
+    expect(alert.textContent).toBe("Could not start a shell: at the terminal limit.");
+    // Under the standing line, above the sessions.
+    expect(alert.previousElementSibling?.tagName).toBe("P");
+    expect(alert.previousElementSibling?.textContent).toContain("demo");
+    expect(alert.nextElementSibling?.tagName).toBe("UL");
   });
 
   it("shows a workspace as one line of its states, the most urgent first, until it is unfolded, and remembers the unfold", async () => {
@@ -580,17 +612,49 @@ describe("Sidebar and the factory", () => {
   it("marks a factory run's workspace and links it to its issue, and names a quiet session so", async () => {
     await renderApp(<Sidebar machines={withFactory(factoryMachines(), factoryStatuses())} {...props} />);
     const run = screen.getByRole("group", { name: "fac 162" });
-    // Folded, the mark shows on the workspace's line.
-    expect(within(run).getByRole("link", { name: "factory #162" }).getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");
+    // Folded, the mark shows on the workspace's line. Its name says what it is; it shows only the issue, since the
+    // workspace's name already says it is a factory task.
+    const mark = within(run).getByRole("link", { name: "factory #162" });
+    expect(mark.getAttribute("href")).toBe("https://github.com/original-solutions/foundry/issues/162");
+    expect(mark.textContent).toBe("#162");
+    expect(mark.getAttribute("title")).toBe("Built by the factory: open its issue");
+    // Folded, its header row is the name, the mark and the line of states, in that order.
+    const header = within(run).getByRole("button", { name: "fac 162" }).parentElement!;
+    expect([...header.children].map((e) => e.textContent)).toEqual(["DEfac 162", "#162", expect.stringMatching(/^$|\+/)]);
+    expect(header.children[2].querySelector("a[data-strip]")).not.toBeNull();
     unfold("fac 162");
+    // Unfolded, the actions sit between the name and the mark.
+    expect(header.children[1].contains(within(run).getByRole("button", { name: "New shell" }))).toBe(true);
+    expect(header.children[2]).toBe(within(run).getByRole("link", { name: "factory #162" }));
     expect(within(run).getByText("Quiet 10+ min")).toBeDefined();
     expect(within(screen.getByRole("group", { name: "on a commit" })).queryByRole("link", { name: /^factory/ })).toBeNull();
+  });
+
+  it("leaves the mark in full where it is not compact, as the board and its list show it", () => {
+    render(<FactoryMark run={{ run: "original-solutions__foundry__162__1", issue: 162, url: "https://github.com/original-solutions/foundry/issues/162" }} />);
+    const mark = screen.getByRole("link", { name: "factory #162" });
+    expect(mark.textContent).toBe("factory #162");
+    expect(mark.hasAttribute("aria-label")).toBe(false);
+  });
+
+  it("says factory alone on the mark of a run whose id names no issue", async () => {
+    await renderApp(<Sidebar machines={withFactory(factoryMachines(), factoryStatus("p1", { "not-a-run": ["w1"] }))} {...props} />);
+    const run = screen.getByRole("group", { name: "fac 162" });
+    const header = within(run).getByRole("button", { name: "fac 162" }).parentElement!;
+    const mark = within(header).getByText("factory", { exact: true });
+    expect(mark.tagName).toBe("SPAN");
+    expect(mark.hasAttribute("aria-label")).toBe(false);
+    expect(header.textContent).not.toContain("#");
   });
 
   it("shows a workspace with no branch by its commit", async () => {
     await renderApp(<Sidebar machines={factoryMachines()} {...props} />);
     unfold("on a commit");
-    expect(within(screen.getByRole("group", { name: "on a commit" })).getByText("fedcba9")).toBeDefined();
+    const commit = within(screen.getByRole("group", { name: "on a commit" })).getByText("fedcba9");
+    // On the standing line, after the project.
+    const line = commit.closest("p")!;
+    expect(line.textContent).toBe("demo · fedcba9");
+    expect(commit.className.split(" ")).toEqual(expect.arrayContaining(["font-mono", "text-[11px]"]));
   });
 });
 
@@ -648,17 +712,50 @@ describe("where a workspace's work stands", () => {
     expect(calls).toEqual([{ url: "/api/workspaces/w1/pr", method: "POST", body: undefined }]);
   });
 
-  it("shows the same line under an unfolded workspace's name, and its branch alone on the line of actions", async () => {
+  it("shows the same line under an unfolded workspace's name, ending in its branch, with New shell in its header row", async () => {
     reads({ w1: () => json(200, ready) });
     await renderApp(<Sidebar machines={fleet(mine(), both, {}, [ME, OTHER])} {...props} />);
     unfold("fix login");
     const group = within(screen.getByRole("group", { name: "fix login" }));
 
-    const line = await lineOf("fix login", "demo · PR #88 · Ready to merge");
+    const line = await lineOf("fix login", "demo · PR #88 · Ready to merge · fix-login");
+    expect(line.getAttribute("title")).toBe("demo · PR #88 · Ready to merge · fix-login");
     expect(within(line).getByRole("link", { name: "PR #88 · Ready to merge" }).getAttribute("href")).toBe("https://github.com/o/r/pull/88");
-    expect(group.getByText("fix-login", { exact: true })).toBeDefined();
-    expect(group.queryByText(/fix-login · demo/)).toBeNull();
-    expect(group.getByRole("button", { name: "New shell" })).toBeDefined();
+    const branch = within(line).getByText("fix-login", { exact: true });
+    expect(branch.className.split(" ")).toEqual(expect.arrayContaining(["font-mono", "text-[11px]"]));
+    // Shown once: nowhere else in the workspace.
+    expect(group.getAllByText(/fix-login/)).toEqual([branch]);
+    const header = group.getByRole("button", { name: "fix login" }).parentElement!;
+    expect(within(header).getByRole("button", { name: "New shell" })).toBeDefined();
+  });
+
+  it("shows no branch on the line of a workspace named the same as its branch", async () => {
+    reads({ w1: () => json(200, ready) });
+    const named = [sample(ME, 1), workspace(ME, "w1", "fix-login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "idle")];
+    await renderApp(<Sidebar machines={fleet(named, both, {}, [ME, OTHER])} {...props} />);
+    unfold("fix-login");
+
+    const line = await lineOf("fix-login", "demo · PR #88 · Ready to merge");
+    expect(line.getAttribute("title")).toBe("demo · PR #88 · Ready to merge");
+    expect(within(screen.getByRole("group", { name: "fix-login" })).getAllByText("fix-login", { exact: true })).toHaveLength(1);
+  });
+
+  it("shows no branch on a folded workspace's line", async () => {
+    reads({ w1: () => json(200, ready) });
+    await renderApp(<Sidebar machines={fleet(mine(), both, {}, [ME, OTHER])} {...props} />);
+    await lineOf("fix login", "demo · PR #88 · Ready to merge");
+  });
+
+  it("shows the project and the branch alone until the read answers, or when it fails", async () => {
+    reads({ w1: () => new Promise<Response>(() => {}) as unknown as Response, w9: () => json(400, { error: "no such route" }) });
+    await renderApp(<Sidebar machines={fleet([...mine(), ...theirs], both, {}, [ME, OTHER])} {...props} />);
+    unfold("fix login");
+    unfold("remote job");
+
+    const waiting = await lineOf("fix login", "demo · fix-login");
+    expect(waiting.getAttribute("title")).toBe("demo · fix-login");
+    const failed = await lineOf("remote job", "demo · remote-job");
+    expect(failed.getAttribute("title")).toBe("demo · remote-job");
   });
 
   it("reads a workspace on another online machine with a POST, which the daemon carries to its owner", async () => {
