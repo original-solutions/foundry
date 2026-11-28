@@ -6788,7 +6788,7 @@ mod tests {
     mod a_reported_pull_request_cut_off_at_work {
         use super::*;
         use crate::factory::gate::{self, MACHINE_GONE_AFTER};
-        use crate::factory::runs::gating::gate_running;
+        use crate::factory::runs::gating::{GATE_COULD_NOT_RUN, gate_running};
         use crate::factory::runs::progress::GATE_REQUESTED;
 
         const HEAD: &str = "1111111111111111111111111111111111111111";
@@ -6958,6 +6958,122 @@ mod tests {
             assert!(could_not_run < interrupted);
             // Nothing is asked of the gate's machine, which is gone.
             assert_eq!(rig.worker.calls(), vec![archived_call()]);
+        }
+
+        /// A gate in flight on a machine that is not gone is still at work there: it is left
+        /// to the gate's own rules, holding its slot, and the run is interrupted all the same.
+        #[test]
+        fn a_gate_in_flight_on_a_machine_that_is_not_gone_is_left_to_the_gates_own_rules() {
+            let (mut rig, run) = reported();
+            rig.step(
+                &run,
+                &format!("{GATE_REQUESTED}1 1 {HEAD} {BASE_TIP} {}", m2()),
+            );
+            rig.step(&run, &format!("gate-created 1 {}", gate_workspace()));
+            rig.view = at_work(UNREACHABLE_FOR);
+            pass_one(&rig, &run);
+            assert_eq!(interruptions(&rig, &run).len(), 1);
+            assert!(gate_running(&rig.events(&run)));
+            assert!(
+                !rig.steps(&run)
+                    .iter()
+                    .any(|step| step.starts_with(GATE_COULD_NOT_RUN))
+            );
+            assert_eq!(rig.worker.calls(), vec![archived_call()]);
+        }
+
+        /// The gate's failures to run are counted for the attempt in flight, as the gate counts
+        /// them, and its wait is the gate's for that count.
+        #[test]
+        fn the_gates_failures_to_run_are_counted_for_its_attempt() {
+            let (mut rig, run) = reported();
+            let gone = gate::could_not_run(None, MACHINE_GONE_AFTER, None).unwrap();
+            for (attempt, k) in [(1, 1), (2, 2)] {
+                rig.step(
+                    &run,
+                    &format!("{GATE_REQUESTED}{attempt} {k} {HEAD} {BASE_TIP} {}", m1()),
+                );
+                rig.step(
+                    &run,
+                    &format!("{GATE_COULD_NOT_RUN}{attempt} {k} 1 1 {gone}"),
+                );
+            }
+            rig.step(
+                &run,
+                &format!("{GATE_REQUESTED}2 3 {HEAD} {BASE_TIP} {}", m1()),
+            );
+            assert!(gate_running(&rig.events(&run)));
+            rig.view = at_work(UNREACHABLE_FOR);
+            pass_one(&rig, &run);
+            let wait = gate::backoff(2).unwrap();
+            assert!(
+                rig.steps(&run)
+                    .contains(&format!("{GATE_COULD_NOT_RUN}2 3 2 {wait} {gone}")),
+                "{:?}",
+                rig.steps(&run)
+            );
+        }
+
+        /// The run cut off at work, interrupted, and its resume started in `fac/8-1-r1`.
+        fn resumed_after_cut_off() -> (Rig, RunId) {
+            let (mut rig, run) = reported();
+            rig.view = at_work(UNREACHABLE_FOR);
+            pass_one(&rig, &run);
+            rig.view = archived();
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::NeedsMachine(Placing::Resume { resumes: 1 })
+            );
+            resume_workspace_made(&mut rig, &run);
+            assert!(matches!(
+                resumed(&mut rig, &run),
+                ResumeStep::Started { resumes: 1, .. }
+            ));
+            (rig, run)
+        }
+
+        fn resumed_in(state: SessionState) -> FleetView {
+            with_resume_workspace("fac/8-1-r1", None)
+                .session(session_record(resumed_session(), fresh(), state))
+                .build()
+        }
+
+        /// The resumed session has reported nothing since the interruption: the resume step
+        /// keeps the run, so its end is an interruption of its own, as for a run with no pull
+        /// request reported, and its first message is asked for again.
+        #[test]
+        fn a_resumed_session_stays_the_resume_steps_until_it_reports_again() {
+            let (mut rig, run) = resumed_after_cut_off();
+            rig.view = resumed_in(SessionState::Idle);
+            assert!(takes_from_the_gate(&rig.ctx(), &rig.events(&run)));
+            rig.worker.on_send(Ok(0));
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Resent {
+                    session: resumed_session()
+                }
+            );
+            rig.view = resumed_in(SessionState::Failed);
+            never_written(&rig);
+            assert!(takes_from_the_gate(&rig.ctx(), &rig.events(&run)));
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::Archiving { resumes: 2, .. }
+            ));
+            assert_eq!(interruptions(&rig, &run).len(), 2);
+        }
+
+        /// Once the resumed session reports its pull request again, the gate has the run.
+        #[test]
+        fn a_resumed_session_that_reports_again_is_the_gates() {
+            let (mut rig, run) = resumed_after_cut_off();
+            rig.view = resumed_in(SessionState::Idle);
+            pr_opened(&rig, &run);
+            assert!(!takes_from_the_gate(&rig.ctx(), &rig.events(&run)));
+            rig.view = resumed_in(SessionState::Failed);
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
         }
 
         /// Short of 15 minutes the gate in flight is left to the gate's own rules.

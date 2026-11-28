@@ -3628,13 +3628,25 @@ mod tests {
                 }),
                 "the gate in flight could not run"
             );
-            // The resume goes on in the next pass, as a run with no pull request reported.
+            // The resume goes on in the next pass, as a run with no pull request reported: the
+            // earlier workspace is archived, the session no longer shown, and the builder back,
+            // so nothing is cut off now and the resume owed keeps the run from the gate.
+            rig.view = fleet();
+            rig.worker
+                .inner
+                .on_create(Ok(WorkspaceId(uuid::Uuid::from_u128(0x5e8))));
             let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
             let said = said_of(&report, &run);
             assert!(
                 said.iter()
-                    .any(|s| s.starts_with("resume: ") || s.starts_with("the resume waits")),
+                    .any(|s| s.starts_with("resume: ") && !s.contains("Archiving")),
                 "{said:?}"
+            );
+            assert!(
+                rig.creates().iter().any(|c| c.name == "fac/5-1-r1"),
+                "the resume workspace is asked for: {:?}",
+                rig.creates()
             );
         }
 
