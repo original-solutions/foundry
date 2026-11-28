@@ -1288,6 +1288,47 @@ mod tests {
     }
 
     #[test]
+    fn a_host_target_reads_as_offline_never_unreachable_and_holding_nothing() {
+        let m = machine(1);
+        let held = MachineHeld {
+            logins: vec!["bot".into()],
+            skill: false,
+        };
+        let view = StoreView::builder()
+            .online(m)
+            .unreachable(machine(2), Duration::from_secs(90))
+            .held(m, held.clone())
+            .held(machine(2), held.clone())
+            .build();
+        let host = Target::Host(HostKind::Vims);
+        assert!(!view.online(host));
+        assert_eq!(view.unreachable_for(host), Duration::ZERO);
+        assert!(view.held(host).is_none());
+        assert!(view.online(Target::Machine(m)));
+        assert_eq!(
+            view.unreachable_for(Target::Machine(machine(2))),
+            Duration::from_secs(90)
+        );
+        assert_eq!(view.held(Target::Machine(m)), Some(&held));
+    }
+
+    #[test]
+    fn the_view_answers_workspace_named_through_the_trait_as_through_the_struct() {
+        let m = machine(1);
+        let view = StoreView::builder()
+            .workspace(workspace_record(m, 1, true, 10, 1, "run"))
+            .workspace(workspace_record(m, 2, false, 11, 1, "run"))
+            .build();
+        let dynamic: &dyn FleetView = &view;
+        assert_eq!(
+            dynamic.workspace_named(project(1), "run").unwrap().body.id,
+            WorkspaceId(id(11))
+        );
+        assert_eq!(dynamic.workspaces_named(project(1), "run").len(), 1);
+        assert!(dynamic.workspace_named(project(2), "run").is_none());
+    }
+
+    #[test]
     fn workspace_named_ignores_an_archived_workspace() {
         let m = machine(1);
         let view = FleetView::builder()
