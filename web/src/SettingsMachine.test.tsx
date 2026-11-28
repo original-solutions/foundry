@@ -431,6 +431,18 @@ describe("SettingsMachine", () => {
     expect(bar()?.textContent).toContain("Name desk → laptop");
   });
 
+  it("keeps a name typed back key by key while its save is out, as a change from what was sent", async () => {
+    const out = held();
+    await show(OTHER);
+    type("Name", "desk");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(out).toHaveLength(1));
+    for (const typed of ["des", "de", "", "l", "laptop"]) type("Name", typed);
+    await act(async () => out[0].answer(new Response(null, { status: 204 })));
+    expect(field("Name").value).toBe("laptop");
+    expect(bar()?.textContent).toContain("Name desk → laptop");
+  });
+
   it("keeps a limit typed back to the saved one while its save is out, as a change from what was sent", async () => {
     const out = held();
     await show(OTHER);

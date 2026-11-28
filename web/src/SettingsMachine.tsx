@@ -192,7 +192,7 @@ function Shared({ machine }: { machine: MachineView }) {
           from[key] = now[key];
         }
       }
-      return { edits, from };
+      return { ...d, edits, from };
     });
   };
 
