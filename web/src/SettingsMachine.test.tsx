@@ -132,8 +132,25 @@ describe("SettingsMachine", () => {
     expect(calls).toHaveLength(2);
   });
 
+  it("keeps a refused limits change in the bar with the daemon's reason beside its field", async () => {
+    const calls = mockFetch(new Response(null, { status: 204 }), json(503, { error: "the coordinator is not reachable" }));
+    await show(OTHER);
+
+    type("Name", "desk");
+    type("Max sessions", "6");
+    fireEvent.click(screen.getByRole("button", { name: "Save 2 changes" }));
+
+    await waitFor(() => expect(row("Max sessions").textContent).toContain("the coordinator is not reachable"));
+    expect(bar()?.textContent).toContain("Max sessions 4 → 6");
+    expect(bar()?.textContent).not.toContain("Name laptop");
+    expect(calls).toHaveLength(2);
+  });
+
   it.each([
     ["Max sessions", "0", "the maximum sessions is a whole number from 1 to 4294967295"],
+    ["Max sessions", "4294967296", "the maximum sessions is a whole number from 1 to 4294967295"],
+    ["Max load per core", "", "the maximum load per core is a number above 0"],
+    ["Min free disk (GB)", "", "the minimum free disk is a number of gigabytes, 0 or more"],
     ["Max sessions", "2.5", "the maximum sessions is a whole number from 1 to 4294967295"],
     ["Max sessions", "", "the maximum sessions is a whole number from 1 to 4294967295"],
     ["Max load per core", "0", "the maximum load per core is a number above 0"],
@@ -343,6 +360,26 @@ describe("SettingsMachine", () => {
       // The serving machine has the same release ready, and nothing was sent to it.
       open(ME);
       expect(screen.queryByText(/^Restarting/)).toBeNull();
+    });
+
+    it("opens another machine's page with none of the last machine's unsaved edits", async () => {
+      const open = await both(OTHER);
+      type("Name", "desk");
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      open(ME);
+      expect(field("Name").value).toBe("studio");
+      expect(bar()).toBeNull();
+    });
+
+    it("names the machine serving the page, not this one, when another machine's page is held by its restart", async () => {
+      mockFetch(json(202, {}));
+      const open = await both(ME);
+      fireEvent.click(screen.getByRole("button", { name: "Install" }));
+      await screen.findByText(/^Restarting/);
+      open(OTHER);
+      expect(screen.getByText(/the machine serving this page is restarting/i)).toBeDefined();
+      expect(screen.queryByText(/^this machine is restarting/i)).toBeNull();
+      expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
     });
 
     it("offers no Install on the serving machine's page while an install to another machine is still out", async () => {

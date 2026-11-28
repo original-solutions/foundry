@@ -261,7 +261,7 @@ describe("UpdateChecklist", () => {
     await settle();
     fireEvent.click(within(dialog()).getByRole("button", { name: "Done" }));
     expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(true);
-    expect(within(dialog()).getByText(/this machine is restarting/i)).toBeDefined();
+    expect(within(dialog()).getByText(/the machine serving this page is restarting/i)).toBeDefined();
   });
 
   it("offers no Install while the serving machine's own call is out", async () => {
@@ -323,8 +323,8 @@ describe("UpdateChecklist", () => {
       update([at(ME, 2, sampled), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
       expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
       expect(within(dialog()).queryByText(/restarting/i)).toBeNull();
-      // A later release reaches it from elsewhere: the hold, lifted once, stays lifted.
-      update([at(ME, 3, { version: "0.9.2" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
+      // Its sample then says neither, as when it rolls back: the hold, lifted once, stays lifted.
+      update([at(ME, 3, { version: "0.9.0", update_ready: "v0.9.2" }), at(OTHER, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
       expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
       expect(within(dialog()).queryByText(/restarting/i)).toBeNull();
     });
@@ -390,7 +390,7 @@ describe("UpdateChecklist", () => {
       const { update } = show([at(ME, 1, { version: "0.9.0", update_ready: "v0.9.1" })]);
       fireEvent.click(within(dialog()).getByRole("button", { name: "Done" }));
       expect((within(dialog()).getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(true);
-      expect(within(dialog()).getByText(/this machine is restarting/i)).toBeDefined();
+      expect(within(dialog()).getByText(/the machine serving this page is restarting/i)).toBeDefined();
       update([at(ME, 2, { version: "0.9.1" })]);
       expect(within(dialog()).queryByText(/restarting/i)).toBeNull();
     });
