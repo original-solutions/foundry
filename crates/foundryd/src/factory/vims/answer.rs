@@ -483,13 +483,35 @@ impl GithubLinks {
                 login,
             });
         }
-        if links.is_empty()
-            && let Some(login) = text(&value, &[&["login"], &["user", "login"]])
-        {
-            links.push(GithubLink { owner: None, login });
+        if !links.is_empty() {
+            return Some(GithubLinks { links });
+        }
+        // The answer names no owner the reader can place. Its login is for every owner only when
+        // nothing else in it could hold owners: a list under a name not guessed, or in a shape
+        // not guessed, would let the login answer for owners it was never named for.
+        if let Value::Object(fields) = &value {
+            let flat = |value: &Value| {
+                value
+                    .as_object()
+                    .is_some_and(|fields| fields.values().all(|field| !nested(field)))
+            };
+            if fields
+                .iter()
+                .any(|(name, field)| nested(field) && !(name == "user" && flat(field)))
+            {
+                return None;
+            }
+            if let Some(login) = text(&value, &[&["login"], &["user", "login"]]) {
+                links.push(GithubLink { owner: None, login });
+            }
         }
         Some(GithubLinks { links })
     }
+}
+
+/// Whether `value` is a list or an object.
+fn nested(value: &Value) -> bool {
+    value.is_array() || value.is_object()
 }
 
 /// Whether the profile `vims profile show` gives holds the skill named `skill`.

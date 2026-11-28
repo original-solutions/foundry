@@ -1254,6 +1254,30 @@ mod tests {
     }
 
     #[test]
+    fn a_login_at_the_top_beside_owners_the_reader_cannot_place_makes_the_answer_unreadable() {
+        for answer in [
+            r#"{"login":"tomkaczocha","orgs":[{"login":"Trilogy-Care"}]}"#,
+            r#"{"login":"tomkaczocha","installations":{"Trilogy-Care":{"login":"bot"}}}"#,
+            r#"{"login":"tomkaczocha","installations":[]}"#,
+            r#"{"user":{"login":"tomkaczocha","orgs":["Trilogy-Care"]}}"#,
+        ] {
+            let fake = FakeVims::new();
+            fake.on("github", Reply::ok(answer));
+            let error = fake.github().unwrap_err();
+            assert!(matches!(error, VimsError::Unknown { .. }), "{answer}");
+        }
+        let fake = FakeVims::new();
+        fake.on(
+            "github",
+            Reply::ok(r#"{"user":{"login":"tomkaczocha","id":7},"scope":"repo"}"#),
+        );
+        assert_eq!(
+            fake.github().unwrap().login_for("anyone"),
+            Some("tomkaczocha")
+        );
+    }
+
+    #[test]
     fn the_profile_says_whether_it_holds_a_skill() {
         let fake = FakeVims::new();
         fake.on(
