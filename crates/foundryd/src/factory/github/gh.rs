@@ -6,11 +6,12 @@
 //! [`TrackerError::Timeout`]. [`finish`] reads how a call ended, for the real `gh` and for the
 //! fake alike.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -292,11 +293,177 @@ pub fn finish(args: &[String], answer: Answer) -> Result<String, TrackerError> {
     }
 }
 
+/// How long the counts of a login run before they are logged and start again.
+const REPORT_EVERY: Duration = Duration::from_secs(3600);
+
+/// The most keys the hourly line names.
+const MOST: usize = 5;
+
+/// The GitHub rate limit a call spends from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Budget {
+    /// The GraphQL budget: `gh issue`, `gh pr`, `gh release` and `gh api graphql`.
+    Graphql,
+    /// The REST budget: any other `gh api <path>`.
+    Rest,
+}
+
+/// The first positional argument after `api`: the path, or `graphql`.
+fn api_path(args: &[String]) -> Option<&str> {
+    if args.first().map(String::as_str) != Some("api") {
+        return None;
+    }
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
+        if !arg.starts_with('-') {
+            return Some(arg);
+        }
+        let takes_value = matches!(
+            arg.as_str(),
+            "-X" | "--method"
+                | "-H"
+                | "--header"
+                | "-f"
+                | "--raw-field"
+                | "-F"
+                | "--field"
+                | "-q"
+                | "--jq"
+                | "-t"
+                | "--template"
+                | "--input"
+                | "--hostname"
+                | "--cache"
+                | "-p"
+                | "--preview"
+        );
+        if takes_value {
+            rest.next();
+        }
+    }
+    None
+}
+
+/// The budget the call with `args` spends from.
+pub fn budget_of(args: &[String]) -> Budget {
+    match api_path(args) {
+        Some("graphql") | None => Budget::Graphql,
+        Some(_) => Budget::Rest,
+    }
+}
+
+/// The key the call with `args` is counted under: the first two words of `issue`, `pr` and
+/// other commands, `api graphql`, or `api ` and the REST path with its query dropped and each
+/// all-digit segment written `N`.
+pub fn command_key(args: &[String]) -> String {
+    match api_path(args) {
+        Some("graphql") => "api graphql".to_string(),
+        Some(path) => {
+            let path = path.split('?').next().unwrap_or_default();
+            let path: Vec<&str> = path
+                .split('/')
+                .map(|part| {
+                    if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
+                        "N"
+                    } else {
+                        part
+                    }
+                })
+                .collect();
+            format!("api {}", path.join("/"))
+        }
+        None => args
+            .iter()
+            .take(2)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// The last known GraphQL quota of a login.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Quota {
+    /// Points left in the hour.
+    pub remaining: u64,
+    /// Points the hour starts with.
+    pub limit: u64,
+    /// When the hour ends, as GitHub wrote it.
+    pub reset_at: String,
+}
+
+/// What the calls of one login have spent, shared by every [`Gh`] for the login. It is the
+/// per-login state at the seam, held as `Arc<Mutex<LoginBudget>>`.
+#[derive(Debug, Default)]
+pub struct LoginBudget {
+    /// Calls since `since`, by budget and command key.
+    pub counts: BTreeMap<(Budget, String), u64>,
+    /// GraphQL points foundryd spent since `since`.
+    pub points: u64,
+    /// The quota the last answer with a rate limit reported.
+    pub quota: Option<Quota>,
+    /// The clock reading when the current counts started.
+    pub since: Option<Duration>,
+}
+
+/// The [`LoginBudget`] of each login, made once.
+#[derive(Debug, Default)]
+pub struct Budgets(Mutex<BTreeMap<String, Arc<Mutex<LoginBudget>>>>);
+
+impl Budgets {
+    /// The budget of `login`, the same one on every call.
+    pub fn of(&self, login: &str) -> Arc<Mutex<LoginBudget>> {
+        let mut all = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        all.entry(login.to_string()).or_default().clone()
+    }
+}
+
+/// The line that reports what `login` spent in the hour of `budget`'s counts.
+fn hourly_line(login: &str, budget: &LoginBudget) -> String {
+    let calls = |kind: Budget| -> u64 {
+        budget
+            .counts
+            .iter()
+            .filter(|((of, _), _)| *of == kind)
+            .map(|(_, n)| n)
+            .sum()
+    };
+    let quota = match &budget.quota {
+        Some(quota) => format!(
+            "remaining {} of {}, resets {}",
+            quota.remaining,
+            quota.limit,
+            one_line(&quota.reset_at)
+        ),
+        None => "remaining unknown".to_string(),
+    };
+    let mut keys: Vec<(&str, u64)> = budget
+        .counts
+        .iter()
+        .map(|((_, key), n)| (key.as_str(), *n))
+        .collect();
+    keys.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let most: Vec<String> = keys
+        .iter()
+        .take(MOST)
+        .map(|(key, n)| format!("{} {n}", one_line(key)))
+        .collect();
+    format!(
+        "factory: GitHub use by {} in the last hour: graphql {} calls, {} points; rest {} calls; {quota}; most: {}",
+        one_line(login),
+        calls(Budget::Graphql),
+        budget.points,
+        calls(Budget::Rest),
+        most.join(", ")
+    )
+}
+
 /// The tracker for one GitHub login, through the `gh` CLI.
 pub struct Gh {
     login: String,
     token: String,
     clock: Arc<dyn Clock>,
+    budget: Arc<Mutex<LoginBudget>>,
     program: PathBuf,
 }
 
@@ -310,12 +477,19 @@ impl fmt::Debug for Gh {
 }
 
 impl Gh {
-    /// The tracker that acts as `login` with `token`, timing each call on `clock`.
-    pub fn new(login: impl Into<String>, token: impl Into<String>, clock: Arc<dyn Clock>) -> Self {
+    /// The tracker that acts as `login` with `token`, timing each call on `clock` and counting
+    /// it in `budget`, the one every tracker for the login shares.
+    pub fn new(
+        login: impl Into<String>,
+        token: impl Into<String>,
+        clock: Arc<dyn Clock>,
+        budget: Arc<Mutex<LoginBudget>>,
+    ) -> Self {
         Self {
             login: login.into(),
             token: token.into(),
             clock,
+            budget,
             program: PathBuf::from("gh"),
         }
     }
@@ -407,9 +581,67 @@ impl Gh {
     }
 }
 
+impl Gh {
+    /// Adds the cost and keeps the quota of the `rateLimit` in a GraphQL answer, if it has one.
+    fn note_rate_limit(&self, stdout: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout) else {
+            return;
+        };
+        let Some(limit) = value.pointer("/data/rateLimit") else {
+            return;
+        };
+        let number = |name: &str| limit.get(name).and_then(serde_json::Value::as_u64);
+        let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(cost) = number("cost") {
+            budget.points += cost;
+        }
+        if let (Some(remaining), Some(total), Some(reset_at)) = (
+            number("remaining"),
+            number("limit"),
+            limit.get("resetAt").and_then(serde_json::Value::as_str),
+        ) {
+            budget.quota = Some(Quota {
+                remaining,
+                limit: total,
+                reset_at: reset_at.to_string(),
+            });
+        }
+    }
+}
+
 impl Tracker for Gh {
     fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
-        finish(args, self.run(args))
+        let key = command_key(args);
+        let line = {
+            let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+            let now = self.clock.now();
+            let mut line = None;
+            match budget.since {
+                Some(since) if now.saturating_sub(since) >= REPORT_EVERY => {
+                    line = Some(hourly_line(&self.login, &budget));
+                    budget.counts.clear();
+                    budget.points = 0;
+                    budget.since = Some(now);
+                }
+                Some(_) => {}
+                None => budget.since = Some(now),
+            }
+            *budget
+                .counts
+                .entry((budget_of(args), key.clone()))
+                .or_insert(0) += 1;
+            line
+        };
+        if let Some(line) = line {
+            tracing::info!("{line}");
+        }
+        let answer = self.run(args);
+        if key == "api graphql"
+            && let Answer::Exit { stdout, .. } = &answer
+        {
+            self.note_rate_limit(stdout);
+        }
+        finish(args, answer)
     }
 }
 

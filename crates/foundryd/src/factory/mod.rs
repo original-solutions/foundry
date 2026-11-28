@@ -1041,6 +1041,7 @@ pub struct Daemon {
     coordinator: Arc<Coordinator>,
     secrets: Arc<dyn Secrets>,
     clock: Arc<dyn Clock>,
+    budgets: github::Budgets,
     home: PathBuf,
     runtime: tokio::runtime::Handle,
 }
@@ -1066,7 +1067,7 @@ impl Host for Daemon {
                 return None;
             }
         };
-        let gh = github::Gh::new(login, token, self.clock.clone());
+        let gh = github::Gh::new(login, token, self.clock.clone(), self.budgets.of(login));
         Some(Arc::new(github::Hiding::new(Arc::new(gh), self.hide())))
     }
 
@@ -1136,6 +1137,7 @@ impl Factory<Daemon> {
             coordinator,
             secrets,
             clock: clock.clone(),
+            budgets: github::Budgets::default(),
             home,
             runtime: tokio::runtime::Handle::current(),
         });

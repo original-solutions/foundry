@@ -27,7 +27,7 @@ use super::lifecycle::approval::{Approval, TextCheck};
 use super::worker::Target;
 
 pub use fake::FakeTracker;
-pub use gh::{Answer, Gh};
+pub use gh::{Answer, Budget, Budgets, Gh, LoginBudget, Quota, budget_of, command_key};
 pub use read::{
     Activity, Blocker, BodyEdit, CheckState, CheckStatus, Comment, DropReason, Dropped, Feedback,
     FeedbackKind, InlineComment, IssueDetail, IssueLabels, IssueSummary, Listing, Mergeable,
