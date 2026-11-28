@@ -5031,6 +5031,186 @@ mod tests {
             assert_eq!(held[0].workspaces, vec![workspace_of(5, 1)]);
         }
 
+        /// A machine the builder's runs move to in a round.
+        fn mover() -> MachineId {
+            MachineId(uuid::Uuid::from_u128(0x3))
+        }
+
+        /// The workspace round `name` (`r1`, `f1`) of `issue` is made in.
+        fn round_workspace(issue: u64, name: u128) -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(
+                0xc000 + u128::from(issue) * 0x10 + name,
+            ))
+        }
+
+        fn steps(rig: &Rig, run: &RunId, steps: &[String]) {
+            let cause = Cause::new(CauseStep::Start, "test");
+            for step in steps {
+                let event = Event::StepChanged { step: step.clone() };
+                rig.ledger.write(run, &event, &cause).unwrap();
+            }
+        }
+
+        fn resumed(issue: u64) -> Vec<String> {
+            vec![
+                format!("resume-machine 1 {}", mover()),
+                format!("resume-workspace 1 {}", round_workspace(issue, 1)),
+            ]
+        }
+
+        #[test]
+        fn a_live_run_resumed_on_another_machine_names_both_workspaces_and_the_new_machine() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    vec![format!("workspace-created {}", workspace_of(5, 1))],
+                    resumed(5),
+                ]
+                .concat(),
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(
+                live[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 1)]
+            );
+            assert_eq!(live[0].machine, mover());
+        }
+
+        #[test]
+        fn a_live_run_with_a_feedback_round_names_the_feedback_workspace() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    format!("workspace-created {}", workspace_of(5, 1)),
+                    format!("feedback-machine 1 {}", mover()),
+                    format!("feedback-workspace 1 {}", round_workspace(5, 2)),
+                ],
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(
+                live[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 2)]
+            );
+            assert_eq!(live[0].machine, mover());
+        }
+
+        #[test]
+        fn a_run_names_a_round_workspace_once_and_keeps_the_claims_machine_without_a_round_machine()
+        {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    format!("workspace-created {}", workspace_of(5, 1)),
+                    format!("resume-workspace 1 {}", workspace_of(5, 1)),
+                    format!("feedback-workspace 1 {}", round_workspace(5, 2)),
+                    format!("feedback-workspace 1 {}", round_workspace(5, 2)),
+                ],
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(
+                live[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 2)]
+            );
+            assert_eq!(live[0].machine, builder_machine());
+        }
+
+        #[test]
+        fn a_held_up_run_that_was_resumed_names_its_resume_workspace() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    vec![format!("workspace-created {}", workspace_of(5, 1))],
+                    resumed(5),
+                ]
+                .concat(),
+            );
+            let cause = Cause::new(CauseStep::Start, "test");
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::StateChanged {
+                        from: State::Building,
+                        to: State::Stuck,
+                    },
+                    &cause,
+                )
+                .unwrap();
+            rig.pass();
+            let held = rig.status().held_up;
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert_eq!(
+                held[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 1)]
+            );
+        }
+
+        #[test]
+        fn a_finished_held_up_run_that_was_resumed_names_its_resume_workspace() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &["factory:stuck"]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    vec![format!("workspace-created {}", workspace_of(5, 1))],
+                    resumed(5),
+                ]
+                .concat(),
+            );
+            let cause = Cause::new(CauseStep::Start, "test");
+            for event in [
+                Event::Stuck {
+                    reason: "no".into(),
+                    branch: None,
+                    commits_ahead: None,
+                },
+                Event::StateChanged {
+                    from: State::Building,
+                    to: State::Stuck,
+                },
+                Event::Finished {
+                    outcome: Outcome::Stuck,
+                    total_ms: 0,
+                    gate_attempts: 0,
+                    review_cycles: None,
+                    pr_url: None,
+                    pr_end: None,
+                },
+            ] {
+                rig.ledger.write(&run, &event, &cause).unwrap();
+            }
+            rig.pass();
+            let held = rig.status().held_up;
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert_eq!(
+                held[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 1)]
+            );
+        }
+
         #[test]
         fn a_held_up_run_is_let_go_once_its_issue_leaves_the_label() {
             let mut rig = Rig::new();
