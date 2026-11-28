@@ -268,6 +268,31 @@ pub struct ChecksTimedOut {
 }
 
 /// A run's progress, read from its events.
+/// A workspace a resume or feedback round was answered with, and the machine that round named
+/// for it when the answer came.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoundWorkspace {
+    /// The id in the step, as written.
+    pub workspace: String,
+    /// The newest `resume-machine <k> <id>` or `feedback-machine <n> <id>` of that round before
+    /// the step, unless a `-machine-given-up` step dropped it; `None` for none.
+    pub machine: Option<String>,
+}
+
+/// The machine, machine-given-up and workspace step prefixes of the resume and the feedback rounds.
+const ROUND_STEPS: [(&str, &str, &str); 2] = [
+    (
+        super::resume::MACHINE,
+        super::resume::MACHINE_GIVEN_UP,
+        super::resume::WORKSPACE,
+    ),
+    (
+        super::feedback::MACHINE,
+        super::feedback::MACHINE_GIVEN_UP,
+        super::feedback::WORKSPACE,
+    ),
+];
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Seen {
     pub claimed: bool,
@@ -281,6 +306,10 @@ pub struct Seen {
     pub workspace_requested: Option<String>,
     /// The id in the newest `workspace-created` step: the worker answered the create.
     pub workspace: Option<String>,
+    /// The workspaces the resume and feedback rounds were answered with, one per
+    /// `resume-workspace <k> <id>` or `feedback-workspace <n> <id>` step, in ledger order. Unlike
+    /// [`Seen::workspace`], which stays the build workspace, these are the ones a run moved to.
+    pub round_workspaces: Vec<RoundWorkspace>,
     /// The moment in the first `approved <time>` step: when an instructor applied the label the run was approved on.
     pub approved_at: Option<String>,
     /// The instructor on that step's cause (`actor`), who applied the label; `None` when the line names none.
@@ -687,6 +716,8 @@ fn working(state: Option<State>) -> bool {
 /// [`Ledger::read`]: crate::factory::ledger::Ledger::read
 pub fn read_progress(events: &[RunEvent]) -> Seen {
     let mut seen = Seen::default();
+    // The machine each round (its machine prefix and count) names now.
+    let mut round_machines: BTreeMap<(&str, u32), String> = BTreeMap::new();
     let mut launch_pull_request: Option<(String, String)> = None;
     let mut waits = Waits::default();
     // The command ids sent under the idle marker with no outcome yet; `None` once a marker names none.
@@ -758,6 +789,22 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 }
                 if let Some(id) = step.strip_prefix(WORKSPACE_CREATED) {
                     seen.workspace = Some(id.to_owned());
+                }
+                for (machine, given_up, workspace) in ROUND_STEPS {
+                    let counted = |prefix: &str| -> Option<(u32, String)> {
+                        let (count, tail) = step.strip_prefix(prefix)?.split_once(' ')?;
+                        Some((canonical(count)?, tail.to_owned()))
+                    };
+                    if let Some((count, id)) = counted(machine) {
+                        round_machines.insert((machine, count), id);
+                    } else if let Some((count, _)) = counted(given_up) {
+                        round_machines.remove(&(machine, count));
+                    } else if let Some((count, id)) = counted(workspace) {
+                        seen.round_workspaces.push(RoundWorkspace {
+                            workspace: id,
+                            machine: round_machines.get(&(machine, count)).cloned(),
+                        });
+                    }
                 }
                 if step == RESULT_LINE_REMINDED {
                     seen.reminded = true;

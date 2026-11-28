@@ -1569,14 +1569,6 @@ impl<'a, 'w> Pass<'a, 'w> {
         let world = self.world;
         let known = self.known()?;
         let unfinished: BTreeSet<RunId> = known.iter().map(|k| k.info.id.clone()).collect();
-        // The workspace a run's progress names as its current one, if any.
-        let workspace_of = |seen: &super::runs::progress::Seen| -> Vec<WorkspaceId> {
-            seen.workspace
-                .as_deref()
-                .and_then(|w| w.parse().ok().map(WorkspaceId))
-                .into_iter()
-                .collect()
-        };
         for k in &known {
             let run = k.info.id.clone();
             match k.info.state {
@@ -1590,17 +1582,12 @@ impl<'a, 'w> Pass<'a, 'w> {
                         run,
                         kind,
                         reason: k.seen.stuck.clone().unwrap_or_default(),
-                        workspaces: workspace_of(&k.seen),
+                        workspaces: workspaces_of(&k.seen),
                     });
                 }
                 _ if k.info.unreadable || !k.info.confirmed => {}
                 state => {
-                    let machine = k
-                        .seen
-                        .machine
-                        .as_deref()
-                        .and_then(machine_id)
-                        .unwrap_or(world.me);
+                    let machine = live_machine_of(&k.seen).unwrap_or(world.me);
                     let used = super::runs::progress::next_gate_attempt(&k.seen).saturating_sub(1);
                     self.results.live(LiveRun {
                         title: self.title(run.issue()),
@@ -1612,7 +1599,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                         machine,
                         gate_retries_used: used,
                         minutes_used: k.seen.worked_ms / 60_000,
-                        workspaces: workspace_of(&k.seen),
+                        workspaces: workspaces_of(&k.seen),
                         sessions: k
                             .seen
                             .thread_id
@@ -1692,7 +1679,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                                 "factory: a held-up run's events could not be read, so it names no workspace: {error}"
                             );
                         })
-                        .map(|events| workspace_of(&read_progress(&events)))
+                        .map(|events| workspaces_of(&read_progress(&events)))
                         .unwrap_or_default();
                     self.results.held_up.push(HeldUp {
                         run: done.run.run.clone(),
@@ -1783,6 +1770,46 @@ impl PassResults {
 }
 
 /// A machine id as the ledger writes one.
+/// The workspaces a run's progress names, oldest first: the build workspace, then each resume and
+/// feedback round's, none twice.
+fn workspaces_of(seen: &super::runs::progress::Seen) -> Vec<WorkspaceId> {
+    let mut listed: Vec<WorkspaceId> = seen
+        .workspace
+        .as_deref()
+        .and_then(|w| w.parse().ok().map(WorkspaceId))
+        .into_iter()
+        .collect();
+    for round in &seen.round_workspaces {
+        if let Some(id) = round.workspace.parse().ok().map(WorkspaceId)
+            && !listed.contains(&id)
+        {
+            listed.push(id);
+        }
+    }
+    listed
+}
+
+/// The machine of a run's newest workspace: the machine its newest round named, when that round's
+/// workspace is the newest listed; otherwise the claim's. `None` when neither parses.
+fn live_machine_of(seen: &super::runs::progress::Seen) -> Option<MachineId> {
+    let newest = workspaces_of(seen).pop();
+    let from_round = seen
+        .round_workspaces
+        .iter()
+        .rev()
+        .find(|round| round.workspace.parse().ok().map(WorkspaceId) == newest)
+        .filter(|_| {
+            newest.is_some()
+                && seen
+                    .workspace
+                    .as_deref()
+                    .and_then(|w| w.parse().ok().map(WorkspaceId))
+                    != newest
+        })
+        .and_then(|round| round.machine.as_deref().and_then(machine_id));
+    from_round.or_else(|| seen.machine.as_deref().and_then(machine_id))
+}
+
 fn machine_id(text: &str) -> Option<MachineId> {
     uuid::Uuid::parse_str(text).ok().map(MachineId)
 }
