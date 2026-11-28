@@ -222,19 +222,19 @@ impl Grant {
 }
 
 /// What an answer names, by its guessed fields. The checks saw a workspace's id, `wsp_…`; the
-/// rest are guesses. A failure's code and [`Change::read`] both read it.
-pub(super) struct Named {
+/// rest are guesses.
+struct Named {
     /// An operation, under `operation` or by `operationId`.
-    pub operation: bool,
+    operation: bool,
     /// A workspace, under `workspace`.
-    pub workspace: bool,
+    workspace: bool,
     /// The answer's own `id`: a workspace's when it starts `wsp_`, else an operation's or
     /// another thing's.
-    pub id: Option<String>,
+    id: Option<String>,
 }
 
 impl Named {
-    pub(super) fn in_answer(value: &Value) -> Self {
+    fn in_answer(value: &Value) -> Self {
         Named {
             operation: value.get("operation").is_some_and(Value::is_object)
                 || text(value, &[&["operationId"], &["operation_id"]]).is_some(),
@@ -244,7 +244,7 @@ impl Named {
     }
 
     /// Whether the answer's own `id` is a workspace's.
-    pub(super) fn is_workspace(&self) -> bool {
+    fn is_workspace(&self) -> bool {
         self.id.as_deref().is_some_and(|id| id.starts_with("wsp_"))
     }
 }

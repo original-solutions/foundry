@@ -86,22 +86,19 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
         } => {
             // Stdout can carry the command's own output, so only its JSON answer, whole or on
             // its last line, is read for a code there; stderr is read for any JSON line, and for
-            // a code in plain text when it holds none. A code is no refusal when any JSON on
-            // either stream names something Vims took (an operation, a workspace, an id, or a
-            // state other than failed), when either stream holds a `{` the reader cannot read,
-            // which may name such work, or when an `exec` waits, since it can print its
-            // command's output on either: the command ran.
+            // a code in plain text when it holds none. The code is Vims's refusal only when both
+            // streams hold nothing but the failure: any other JSON, or JSON the reader cannot
+            // read, may name work Vims took. An `exec` that waits can print its command's
+            // output on either, so its code is never a refusal: the command ran.
             let out = json_answer(&stdout, false);
             let err = json_answer(&stderr, true);
-            let took = [&stdout, &stderr]
-                .into_iter()
-                .any(|text| !all_read(text) || json_objects(text).any(|value| names_work(&value)));
+            let only_failure = only_failure(&stdout) && only_failure(&stderr);
             let coded = out.as_ref().and_then(json_code).or_else(|| match &err {
                 Some(err) => json_code(err),
                 None => plain_code(&stderr),
             });
             if !call.runs_attached()
-                && !took
+                && only_failure
                 && let Some(refusal) = coded.as_ref()
                 && refusal.is_vims_s()
             {
@@ -155,32 +152,30 @@ fn json_answer(text: &str, any_line: bool) -> Option<Value> {
         .filter(Value::is_object)
 }
 
-/// Whether the reader sees all the JSON in `text`: it is all one JSON value, or each of its
-/// lines that holds a `{` is a JSON object (so a text with no `{` is read in full).
-fn all_read(text: &str) -> bool {
-    let object =
-        |text: &str| serde_json::from_str::<Value>(text.trim()).is_ok_and(|v| v.is_object());
-    serde_json::from_str::<Value>(text.trim()).is_ok()
-        || text.lines().filter(|line| line.contains('{')).all(object)
-}
-
-/// Every JSON object in `text`: all of it, and each of its lines.
-fn json_objects(text: &str) -> impl Iterator<Item = Value> + '_ {
-    std::iter::once(text)
-        .chain(text.lines())
-        .filter_map(|text| serde_json::from_str::<Value>(text.trim()).ok())
-        .filter(Value::is_object)
-}
-
-/// Whether an answer names something Vims took: anything [`answer::Named`] reads (an
-/// operation, a workspace or an id), or a state other than failed.
-fn names_work(value: &Value) -> bool {
-    let named = answer::Named::in_answer(value);
-    named.operation
-        || named.workspace
-        || named.id.is_some()
-        || answer::text(value, &[&["status"], &["state"]])
-            .is_some_and(|state| OpState::read(&state) != OpState::Failed)
+/// Whether `text` holds nothing but a failure: no JSON, or only JSON objects whose fields are
+/// all an error's (`error`, `code`, `message`, and a `status` or `state` that says failed). It
+/// is read as one JSON value, else line by line, where each line that holds a `{` or a `[`
+/// must be such an object: anything else may name work Vims took, an operation, a workspace,
+/// a list or an envelope, in a shape the reader does not know.
+fn only_failure(text: &str) -> bool {
+    let failure = |value: Value| {
+        value.as_object().is_some_and(|fields| {
+            fields.iter().all(|(name, field)| match name.as_str() {
+                "error" | "code" | "message" => true,
+                "status" | "state" => field
+                    .as_str()
+                    .is_some_and(|state| OpState::read(state) == OpState::Failed),
+                _ => false,
+            })
+        })
+    };
+    match serde_json::from_str::<Value>(text.trim()) {
+        Ok(value) => failure(value),
+        Err(_) => text
+            .lines()
+            .filter(|line| line.contains(['{', '[']))
+            .all(|line| serde_json::from_str::<Value>(line.trim()).is_ok_and(failure)),
+    }
 }
 
 /// The code and message of the failure a JSON answer reports: `error.code`, or `code`, or an
@@ -877,6 +872,40 @@ mod tests {
                 "{script}: {error:?}"
             );
         }
+        // Work in an array or under an envelope is still work.
+        for stdout in [
+            r#"[{"id":"op_7","status":"queued"}]"#,
+            r#"{"data":{"id":"op_7","status":"queued"}}"#,
+            r#"{"result":"op_7"}"#,
+        ] {
+            let program = fake_vims(
+                dir.path(),
+                &format!("echo '{stdout}'\necho 'Error: QUOTA_EXCEEDED: vCPU' >&2\nexit 1"),
+            );
+            let error = vims_at(&program, Arc::new(SystemClock))
+                .call(&exec_call())
+                .unwrap_err();
+            assert!(
+                matches!(&error, VimsError::Unknown { code: Some(found), .. } if found == "QUOTA_EXCEEDED"),
+                "{stdout}: {error:?}"
+            );
+        }
+        let program = fake_vims(
+            dir.path(),
+            "printf '[\\n  {\"id\": \"op_7\"}\\n]\\n'\necho 'Error: QUOTA_EXCEEDED: vCPU' >&2\nexit 1",
+        );
+        let error = vims_at(&program, Arc::new(SystemClock))
+            .call(&exec_call())
+            .unwrap_err();
+        assert!(error.refusal().is_none(), "{error:?}");
+        let program = fake_vims(
+            dir.path(),
+            "echo '[\"op_7\"]'\necho 'hint: try again'\necho 'Error: QUOTA_EXCEEDED: vCPU' >&2\nexit 1",
+        );
+        let error = vims_at(&program, Arc::new(SystemClock))
+            .call(&exec_call())
+            .unwrap_err();
+        assert!(error.refusal().is_none(), "{error:?}");
         // Stdout that names nothing leaves stderr's code a refusal.
         let program = fake_vims(
             dir.path(),
