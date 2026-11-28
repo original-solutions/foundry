@@ -337,6 +337,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn run_writes_the_same_record_again_after_ten_minutes_and_not_before() {
+        let rig = rig();
+        let first = version_after(&rig, None).await;
+        let body = held(&rig);
+
+        pass(&rig, Duration::from_secs(599)).await;
+        let_a_check_run();
+        assert_eq!(version(&rig), first, "nothing changed, so nothing yet");
+
+        pass(&rig, CHECK_EVERY).await;
+        let second = version_after(&rig, first).await;
+        assert!(second > first, "{second:?} after {first:?}");
+        assert_eq!(held(&rig), body, "the same body, at a new version");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn run_does_not_list_a_name_that_is_no_login() {
         let rig = rig();
         let first = version_after(&rig, None).await;
@@ -467,6 +483,49 @@ mod tests {
         let again = check(&store, me, &secrets, None, Some(first.clone())).unwrap();
         assert_eq!(again, first);
         assert_eq!(version_of(&store, me), version);
+    }
+
+    /// Lists the names on every first call and fails on every second, as a store that fails
+    /// between two reads does.
+    struct EverySecondListFails {
+        inner: FileSecrets,
+        lists: AtomicUsize,
+    }
+
+    impl Secrets for EverySecondListFails {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            self.inner.get(name)
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+            self.inner.set(name, value)
+        }
+        fn update(&self, name: &str, edit: crate::secrets::Edit<'_>) -> Result<(), SecretsError> {
+            self.inner.update(name, edit)
+        }
+        fn names(&self) -> Result<Vec<String>, SecretsError> {
+            if self.lists.fetch_add(1, Ordering::SeqCst) % 2 == 1 {
+                return Err(SecretsError::Unreadable {
+                    path: PathBuf::from("secrets.json"),
+                });
+            }
+            self.inner.names()
+        }
+    }
+
+    #[test]
+    fn check_leaves_gateway_none_when_only_the_gateway_names_read_fails() {
+        let (dir, store, _, me) = rig_without_a_task();
+        let secrets = EverySecondListFails {
+            inner: FileSecrets::new(dir.path().join("secrets.json")),
+            lists: AtomicUsize::new(0),
+        };
+        secrets.set("github:octocat", "ghp_held_nine").unwrap();
+
+        let held = check(&store, me, &secrets, None, None).unwrap();
+
+        assert_eq!(held.logins, ["octocat"]);
+        assert_eq!(held.gateway, None);
+        assert_eq!(store.lock().unwrap().held(me).unwrap(), Some(held));
     }
 
     #[test]
