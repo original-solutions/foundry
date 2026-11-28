@@ -143,18 +143,19 @@ impl Change {
         Self::read_or(stdout, None)
     }
 
-    /// As [`Change::read`], for a change whose answer may be the thing it made, such as a
-    /// grant: an answer that is no error, names neither an operation nor a workspace, and has
-    /// no state, a done state, or one of `made` beside its own id (such as [`GRANTED`]), is the
-    /// change made. Any other state cannot be read. Guessed: P2c records no grant's answer.
-    pub(super) fn read_made(stdout: &str, made: &[&str]) -> Option<Self> {
-        Self::read_or(stdout, Some(made))
+    /// As [`Change::read`], for a grant, whose answer may be the grant itself: an answer that
+    /// is no error, names neither an operation nor a workspace, and has a done state or one of
+    /// `grant`'s words beside its own id, is the change made. So is one with no state, for
+    /// [`Grant::Put`] only: the grant itself says it stands, which a removal must not. Any other
+    /// answer cannot be read. Guessed: P2c records no grant's answer.
+    pub(super) fn read_made(stdout: &str, grant: Grant) -> Option<Self> {
+        Self::read_or(stdout, Some(grant))
     }
 
-    /// The change `stdout` answers, or, when `made` is given, [`Change::Done`] for an answer
-    /// that is no error, names neither an operation nor a workspace, and whose state says the
+    /// The change `stdout` answers, or, for a grant, [`Change::Done`] for an answer that is no
+    /// error, names neither an operation nor a workspace, and whose state says the grant's
     /// change is made.
-    fn read_or(stdout: &str, made_by: Option<&[&str]>) -> Option<Self> {
+    fn read_or(stdout: &str, made_by: Option<Grant>) -> Option<Self> {
         if stdout.trim().is_empty() {
             return Some(Change::Done);
         }
@@ -186,24 +187,39 @@ impl Change {
             return Workspace::from_value(&value).map(Change::Workspace);
         }
         // The change is made only by an answer that is no error and whose state, if it has one,
-        // says it is done, or is one of `made_by`'s on the thing's own id. A failed or cancelled
+        // says it is done, or is one of the grant's words on its own id. A failed or cancelled
         // state is never the change made; work under way, or any other word, may not have
         // happened yet, so the caller finds out by the key.
-        let made_by = made_by?;
+        let grant = made_by?;
         let made_state = match &state {
-            None | Some(OpState::Finished) => true,
-            Some(OpState::Other(word)) => id.is_some() && made_by.contains(&word.as_str()),
+            None => grant == Grant::Put,
+            Some(OpState::Finished) => true,
+            Some(OpState::Other(word)) => id.is_some() && grant.words().contains(&word.as_str()),
             Some(OpState::Running | OpState::Failed | OpState::Cancelled) => false,
         };
         (!failed && made_state).then_some(Change::Done)
     }
 }
 
-/// The states a grant's own answer has once it is made. Guessed: P2c records no grant's answer.
-pub(super) const GRANTED: &[&str] = &["active", "granted"];
+/// Which way a grant's change goes, for reading its answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Grant {
+    /// `workspace turn-grant put`.
+    Put,
+    /// `workspace turn-grant rm`.
+    Rm,
+}
 
-/// The states a grant's own answer has once it is taken away. Guessed, as [`GRANTED`] is.
-pub(super) const REMOVED: &[&str] = &["revoked", "removed"];
+impl Grant {
+    /// The states the grant's own answer has once this change is made. Guessed: P2c records
+    /// no grant's answer.
+    fn words(self) -> &'static [&'static str] {
+        match self {
+            Grant::Put => &["active", "granted"],
+            Grant::Rm => &["revoked", "removed"],
+        }
+    }
+}
 
 /// What an answer names, by its guessed fields. The checks saw a workspace's id, `wsp_…`; the
 /// rest are guesses. A failure's code and [`Change::read`] both read it.

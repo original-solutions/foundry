@@ -767,6 +767,7 @@ mod tests {
             r#"{"operationId":"op_5","error":{"code":"NOT_FOUND"}}"#,
             r#"{"operation":{"id":"op_5"},"error":{"code":"NOT_FOUND"}}"#,
             r#"{"status":"running","error":{"code":"PRECONDITION_FAILED"}}"#,
+            r#"{"workspace":{"id":"wsp_9"},"error":{"code":"PRECONDITION_FAILED"}}"#,
         ] {
             let program = fake_vims(dir.path(), &format!("echo '{answer}'\nexit 1"));
             let error = vims_at(&program, Arc::new(SystemClock))

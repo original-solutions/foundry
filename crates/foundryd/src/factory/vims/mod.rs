@@ -452,7 +452,7 @@ pub trait Vims: Send + Sync {
         read(
             &call,
             self.call(&call)?,
-            |stdout| Change::read_made(stdout, answer::GRANTED),
+            |stdout| Change::read_made(stdout, answer::Grant::Put),
             "an operation, a workspace or nothing",
         )
     }
@@ -476,7 +476,7 @@ pub trait Vims: Send + Sync {
         read(
             &call,
             self.call(&call)?,
-            |stdout| Change::read_made(stdout, answer::REMOVED),
+            |stdout| Change::read_made(stdout, answer::Grant::Rm),
             "an operation, a workspace or nothing",
         )
     }
@@ -1033,6 +1033,29 @@ mod tests {
             assert_eq!(removed.is_ok(), rm, "rm {state}: {removed:?}");
             if let Err(error) = removed {
                 assert!(matches!(error, VimsError::Unknown { .. }), "rm {state}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_grant_taken_away_is_made_only_by_an_empty_answer_or_a_state_that_says_so() {
+        for (answer, removed) in [
+            ("", true),
+            ("{}", true),
+            (r#"{"status":"succeeded"}"#, true),
+            (r#"{"id":"tg_1","status":"revoked"}"#, true),
+            (
+                r#"{"turn":"fetch","connection":"conn_gh","expiresAt":"2026-11-28T10:30:00Z"}"#,
+                false,
+            ),
+            (r#"{"id":"tg_1","turn":"fetch"}"#, false),
+        ] {
+            let fake = FakeVims::new();
+            fake.on("workspace turn-grant rm", Reply::ok(answer));
+            let result = fake.ungrant("wsp_1", "fetch", "conn_gh", "k1");
+            assert_eq!(result.is_ok(), removed, "{answer}: {result:?}");
+            if let Err(error) = result {
+                assert!(matches!(error, VimsError::Unknown { .. }), "{answer}");
             }
         }
     }
