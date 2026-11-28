@@ -3002,6 +3002,68 @@ mod tests {
     mod the_workspace_a_launch_asks_for {
         use super::*;
 
+        /// The workspace and machine of each round workspace read from `steps`.
+        fn rounds_of(steps: &[&str]) -> Vec<(String, Option<String>)> {
+            let lines: Vec<Line> = steps
+                .iter()
+                .enumerate()
+                .map(|(i, text)| step(i as u64 + 1, text))
+                .collect();
+            seen_of(&lines)
+                .round_workspaces
+                .into_iter()
+                .map(|round| (round.workspace, round.machine))
+                .collect()
+        }
+
+        #[test]
+        fn reads_a_round_workspace_with_the_machine_the_round_named_before_it() {
+            assert_eq!(
+                rounds_of(&["resume-machine 1 A", "resume-workspace 1 w"]),
+                vec![("w".to_owned(), Some("A".to_owned()))]
+            );
+        }
+
+        #[test]
+        fn keeps_the_machines_of_resume_and_feedback_rounds_apart() {
+            assert_eq!(
+                rounds_of(&[
+                    "resume-machine 1 A",
+                    "feedback-machine 1 B",
+                    "resume-workspace 1 w"
+                ]),
+                vec![("w".to_owned(), Some("A".to_owned()))]
+            );
+        }
+
+        #[test]
+        fn forgets_the_workspace_and_the_machine_of_a_round_that_gave_its_machine_up() {
+            assert_eq!(
+                rounds_of(&[
+                    "resume-machine 1 M2",
+                    "resume-workspace 1 W2",
+                    "resume-machine-given-up 1 M2",
+                    "resume-machine 1 M3",
+                    "resume-workspace 1 W3",
+                ]),
+                vec![("W3".to_owned(), Some("M3".to_owned()))]
+            );
+            assert_eq!(
+                rounds_of(&[
+                    "feedback-machine 2 M2",
+                    "feedback-workspace 2 W2",
+                    "resume-workspace 1 W1",
+                    "feedback-machine-given-up 2 M2",
+                ]),
+                vec![("W1".to_owned(), None)]
+            );
+        }
+
+        #[test]
+        fn does_not_read_a_round_workspace_of_a_count_that_is_not_canonical() {
+            assert_eq!(rounds_of(&["resume-workspace 01 x"]), vec![]);
+        }
+
         #[test]
         fn reads_the_machine_of_the_first_claimed_line() {
             let seen = seen_of(&[

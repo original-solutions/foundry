@@ -115,7 +115,9 @@ describe("lanes of factory runs", () => {
 
   it("marks the resume workspace of a run that lists its build workspace, then the resume workspace", () => {
     const of = factoryRuns(factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1", "w2"] }));
-    expect(of(board[0].workspaces[1])).toEqual({ run: "original-solutions__foundry__162__1", issue: 162, url: "https://github.com/original-solutions/foundry/issues/162" });
+    const mark = { run: "original-solutions__foundry__162__1", issue: 162, url: "https://github.com/original-solutions/foundry/issues/162" };
+    expect(of(board[0].workspaces[0])).toEqual(mark);
+    expect(of(board[0].workspaces[1])).toEqual(mark);
   });
 
   it("marks nothing for a status of another project that names the same workspace id", () => {

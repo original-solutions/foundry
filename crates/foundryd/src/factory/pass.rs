@@ -5063,6 +5063,11 @@ mod tests {
             MachineId(uuid::Uuid::from_u128(0x3))
         }
 
+        /// A machine a round moves to after giving up `mover`.
+        fn other_mover() -> MachineId {
+            MachineId(uuid::Uuid::from_u128(0x4))
+        }
+
         /// The workspace round `name` (`r1`, `f1`) of `issue` is made in.
         fn round_workspace(issue: u64, name: u128) -> WorkspaceId {
             WorkspaceId(uuid::Uuid::from_u128(
@@ -5156,6 +5161,78 @@ mod tests {
                 live[0].workspaces,
                 vec![workspace_of(5, 1), round_workspace(5, 2)]
             );
+            assert_eq!(live[0].machine, builder_machine());
+        }
+
+        #[test]
+        fn a_run_whose_round_gave_up_its_machine_forgets_the_workspace_made_there() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    format!("workspace-created {}", workspace_of(5, 1)),
+                    format!("resume-machine 1 {}", mover()),
+                    format!("resume-workspace 1 {}", round_workspace(5, 1)),
+                    format!("resume-machine-given-up 1 {}", mover()),
+                    format!("resume-machine 1 {}", other_mover()),
+                    format!("resume-workspace 1 {}", round_workspace(5, 2)),
+                ],
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(
+                live[0].workspaces,
+                vec![workspace_of(5, 1), round_workspace(5, 2)]
+            );
+            assert_eq!(live[0].machine, other_mover());
+        }
+
+        #[test]
+        fn a_run_whose_round_gave_up_its_machine_after_the_workspace_names_only_the_build_workspace()
+         {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            let mut given_up = resumed(5);
+            given_up.push(format!("resume-machine-given-up 1 {}", mover()));
+            steps(
+                &rig,
+                &run,
+                &[
+                    vec![format!("workspace-created {}", workspace_of(5, 1))],
+                    given_up,
+                ]
+                .concat(),
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(live[0].workspaces, vec![workspace_of(5, 1)]);
+            assert_eq!(live[0].machine, builder_machine());
+        }
+
+        #[test]
+        fn a_round_workspace_that_is_the_build_workspace_keeps_the_claims_machine() {
+            let mut rig = Rig::new();
+            rig.hub.issue(5, &[]);
+            let run = rig.run_in(5, 1, State::Building);
+            steps(
+                &rig,
+                &run,
+                &[
+                    format!("workspace-created {}", workspace_of(5, 1)),
+                    format!("resume-machine 1 {}", mover()),
+                    format!("resume-workspace 1 {}", workspace_of(5, 1)),
+                ],
+            );
+            rig.pass();
+            let live = rig.status().runs;
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(live[0].workspaces, vec![workspace_of(5, 1)]);
             assert_eq!(live[0].machine, builder_machine());
         }
 
