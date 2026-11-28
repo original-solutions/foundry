@@ -172,8 +172,8 @@ function Shared({ machine }: { machine: MachineView }) {
       let edits = { ...d.edits };
       let from = { ...d.from };
       for (const key of keys) {
-        // Put back to what the settings hold, it is untouched again and follows them.
-        if (diff(now, { ...now, [key]: patch[key] }, defs).length === 0) {
+        // Typed back to exactly what the settings hold, it is untouched again and follows them.
+        if (patch[key] === now[key]) {
           edits = without(edits, [key]);
           from = without(from, [key]);
         } else {
