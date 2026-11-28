@@ -222,7 +222,10 @@ function Shared({ machine }: { machine: MachineView }) {
     setDraft((d) => {
       const kept = done.filter((key) => d.edits[key] !== sending[key]);
       const gone = done.filter((key) => !kept.includes(key));
-      return { edits: without(d.edits, gone), from: without(d.from, gone) };
+      const from = without(d.from, gone);
+      // What this page just sent is the baseline for what was typed since.
+      for (const key of kept) from[key] = sentValues[key];
+      return { edits: without(d.edits, gone), from };
     });
     const found = results.flatMap((r) => (r.error ? [r.error] : []));
     setRefusals(found);
