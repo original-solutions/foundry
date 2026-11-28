@@ -68,7 +68,7 @@ function Update({ machine, machines, here }: { machine: MachineView; machines: M
   const sent = calls[machine.id];
   const call = sent?.call;
   const going = sent?.tag === tag && (call?.kind === "queued" || call?.kind === "out" || (call?.kind === "answered" && call.status === 202));
-  const says = sent && rowSays(sent, machine);
+  const says = sent?.tag === tag && rowSays(sent, machine);
 
   return (
     <Section id={id} title="Update">
