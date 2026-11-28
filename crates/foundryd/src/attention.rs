@@ -1960,7 +1960,8 @@ mod tests {
         let closed = world.session(peer, SessionState::Working);
         world.terminal(peer, closed.terminal, closed.workspace, None, true);
         let open = world.session(peer, SessionState::Working);
-        stuck_with(&mut world, None, vec![gone, closed.id, open.id]);
+        let later = world.session(peer, SessionState::Working);
+        stuck_with(&mut world, None, vec![gone, closed.id, open.id, later.id]);
         assert_eq!(world.of(Kind::RunStuck)[0].terminal, Some(open.terminal));
     }
 

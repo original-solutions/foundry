@@ -266,6 +266,14 @@ describe("AttentionList", () => {
     expect(screen.queryByRole("link", { name: "Open terminal" })).toBeNull();
   });
 
+  it("shows a grouped run's Pull request link when it is the only link the run has", async () => {
+    lists = [[{ ...stuck(1), pr_url: pull(10) }, stuck(2)]];
+    await renderApp(<AttentionList />);
+    const card = await screen.findByRole("listitem", { name: "2 runs stuck" });
+    expect(within(card).getAllByRole("link").map((link) => link.getAttribute("href"))).toEqual([pull(10)]);
+    expect(within(card).getByRole("link", { name: "Pull request" })).toBeTruthy();
+  });
+
   it("shows each grouped run's own links", async () => {
     lists = [
       [
