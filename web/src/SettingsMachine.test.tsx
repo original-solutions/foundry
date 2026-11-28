@@ -272,6 +272,9 @@ describe("SettingsMachine", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save 2 changes" }));
     await waitFor(() => expect(row("Max sessions").textContent).toContain("the coordinator is not reachable"));
     expect(bar()?.textContent).toContain("1 change");
+    type("Max sessions", "6");
+    expect(row("Max sessions").textContent).not.toContain("the coordinator is not reachable");
+    expect(row("Max load per core").textContent).not.toContain("the coordinator is not reachable");
   });
 
   it("saves a rename and Clear limits together with one request each", async () => {
