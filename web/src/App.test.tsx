@@ -1377,6 +1377,18 @@ describe("App", () => {
       expect(within(nav).getByRole("link", { name: /^Notifications/ }).textContent).not.toContain("desktop");
     });
 
+    it("closes the sidebar drawer when the gear in it is tapped, and goes to Settings", async () => {
+      factoryNow = fleetFactory;
+      mockActions();
+      const r = await open("/terminals/t1", live);
+      fireEvent.click(screen.getByRole("button", { name: "Workspaces" }));
+      const wrapper = () => screen.getByRole("navigation", { name: "Workspaces" }).closest("[data-fleet]")!;
+      expect(wrapper().className).toContain("fixed");
+      fireEvent.click(within(screen.getByRole("navigation", { name: "Workspaces" })).getByRole("link", { name: "Settings" }));
+      await waitFor(() => expect(pathname(r)).toBe("/settings"));
+      await waitFor(() => expect(wrapper().className).not.toContain("fixed"));
+    });
+
     it("closes the sidebar drawer when the bell in it is tapped", async () => {
       factoryNow = fleetFactory;
       mockActions();
