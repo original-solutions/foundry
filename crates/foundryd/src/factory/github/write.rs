@@ -327,13 +327,13 @@ fn claim_marker_of(body: &str) -> Option<Marker> {
 }
 
 /// The run and target of Foundry's marker, `<run id> <target>`, each in the one form Foundry
-/// writes it. A host kind this build does not know does not parse.
+/// writes it ([`Target`] reads only that form). A host kind this build does not know does not
+/// parse.
 fn parse_foundry_claim(named: &str) -> Option<(RunId, Target)> {
     let (run, target) = named.split_once(' ')?;
     let parsed_run = RunId::from_str(run).ok()?;
     let parsed_target = Target::from_str(target).ok()?;
-    (parsed_run.to_string() == run && parsed_target.to_string() == target)
-        .then_some((parsed_run, parsed_target))
+    (parsed_run.to_string() == run).then_some((parsed_run, parsed_target))
 }
 
 /// Whose the issue is by its newest claim comment, or `None` when it has none.
