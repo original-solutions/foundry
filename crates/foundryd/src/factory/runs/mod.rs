@@ -1958,6 +1958,49 @@ mod tests {
         }
 
         #[test]
+        fn a_forward_wakes_the_runs_workspace_before_it_is_sent() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            let payload = ActionPayload {
+                forward: Some(ForwardPayload {
+                    message: Message {
+                        line: "see this".into(),
+                        body: None,
+                    },
+                    step: None,
+                }),
+                ..ActionPayload::default()
+            };
+            let actions = [Action::ForwardComment {
+                comment_id: "c1".into(),
+            }];
+            rig.view = FleetView::builder()
+                .turn(foundry_proto::factory::SessionTurn {
+                    session: session_id(SESSION).unwrap(),
+                    workspace: workspace_id(WORKSPACE).unwrap(),
+                    project: project_id(),
+                    turn: 1,
+                    prompts: 1,
+                    question: false,
+                })
+                .build();
+            rig.worker.on_send(Ok(1));
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            assert_eq!(
+                rig.worker.host_calls(),
+                [(
+                    0,
+                    HostCall::Wake {
+                        workspace: workspace_id(WORKSPACE).unwrap()
+                    }
+                )]
+            );
+            assert!(matches!(rig.worker.calls()[0], Call::Send { .. }));
+        }
+
+        #[test]
         fn the_gate_results_are_posted_once() {
             let rig = Rig::new();
             let run = run_id(1);
@@ -2826,12 +2869,17 @@ mod tests {
             ("send", ctx.send(session, message, None).map(|_| ())),
             ("end_sessions", ctx.end_sessions(workspace)),
             ("archive", ctx.archive(workspace)),
+            ("advance", ctx.advance(workspace)),
+            ("rest", ctx.rest(workspace)),
+            ("wake", ctx.wake(workspace)),
+            ("keep", ctx.keep(workspace)),
         ];
         for (name, result) in results {
             assert!(matches!(result, Err(RunError::LeaseLost(_))), "{name}");
         }
         assert!(rig.sim.calls().is_empty());
         assert!(rig.worker.calls().is_empty());
+        assert!(rig.worker.host_calls().is_empty());
     }
 
     mod going_stuck {

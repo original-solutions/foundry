@@ -981,10 +981,15 @@ mod tests {
                 request: req
             }]
         );
-        // A scripted answer still comes first.
+        // A queued answer does not make a host create succeed, and is left for the next call.
         let scripted = WorkspaceId(id(9));
         fake.on_create(Ok(scripted));
-        assert_eq!(fake.create(host, request("a", "r1")), Ok(scripted));
+        let Err(WorkerError::Failed(said)) = fake.create(host, request("a", "r1")) else {
+            panic!("a host create is refused whatever is queued");
+        };
+        assert!(said.contains("vims"), "{said}");
+        let m = Target::Machine(machine(1));
+        assert_eq!(fake.create(m, request("a", "r1")), Ok(scripted));
     }
 
     #[test]

@@ -4613,6 +4613,38 @@ mod tests {
         }
 
         #[test]
+        fn a_run_whose_retries_run_out_keeps_its_build_workspace_once_after_its_session_ends() {
+            let (mut rig, run, _hub) = built();
+            rig.config.limits.gate_retries = 0;
+            let step = gated(&mut rig, &run, 101, FAIL_TAIL);
+            assert!(matches!(step, GateStep::Stuck { .. }), "{step:?}");
+            let kept: Vec<usize> = rig
+                .worker
+                .host_calls()
+                .into_iter()
+                .filter(|(_, call)| {
+                    *call
+                        == HostCall::Keep {
+                            workspace: workspace(),
+                        }
+                })
+                .map(|(before, _)| before)
+                .collect();
+            assert_eq!(kept.len(), 1, "{:?}", rig.worker.host_calls());
+            let ended = rig
+                .worker
+                .calls()
+                .iter()
+                .position(|call| *call == end_of_build())
+                .expect("the build session is ended");
+            assert!(
+                kept[0] > ended,
+                "kept after call {} but ended at {ended}",
+                kept[0]
+            );
+        }
+
+        #[test]
         fn a_failed_attempt_is_stuck_at_once_when_no_retries_are_allowed() {
             let (mut rig, run, _hub) = built();
             rig.config.limits.gate_retries = 0;
