@@ -259,4 +259,51 @@ describe("SettingsFactory", () => {
     expect(row("Max runs").getAttribute("data-stale")).toBeNull();
     expect(screen.getByRole("button", { name: "Save 1 change" })).toBeDefined();
   });
+
+  it("sends an effort typed with a space after it as one word", async () => {
+    const { calls } = await show(json(200, { settings: { ...saved, effort: "low" } }), json(200, overview({ effort: "low" })));
+    type("Effort", "low ");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(calls.filter((c) => c.method === "POST")).toHaveLength(1));
+    expect(calls.find((c) => c.method === "POST")?.body).toMatchObject({ effort: "low" });
+  });
+
+  it("follows the overview as read again after a save, whatever the save answered", async () => {
+    await show(json(200, { settings: { ...saved, max_runs: 5 } }), json(200, overview({ max_runs: 7 })));
+    type("Max runs", "5");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("7"));
+    expect(bar()).toBeNull();
+  });
+
+  it("shows no hidden text for an overview whose model the daemon could not read", async () => {
+    mockFetch(json(200, overview({ model: HIDDEN, effort: HIDDEN })));
+    await renderApp(<SettingsFactory {...pageProps()} />);
+    await screen.findByLabelText("Max runs");
+    expect(document.body.textContent).not.toContain("[hidden");
+    expect(Array.from(document.querySelectorAll("input")).some((i) => i.value.includes("[hidden"))).toBe(false);
+    expect(bar()).toBeNull();
+  });
+
+  it("keeps an edit typed back to the old value while its save is in flight", async () => {
+    let answer: (r: Response) => void = () => {};
+    const pending = new Promise<Response>((resolve) => (answer = resolve));
+    mockFetch(json(200, overview()));
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn<(url: string, init?: RequestInit) => Promise<Response>>>;
+    const first = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => (init?.method === "POST" ? pending : first(url, init)));
+    const view = await renderApp(<SettingsFactory {...pageProps()} />);
+    await screen.findByLabelText("Max runs");
+
+    type("Max runs", "4");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    type("Max runs", "3");
+    await act(async () => answer(json(200, { settings: { ...saved, max_runs: 4 } })));
+    await act(async () => {
+      view.client.setQueryData(factoryKey, overview({ max_runs: 4 }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect((screen.getByLabelText("Max runs") as HTMLInputElement).value).toBe("3");
+    expect(bar()?.textContent).toContain("Runs at once 4 → 3");
+  });
 });

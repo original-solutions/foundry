@@ -1,7 +1,7 @@
 import { act, fireEvent, screen } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import type { Change } from "./reviewDiff";
+import type { Change, Refusal } from "./reviewDiff";
 import { ReviewBar } from "./ReviewBar";
 import { renderApp } from "./test-utils";
 
@@ -104,5 +104,16 @@ describe("ReviewBar", () => {
     // A different field going stale on top of the looked-at one asks again.
     act(() => set(["max_runs", "paused"]));
     expect(screen.getByRole("button", { name: "Look again" })).toBeDefined();
+  });
+
+  it("calls onSave once when Save is pressed again while it is still pending", async () => {
+    let finish: (r: Refusal[]) => void = () => {};
+    const onSave = vi.fn(() => new Promise<Refusal[]>((resolve) => (finish = resolve)));
+    await bar({ onSave });
+    const save = await screen.findByRole("button", { name: "Save 2 changes" });
+    fireEvent.click(save);
+    fireEvent.click(save);
+    expect(onSave).toHaveBeenCalledTimes(1);
+    await act(async () => finish([]));
   });
 });

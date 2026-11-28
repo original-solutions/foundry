@@ -83,6 +83,16 @@ describe("useSettingsKey", () => {
     done();
   });
 
+  it("takes Cmd on an iPad too", () => {
+    const run = vi.fn();
+    const { done } = mounted(run, "iPad");
+    fireEvent.keyDown(document.body, { key: ",", ctrlKey: true });
+    expect(run).not.toHaveBeenCalled();
+    fireEvent.keyDown(document.body, { key: ",", metaKey: true });
+    expect(run).toHaveBeenCalledTimes(1);
+    done();
+  });
+
   it("runs on Ctrl+, elsewhere, and not on Cmd+, there", () => {
     const run = vi.fn();
     const { done } = mounted(run);
