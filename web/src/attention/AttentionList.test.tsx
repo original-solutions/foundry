@@ -351,7 +351,7 @@ describe("AttentionList", () => {
     expect(within(timed).queryByText(other.todo)).toBeNull();
     for (const issue of [1, 3]) expect(within(timed).getByRole("button", { name: atTimeLimit(issue).what })).toBeTruthy();
     expect(within(cards[1]).getByText("Run stuck")).toBeTruthy();
-    expect(within(cards[1]).getByText(other.what)).toBeTruthy();
+    expect(within(cards[1]).getByText(/tc\/people-hub#2 is stuck: make check fails on main/)).toBeTruthy();
     expect(within(cards[1]).queryByText(timeLimitTodo)).toBeNull();
     expect(within(list).getAllByText(timeLimitTodo)).toHaveLength(1);
     expect(within(list).getAllByText(other.todo)).toHaveLength(1);
