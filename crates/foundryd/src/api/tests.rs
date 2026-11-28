@@ -818,18 +818,103 @@ async fn a_held_change_arrives_as_one_held_frame() {
 
 /// Spoils the stored held row of `daemon`, as a newer build's would be after a rollback.
 fn spoil_held(daemon: &Daemon) {
+    spoil_held_of(daemon, daemon.me);
+}
+
+/// Spoils the stored held row of `machine`, and no other.
+fn spoil_held_of(daemon: &Daemon, machine: MachineId) {
     let record = format!(
-        r#"{{"owner":"{}","version":1,"kind":"machine_held","body":{{"logins":5,"skill":true}}}}"#,
-        daemon.me
+        r#"{{"owner":"{machine}","version":1,"kind":"machine_held","body":{{"logins":5,"skill":true}}}}"#
     );
     let changed = rusqlite::Connection::open(daemon.data.path().join("foundry.db"))
         .unwrap()
         .execute(
-            "UPDATE factory_records SET record = ?1 WHERE kind = 'machine_held'",
-            [record],
+            "UPDATE factory_records SET record = ?1 WHERE kind = 'machine_held' AND id = ?2",
+            [record, machine.to_string()],
         )
         .unwrap();
     assert_eq!(changed, 1);
+}
+
+/// Writes `held` as `machine`'s record, at version 1, as a peer's arriving.
+fn write_held_of(daemon: &Daemon, machine: MachineId, held: &foundry_proto::factory::MachineHeld) {
+    let record = foundry_proto::factory::FactoryRecord {
+        owner: machine,
+        version: 1,
+        body: foundry_proto::factory::FactoryBody::Held(held.clone()),
+    };
+    daemon
+        .store
+        .lock()
+        .unwrap()
+        .apply_factory(&record, machine)
+        .unwrap();
+}
+
+fn held_frames(frames: &[UiMessage]) -> Vec<(MachineId, foundry_proto::factory::MachineHeld)> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            UiMessage::Held { machine, held, .. } => Some((*machine, held.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_state_holds_the_readable_records_when_another_cannot_be_read() {
+    let daemon = Daemon::new(TURN).await;
+    let other = MachineId::random();
+    write_held(&daemon, &holds("os-factory"));
+    write_held_of(&daemon, other, &holds("elsewhere"));
+    spoil_held(&daemon);
+
+    let reply = daemon.call("GET", "/api/state", None).await;
+
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    match serde_json::from_str::<UiMessage>(&reply.body).unwrap() {
+        UiMessage::State { held, .. } => {
+            assert_eq!(held, [(other, holds("elsewhere"))].into(), "{held:?}")
+        }
+        other => panic!("not the state: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn events_hold_the_readable_records_and_send_their_changes_while_another_cannot_be_read() {
+    let daemon = Daemon::new(TURN).await;
+    let other = MachineId::random();
+    write_held(&daemon, &holds("os-factory"));
+    write_held_of(&daemon, other, &holds("elsewhere"));
+    spoil_held(&daemon);
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url("/api/events"))
+        .await
+        .unwrap();
+    match next_message(&mut socket).await {
+        UiMessage::State { held, .. } => {
+            assert_eq!(held, [(other, holds("elsewhere"))].into(), "{held:?}")
+        }
+        other => panic!("the first message is not the state: {other:?}"),
+    }
+
+    let record = foundry_proto::factory::FactoryRecord {
+        owner: other,
+        version: 2,
+        body: foundry_proto::factory::FactoryBody::Held(holds("changed")),
+    };
+    daemon
+        .store
+        .lock()
+        .unwrap()
+        .apply_factory(&record, other)
+        .unwrap();
+    let frames = frames_within(&mut socket, 5 * EVENTS_EVERY).await;
+    assert_eq!(
+        held_frames(&frames),
+        [(other, holds("changed"))],
+        "{frames:?}"
+    );
 }
 
 #[tokio::test]
@@ -858,22 +943,14 @@ async fn events_go_on_while_a_held_record_cannot_be_read() {
         UiMessage::State { held, .. } => assert!(held.is_empty(), "{held:?}"),
         other => panic!("the first message is not the state: {other:?}"),
     }
-    // A factory record written elsewhere makes the socket look at the held rows again.
+    // A factory record written elsewhere makes the socket look at the held rows again: the
+    // readable one is sent, the spoiled one is not.
     let other = MachineId::random();
-    let record = foundry_proto::factory::FactoryRecord {
-        owner: other,
-        version: 1,
-        body: foundry_proto::factory::FactoryBody::Held(holds("elsewhere")),
-    };
-    daemon
-        .store
-        .lock()
-        .unwrap()
-        .apply_factory(&record, other)
-        .unwrap();
+    write_held_of(&daemon, other, &holds("elsewhere"));
     let frames = frames_within(&mut socket, 3 * EVENTS_EVERY).await;
-    assert!(
-        frames.iter().all(|f| !matches!(f, UiMessage::Held { .. })),
+    assert_eq!(
+        held_frames(&frames),
+        [(other, holds("elsewhere"))],
         "{frames:?}"
     );
 
@@ -897,10 +974,15 @@ async fn a_held_the_state_carries_is_not_sent_again_as_a_held_frame() {
         other => panic!("the first message is not the state: {other:?}"),
     }
 
+    // A factory record is written after the state, so the held records are read again: only the
+    // one the state did not carry is sent.
+    let other = MachineId::random();
+    write_held_of(&daemon, other, &holds("elsewhere"));
     let frames = frames_within(&mut socket, 3 * EVENTS_EVERY).await;
 
-    assert!(
-        frames.iter().all(|f| !matches!(f, UiMessage::Held { .. })),
+    assert_eq!(
+        held_frames(&frames),
+        [(other, holds("elsewhere"))],
         "{frames:?}"
     );
 }

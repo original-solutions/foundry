@@ -81,7 +81,7 @@ pub(crate) async fn run_with(
     clock: Arc<dyn Clock>,
 ) {
     let mut written: Option<MachineHeld> = None;
-    // When the record was last written (or found to need no write), on the clock.
+    // When the record was last written, on the clock.
     let mut written_at = Duration::ZERO;
     // What the last failed check said, while checks keep failing.
     let mut failing: Option<String> = None;
@@ -367,6 +367,19 @@ mod tests {
         let second = version_after(&rig, first).await;
         assert!(second > first, "{second:?} after {first:?}");
         assert_eq!(held(&rig), body, "the same body, at a new version");
+
+        for _ in 0..2 {
+            pass(&rig, CHECK_EVERY).await;
+            let_a_check_run();
+        }
+        assert_eq!(
+            version(&rig),
+            second,
+            "a rewrite starts the ten minutes again"
+        );
+        pass(&rig, Duration::from_secs(580)).await;
+        let_a_check_run();
+        assert_eq!(version(&rig), second, "not before the next ten minutes");
     }
 
     #[tokio::test(start_paused = true)]
