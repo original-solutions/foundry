@@ -311,9 +311,9 @@ use super::progress::{
     read_progress, step_text,
 };
 use super::{
-    ActionPayload, Closing, Progress, RunContext, RunError, SendPayload, Stop, StuckStop, abandon,
-    apply_actions, closed_issue, end_own_merge, end_run, go_stuck, progress_from, recorded_reason,
-    session_id, workspace_id,
+    ActionPayload, Closing, Ending, Progress, RunContext, RunError, SendPayload, Stop, StuckStop,
+    abandon, apply_actions, closed_issue, end_own_merge, end_run, go_stuck_after, progress_from,
+    recorded_reason, session_id, workspace_id,
 };
 use crate::factory::config;
 use crate::factory::gate::{self, CommandResult, GateResult};
@@ -1199,19 +1199,21 @@ impl Gate<'_, '_> {
         self.archive_all()?;
         let (seen, _) = self.fresh()?;
         let mut at = self.at(&seen);
-        // Kept here, as `go_stuck` would: its worktree is cleared below. A gone build machine
-        // is not called, as `end_session` does not call it; a run already stuck is not kept
-        // again, as `go_stuck` returns first.
-        if at.state != State::Stuck
-            && let Some(workspace) = self.build_workspace(&seen)?
-            && !self.build_machine_gone(&seen, workspace)
-        {
-            self.ctx.keep(workspace)?;
-        }
-        // Ended above: `go_stuck` has nothing to stop.
-        at.worktree = None;
+        // Ended above, so the stuck path stops nothing. It keeps the build workspace, unless
+        // its machine is gone, which `end_session` does not call either.
+        let keep = self
+            .build_workspace(&seen)?
+            .filter(|workspace| !self.build_machine_gone(&seen, *workspace));
         let reason = recorded_reason(&stop);
-        go_stuck(self.ctx, self.issue, &mut at, code, stop, None)?;
+        go_stuck_after(
+            self.ctx,
+            self.issue,
+            &mut at,
+            code,
+            stop,
+            None,
+            Ending::Ended { keep },
+        )?;
         Ok(GateStep::Stuck { reason })
     }
 
@@ -3485,6 +3487,24 @@ mod tests {
                 )]
             );
             assert_eq!(creates(&rig), 1);
+        }
+
+        /// A rest that fails asks for no gate: the pass ends there, and the next pass rests the
+        /// build workspace again before it places the gate.
+        #[test]
+        fn a_rest_that_fails_places_no_gate_and_the_next_pass_rests_again() {
+            let (mut rig, run, _hub) = built();
+            rig.worker
+                .on_rest(Err(WorkerError::Failed("no room".into())));
+            assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
+            assert_eq!(creates(&rig), 0);
+            place(&mut rig, &run, 1, 1);
+            assert_eq!(creates(&rig), 1);
+            let rests = host_calls(&rig)
+                .into_iter()
+                .filter(|call| matches!(call, HostCall::Rest { .. }))
+                .count();
+            assert_eq!(rests, 2);
         }
 
         #[test]
@@ -8663,6 +8683,54 @@ mod tests {
                 view = view.workspace(workspace).terminal(terminal);
             }
             rig.view = view.build();
+        }
+
+        fn keeps(rig: &Rig) -> usize {
+            host_calls(rig)
+                .iter()
+                .filter(|call| matches!(call, HostCall::Keep { .. }))
+                .count()
+        }
+
+        /// A gate whose retries run out while the build machine is gone keeps nothing: the
+        /// machine is not called to keep, as it is not called to end the session.
+        #[test]
+        fn a_run_stuck_while_its_build_machine_is_gone_keeps_nothing() {
+            let (mut rig, run, _hub) = built();
+            rig.config.limits.gate_retries = 0;
+            place(&mut rig, &run, 1, 1);
+            build_machine_away(
+                &mut rig,
+                &run,
+                1,
+                101,
+                crate::factory::runs::progress::UNREACHABLE_FOR,
+            );
+            rig.worker.on_tail(Ok(FAIL_TAIL.into()));
+            let step = go(&rig, &run);
+            assert!(matches!(step, GateStep::Stuck { .. }), "{step:?}");
+            assert!(rig.finished(&run));
+            assert_eq!(keeps(&rig), 0, "{:?}", rig.worker.host_calls());
+        }
+
+        /// A stuck path an earlier pass cut short after the run became stuck only finishes: the
+        /// workspace the first try kept is not kept again.
+        #[test]
+        fn a_stuck_path_resumed_after_the_run_is_stuck_keeps_nothing_again() {
+            let (rig, run, _hub) = built();
+            rig.write(
+                &run,
+                Event::Stuck {
+                    reason: "the gate failed".into(),
+                    branch: None,
+                    commits_ahead: None,
+                },
+            );
+            rig.moved(&run, State::Building, State::Stuck);
+            let step = go(&rig, &run);
+            assert!(matches!(step, GateStep::Stuck { .. }), "{step:?}");
+            assert!(rig.finished(&run));
+            assert_eq!(keeps(&rig), 0, "{:?}", rig.worker.host_calls());
         }
 
         #[test]

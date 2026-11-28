@@ -528,6 +528,10 @@ struct FakeState {
     tail: VecDeque<Result<String, WorkerError>>,
     end_sessions: VecDeque<Result<(), WorkerError>>,
     archive: VecDeque<Result<(), WorkerError>>,
+    advance: VecDeque<Result<(), WorkerError>>,
+    rest: VecDeque<Result<(), WorkerError>>,
+    wake: VecDeque<Result<(), WorkerError>>,
+    keep: VecDeque<Result<(), WorkerError>>,
     /// The workspaces the default create made, by machine, tag and name.
     made: Vec<(Target, FactoryTag, String, WorkspaceId)>,
     /// How many messages each session was delivered.
@@ -566,7 +570,7 @@ impl FakeWorker {
 
     /// Every call of [`Worker::advance`], [`Worker::rest`], [`Worker::wake`] and
     /// [`Worker::keep`] so far, in order, each with the number of [`FakeWorker::calls`] made
-    /// before it. They are not in [`FakeWorker::calls`]. Each answers `Ok`.
+    /// before it, whether it failed or not. They are not in [`FakeWorker::calls`].
     pub fn host_calls(&self) -> Vec<(usize, HostCall)> {
         self.lock().host_calls.clone()
     }
@@ -613,11 +617,42 @@ impl FakeWorker {
         self
     }
 
+    /// Queues an answer for [`Worker::advance`].
+    pub fn on_advance(&self, answer: Result<(), WorkerError>) -> &Self {
+        self.lock().advance.push_back(answer);
+        self
+    }
+
+    /// Queues an answer for [`Worker::rest`].
+    pub fn on_rest(&self, answer: Result<(), WorkerError>) -> &Self {
+        self.lock().rest.push_back(answer);
+        self
+    }
+
+    /// Queues an answer for [`Worker::wake`].
+    pub fn on_wake(&self, answer: Result<(), WorkerError>) -> &Self {
+        self.lock().wake.push_back(answer);
+        self
+    }
+
+    /// Queues an answer for [`Worker::keep`].
+    pub fn on_keep(&self, answer: Result<(), WorkerError>) -> &Self {
+        self.lock().keep.push_back(answer);
+        self
+    }
+
+    /// Records `call` and answers from its own queue, `Ok` when that is empty.
     fn host_call(&self, call: HostCall) -> Result<(), WorkerError> {
         let mut state = self.lock();
         let before = state.calls.len();
         state.host_calls.push((before, call));
-        Ok(())
+        let queue = match call {
+            HostCall::Advance { .. } => &mut state.advance,
+            HostCall::Rest { .. } => &mut state.rest,
+            HostCall::Wake { .. } => &mut state.wake,
+            HostCall::Keep { .. } => &mut state.keep,
+        };
+        queue.pop_front().unwrap_or(Ok(()))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FakeState> {
@@ -1029,6 +1064,30 @@ mod tests {
                 (2, HostCall::Keep { workspace: ws }),
             ]
         );
+    }
+
+    #[test]
+    fn each_host_call_answers_from_its_own_queue_and_a_failed_one_is_recorded_too() {
+        let fake = FakeWorker::new();
+        let ws = WorkspaceId(id(5));
+        let no = |what: &str| Err(WorkerError::Failed(what.into()));
+        fake.on_advance(no("advance"))
+            .on_rest(no("rest"))
+            .on_wake(no("wake"))
+            .on_keep(no("keep"));
+        assert_eq!(fake.keep(ws), no("keep"));
+        assert_eq!(fake.wake(ws), no("wake"));
+        assert_eq!(fake.rest(ws), no("rest"));
+        assert_eq!(fake.advance(ws), no("advance"));
+        for answer in [
+            fake.advance(ws),
+            fake.rest(ws),
+            fake.wake(ws),
+            fake.keep(ws),
+        ] {
+            assert_eq!(answer, Ok(()));
+        }
+        assert_eq!(fake.host_calls().len(), 8);
     }
 
     #[test]

@@ -167,7 +167,7 @@ use super::runs::start::{self, ClaimOutcome, StartStep};
 use super::runs::stop::{self, ReconcileStep, StopStep};
 use super::runs::{RunContext, RunError, RunProject, RunSettings, run_config};
 use super::status::{self, PassResults};
-use super::worker::{FleetView, Guard, Worker};
+use super::worker::{FleetView, Guard, Target, Worker};
 use crate::clock::Clock;
 use crate::store::{Applied, Store, StoreError};
 
@@ -1084,12 +1084,18 @@ impl<'a, 'w> Pass<'a, 'w> {
 
     /// Whose claim `issue` carries: a run of Foundry's, named by Foundry's newest claim
     /// comment or, with no claim comment at all, by the fleet's workspace names; another
-    /// factory's, or another login's comment is none; or nothing at all.
+    /// factory's, or Foundry's at a host; another login's comment is none; or nothing at all.
     fn found_claim(&mut self, issue: &IssueSummary) -> Result<Found, Ended> {
         let world = self.world;
         let repo = &world.project.repo;
         let comments = world.tracker.issue_comments(repo, issue.number)?;
         match newest_claim(&comments, &world.project.login) {
+            // A claim at a host is left alone, as before a claim could name one: this build
+            // makes no workspace on a host. #360 lifts this.
+            Some(Claim::Foundry {
+                target: Target::Host(_),
+                ..
+            }) => Ok(Found::Foreign),
             Some(Claim::Foundry { run, .. })
                 if run.repo().eq_ignore_ascii_case(repo) && run.issue() == issue.number =>
             {
@@ -3149,6 +3155,43 @@ mod tests {
                     rig.hub.writes()
                 );
             }
+        }
+
+        /// The login's newest claim comment is Foundry's claim of this issue's run at a host,
+        /// which this build makes no workspace on: it is a foreign claim, as it was before a
+        /// claim could name a host. No run is carried on from it.
+        #[test]
+        fn a_foundry_claim_at_a_host_is_foreign() {
+            let mut rig = Rig::new();
+            let run = RunId::new(REPO, 5, 1).unwrap();
+            rig.hub.issue(5, &["factory:triage"]);
+            rig.hub
+                .edit(5, |issue| issue.assignees = vec![LOGIN.into()]);
+            rig.hub.comment_as(
+                5,
+                LOGIN,
+                &crate::factory::github::claim_comment(
+                    &run,
+                    &Target::Host(foundry_proto::factory::HostKind::Vims),
+                ),
+            );
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(
+                report.foreign,
+                vec![ForeignClaim {
+                    issue: 5,
+                    title: "Issue 5".into(),
+                    state: "triage".into(),
+                }]
+            );
+            assert!(rig.ledger.read(&run).unwrap().is_empty());
+            assert!(rig.creates().is_empty(), "{:?}", rig.creates());
+            assert!(
+                rig.hub.writes().iter().all(|w| !w.contains(" 5 ")),
+                "{:?}",
+                rig.hub.writes()
+            );
         }
 
         #[test]

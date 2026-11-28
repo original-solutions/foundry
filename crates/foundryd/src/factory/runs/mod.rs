@@ -923,11 +923,11 @@ pub fn recorded_reason(stop: &Stop) -> String {
     }
 }
 
-/// The stuck path. The session is stopped first (see [`stop_session`]), so a failure leaves the
-/// issue as it was and the next pass retries. Then `after_stop`, the actions
-/// [`transition`] asks for, `state_changed` and the summary line. A comment the ledger already
-/// records is skipped, a ready pull request goes back to draft first, and `code` is the reason
-/// of every line written.
+/// The stuck path. The session is stopped first (see [`stop_session`]) and the run's workspace
+/// kept, so a failure leaves the issue as it was and the next pass retries. Then `after_stop`,
+/// the actions [`transition`] asks for, `state_changed` and the summary line. A comment the
+/// ledger already records is skipped, a ready pull request goes back to draft first, and
+/// `code` is the reason of every line written.
 pub fn go_stuck(
     ctx: &RunContext<'_>,
     issue: u64,
@@ -936,15 +936,44 @@ pub fn go_stuck(
     stop: Stop,
     after_stop: Option<&dyn Fn() -> Result<(), RunError>>,
 ) -> Result<(), RunError> {
+    go_stuck_after(ctx, issue, at, code, stop, after_stop, Ending::Stop)
+}
+
+/// Who ends the session of a run going stuck, and so which workspace [`go_stuck_after`] keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// The stuck path stops the session (see [`stop_session`]) and keeps the run's worktree.
+    Stop,
+    /// The caller ended the session itself: nothing is stopped, and `keep` is kept, if any.
+    Ended { keep: Option<WorkspaceId> },
+}
+
+/// [`go_stuck`], with the session ended as `ending` says. A run already stuck is only
+/// finished: nothing is stopped or kept again.
+pub fn go_stuck_after(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    at: &mut Progress,
+    code: &str,
+    stop: Stop,
+    after_stop: Option<&dyn Fn() -> Result<(), RunError>>,
+    ending: Ending,
+) -> Result<(), RunError> {
     let cause = Cause::new(at.step, code);
     if at.state == State::Stuck {
         ctx.ledger
             .finish(&at.run, Outcome::Stuck, None, None, &cause, None)?;
         return Ok(());
     }
-    stop_session(ctx, at)?;
-    if let Some(workspace) = &at.worktree {
-        ctx.keep(workspace_id(workspace)?)?;
+    let keep = match ending {
+        Ending::Stop => {
+            stop_session(ctx, at)?;
+            at.worktree.as_deref().map(workspace_id).transpose()?
+        }
+        Ending::Ended { keep } => keep,
+    };
+    if let Some(workspace) = keep {
+        ctx.keep(workspace)?;
     }
     if let Some(after_stop) = after_stop {
         after_stop()?;
@@ -2545,6 +2574,33 @@ mod tests {
             assert_eq!(send_counts(&rig), vec![Some(4)]);
         }
 
+        /// A wake that fails sends nothing and records no try, so the next pass wakes again and
+        /// sends under the count it reads then.
+        #[test]
+        fn a_send_whose_wake_fails_records_no_try_and_sends_nothing() {
+            let (rig, run, payload, actions) = forward_rig(3);
+            rig.worker
+                .on_wake(Err(crate::factory::worker::WorkerError::Failed(
+                    "still asleep".into(),
+                )));
+            assert!(matches!(
+                forward(&rig, &run, &payload, &actions),
+                Err(RunError::Worker(_))
+            ));
+            assert!(rig.worker.calls().is_empty());
+            assert!(
+                !rig.steps(&run)
+                    .iter()
+                    .any(|step| step.starts_with(SEND_INTENT)),
+                "{:?}",
+                rig.steps(&run)
+            );
+            rig.worker.on_send(Ok(3));
+            forward(&rig, &run, &payload, &actions).unwrap();
+            assert_eq!(send_counts(&rig), vec![Some(3)]);
+            assert_eq!(rig.worker.host_calls().len(), 2);
+        }
+
         /// A send with no count to go under (the fleet shows no turn for the session) waits:
         /// nothing is written and nothing is asked of the worker, and the next pass that shows
         /// a turn sends under its count.
@@ -3257,6 +3313,28 @@ mod tests {
             assert!(matches!(result, Err(RunError::Worker(_))));
             assert!(rig.sim.writes().is_empty());
             assert_eq!(rig.names(&run), before);
+        }
+
+        /// A keep that fails writes nothing either: the run is not stuck yet, and the next try
+        /// stops the session and keeps the workspace again.
+        #[test]
+        fn a_workspace_that_cannot_be_kept_writes_nothing_and_the_next_try_keeps_it() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.worker
+                .on_keep(Err(WorkerError::Failed("no room".into())));
+            let before = rig.names(&run);
+            let mut at = progress(&rig, &run, State::Building);
+            let result = go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None);
+            assert!(matches!(result, Err(RunError::Worker(_))));
+            assert!(rig.sim.writes().is_empty());
+            assert_eq!(rig.names(&run), before);
+            assert!(!rig.finished(&run));
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            assert!(rig.finished(&run));
+            assert_eq!(rig.worker.host_calls().len(), 2);
         }
 
         #[test]
