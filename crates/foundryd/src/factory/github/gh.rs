@@ -716,7 +716,14 @@ mod tests {
                 Budget::Rest,
                 "api repos/o/r/issues/comments/N",
             ),
-            ("auth status", Budget::Graphql, "auth status"),
+            ("label create --repo o/r", Budget::Rest, "label create"),
+            ("auth status", Budget::Rest, "auth status"),
+            (
+                "api -f body=secret repos/o/r/issues/comments/1",
+                Budget::Rest,
+                "api repos/o/r/issues/comments/N",
+            ),
+            ("api -F x=1 --jq .a graphql", Budget::Graphql, "api graphql"),
         ] {
             let call: Vec<String> = call.split(' ').map(String::from).collect();
             assert_eq!(budget_of(&call), budget, "{call:?}");
@@ -799,6 +806,14 @@ mod tests {
             budget.lock().unwrap().quota.as_ref().unwrap().remaining,
             4987
         );
+        let rest = args(&["api", "repos/o/r"]);
+        fs::write(&answer, limited(7, 100)).unwrap();
+        gh.gh(&rest).unwrap();
+        {
+            let held = budget.lock().unwrap();
+            assert_eq!(held.points, 5);
+            assert_eq!(held.quota.as_ref().unwrap().remaining, 4987);
+        }
         for other in [r#"{"data":{"viewer":{"login":"x"}}}"#, "not json at all"] {
             fs::write(&answer, other).unwrap();
             gh.gh(&call).unwrap();
@@ -806,6 +821,51 @@ mod tests {
             assert_eq!(held.points, 5, "{other}");
             assert_eq!(held.quota.as_ref().unwrap().remaining, 4987, "{other}");
         }
+    }
+
+    #[test]
+    fn points_restart_with_the_hour_and_the_quota_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fake_gh(
+            dir.path(),
+            r#"echo '{"data":{"rateLimit":{"cost":4,"remaining":4990,"limit":5000,"resetAt":"2026-11-28T12:00:00Z"}}}'"#,
+        );
+        let clock = Arc::new(FakeClock::new());
+        let budget = Budgets::default().of("rawphp");
+        let gh = Gh::new("rawphp", TOKEN, clock.clone(), budget.clone()).with_program(&program);
+        let logged = crate::test_log::Logged::default();
+        let _capture = logged.capture();
+        let call = args(&["api", "graphql", "-f", "query=x"]);
+        gh.gh(&call).unwrap();
+        clock.advance(Duration::from_secs(3600));
+        gh.gh(&call).unwrap();
+        let text = logged.text();
+        assert!(text.contains("4 points"), "{text}");
+        assert!(text.contains("remaining 4990 of 5000"), "{text}");
+        let held = budget.lock().unwrap();
+        assert_eq!(held.points, 4);
+        assert_eq!(held.quota.as_ref().unwrap().remaining, 4990);
+    }
+
+    #[test]
+    fn counting_turns_the_hour_at_sixty_minutes() {
+        let mut budget = LoginBudget::default();
+        let call = |budget: &mut LoginBudget, minutes: u64| {
+            budget.count(
+                "rawphp",
+                Duration::from_secs(minutes * 60),
+                Budget::Graphql,
+                "issue view".into(),
+            )
+        };
+        assert_eq!(call(&mut budget, 0), None);
+        assert_eq!(call(&mut budget, 59), None);
+        budget.points = 3;
+        let line = call(&mut budget, 60).unwrap();
+        assert!(line.contains("graphql 2 calls, 3 points"), "{line}");
+        assert_eq!(budget.points, 0);
+        assert_eq!(budget.counts.values().sum::<u64>(), 1);
+        assert_eq!(budget.since, Some(Duration::from_secs(3600)));
     }
 
     fn quota_budget() -> LoginBudget {

@@ -1872,6 +1872,20 @@ mod tests {
     }
 
     #[test]
+    fn every_gh_of_a_login_shares_the_hosts_budget_for_it() {
+        let secrets = crate::secrets::MemorySecrets::default();
+        secrets.set("github:tomkaczocha", "ghp_one").unwrap();
+        secrets.set("github:rawphp", "ghp_two").unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::FakeClock::new());
+        let budgets = github::Budgets::default();
+        let of = |login: &str| gh_of(&secrets, clock.clone(), &budgets, login);
+        let (first, second) = (of("tomkaczocha").unwrap(), of("tomkaczocha").unwrap());
+        assert!(Arc::ptr_eq(first.budget(), second.budget()));
+        assert!(!Arc::ptr_eq(first.budget(), of("rawphp").unwrap().budget()));
+        assert!(of("nobody").is_none());
+    }
+
+    #[test]
     fn a_token_git_would_refuse_has_no_mark_so_its_lease_is_not_remade_every_scan() {
         let secrets = crate::secrets::MemorySecrets::default();
         secrets.set("github:bot", " ghp_ok ").unwrap();
