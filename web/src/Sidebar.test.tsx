@@ -555,7 +555,7 @@ describe("Sidebar and the factory", () => {
     expect(mark.getAttribute("title")).toBe("Built by the factory: open its issue");
     // Folded, its header row is the name, the mark and the line of states, in that order.
     const header = within(run).getByRole("button", { name: "fac 162" }).parentElement!;
-    expect([...header.children].map((e) => e.textContent)).toEqual(["fac 162", "#162", expect.stringMatching(/^$|\+/)]);
+    expect([...header.children].map((e) => e.textContent)).toEqual(["DEfac 162", "#162", expect.stringMatching(/^$|\+/)]);
     expect(header.children[2].querySelector("a[data-strip]")).not.toBeNull();
     unfold("fac 162");
     // Unfolded, the actions sit between the name and the mark.
