@@ -890,7 +890,8 @@ fn pass(ctx: &RunContext<'_>, run: &RunId, placed: Option<Target>) -> Result<Res
     };
     match ended {
         Some(ended) => {
-            if with_the_gate {
+            // A gate in flight for the reported pull request, whoever holds the run now.
+            if seen.pr_reported {
                 gate_cut_off(ctx, run, &events)?;
             }
             decide(ctx, run, &events, &seen, &mut at, &ended)
@@ -981,7 +982,8 @@ fn session_owner(ctx: &RunContext<'_>, seen: &Seen) -> Option<MachineId> {
 }
 
 /// A gate in flight when the session of a run whose pull request is reported is interrupted
-/// is marked could not run before the interruption is recorded, with the gate's count of
+/// (cut off at work, or a resumed session that ends while a gate placed for it runs) is marked
+/// could not run before the interruption is recorded, with the gate's count of
 /// failures to run for its attempt. The gate reads no gate while the session may be at work,
 /// nor while the run is this step's after it, so one left in flight would hold its slot
 /// unread. On a machine gone for `gate::MACHINE_GONE_AFTER` that is the gate's own rule, with
