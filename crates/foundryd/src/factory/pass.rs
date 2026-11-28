@@ -23,7 +23,9 @@
 //! 5. Every run is advanced through tasks 22 to 28, routed as each step's module says the pass
 //!    must ([`work_run`]): a stop asked for first, the gate's runs to the gate, the time limit,
 //!    the resume before the start and the build, the reconcile before the build, the build
-//!    and its forward, and the gate in the same pass as a pull request is reported. A run whose
+//!    and its forward, and the gate in the same pass as a pull request is reported. A run the
+//!    gate holds whose session may be at work on a machine cut off for 15 minutes is the
+//!    resume's (`resume::takes_from_the_gate`, #367), before any gate in flight. A run whose
 //!    end the reconcile is winding up is touched by no other step that pass. Runs in `pr-open`,
 //!    and runs a feedback round owns, have their feedback step after the other runs' steps and
 //!    before the claims, as the issue numbers them (the runner's `prOpenRuns` came after its
@@ -1141,7 +1143,12 @@ impl<'a, 'w> Pass<'a, 'w> {
         let state = k.info.state;
         let config = run_config(self.config, k.info.base.as_deref());
         let ctx = context(self.world, self.ledger, self.settings, &config);
-        if gating::gate_running(&k.events) {
+        let gate_holds = k.info.pr_reported || k.seen.pass.is_some();
+        // A session that may be at work on a machine cut off for 15 minutes is an interruption
+        // with its pull request reported too (#367): the resume step has the run, and a gate in
+        // flight, which is not read while the session may be at work, does not hide it.
+        let resume_has_it = gate_holds && resume::takes_from_the_gate(&ctx, &k.events);
+        if gating::gate_running(&k.events) && !resume_has_it {
             // Its slot is already counted: a gate in flight is polled, not placed.
             return self.gate(&ctx, run, false);
         }
@@ -1158,8 +1165,7 @@ impl<'a, 'w> Pass<'a, 'w> {
         {
             return Ok(format!("stuck: {reason}"));
         }
-        let gate_holds = k.info.pr_reported || k.seen.pass.is_some();
-        if !gate_holds
+        if (!gate_holds || resume_has_it)
             && matches!(
                 state,
                 None | Some(State::Triage | State::Building | State::Stuck)
@@ -3614,7 +3620,7 @@ mod tests {
             rig.worker.inner.on_create(Ok(gate_workspace()));
             let report = rig.pass();
             assert_eq!(report.failed, None, "{report:?}");
-            assert!(seen(&rig, &run).pr_reported, "{report:?}");
+            assert!(seen(rig, &run).pr_reported, "{report:?}");
             assert!(
                 gating::gate_running(&rig.ledger.read(&run).unwrap()),
                 "{report:?}"
