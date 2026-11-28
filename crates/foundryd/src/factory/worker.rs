@@ -2,9 +2,9 @@
 //!
 //! [`Worker`] is the seam between a run and the fleet: it makes workspaces, starts and talks to
 //! sessions, and reads their turns. [`Guard`] says whether the factory may still act at all.
-//! [`FleetView`] is what a run reads of the fleet in one pass, and [`StoreView`] its source, taken
-//! from the store. [`FakeWorker`] and [`StoreView::builder`] stand in for both in tests, so a run is tested
-//! with no daemon.
+//! [`FleetView`] is what a run reads of the fleet in one pass, and [`StoreView`] its source,
+//! taken from the store. [`FakeWorker`] and [`StoreView::builder`] stand in for both in tests,
+//! so a run is tested with no daemon.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -196,9 +196,9 @@ impl Guard for Lost {
     }
 }
 
-/// The fleet as one pass of the factory sees it: a snapshot, so a pass reads no store twice.
-/// Sessions and terminals are held as stored; the offline rule of [`as_seen`] is applied when
-/// one is read.
+/// The store's source of [`FleetView`]: a snapshot of the fleet taken once a pass, so a pass
+/// reads no store twice. Sessions and terminals are held as stored; the offline rule of
+/// [`as_seen`] is applied when one is read.
 #[derive(Clone, Debug, Default)]
 pub struct StoreView {
     workspaces: Vec<Record<Workspace>>,
@@ -300,8 +300,7 @@ impl StoreView {
 /// can give its own answers; [`StoreView`] is the fleet's source taken from the store.
 pub trait FleetView: Send + Sync {
     /// The workspace of `project` named `name` that is not archived. The first in the order
-    /// held: by owner machine id, then version, for [`StoreView::read`], and the order given
-    /// for the builder. A run may have workspaces of one name on two machines, after a
+    /// held. A run may have workspaces of one name on two machines, after a
     /// relaunch on another machine: the caller then reads [`FleetView::workspaces_named`].
     fn workspace_named(&self, project: ProjectId, name: &str) -> Option<&Record<Workspace>> {
         self.workspaces_named(project, name).into_iter().next()
@@ -310,27 +309,22 @@ pub trait FleetView: Send + Sync {
     /// Every workspace of `project` named `name` that is not archived, in the order held.
     fn workspaces_named(&self, project: ProjectId, name: &str) -> Vec<&Record<Workspace>>;
 
-    /// The session of `workspace` to read, as seen: ranked on the records as stored, then the
-    /// chosen one put through the offline rule of [`as_seen`], so its state is
+    /// The session of `workspace` to read, as seen: its state is
     /// [`SessionState::Unreachable`] while its owner is offline, as [`FleetView::session_state`]
     /// gives. The rank is a session with a turn, then a live one before an ended one, then the
     /// highest version; an ended session is still answered when it is the best there is.
     ///
-    /// A factory session is known only by its turn record ([`FleetView::session_turn`]), which
-    /// its machine first writes after the session's first hook and which syncs apart from the
-    /// session record. Until the view holds it, a factory session ranks like any other session
-    /// of the workspace, so a person's P1 session there can be answered instead. A caller that
-    /// holds the id `start_session` returned (kept in the run's events) reads that session by
-    /// id with [`FleetView::session_state`] and [`FleetView::session_turn`]; this is for
-    /// finding a workspace's session when no id is known.
+    /// A caller that holds the id `start_session` returned (kept in the run's events) reads
+    /// that session by id with [`FleetView::session_state`] and [`FleetView::session_turn`];
+    /// this is for finding a workspace's session when no id is known.
     fn session_of(&self, workspace: WorkspaceId) -> Option<Record<Session>>;
 
     /// The state of `session`, as its owner's record shows it: [`SessionState::Unreachable`]
     /// while its owner is offline. `None` for one unknown or deleted.
     fn session_state(&self, session: SessionId) -> Option<SessionState>;
 
-    /// The state and exit code of `terminal`. `None` for one unknown. A terminal whose owner
-    /// is offline is unreachable, and a deleted one has exited, as P1 treats it.
+    /// The state and exit code of `terminal`. `None` for one unknown or deleted. A terminal
+    /// whose owner is offline is unreachable, and a deleted one has exited, as P1 treats it.
     fn terminal(&self, terminal: TerminalId) -> Option<(TerminalState, Option<i32>)>;
 
     /// The newest turn of `session`, when it is a factory session.
@@ -351,6 +345,8 @@ pub trait FleetView: Send + Sync {
 }
 
 impl FleetView for StoreView {
+    /// The order held is by owner machine id, then version, for [`StoreView::read`], and the
+    /// order given for the builder.
     fn workspaces_named(&self, project: ProjectId, name: &str) -> Vec<&Record<Workspace>> {
         self.workspaces
             .iter()
@@ -358,6 +354,13 @@ impl FleetView for StoreView {
             .collect()
     }
 
+    /// Ranked on the records as stored, then the chosen one put through the offline rule of
+    /// [`as_seen`].
+    ///
+    /// A factory session is known only by its turn record, which its machine first writes
+    /// after the session's first hook and which syncs apart from the session record. Until
+    /// the store's snapshot holds it, a factory session ranks like any other session of the
+    /// workspace, so a person's P1 session there can be answered instead.
     fn session_of(&self, workspace: WorkspaceId) -> Option<Record<Session>> {
         let chosen = self
             .sessions
@@ -394,6 +397,7 @@ impl FleetView for StoreView {
         self.turns.get(&session)
     }
 
+    /// A [`Target::Host`] reads as offline: the store holds no host's heartbeat.
     fn online(&self, target: Target) -> bool {
         match target {
             Target::Machine(machine) => self.online.contains(&machine),
@@ -401,6 +405,7 @@ impl FleetView for StoreView {
         }
     }
 
+    /// A [`Target::Host`] is never unreachable: it reads as offline, with no span.
     fn unreachable_for(&self, target: Target) -> Duration {
         let Target::Machine(machine) = target else {
             return Duration::ZERO;
@@ -415,6 +420,7 @@ impl FleetView for StoreView {
         &self.samples
     }
 
+    /// A [`Target::Host`] holds nothing in the store.
     fn held(&self, target: Target) -> Option<&MachineHeld> {
         match target {
             Target::Machine(machine) => self.held.get(&machine),
@@ -1346,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_answers_workspace_named_through_the_trait_as_through_the_struct() {
+    fn the_view_answers_workspace_named_as_a_dyn_fleet_view() {
         let m = machine(1);
         let view = StoreView::builder()
             .workspace(workspace_record(m, 1, true, 10, 1, "run"))
