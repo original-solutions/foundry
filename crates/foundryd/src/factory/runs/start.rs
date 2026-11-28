@@ -67,6 +67,7 @@ use crate::factory::lifecycle::{
     Action, Event as LifecycleEvent, InvalidTransition, State, transition,
 };
 use crate::factory::messages::{self, CUT_SHORT_COMMENT, Message, ResumeFrom};
+use crate::factory::pass::POSTPONED;
 use crate::factory::text;
 use crate::factory::worker::{CreateWorkspace, Target, WorkerError};
 use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
@@ -155,6 +156,16 @@ pub fn claim(ctx: &RunContext<'_>, issue: u64, target: Target) -> Result<ClaimOu
     if detail.state != Some(State::Ready) {
         return Ok(ClaimOutcome::Skipped {
             reason: format!("issue #{issue} is not factory:ready"),
+        });
+    }
+    // Judged on the live fetch, not the pass's listing, which can be older.
+    if detail
+        .labels
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(POSTPONED))
+    {
+        return Ok(ClaimOutcome::Skipped {
+            reason: "labelled postponed, so it is not claimed".into(),
         });
     }
     if !detail.assignees.is_empty() {
@@ -2150,6 +2161,48 @@ mod tests {
                 claim_it(&rig).unwrap(),
                 ClaimOutcome::Skipped {
                     reason: "issue #8 is closed".into()
+                }
+            );
+            assert!(rig.sim.writes().is_empty());
+            assert!(rig.ledger.issue_runs(REPO, ISSUE).unwrap().is_empty());
+        }
+
+        /// A claim judges `postponed` on its own live fetch, not on the pass's listing, which
+        /// can be older: a ready, open, unassigned, approved issue labelled `Postponed` is
+        /// skipped with the pass's words, and nothing is written.
+        #[test]
+        fn a_ready_issue_postponed_on_its_live_fetch_is_skipped_with_nothing_written() {
+            let rig = Rig::new();
+            rig.sim.set_labels(&["factory:ready", "Postponed"]);
+            assert_eq!(
+                claim_it(&rig).unwrap(),
+                ClaimOutcome::Skipped {
+                    reason: "labelled postponed, so it is not claimed".into()
+                }
+            );
+            assert!(rig.sim.writes().is_empty());
+            assert!(rig.ledger.issue_runs(REPO, ISSUE).unwrap().is_empty());
+        }
+
+        /// `postponed` is judged after a closed issue and a label that is not `factory:ready`,
+        /// so each of those keeps its own reason when the issue is postponed too.
+        #[test]
+        fn a_postponed_issue_that_is_closed_or_not_ready_keeps_that_reason() {
+            let rig = Rig::new();
+            rig.sim.set_labels(&["factory:ready", "postponed"]);
+            rig.sim.set_closed(true);
+            assert_eq!(
+                claim_it(&rig).unwrap(),
+                ClaimOutcome::Skipped {
+                    reason: "issue #8 is closed".into()
+                }
+            );
+            let rig = Rig::new();
+            rig.sim.set_labels(&["factory:proposed", "postponed"]);
+            assert_eq!(
+                claim_it(&rig).unwrap(),
+                ClaimOutcome::Skipped {
+                    reason: "issue #8 is not factory:ready".into()
                 }
             );
             assert!(rig.sim.writes().is_empty());
