@@ -32,8 +32,9 @@ impl Reply {
         Self::exit(0, stdout, "")
     }
 
-    /// Vims refused the call with `code`. A code Vims is not known to refuse with reads as no
-    /// answer, as it would from the real `vims`, and holds no key.
+    /// Vims refused the call with `code`. A code Vims is not known to refuse with, or any code
+    /// to an `exec` that waits for its command, reads as no answer, as it would from the real
+    /// `vims`, and holds no key.
     pub fn refused(code: &str, message: &str) -> Self {
         let error = json!({"error": {"code": code, "message": message}});
         Self::exit(1, "", error.to_string())

@@ -113,6 +113,13 @@ impl Call {
         argv
     }
 
+    /// Whether what `vims` prints can hold the output of the command it runs: an `exec` that
+    /// waits for its command. A code in that output may be the command's, so it is never read
+    /// as Vims's refusal.
+    pub fn runs_attached(&self) -> bool {
+        self.command == "exec" && !self.args.iter().any(|arg| arg == "--no-wait")
+    }
+
     /// Whether `other` asks for the same thing, whatever key either carries.
     pub fn same_request(&self, other: &Call) -> bool {
         self.command == other.command
@@ -978,6 +985,8 @@ mod tests {
             r#"{"state":"failed","error":"grant not removed"}"#,
             r#"{"status":"error","message":"grant not found"}"#,
             r#"{"state":"cancelled"}"#,
+            r#"{"id":"tg_1","status":"revoked","error":{"code":"PRECONDITION_FAILED"}}"#,
+            r#"{"status":"succeeded","error":{"code":"PRECONDITION_FAILED"}}"#,
         ] {
             let fake = FakeVims::new();
             fake.on("workspace turn-grant put", Reply::ok(answer))
@@ -1229,9 +1238,11 @@ mod tests {
     }
 
     #[test]
-    fn a_github_entry_whose_owner_cannot_be_read_makes_the_answer_unreadable() {
+    fn a_github_entry_whose_owner_or_login_cannot_be_read_makes_the_answer_unreadable() {
         for answer in [
             r#"{"installations":[{"account":{"id":42,"name":"Trilogy-Care"},"login":"bot"}]}"#,
+            r#"{"login":"tomkaczocha","installations":[{"account":{"login":"Trilogy-Care"},"actor":{"login":"bot"}}]}"#,
+            r#"[{"account":{"login":"Trilogy-Care"}}]"#,
             r#"[{"login":"bot","target":"Trilogy-Care"}]"#,
             r#"{"installations":[{"account":{"login":"Trilogy-Care"},"login":"tomkaczocha"},{"account":{"slug":"rawphp"},"login":"bot"}]}"#,
         ] {

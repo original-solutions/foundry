@@ -86,8 +86,11 @@ pub fn finish(call: &Call, outcome: Outcome) -> Result<String, VimsError> {
         } => {
             // Stdout can carry the command's own output, so only its JSON answer, whole or on
             // its last line, is read for a code there; stderr is read for one in plain text too.
+            // An `exec` that waits can print its command's output on either, so a code there is
+            // never a refusal: the command ran.
             let coded = coded(&stdout, false).or_else(|| coded(&stderr, true));
-            if let Some((refusal, false)) = coded.as_ref()
+            if !call.runs_attached()
+                && let Some((refusal, false)) = coded.as_ref()
                 && refusal.is_vims_s()
             {
                 return Err(VimsError::Refused {
@@ -798,6 +801,45 @@ mod tests {
             assert!(
                 matches!(error, VimsError::Unknown { .. }),
                 "{script}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_from_an_exec_that_waits_for_its_command_is_no_refusal_and_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let attached =
+            Call::new("exec")
+                .arg("wsp_1")
+                .keyed("k1")
+                .after(["bash", "-lc", "make test"]);
+        for (script, code) in [
+            (
+                "echo 'Error: NOT_FOUND: fixture missing' >&2\nexit 1",
+                "NOT_FOUND",
+            ),
+            (
+                "echo '{\"error\":{\"code\":\"PRECONDITION_FAILED\"}}' >&2\nexit 1",
+                "PRECONDITION_FAILED",
+            ),
+            (
+                "echo '{\"error\":{\"code\":\"PRECONDITION_FAILED\"}}'\nexit 1",
+                "PRECONDITION_FAILED",
+            ),
+        ] {
+            let program = fake_vims(dir.path(), script);
+            let vims = vims_at(&program, Arc::new(SystemClock));
+            let error = vims.call(&attached).unwrap_err();
+            assert!(
+                matches!(&error, VimsError::Unknown { code: Some(found), .. } if found == code),
+                "{script}: {error:?}"
+            );
+            // The same answer to an `exec --no-wait`, which prints no command's output, is Vims's.
+            let error = vims.call(&exec_call()).unwrap_err();
+            assert_eq!(
+                error.refusal().map(|refusal| refusal.code.as_str()),
+                Some(code),
+                "{script}"
             );
         }
     }

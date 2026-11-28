@@ -464,25 +464,24 @@ impl GithubLinks {
             )
             .and_then(Value::as_array),
         };
+        // An entry whose login or owner cannot be read makes the answer unreadable: dropped, or
+        // kept as no owner, it would let a login answer for owners it was never named for.
         for item in list.into_iter().flatten() {
-            if let Some(login) = text(item, &[&["login"], &["user", "login"], &["githubLogin"]]) {
-                // An entry's owner that cannot be read makes the answer unreadable: kept as no
-                // owner, it would answer for every owner.
-                let owner = text(
-                    item,
-                    &[
-                        &["account", "login"],
-                        &["owner"],
-                        &["org"],
-                        &["organization"],
-                        &["account"],
-                    ],
-                )?;
-                links.push(GithubLink {
-                    owner: Some(owner),
-                    login,
-                });
-            }
+            let login = text(item, &[&["login"], &["user", "login"], &["githubLogin"]])?;
+            let owner = text(
+                item,
+                &[
+                    &["account", "login"],
+                    &["owner"],
+                    &["org"],
+                    &["organization"],
+                    &["account"],
+                ],
+            )?;
+            links.push(GithubLink {
+                owner: Some(owner),
+                login,
+            });
         }
         if links.is_empty()
             && let Some(login) = text(&value, &[&["login"], &["user", "login"]])
