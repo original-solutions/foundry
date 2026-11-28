@@ -1,7 +1,8 @@
 import { Link } from "@tanstack/react-router";
-import { useEffect, useRef, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { byUrgency, needingRows, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import type { Glyph } from "./labels";
+import { factoryBadge } from "./FactoryMark";
 import { Named } from "./Now";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { TerminalMenu, useTerminalActions } from "./TerminalMenu";
@@ -56,6 +57,8 @@ interface Props {
   machines: MachineView[];
   selected?: string;
   docked: boolean;
+  /** Whether the list takes the focus when it shows: when a person opened it, not when a docked list shows by itself. */
+  focus: boolean;
   onDock: (on: boolean) => void;
   /** Called when a session is picked. */
   onPick: () => void;
@@ -63,17 +66,22 @@ interface Props {
 
 /**
  * The fleet's sessions and shells as one list beside the rail: grouped by state, each row its
- * workspace, its factory issue, what it is doing and, with more than one machine, where. It opens
- * with the open terminal focused, and the arrows walk it. Ended terminals clear from their group.
+ * workspace, its factory issue, what it is doing and, with more than one machine, where. Opened by
+ * a person, it focuses the open terminal's row, and the arrows walk it. Ended terminals clear from their group.
  */
-export function SessionList({ machines, selected, docked, onDock, onPick }: Props) {
+export function SessionList({ machines, selected, docked, focus, onDock, onPick }: Props) {
   const groups = sessionGroups(machines);
   const many = machines.length > 1;
   const terminals = useTerminalActions();
   const ref = useRef<HTMLElement>(null);
   const count = groups.reduce((n, g) => n + g.items.length, 0);
+  // One Tab stop, as the sidebar's list: the row last focused, else the open terminal's, else the first.
+  const [focused, setFocused] = useState<string>();
+  const ids = groups.flatMap((g) => g.items.map((i) => i.row.terminal));
+  const stop = [focused, selected].find((id) => id !== undefined && ids.includes(id)) ?? ids[0];
 
   useEffect(() => {
+    if (!focus) return;
     const links = [...(ref.current?.querySelectorAll<HTMLElement>("[data-session]") ?? [])];
     (links.find((l) => l.dataset.session === selected) ?? links[0])?.focus();
     // Only when the list opens: a fleet update must not move the focus.
@@ -133,7 +141,15 @@ export function SessionList({ machines, selected, docked, onDock, onPick }: Prop
               <ul>
                 {items.map(({ row, workspace, machine }) => (
                   <li key={row.terminal}>
-                    <SessionRow row={row} workspace={workspace} machine={many ? machine : undefined} current={row.terminal === selected} onPick={onPick} />
+                    <SessionRow
+                      row={row}
+                      workspace={workspace}
+                      machine={many ? machine : undefined}
+                      current={row.terminal === selected}
+                      stop={row.terminal === stop}
+                      onFocus={() => setFocused(row.terminal)}
+                      onPick={onPick}
+                    />
                   </li>
                 ))}
               </ul>
@@ -145,11 +161,29 @@ export function SessionList({ machines, selected, docked, onDock, onPick }: Prop
   );
 }
 
-function SessionRow({ row, workspace, machine, current, onPick }: { row: Row; workspace: WorkspaceView; machine?: string; current: boolean; onPick: () => void }) {
+function SessionRow({
+  row,
+  workspace,
+  machine,
+  current,
+  stop,
+  onFocus,
+  onPick,
+}: {
+  row: Row;
+  workspace: WorkspaceView;
+  machine?: string;
+  current: boolean;
+  /** Whether Tab stops here. */
+  stop: boolean;
+  onFocus: () => void;
+  onPick: () => void;
+}) {
   const name = `${workspace.name} / ${row.name}: ${row.fullLabel ?? row.label}`;
   const quiet = row.glyph === "done" || row.glyph === "away";
+  // No place for the menu: its Rename opens the terminal and edits the name in its tab, since the sidebar's row is not shown beside the rail.
   return (
-    <TerminalMenu id={row.terminal} place="row">
+    <TerminalMenu id={row.terminal}>
       <Link
         to="/terminals/$terminalId"
         params={{ terminalId: row.terminal }}
@@ -157,7 +191,8 @@ function SessionRow({ row, workspace, machine, current, onPick }: { row: Row; wo
         aria-current={current ? "true" : undefined}
         title={row.title ? `${name}\n${row.title}` : name}
         data-session={row.terminal}
-        tabIndex={-1}
+        tabIndex={stop ? 0 : -1}
+        onFocus={onFocus}
         onClick={onPick}
         className={`grid grid-cols-[0.75rem_minmax(0,1fr)_auto] items-center gap-x-2 rounded-md px-2 py-1.5 hover:bg-neutral-800 focus-visible:outline-2 focus-visible:outline-emerald-400 ${
           current ? "bg-neutral-800 shadow-[inset_2px_0_0] shadow-emerald-400" : ""
@@ -167,7 +202,7 @@ function SessionRow({ row, workspace, machine, current, onPick }: { row: Row; wo
         <span className={`truncate font-medium ${quiet ? "text-neutral-400" : ""}`}>{workspace.name}</span>
         {/* The issue as text: the row is already a link, and FactoryMark is one too. */}
         {workspace.factory?.issue !== undefined ? (
-          <span className="rounded border border-violet-500/40 px-1 text-[10px] leading-4 font-medium text-violet-300">#{workspace.factory.issue}</span>
+          <span className={factoryBadge}>#{workspace.factory.issue}</span>
         ) : (
           <span />
         )}

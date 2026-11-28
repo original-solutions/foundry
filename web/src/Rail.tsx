@@ -28,12 +28,20 @@ interface Props {
  * The sidebar collapsed to a strip as narrow as a button, for a window too narrow for the full
  * list beside a terminal, or a terminal wanting the room. It holds only buttons: the board, the
  * factory, the sessions, jump, a new task and the bell. Sessions carries how many need you and
- * opens every terminal as one list (`SessionList`), over the terminal until a session is picked,
- * Escape is pressed or the terminal is clicked, or docked beside the rail to stay open.
+ * opens every terminal as one list (`SessionList`), over the terminal until another terminal opens
+ * (a pick, or from a row's menu), Escape is pressed or the terminal is clicked, or docked beside the rail to stay open.
  */
 export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }: Props) {
   const [docked, setDocked] = useState(loadDocked);
   const [open, setOpen] = useState(docked);
+  // The floating list closes when another terminal opens, by a pick or from a row's menu, so it never covers that terminal.
+  const [was, setWas] = useState(selected);
+  if (was !== selected) {
+    setWas(selected);
+    if (!docked) setOpen(false);
+  }
+  // A docked list that shows by itself leaves the focus where it is; opened from its button, it takes it.
+  const [asked, setAsked] = useState(false);
   const button = useRef<HTMLButtonElement>(null);
   const need = needing(machines).length;
   const flying = open && !docked;
@@ -78,7 +86,10 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
           aria-label={need > 0 ? `Sessions: ${need} need${need === 1 ? "s" : ""} you` : "Sessions"}
           aria-expanded={open}
           title="Every session and shell, by state"
-          onClick={() => setOpen(!open)}
+          onClick={() => {
+            setAsked(true);
+            setOpen(!open);
+          }}
           className={`relative grid size-8 place-items-center rounded-md hover:bg-neutral-800 hover:text-neutral-200 ${open ? "bg-neutral-800 text-neutral-200" : ""}`}
         >
           <SessionsIcon className="size-4" />
@@ -103,7 +114,7 @@ export function Rail({ machines, selected, onExpand, onJump, onCreate, alerts }:
           <SettingsLink />
         </div>
       </nav>
-      {open && <SessionList machines={machines} selected={selected} docked={docked} onDock={dock} onPick={() => !docked && setOpen(false)} />}
+      {open && <SessionList machines={machines} selected={selected} docked={docked} focus={asked} onDock={dock} onPick={() => !docked && setOpen(false)} />}
     </>
   );
 }

@@ -12,7 +12,7 @@ describe("SessionList and the factory", () => {
       fleet([sample(ME, 1), workspace(ME, "w2", "fac/1027-2"), terminal(ME, "t2", "w2"), session(ME, "s2", "w2", "t2", "finished")], settings()),
       factoryStatus("p1", {}, { "o__r__1027__2": { kind: "stuck", workspaces: ["w2"], reason } }),
     );
-    await renderApp(<SessionList machines={machines} docked onDock={vi.fn()} onPick={vi.fn()} />);
+    await renderApp(<SessionList machines={machines} docked focus={false} onDock={vi.fn()} onPick={vi.fn()} />);
     const needs = screen.getByRole("group", { name: "Needs you" });
     const row = within(needs).getByRole("link", { name: `fac/1027-2 / opus: Stuck · ${reason}` });
     const label = within(row).getByText("Stuck · gate red: make check…");

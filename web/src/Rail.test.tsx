@@ -101,6 +101,33 @@ describe("Rail", () => {
     expect(list()).toBeNull();
   });
 
+  it("leaves the focus where it is when a docked list shows by itself, and takes it when opened from its button", async () => {
+    localStorage.setItem("foundry.sessions", "docked");
+    await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
+
+    expect(list()).not.toBeNull();
+    expect(document.activeElement).toBe(document.body);
+
+    fireEvent.click(sessions());
+    expect(list()).toBeNull();
+    fireEvent.click(sessions());
+    expect(document.activeElement).toBe(within(list()!).getByRole("link", { name: "fix login / shell: Open" }));
+  });
+
+  it("is one Tab stop, on the open terminal's row or else the first, which moves with the focus", async () => {
+    localStorage.setItem("foundry.sessions", "docked");
+    const { unmount } = await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
+    const stops = () => within(list()!).getAllByRole("link").filter((l) => l.tabIndex === 0).map((l) => l.getAttribute("aria-label"));
+
+    expect(stops()).toEqual(["fix login / shell: Open"]);
+    fireEvent.focus(within(list()!).getByRole("link", { name: "fix login / opus: Working" }));
+    expect(stops()).toEqual(["fix login / opus: Working"]);
+    unmount();
+
+    await renderApp(<Rail machines={machines()} {...handlers()} />);
+    expect(stops()).toEqual(["on the laptop / opus: Needs you"]);
+  });
+
   it("walks the list with the arrows from the session that is open", async () => {
     await renderApp(<Rail machines={machines()} selected="t2" {...handlers()} />);
     fireEvent.click(sessions());

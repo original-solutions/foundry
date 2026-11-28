@@ -214,7 +214,7 @@ Press `?` outside a text field or the terminal, or the sidebar's **Keyboard** bu
 | | `Cmd+J` | Go to the next terminal that needs you |
 | | `Cmd+F` | Find in the open terminal |
 | | `Cmd+\` | Open a terminal beside this one, or close the split |
-| | `Cmd+B` | Collapse the workspaces list to a rail of states, or expand it |
+| | `Cmd+B` | Collapse the workspaces list to a rail, or expand it |
 | | `Esc` | Close what is on top: a dialog, sheet, drawer or card |
 | | `?` | The keyboard list |
 | Find | `Enter` / `Shift+Enter` | The older / the newer match |

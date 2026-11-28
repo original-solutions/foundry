@@ -47,7 +47,7 @@ const setupFailed: AttentionItem = {
 type Request = { url: string; method: string };
 
 let lists: AttentionItem[][];
-let dismissAnswer: () => Response;
+let dismissAnswer: (url: string) => Response;
 let closeAnswer: () => Response;
 let requests: Request[];
 
@@ -61,7 +61,7 @@ beforeEach(() => {
     vi.fn(async (url: string, init: RequestInit = {}) => {
       requests.push({ url, method: init.method ?? "GET" });
       if (url === "/api/attention") return json(200, { items: lists.length > 1 ? lists.shift() : lists[0] });
-      if (url.endsWith("/dismiss")) return dismissAnswer();
+      if (url.endsWith("/dismiss")) return dismissAnswer(url);
       if (url.endsWith("/close")) return closeAnswer();
       throw new Error(`unexpected request ${url}`);
     }),
@@ -219,6 +219,111 @@ describe("AttentionList", () => {
     lists = [[{ ...offline, id: "lease_lost:p1", kind: "lease_lost", terminal: null }]];
     await renderApp(<AttentionList />);
     expect(await screen.findByText("lease_lost")).toBeTruthy();
+  });
+
+  const stuck = (issue: number): AttentionItem => ({
+    id: `run_stuck:tc__people-hub__${issue}__1`,
+    kind: "run_stuck",
+    machine: "m1",
+    machine_name: "trilogy-mac",
+    what: `The factory's run of tc/people-hub#${issue} is stuck: make check fails on main\nReportingEdgeTest > totals ${issue}`,
+    todo: "Read the factory's last comment on the issue, fix the cause, then move the issue out of factory:stuck",
+    terminal: null,
+  });
+
+  it("collapses items of one kind into one card that counts them and says their shared todo once", async () => {
+    const items = [stuck(1), stuck(2), stuck(3)];
+    lists = [[offline, ...items]];
+    await renderApp(<AttentionList />);
+    const list = await screen.findByRole("region", { name: "Needs attention" });
+    expect(within(list).getByRole("button", { name: /4 need attention/ })).toBeTruthy();
+    const card = within(list).getByRole("listitem", { name: "3 runs stuck" });
+    expect(within(card).getAllByText(items[0].todo)).toHaveLength(1);
+    expect(within(card).getAllByText("trilogy-mac")).toHaveLength(1);
+    for (const item of items) {
+      expect(within(card).getByRole("button", { name: item.what.split("\n")[0] })).toBeTruthy();
+      expect(within(card).queryByText(/ReportingEdgeTest/)).toBeNull();
+    }
+    expect(within(list).getByText(offline.what)).toBeTruthy();
+    expect(within(list).getByText("Machine offline")).toBeTruthy();
+  });
+
+  it("shows a grouped item's full what when its line is opened", async () => {
+    lists = [[stuck(1), stuck(2)]];
+    await renderApp(<AttentionList />);
+    const line = await screen.findByRole("button", { name: stuck(2).what.split("\n")[0] });
+    expect(line.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(line);
+    expect(line.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText(/ReportingEdgeTest > totals 2/)).toBeTruthy();
+    expect(screen.queryByText(/ReportingEdgeTest > totals 1/)).toBeNull();
+  });
+
+  it("says each grouped item's own todo and machine when they differ", async () => {
+    const one = { ...stuck(1), id: "foreign_claim:p__1", kind: "foreign_claim", what: "Issue #1 is claimed", todo: "Move it out of factory:ready" };
+    const two = { ...one, id: "foreign_claim:p__2", what: "Issue #2 is claimed", todo: "Move it out of factory:building", machine: "m3", machine_name: "build-box" };
+    lists = [[one, two]];
+    await renderApp(<AttentionList />);
+    const card = await screen.findByRole("listitem", { name: "2 foreign claims" });
+    expect(within(card).getByText("trilogy-mac")).toBeTruthy();
+    expect(within(card).getByText("build-box")).toBeTruthy();
+    expect(within(card).queryByText(one.todo)).toBeNull();
+    fireEvent.click(within(card).getByRole("button", { name: two.what }));
+    expect(within(card).getByText(two.todo)).toBeTruthy();
+    expect(within(card).queryByText(one.todo)).toBeNull();
+  });
+
+  it("keeps each grouped item's terminal and close button", async () => {
+    const other = { ...setupFailed, id: "setup_failed:w2", what: "The setup of /fix-login on trilogy-mac failed", terminal: "t8" };
+    lists = [[setupFailed, other], [other]];
+    await renderApp(<AttentionList />);
+    const card = await screen.findByRole("listitem", { name: "2 setups failed" });
+    expect(within(card).getAllByRole("link", { name: "Open terminal" }).map((link) => link.getAttribute("href"))).toEqual([
+      "/terminals/t9",
+      "/terminals/t8",
+    ]);
+    fireEvent.click(within(card).getAllByRole("button", { name: "Close terminal" })[0]);
+    await waitFor(() => expect(requests).toContainEqual({ url: "/api/terminals/t9/close", method: "POST" }));
+  });
+
+  it("says why a grouped item's dismissal failed on that item's line, and keeps both lines", async () => {
+    const other = { ...overwritten, id: "setting_overwritten:project:p2", what: "Two sides of a split both edited the project docs; the edit made on this-mac was replaced" };
+    lists = [[overwritten, other]];
+    dismissAnswer = (url) =>
+      url.includes("p2") ? json(503, { error: "no link to m3, the acting coordinator, is open, so the edit was not sent" }) : new Response(null, { status: 204 });
+    await renderApp(<AttentionList />);
+    const card = await screen.findByRole("listitem", { name: "2 settings overwritten" });
+    const line = (what: string) => within(card).getByRole("button", { name: what }).closest("li")!;
+    fireEvent.click(within(line(other.what)).getByRole("button", { name: "Dismiss" }));
+    const alert = await within(card).findByRole("alert");
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(alert.textContent).toContain("no link to m3");
+    expect(line(other.what).contains(alert)).toBe(true);
+    expect(line(overwritten.what).contains(alert)).toBe(false);
+  });
+
+  it("keeps a what's line breaks, alone or opened in a group", async () => {
+    const claim = (issue: number): AttentionItem => ({
+      ...stuck(issue),
+      id: `foreign_claim:p__${issue}`,
+      kind: "foreign_claim",
+      what: `Issue #${issue} is claimed\nby another-factory`,
+    });
+    lists = [[stuck(1), claim(1), claim(2)]];
+    await renderApp(<AttentionList />);
+    const alone = await screen.findByText(/ReportingEdgeTest > totals 1/);
+    expect(alone.className).toContain("whitespace-pre-line");
+    fireEvent.click(screen.getByRole("button", { name: "Issue #2 is claimed" }));
+    expect(screen.getByText(/Issue #2 is claimed\s+by another-factory/).className).toContain("whitespace-pre-line");
+  });
+
+  it("names a run stuck item", async () => {
+    const one = { ...stuck(1), what: "The factory's run of tc/people-hub#1 is stuck: make check fails on main" };
+    lists = [[one]];
+    await renderApp(<AttentionList />);
+    expect(await screen.findByText("Run stuck")).toBeTruthy();
+    expect(screen.getByText(one.what)).toBeTruthy();
+    expect(screen.getByText(one.todo)).toBeTruthy();
   });
 
   it("names a placement waiting item", async () => {
