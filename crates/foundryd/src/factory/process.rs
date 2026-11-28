@@ -64,7 +64,7 @@ mod tests {
 
     use super::*;
 
-    /// A reader of `len` zero bytes that counts what it has handed out.
+    /// A reader of `left` bytes of `x` that counts what it has handed out.
     struct Counted {
         left: usize,
         read: Arc<AtomicUsize>,
@@ -78,6 +78,58 @@ mod tests {
             self.read.fetch_add(n, Ordering::SeqCst);
             Ok(n)
         }
+    }
+
+    /// A reader that answers each read with the next of `steps`, then with the end of the pipe.
+    struct Scripted {
+        steps: std::collections::VecDeque<std::io::Result<&'static [u8]>>,
+    }
+
+    impl Scripted {
+        fn new(steps: Vec<std::io::Result<&'static [u8]>>) -> Self {
+            Self {
+                steps: steps.into(),
+            }
+        }
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.steps.pop_front() {
+                None => Ok(0),
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(error)) => Err(error),
+            }
+        }
+    }
+
+    #[test]
+    fn a_drain_reads_on_after_an_interrupted_read() {
+        let pipe = Scripted::new(vec![
+            Ok(b"ab"),
+            Err(std::io::ErrorKind::Interrupted.into()),
+            Ok(b"cd"),
+        ]);
+        assert_eq!(
+            drain(Some(pipe), 4).join().unwrap(),
+            (b"abcd".to_vec(), false)
+        );
+    }
+
+    #[test]
+    fn a_drain_ends_at_a_read_that_fails_and_keeps_what_came_before() {
+        let pipe = Scripted::new(vec![
+            Ok(b"ab"),
+            Err(std::io::ErrorKind::BrokenPipe.into()),
+            Ok(b"cd"),
+        ]);
+        assert_eq!(
+            drain(Some(pipe), 4).join().unwrap(),
+            (b"ab".to_vec(), false)
+        );
     }
 
     #[test]
@@ -222,7 +274,8 @@ mod tests {
 
         kill_group(&mut child);
 
-        let reaped = child.try_wait().unwrap().is_some();
+        // An unreaped leader is a zombie that still answers a signal; `try_wait` would reap it.
+        let reaped = goes_away(group.as_raw());
         let gone = goes_away(gpid);
         // A failing run leaves no sleeper behind.
         let _ = killpg(group, Signal::SIGKILL);
