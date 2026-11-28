@@ -1021,6 +1021,44 @@ async fn an_archive_deletes_the_worktree_it_moved_aside() {
 }
 
 #[tokio::test]
+async fn archives_at_once_each_move_aside_and_delete_only_their_own_worktree() {
+    let setup = Setup::new();
+    let remote = setup.project(&[(".gitignore", "build/\n")]);
+    let other = setup.project(&[(".gitignore", "build/\n")]);
+    let mut ids = Vec::new();
+    for (remote, branch) in [(&remote, "one"), (&remote, "two"), (&other, "three")] {
+        let id = setup.create(remote, "main", branch).await;
+        let worktree = setup.worktree(remote.project, branch);
+        std::fs::create_dir_all(worktree.join("build")).unwrap();
+        std::fs::write(worktree.join("build").join("out.bin"), "o").unwrap();
+        ids.push((id, worktree));
+    }
+    setup.create(&remote, "main", "stays").await;
+    let stays = setup.worktree(remote.project, "stays");
+    std::fs::write(stays.join("draft.txt"), "d").unwrap();
+
+    let archived = futures::future::join_all(
+        ids.iter()
+            .map(|(id, _)| setup.workspaces.archive(*id, false)),
+    )
+    .await;
+
+    for ((id, worktree), archived) in ids.iter().zip(archived) {
+        archived.unwrap();
+        assert!(setup.record(*id).unwrap().deleted);
+        assert!(!worktree.exists());
+    }
+    emptied(&removing(&setup)).await;
+    assert!(stays.join("draft.txt").exists());
+    let worktrees = git(
+        &setup.clone_of(remote.project),
+        &["worktree", "list", "--porcelain"],
+    );
+    let name = stays.file_name().unwrap().to_str().unwrap();
+    assert!(worktrees.contains(&format!("/{name}\n")), "{worktrees}");
+}
+
+#[tokio::test]
 async fn a_start_deletes_what_an_archive_left_to_delete() {
     let setup = Setup::new();
     let left = removing(&setup).join(WorkspaceId::random().to_string());

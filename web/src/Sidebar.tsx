@@ -1,11 +1,11 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named } from "./Now";
 import { startShell } from "./api";
-import { archiveOf } from "./Archive";
+import { useArchive, useLeaving } from "./Archive";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
 import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
@@ -13,7 +13,6 @@ import { FactoryIcon, FactoryMark } from "./FactoryMark";
 import { MachineName } from "./Machines";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
-import { useLeaving } from "./Archive";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { SessionNameField, useRenaming } from "./SessionName";
 import { SparkIcon } from "./FirstPrompt";
@@ -300,16 +299,16 @@ function sweepable(machine: MachineView): string[] {
 /**
  * A machine's sweep, under its numbers: clear every terminal that ended (`over`), and archive every
  * workspace left with no terminals (`empty`). Archiving is not forced, so the daemon keeps any
- * workspace with work it would lose, and the line says how many it kept. Each archive is the same
- * mutation a single one is (`archiveOf`), so every view sees it under way; one that fails leaves
+ * workspace with work it would lose, and the line says how many it kept. Each archive runs as a
+ * single one does (`useArchive`), so every view sees it under way; one that fails leaves
  * the others to finish, and the line says how many could not be archived and why. While the fleet
  * shown is not the daemon's live word (`stale`), both wait: what it lists as ended or empty may not be.
  */
 function Tidy({ over, empty, clear, stale = false }: { over: string[]; empty: string[]; clear: (ids: string[]) => void; stale?: boolean }) {
-  const client = useQueryClient();
+  const one = useArchive();
   const archive = useMutation({
     mutationFn: async (ids: string[]) => {
-      const results = await Promise.allSettled(ids.map((id) => client.getMutationCache().build(client, archiveOf(id)).execute(false)));
+      const results = await Promise.allSettled(ids.map((id) => one.start(id, false)));
       const failed = results.flatMap((r) => (r.status === "rejected" ? [r.reason as unknown] : []));
       return { of: ids.length, kept: results.filter((r) => r.status === "fulfilled" && r.value !== null).length, failed: failed.length, why: failed[0] };
     },
