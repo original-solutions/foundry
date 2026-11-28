@@ -900,12 +900,6 @@ mod tests {
         /// which stands in for macOS's `/bin/sh`.
         const SHELLS: [&str; 2] = ["/bin/sh", "bash"];
 
-        /// No job-control notice of the setup's own shell: a reaped watcher or command.
-        fn assert_no_notice(shell: &str, tail: &str) {
-            assert!(!tail.contains("Killed"), "{shell}: {tail:?}");
-            assert!(!tail.contains("sleep \"$limit\""), "{shell}: {tail:?}");
-        }
-
         #[test]
         fn the_real_setup_prints_only_the_commands_own_lines_and_its_own_for_a_failure() {
             let command = "echo one; echo 'test tests::example ... FAILED'; echo to-stderr >&2; echo three; exit 100";
@@ -915,12 +909,13 @@ mod tests {
                     continue;
                 };
                 assert_eq!(code, 100, "{shell}: {tail:?}");
-                assert!(
-                    tail.contains("test tests::example ... FAILED\n"),
-                    "{shell}: {tail:?}"
+                assert_eq!(
+                    tail,
+                    format!(
+                        "$ {command}\none\ntest tests::example ... FAILED\nto-stderr\nthree\nsetup failed: {command} exited 100\n"
+                    ),
+                    "{shell}"
                 );
-                assert!(tail.contains("to-stderr\n"), "{shell}: {tail:?}");
-                assert_no_notice(shell, &tail);
                 let GateResult::Failed {
                     command: named,
                     how,
@@ -939,7 +934,6 @@ mod tests {
                     "{shell}: {output:?}"
                 );
                 assert!(output.contains("to-stderr"), "{shell}: {output:?}");
-                assert_no_notice(shell, &output);
             }
         }
 
@@ -951,15 +945,41 @@ mod tests {
                     continue;
                 };
                 assert_eq!(code, TIMED_OUT, "{shell}: {tail:?}");
-                assert!(
-                    tail.contains(&format!(
-                        "setup failed: {} ran past {} s and was stopped\n",
+                assert_eq!(
+                    tail,
+                    format!(
+                        "$ {0}\nbefore\nsetup failed: {0} ran past {1} s and was stopped\n",
                         commands[0],
                         COMMAND_LIMIT.as_secs()
-                    )),
-                    "{shell}: {tail:?}"
+                    ),
+                    "{shell}"
                 );
-                assert_no_notice(shell, &tail);
+            }
+        }
+
+        #[test]
+        fn the_real_setup_keeps_its_error_stream_out_of_the_command() {
+            // The marker is split so the echoed `$ <command>` line does not hold it.
+            let command = "if ( : >&3 ) 2>/dev/null; then echo fd3-lea\"\"ked; fi; echo after";
+            for shell in SHELLS {
+                let Some((tail, code)) = run_setup_in(shell, "", &[command]) else {
+                    continue;
+                };
+                assert_eq!(code, 0, "{shell}: {tail:?}");
+                assert!(!tail.contains("fd3-leaked"), "{shell}: {tail:?}");
+                assert!(tail.contains("after\n"), "{shell}: {tail:?}");
+            }
+        }
+
+        #[test]
+        fn the_real_setup_explains_a_mktemp_that_fails() {
+            for shell in SHELLS {
+                let stub = "mktemp() { echo mktemp-broke >&2; return 1; }";
+                let Some((tail, code)) = run_setup_in(shell, stub, &["echo hi"]) else {
+                    continue;
+                };
+                assert_eq!(code, 1, "{shell}: {tail:?}");
+                assert!(tail.contains("mktemp-broke"), "{shell}: {tail:?}");
             }
         }
 
@@ -981,8 +1001,7 @@ mod tests {
                 (Some("echo boom; exit 3"), "exit code 3"),
                 "{tail:?}"
             );
-            // The command's own output comes first. Some shells, such as macOS's `/bin/sh`, add
-            // a line of their own when the stopped watcher is reaped, so the rest is not asserted.
+            // The command's own output comes first.
             assert!(output.starts_with("boom\n"), "{tail:?}");
         }
 
@@ -994,7 +1013,6 @@ mod tests {
             let commands = ["sleep 3187"];
             let (tail, code) = run_setup("sleep() { :; }", &commands);
             assert_eq!(code, TIMED_OUT, "{tail:?}");
-            // Its output is not asserted: some shells print a line of their own for the kill.
             let GateResult::Failed { command, how, .. } =
                 result(TerminalState::Exited, Some(code), &tail, &strs(&commands))
             else {
