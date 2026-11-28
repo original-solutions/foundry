@@ -1006,6 +1006,24 @@ impl Worker for NoWorker {
     }
 }
 
+/// The tracker for `login` with its token, counting in the host's `budgets`; `None` when no
+/// usable token is held or the secret store cannot be read.
+fn gh_of(
+    secrets: &dyn Secrets,
+    clock: Arc<dyn Clock>,
+    budgets: &github::Budgets,
+    login: &str,
+) -> Option<github::Gh> {
+    let token = match usable_token(secrets, login) {
+        Ok(token) => token?,
+        Err(error) => {
+            tracing::warn!("factory: the token for {login} could not be read: {error}");
+            return None;
+        }
+    };
+    Some(github::Gh::new(login, token, clock, budgets.of(login)))
+}
+
 /// The token held for `login`, trimmed, when git can be given it: none held, a blank one and one
 /// with a control character, which an environment variable could not carry whole, are `None`.
 /// The rule is `GitAuth::for_login`'s, whose token this module cannot read: it is copied here,
@@ -1060,14 +1078,7 @@ impl Host for Daemon {
     }
 
     fn tracker(&self, login: &str) -> Option<Arc<dyn Commenting>> {
-        let token = match usable_token(&*self.secrets, login) {
-            Ok(token) => token?,
-            Err(error) => {
-                tracing::warn!("factory: the token for {login} could not be read: {error}");
-                return None;
-            }
-        };
-        let gh = github::Gh::new(login, token, self.clock.clone(), self.budgets.of(login));
+        let gh = gh_of(&*self.secrets, self.clock.clone(), &self.budgets, login)?;
         Some(Arc::new(github::Hiding::new(Arc::new(gh), self.hide())))
     }
 
