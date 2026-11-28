@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient, type UseMutationResult } from "@
 import { Link } from "@tanstack/react-router";
 import { useId, useState } from "react";
 import { pollEvery } from "../poll";
-import { attentionItems, byKind, closable, dismissable, firstLine, heading, settle, type AttentionGroup, type AttentionItem } from "./attention";
+import { attentionItems, byTodo, closable, dismissable, firstLine, heading, settle, type AttentionGroup, type AttentionItem } from "./attention";
 
 /** How often the list is read, so an item shows within 5 seconds of what raised it. */
 export const ATTENTION_EVERY = 2000;
@@ -13,7 +13,7 @@ const key = ["attention"];
  * What needs a person across the fleet that is not a session's question, stall or failure (those
  * lead from the strip beside it, `NextUp`): a card at the head of the page while anything does,
  * nothing otherwise. Each item says what happened, what to do and on which machine, with its terminal one
- * click away. Items of one kind share a card that says their todo once and lists each item on a line of its own. A "setting overwritten" item is dismissed here, and a "setup failed" item clears by closing its
+ * click away. Items of one kind that say the same thing to do share a card that says that todo once and lists each item on a line of its own. A "setting overwritten" item is dismissed here, and a "setup failed" item clears by closing its
  * exited terminal here; every other clears on its own.
  * `folded` starts it folded to its count, each time the card shows.
  */
@@ -58,11 +58,11 @@ function Items({ items, folded }: { items: AttentionItem[]; folded: boolean }) {
       </button>
       {open && (
         <ul className="max-h-[50vh] divide-y divide-neutral-800 overflow-y-auto border-t border-neutral-800">
-          {byKind(items).map((group) =>
+          {byTodo(items).map((group) =>
             group.items.length === 1 ? (
-              <Single key={group.kind} item={group.items[0]} settling={settling} />
+              <Single key={JSON.stringify([group.kind, group.todo])} item={group.items[0]} settling={settling} />
             ) : (
-              <Group key={group.kind} group={group} settling={settling} />
+              <Group key={JSON.stringify([group.kind, group.todo])} group={group} settling={settling} />
             ),
           )}
         </ul>
@@ -73,7 +73,7 @@ function Items({ items, folded }: { items: AttentionItem[]; folded: boolean }) {
 
 type Settling = UseMutationResult<void, Error, AttentionItem>;
 
-/** The only item of its kind: what happened, what to do and its machine, in full. */
+/** The only item of its kind and todo: what happened, what to do and its machine, in full. */
 function Single({ item, settling }: { item: AttentionItem; settling: Settling }) {
   return (
     <li className="space-y-1 px-3 py-2">
@@ -93,7 +93,7 @@ function Single({ item, settling }: { item: AttentionItem; settling: Settling })
   );
 }
 
-/** Several items of one kind: counted once, their shared todo and machine said once, one line each. */
+/** Several items of one kind and todo: counted once, their todo and shared machine said once, one line each. */
 function Group({ group, settling }: { group: AttentionGroup; settling: Settling }) {
   const id = useId();
   return (

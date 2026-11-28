@@ -79,6 +79,8 @@ use serde::Serialize;
 use crate::api::edit_status;
 use crate::clock::Clock;
 use crate::coordinator::{self, Coordinator};
+use crate::factory::messages::TIME_LIMIT;
+use crate::factory::runs::building::SESSION_WAITING;
 use crate::factory::status::{Freshness, believed};
 use crate::machine::{Over, over_limits};
 use crate::secrets::redact;
@@ -622,8 +624,7 @@ fn factory_items(
                 HeldUpKind::Stuck => (
                     Kind::RunStuck,
                     format!("The factory's run of {} is stuck", issue(&held.run)),
-                    "Read the factory's last comment on the issue, fix the cause, then move the \
-                     issue out of factory:stuck",
+                    run_stuck_todo(&held.reason),
                 ),
                 HeldUpKind::NeedsInfo => (
                     Kind::RunNeedsInfo,
@@ -698,6 +699,22 @@ fn issue_url(run: &RunId) -> String {
 /// `owner/name#N` of `run`'s issue.
 fn issue(run: &RunId) -> String {
     format!("{}#{}", run.repo(), run.issue())
+}
+
+/// What to do about a run that stopped for `reason`, read before [`redact`]: a time limit leaves
+/// a branch the next attempt continues from while the issue text is unedited, and a session that
+/// waits for a person can be answered where it waits.
+fn run_stuck_todo(reason: &str) -> &'static str {
+    if reason.starts_with(TIME_LIMIT) {
+        "Check how far the run's branch got. To continue from it, move the issue to \
+         factory:ready without editing the issue text"
+    } else if reason.starts_with(SESSION_WAITING) {
+        "Open the session to see what it is waiting for. Answer it there to finish by hand, or \
+         fix the cause and move the issue out of factory:stuck"
+    } else {
+        "Read the factory's last comment on the issue, fix the cause, then move the issue out of \
+         factory:stuck"
+    }
 }
 
 /// The "factory idle" item of `project`, when it stands: for a reason the believed status

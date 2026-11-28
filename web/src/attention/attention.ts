@@ -63,33 +63,30 @@ export function heading(kind: string, count: number): string {
   return `${count} ${name?.[1] ?? kind}`;
 }
 
-/** The items of one kind, as one card. */
+/** The items of one kind that say the same thing to do, as one card. */
 export interface AttentionGroup {
   kind: string;
   items: AttentionItem[];
-  /** What to do, when every item says the same; null when they differ. */
+  /** What to do, which every item of the group says. Never null from `byTodo`; nullable so a card can still say each item's own. */
   todo: string | null;
   /** The machine every item is on; null when they are on different machines. */
   machine_name: string | null;
 }
 
 /**
- * The items grouped by kind, in the order each kind first comes. Grouping is by kind only: two
- * items of a kind are alike in what to do, whatever their free text says caused them.
+ * The items grouped by kind and todo together, in the order each group first comes. Two items of
+ * a kind can say different things to do (a run stuck at its time limit and one stuck on a failed
+ * gate), so they share a card only when their todo is the same too.
  */
-export function byKind(items: AttentionItem[]): AttentionGroup[] {
-  const groups = new Map<string, AttentionItem[]>();
+export function byTodo(items: AttentionItem[]): AttentionGroup[] {
+  const groups = new Map<string, AttentionGroup>();
   for (const item of items) {
-    const group = groups.get(item.kind);
-    if (group) group.push(item);
-    else groups.set(item.kind, [item]);
+    const key = JSON.stringify([item.kind, item.todo]);
+    const group = groups.get(key);
+    if (group) group.items.push(item);
+    else groups.set(key, { kind: item.kind, items: [item], todo: item.todo, machine_name: null });
   }
-  return [...groups].map(([kind, items]) => ({
-    kind,
-    items,
-    todo: shared(items.map((item) => item.todo)),
-    machine_name: shared(items.map((item) => item.machine_name)),
-  }));
+  return [...groups.values()].map((group) => ({ ...group, machine_name: shared(group.items.map((item) => item.machine_name)) }));
 }
 
 const shared = (values: string[]) => (values.every((value) => value === values[0]) ? values[0] : null);
