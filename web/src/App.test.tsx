@@ -413,6 +413,26 @@ describe("App", () => {
     expect(sweep().map((b) => b.hasAttribute("disabled"))).toEqual([false, false]);
   });
 
+  it("keeps the machine's sweep waiting while the link to the daemon is lost, until it sends again", async () => {
+    mockActions();
+    const swept = { ...live, records: [...live.records, terminal(ME, "t3", "w1", "exited", { exit_code: 0 }), workspace(ME, "w2", "fix logout")] };
+    await open("/", swept);
+    const sweep = () => [
+      screen.getByTitle("Clear the terminals that ended in every workspace on this machine, with their final screens"),
+      within(screen.getByRole("navigation", { name: "Workspaces" })).getByRole("button", { name: "Archive 1 empty" }),
+    ];
+    expect(sweep().map((b) => b.hasAttribute("disabled"))).toEqual([false, false]);
+
+    act(() => sockets("/api/events").at(-1)!.end(1006));
+    expect(sweep().map((b) => b.hasAttribute("disabled"))).toEqual([true, true]);
+
+    await act(() => new Promise((resolve) => setTimeout(resolve, 600)));
+    const again = sockets("/api/events").at(-1)!;
+    act(() => again.open());
+    act(() => again.deliver(JSON.stringify(swept)));
+    expect(sweep().map((b) => b.hasAttribute("disabled"))).toEqual([false, false]);
+  });
+
   it("keeps the live fleet in this browser for the next load, never a frozen one", async () => {
     mockActions();
     await open("/", live);
