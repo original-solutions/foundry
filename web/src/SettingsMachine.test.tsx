@@ -250,6 +250,20 @@ describe("SettingsMachine", () => {
     expect(bar()).toBeNull();
   });
 
+  it("keeps a decimal as typed over a saved whole number, and counts it a change only once it differs", async () => {
+    const calls = mockFetch(new Response(null, { status: 204 }));
+    await show(ME, { given: { ...limited, limits: { [ME]: { max_sessions: 4, max_load_per_core: 1, min_free_disk: 20_000_000_000 } } } });
+    type("Max load per core", "1.0");
+    expect(field("Max load per core").value).toBe("1.0");
+    expect(bar()).toBeNull();
+    type("Max load per core", "1.05");
+    expect(field("Max load per core").value).toBe("1.05");
+    expect(bar()?.textContent).toContain("Max load per core 1 → 1.05");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(bar()).toBeNull());
+    expect(calls).toEqual([{ url: `/api/machines/${ME}/limits`, method: "POST", body: { max_sessions: 4, max_load_per_core: 1.05, min_free_disk_gb: 20 } }]);
+  });
+
   describe("the update", () => {
     const ready = (id: string) => [at(ME, 1, id === ME ? { version: "0.9.0", update_ready: "v0.9.1" } : {}), at(OTHER, 1, id === OTHER ? { version: "0.9.0", update_ready: "v0.9.1" } : {})];
 
