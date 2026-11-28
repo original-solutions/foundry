@@ -439,6 +439,7 @@ const rests: Glyph[] = ["ready", "done"];
  * stage instead: one that has ended, and in a held-up run one that waits for its next prompt too,
  * since none comes until you act. So "Ended" never stands for a run that is stuck. A terminal that
  * works, asks or is quiet keeps its own state, as does a live run's ready one: the factory moves it.
+ * A failed one says the stage too, its red glyph saying it failed: decided in #394, not missed.
  */
 const atRest = (glyph: Glyph, run: FactoryRun): boolean => glyph === "done" || glyph === "failed" || (glyph === "ready" && run.held !== undefined);
 

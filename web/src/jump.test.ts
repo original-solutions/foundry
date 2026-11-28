@@ -36,6 +36,8 @@ describe("destinations", () => {
     const records = [sample(ME, 1), workspace(ME, "w1", "fac/1027-2"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "finished")];
     const run = withFactory(fleet(records, settings()), factoryStatus("p1", {}, { "o__r__1027__2": { kind: "stuck", workspaces: ["w1"], reason } }));
     expect(destinations(run)[0]).toMatchObject({ kind: "terminal", terminal: "t1", label: "Stuck · gate red: make check…", fullLabel: `Stuck · ${reason}`, glyph: "done" });
+    // Found by words past the cut, as its tooltip shows them.
+    expect(search(destinations(run), "fails on main").map((d) => d.key)).toEqual(["t1"]);
   });
 
   it("lists every terminal in the fleet with its workspace, name, state and machine, then a new shell per workspace", () => {

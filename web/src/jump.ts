@@ -34,7 +34,7 @@ export function destinations(machines: MachineView[], commands: Command[] = []):
     for (const w of machine.workspaces) {
       const where = `${w.name} ${w.project} ${branchOf(w)} ${machine.name}`;
       const add = (terminal: string, name: string, label: string, glyph: Glyph, subtitle?: string, fullLabel?: string) =>
-        open.push({ kind: "terminal", key: terminal, terminal, title: `${w.name} / ${name}`, subtitle, label, ...(fullLabel && { fullLabel }), glyph, machine: machine.name, words: `${where} ${name} ${label} ${subtitle ?? ""}` });
+        open.push({ kind: "terminal", key: terminal, terminal, title: `${w.name} / ${name}`, subtitle, label, ...(fullLabel && { fullLabel }), glyph, machine: machine.name, words: `${where} ${name} ${fullLabel ?? label} ${subtitle ?? ""}` });
       // As the sidebar lists them, so a factory run's quiet session reads alike here, with a held-up run's whole reason for the tooltip.
       for (const r of rows(w)) add(r.terminal, r.name, r.label, r.glyph, r.title, r.fullLabel);
       const title = `New shell in ${w.name}`;
