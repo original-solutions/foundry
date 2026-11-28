@@ -31,6 +31,12 @@ describe("diff", () => {
     expect(diff(saved, { ...saved, max_runs: "04" }, fields)).toHaveLength(1);
   });
 
+  it("compares text that is only a number as a number, and other text as it is", () => {
+    expect(diff({ ...saved, max_runs: "3" }, { ...saved, max_runs: "03" }, fields)).toEqual([]);
+    expect(diff({ ...saved, model: "1" }, { ...saved, model: "one" }, fields)).toHaveLength(1);
+    expect(diff({ ...saved, model: "opus" }, { ...saved, model: "Opus" }, fields)).toHaveLength(1);
+  });
+
   it("shows both sides through the field's show, and as text without one", () => {
     const [model] = diff(saved, { ...saved, model: "sonnet" }, fields);
     expect(model).toMatchObject({ before: "opus", after: "sonnet" });
