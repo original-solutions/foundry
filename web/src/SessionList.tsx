@@ -4,7 +4,7 @@ import { byUrgency, needingRows, rows, type MachineView, type Row, type Workspac
 import type { Glyph } from "./labels";
 import { factoryBadge } from "./FactoryMark";
 import { Named } from "./Now";
-import { glyphText, StateGlyph } from "./StateGlyph";
+import { glyphText, StateGlyph, StateLabel } from "./StateGlyph";
 import { TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { readStored, store } from "./storage";
 
@@ -179,7 +179,7 @@ function SessionRow({
   onFocus: () => void;
   onPick: () => void;
 }) {
-  const name = `${workspace.name} / ${row.name}: ${row.label}`;
+  const name = `${workspace.name} / ${row.name}: ${row.fullLabel}`;
   const quiet = row.glyph === "done" || row.glyph === "away";
   // No place for the menu: its Rename opens the terminal and edits the name in its tab, since the sidebar's row is not shown beside the rail.
   return (
@@ -207,7 +207,7 @@ function SessionRow({
           <span />
         )}
         <span className="col-start-2 col-end-4 flex min-w-0 items-baseline gap-1.5 text-xs text-neutral-400">
-          <span className={`shrink-0 ${quiet ? "" : glyphText[row.glyph]}`}>{row.label}</span>
+          <StateLabel of={row} className={`shrink-0 ${quiet ? "" : glyphText[row.glyph]}`} />
           <span className="text-neutral-600">·</span>
           <Named name={row.name} title={row.title} step={row.now} />
           {machine && <span className="shrink-0 text-neutral-500">{machine}</span>}

@@ -144,6 +144,23 @@ describe("the jump palette's preview", () => {
     expect(within(within(dialog).getByRole("region", { name: "Preview of far away" })).getByText(/in its worktree on fedcba9\./)).toBeDefined();
   });
 
+  it("says a held-up run's stage on its ended session, with the whole reason on hover", async () => {
+    const reason = "gate red: make check fails on main, see the gate log";
+    const at = [workspace(OTHER, "w9", "fac/1027-2"), terminal(OTHER, "t9", "w9"), session(OTHER, "s9", "w9", "t9", "finished")];
+    const twoMachines = settings({ machines: [{ id: ME, name: "studio", address: "a" }, { id: OTHER, name: "laptop", address: "b" }] });
+    const run = withFactory(fleet(at, twoMachines), factoryStatus("p1", {}, { "o__r__1027__2": { kind: "stuck", workspaces: ["w9"], reason } }));
+    const { dialog, input } = await open(run);
+    const option = within(dialog).getByRole("option", { name: /^fac\/1027-2 \/ opus/ });
+    expect(within(option).getByText("Stuck · gate red: make check…").getAttribute("title")).toBe(`Stuck · ${reason}`);
+    expect(within(option).queryByText("Ended")).toBeNull();
+    // The preview's head and a new shell's list of its workspace's terminals say it alike.
+    const peek = within(dialog).getByRole("region", { name: "Preview of fac/1027-2 / opus" });
+    expect(within(peek).getByText("Stuck · gate red: make check…").getAttribute("title")).toBe(`Stuck · ${reason}`);
+    fireEvent.change(input, { target: { value: "new shell fac" } });
+    const shell = within(dialog).getByRole("region", { name: "Preview of fac/1027-2" });
+    expect(within(shell).getByText("Stuck · gate red: make check…").getAttribute("title")).toBe(`Stuck · ${reason}`);
+  });
+
   it("has no preview on a narrow screen, and reads nothing for one", async () => {
     wide = false;
     const { dialog } = await open();

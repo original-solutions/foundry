@@ -6,7 +6,7 @@ import type { MachineView } from "./fleet";
 import { addsSteps, plural } from "./labels";
 import { Named, Now } from "./Now";
 import { pollEvery } from "./poll";
-import { glyphText, StateGlyph } from "./StateGlyph";
+import { glyphText, StateGlyph, StateLabel } from "./StateGlyph";
 import { STEPS_EVERY } from "./StepsPanel";
 import { useRereadOnChange } from "./Timeline";
 import { ago, tally } from "./trail";
@@ -53,7 +53,7 @@ export function Away({
       refetchInterval: pollEvery(STEPS_EVERY, addsSteps.includes(m.row.glyph)),
     })),
   });
-  useRereadOnChange(list.map((m) => `${m.row.session}=${m.row.label}`).join("\n"));
+  useRereadOnChange(list.map((m) => `${m.row.session}=${m.row.glyph}`).join("\n"));
   const shown = left.since ? list.map((m) => m.row.session).join(" ") : "";
   const tell = useRef(onShown);
   useLayoutEffect(() => {
@@ -114,7 +114,7 @@ function Line({ m, turns, steps, onOpen }: { m: Moved; turns: number; steps: Mar
   return (
     <button
       type="button"
-      aria-label={`Open ${row.name} in ${m.workspace}: ${row.label}`}
+      aria-label={`Open ${row.name} in ${m.workspace}: ${row.fullLabel}`}
       onClick={onOpen}
       className={`flex w-full flex-col gap-0.5 rounded-lg px-2.5 py-2 text-left hover:bg-neutral-800/70 focus-visible:outline-2 focus-visible:outline-sky-400 ${m.needs ? "bg-amber-400/5" : ""}`}
     >
@@ -123,7 +123,7 @@ function Line({ m, turns, steps, onOpen }: { m: Moved; turns: number; steps: Mar
         <span className="flex min-w-0 flex-1">
           <Named name={row.name} title={row.title} />
         </span>
-        <span className={`shrink-0 text-xs ${glyphText[row.glyph]}`}>{row.label}</span>
+        <StateLabel of={row} className={`shrink-0 text-xs ${glyphText[row.glyph]}`} />
       </span>
       <span className="flex gap-1.5 pl-5 text-[11px] text-neutral-500">
         <span className="truncate">{m.workspace}</span>

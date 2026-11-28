@@ -8,7 +8,7 @@ import { ended, endOf } from "./ends";
 import { matches, MD } from "./media";
 import { locate, type Located, type MachineView, type WorkspaceView } from "./fleet";
 import { button, dangerButton, Modal } from "./Modal";
-import { StateGlyph } from "./StateGlyph";
+import { StateGlyph, StateLabel } from "./StateGlyph";
 
 interface Actions {
   machines: MachineView[];
@@ -391,7 +391,7 @@ function EndDialog({ id, found, onDone }: { id: string; found: Located; onDone: 
         <span className="truncate">
           {found.workspace.name} / {found.title ?? found.name}
         </span>
-        <span className="ml-auto shrink-0 text-neutral-500">{found.label}</span>
+        <StateLabel of={found} className="ml-auto shrink-0 text-neutral-500" />
       </p>
       {end.isError && (
         <p role="alert" className="mt-2 text-xs text-red-400">

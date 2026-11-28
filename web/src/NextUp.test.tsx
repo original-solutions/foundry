@@ -4,7 +4,7 @@ import { NextUp, useOpenStanding } from "./NextUp";
 import type { Needing } from "./needing";
 import { renderApp } from "./test-utils";
 
-const next: Needing = { terminal: "t4", workspace: "tidy cart styles", name: "opus", glyph: "waiting", label: "Needs you", now: { kind: "ask", text: "Run the integration tests against staging?" } };
+const next: Needing = { terminal: "t4", workspace: "tidy cart styles", name: "opus", glyph: "waiting", label: "Needs you", fullLabel: "Needs you", now: { kind: "ask", text: "Run the integration tests against staging?" } };
 
 describe("NextUp", () => {
   it("from a view with no terminal open, leads to the first that needs you, saying where it is, what it asks and how many need you", async () => {
@@ -33,9 +33,17 @@ describe("NextUp", () => {
   });
 
   it("says what state it is in when it asks nothing", async () => {
-    await renderApp(<NextUp next={{ ...next, glyph: "stuck", label: "Stuck", now: undefined }} others={1} />);
+    await renderApp(<NextUp next={{ ...next, glyph: "stuck", label: "Stuck", fullLabel: "Stuck", now: undefined }} others={1} />);
     const link = await screen.findByRole("link", { name: "Next that needs you: tidy cart styles / opus, 1 needs you" });
     expect(link.textContent).toContain("Stuck");
+  });
+
+  it("says what a held-up factory run is stuck on, its whole reason, since the strip has the room and cuts it itself", async () => {
+    const held = { ...next, glyph: "done" as const, label: "Stuck · gate red: make check…", fullLabel: "Stuck · gate red: make check fails on main, see the gate log", now: undefined };
+    await renderApp(<NextUp next={held} others={1} />);
+    const link = await screen.findByRole("link", { name: "Next that needs you: tidy cart styles / opus, 1 needs you" });
+    expect(link.textContent).toContain("Stuck · gate red: make check fails on main, see the gate log");
+    expect(link.title).toContain("Stuck · gate red: make check fails on main, see the gate log ·");
   });
 });
 

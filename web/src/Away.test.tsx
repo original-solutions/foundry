@@ -146,6 +146,19 @@ describe("Away", () => {
     expect(items.map((b) => b.getAttribute("aria-label"))).toEqual(["Open opus in tidy readme: Stuck", "Open opus in fix login: Ready"]);
   });
 
+  it("says a held-up run's whole reason on hover and to a screen reader, where its label cuts it", async () => {
+    const reason = "gate red: make check fails on main, see the gate log";
+    const { move } = view(fleetAt(), vi.fn(), factoryStatus("p1", {}, { "original-solutions__foundry__170__1": { kind: "stuck", workspaces: ["w2"], reason } }));
+    vi.spyOn(Date, "now").mockReturnValue(at(0));
+    setVisibility("hidden");
+    move(fleetAt({ s3: "finished" }, { s3: 3 }));
+    vi.spyOn(Date, "now").mockReturnValue(at(12));
+    setVisibility("visible");
+
+    const line = await within(panel()).findByRole("button", { name: `Open opus in tidy readme: Stuck · ${reason}` });
+    expect(within(line).getByText("Stuck · gate red: make check…").getAttribute("title")).toBe(`Stuck · ${reason}`);
+  });
+
   it("puts a session that needs you above a live factory run's session, whatever their states", async () => {
     const { move } = view(fleetAt(), vi.fn(), factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1"] }));
     vi.spyOn(Date, "now").mockReturnValue(at(0));

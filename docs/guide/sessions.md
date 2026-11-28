@@ -24,7 +24,7 @@ When the bar is short of room, for example with the sidebar and Steps both open,
 
 A session is Claude Code. A shell is a plain command line in the same worktree, for running tests, checking git or making an edit yourself. Both show in the tab strip and the sidebar, and both take typing: click in the terminal and type.
 
-Only a session reports what it is doing. A shell shows **Open** while it is open, **Ended** after a clean exit and **Failed · exit N** after any other.
+Only a session reports what it is doing. A shell shows **Open** while it is open, **Ended** after a clean exit and **Failed · exit N** after any other. In a factory run's workspace, a terminal that has ended says where the run stands instead, and while the run waits on you an open shell does too. See [Session states](#session-states).
 
 ### Start a session or a shell
 
@@ -56,6 +56,8 @@ The tab, the sidebar and the board all show a session's state the same way. Thre
 | **Ready** | The turn is done and Claude waits for your next prompt. | Type a prompt, or pick a next step. |
 
 You may also see **Starting**, before the session has reported anything, and **Stuck**, after ten minutes with no output. Open a stuck session and see what it is doing. A session in a live factory run reads **Quiet 10+ min** instead, wherever it shows, because the factory watches it. See [Group the board](board.md#group-the-board). **Failed** and **Ended** mean it stopped. **Unreachable** means its machine cannot be reached right now.
+
+In a factory run's workspace, a session or shell that has ended or failed reads where the run stands instead: **Stuck ·** or **Needs info ·** followed by the reason the factory gave while the run waits on you, else the run's step, such as **Claimed**, **Building**, **Building · gate attempt 2** or **PR open**. While the run waits on you, a **Ready** session and an open shell read its reason too, since nothing moves until you act. A stuck run here is held up on its issue, not ten minutes quiet: read the reason, then act on the issue. A failed one still says it failed: hover its label, or listen with a screen reader, for **Failed** (**Failed · exit N** for a shell) before the run's stage, and type `failed` in **Jump to** to find it. The reason is cut to fit; hover the label to see all of it. The amber strip shows it whole. Hover the run's **#N** mark to see its stage, for example "Factory run, Building: open its issue".
 
 ## Steps
 

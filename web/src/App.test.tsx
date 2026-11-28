@@ -1620,6 +1620,31 @@ describe("App", () => {
     expect(tab().getAttribute("data-changed")).toBeNull();
   });
 
+  it("marks an ended terminal's tab in a factory run's workspace once when the run's step moves, since its label says the stage", async () => {
+    const records = [...live.records, terminal(ME, "t3", "w1", "exited", { exit_code: 0 })];
+    const router = await open("/terminals/t3", { ...live, records });
+    const events = sockets("/api/events").at(-1)!;
+    const run = { run: "original-solutions__foundry__162__1", title: "t", step: "building", machine: ME, gate_retries_used: 0, minutes_used: 1, workspaces: ["w1"], sessions: ["s1"] };
+    const at = (step: string) => act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: { ...heldStatus(2), runs: [{ ...run, step }] } })));
+    at("building");
+    const ended = () => screen.getByRole("tab", { name: /^shell 2/ });
+    await waitFor(() => expect(ended().getAttribute("title")).toBe("fix login / shell 2: Building"));
+    fireEvent.click(screen.getByRole("tab", { name: /^sonnet/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+    expect(ended().getAttribute("data-changed")).toBeNull();
+
+    at("pr-open");
+    expect(ended().getAttribute("data-changed")).toBe("true");
+    expect(within(ended()).getByText("PR open")).toBeDefined();
+    fireEvent.click(ended());
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t3"));
+    fireEvent.click(screen.getByRole("tab", { name: /^sonnet/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+    // The same status again is no news.
+    at("pr-open");
+    expect(ended().getAttribute("data-changed")).toBeNull();
+  });
+
   it("slides in a card when a session you are not looking at finishes its turn, and its Open goes there", async () => {
     const router = await open("/terminals/t2", live);
     const events = sockets("/api/events").at(-1)!;
@@ -2068,6 +2093,33 @@ describe("App", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(calls).toEqual([]);
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("shows a held-up run's whole reason on hover in the palette's actions and the End dialog", async () => {
+    mockActions();
+    const reason = "gate red: make check fails on main, see the gate log";
+    const records = live.records.map((r) => (r.kind === "session" && r.body.id === "s1" ? session(ME, "s1", "w1", "t1", "idle", { model: "sonnet" }) : r));
+    await open("/terminals/t1", { ...live, records });
+    const events = sockets("/api/events").at(-1)!;
+    const held = { run: "original-solutions__foundry__170__1", kind: "stuck", reason, workspaces: ["w1"] };
+    act(() => events.deliver(JSON.stringify({ type: "factory_status", protocol: 5, status: { ...heldStatus(2), held_up: [held] } })));
+    const cut = "Stuck · gate red: make check…";
+
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Jump to" });
+    const input = within(palette).getByRole("combobox");
+    fireEvent.change(input, { target: { value: "login sonnet" } });
+    fireEvent.keyDown(input, { key: "Tab" });
+    expect(within(palette).getByRole("listbox", { name: "Actions for fix login / sonnet" })).toBeDefined();
+    expect(within(palette).getByText(cut, { selector: ".ml-auto > span" }).getAttribute("title")).toBe(`Stuck · ${reason}`);
+    fireEvent.keyDown(input, { key: "Escape" });
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull());
+
+    fireEvent.keyDown(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "More" }), { key: "Enter" });
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "End sonnet…" }));
+    const end = await screen.findByRole("dialog", { name: "End sonnet?" });
+    expect(within(end).getByText(cut).getAttribute("title")).toBe(`Stuck · ${reason}`);
   });
 
   it("acts on a pick from the palette: Tab lists what can be done with it, typing narrows the list and Enter does it", async () => {

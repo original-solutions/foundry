@@ -2,8 +2,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AnyRecord, Mark, SessionState } from "./api";
-import { fleet } from "./fleet";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { fleet, withFactory } from "./fleet";
+import { factoryStatus, ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { RETRY_EVERY } from "./poll";
 import { STEPS_EVERY } from "./StepsPanel";
 import { json } from "./test-utils";
@@ -115,6 +115,19 @@ describe("Timeline", () => {
     expect(reads.some((url) => url.includes("/s4/"))).toBe(false);
   });
 
+  it("says a held-up run's stage on its lane, with the whole reason on hover", async () => {
+    const reason = "gate red: make check fails on main, see the gate log";
+    const machines = withFactory(fleet(withS1("idle"), listed()), factoryStatus("p1", {}, { "o__r__1027__2": { kind: "stuck", workspaces: ["w1"], reason } }));
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Timeline machines={machines} traced={traced} onSteps={vi.fn()} />
+      </QueryClientProvider>,
+    );
+    const head = await waitFor(() => within(lane(/^opus .*fix login/)).getByRole("button", { name: /^opus/ }));
+    expect(head.getAttribute("title")).toBe(`opus · fix login: Stuck · ${reason}`);
+    expect(within(head).getByText("Stuck · gate red: make check…").getAttribute("title")).toBe(`Stuck · ${reason}`);
+  });
+
   it("adds up the window: turns, agent time, tool calls and questions", async () => {
     show();
     await waitFor(() => expect(screen.getByText(/2 turns/)).toBeDefined());
@@ -187,6 +200,27 @@ describe("Timeline", () => {
     move("idle");
     await waitFor(() => expect(readsOf("s1")).toBe(8));
     expect(client.getQueryCache().findAll({ queryKey: ["trail", "s1"] })).toHaveLength(1);
+  });
+
+  it("reads an ended session's trail again only when the session moves, not when its factory run's step does", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const client = new QueryClient();
+    const at = (step: string) => {
+      const statuses = factoryStatus("p1", { o__r__162__1: ["w1"] });
+      statuses.p1.runs[0].step = step;
+      return (
+        <QueryClientProvider client={client}>
+          <Timeline machines={withFactory(fleet(withS1("finished"), listed()), statuses)} traced={traced} onSteps={vi.fn()} />
+        </QueryClientProvider>
+      );
+    };
+    const view = render(at("building"));
+    await waitFor(() => expect(readsOf("s1")).toBe(1));
+    expect(within(lane(/^opus .*fix login/)).getByText("Building")).toBeDefined();
+    view.rerender(at("pr-open"));
+    expect(within(lane(/^opus .*fix login/)).getByText("PR open")).toBeDefined();
+    await wait(60_000);
+    expect(readsOf("s1")).toBe(1);
   });
 
   it("keeps reading a working session after a failed read, at the back-off, and stops on a 404", async () => {

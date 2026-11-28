@@ -6,7 +6,7 @@ import { totals } from "./changes";
 import type { Card } from "./lanes";
 import { words } from "./labels";
 import { Now } from "./Now";
-import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
+import { glyphFill, glyphText, StateGlyph, StateLabel } from "./StateGlyph";
 import { TerminalMenu } from "./TerminalMenu";
 import { readStored, store } from "./storage";
 import { ProjectFace } from "./ProjectFace";
@@ -85,8 +85,8 @@ export function WorkspaceLine({ card, showMachine, onChanges, arrived = false }:
             <Link
               to="/terminals/$terminalId"
               params={{ terminalId: row.terminal }}
-              aria-label={`${row.name} ${row.label}`}
-              title={`${row.name}: ${row.label}${row.title ? ` · ${row.title}` : ""}`}
+              aria-label={`${row.name} ${row.fullLabel}`}
+              title={`${row.name}: ${row.fullLabel}${row.title ? ` · ${row.title}` : ""}`}
               className="grid size-6 place-items-center rounded hover:bg-neutral-800"
             >
               <StateGlyph glyph={row.glyph} />
@@ -123,7 +123,7 @@ export function WorkspaceLine({ card, showMachine, onChanges, arrived = false }:
       <span className={`col-start-2 row-start-2 flex min-w-0 items-baseline gap-2 text-xs md:col-span-1 md:col-start-3 md:row-start-1 ${none ? "col-span-2" : ""}`}>
         {lead ? (
           <>
-            <span className={`shrink-0 max-md:sr-only ${glyphText[lead.glyph]}`}>{lead.label}</span>
+            <StateLabel of={lead} className={`shrink-0 max-md:sr-only ${glyphText[lead.glyph]}`} />
             <Doing row={lead} />
           </>
         ) : (

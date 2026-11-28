@@ -33,7 +33,8 @@ export const nextKey = jumpKey === "⌘K" ? "⌘J" : "Ctrl J";
 export function NextUp({ next, others, open }: { next: Needing; others: number; open?: "needing" | "answered" }) {
   const answered = open === "answered";
   const count = `${others} ${open === "needing" ? "more " : ""}${others === 1 ? "needs" : "need"} you`;
-  const asks = next.now?.text ?? next.label;
+  // A factory run's whole reason: the strip has the room, and cuts it itself.
+  const asks = next.now?.text ?? next.fullLabel;
   return (
     <Link
       // A new element when it fills, so its glow plays once then.

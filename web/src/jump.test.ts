@@ -31,6 +31,21 @@ describe("destinations", () => {
     expect(destinations(run)[0]).toMatchObject({ kind: "terminal", terminal: "t1", label: "Quiet 10+ min", glyph: "stuck" });
   });
 
+  it("says a held-up run's stage on its ended session, with the whole reason beside it", () => {
+    const reason = "gate red: make check fails on main, see the gate log";
+    const records = [sample(ME, 1), workspace(ME, "w1", "fac/1027-2"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "finished")];
+    const run = withFactory(fleet(records, settings()), factoryStatus("p1", {}, { "o__r__1027__2": { kind: "stuck", workspaces: ["w1"], reason } }));
+    expect(destinations(run)[0]).toMatchObject({ kind: "terminal", terminal: "t1", label: "Stuck · gate red: make check…", fullLabel: `Stuck · ${reason}`, glyph: "done" });
+    // Found by words past the cut, as its tooltip shows them.
+    expect(search(destinations(run), "fails on main").map((d) => d.key)).toEqual(["t1"]);
+  });
+
+  it("finds a failed shell in a factory run by its own state, though its label says the run's stage", () => {
+    const records = [sample(ME, 1), workspace(ME, "w1", "fac/214-1"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "working"), terminal(ME, "t2", "w1", "exited", { exit_code: 2 })];
+    const run = withFactory(fleet(records, settings()), factoryStatus("p1", { o__r__214__1: ["w1"] }));
+    expect(search(destinations(run), "failed").map((d) => [d.key, d.kind === "terminal" && d.label])).toEqual([["t2", "Building"]]);
+  });
+
   it("lists every terminal in the fleet with its workspace, name, state and machine, then a new shell per workspace", () => {
     const all = destinations(machines());
     expect(all.map((d) => d.title)).toEqual(["fix login / sonnet", "fix login / shell", "tidy readme / opus", "New shell in fix login", "New shell in tidy readme"]);

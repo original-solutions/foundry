@@ -4,14 +4,14 @@ import { machineQuery, sessionTrail } from "./api";
 import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
 import { totals } from "./changes";
-import { branchOf, locate, rows, type MachineView, type WorkspaceView } from "./fleet";
+import { branchOf, locate, rows, type Located, type MachineView, type WorkspaceView } from "./fleet";
 import type { Destination } from "./jump";
 import { addsSteps, words, type Glyph } from "./labels";
 import { topFiles } from "./lanes";
 import { MD, useMediaQuery } from "./media";
 import { Now } from "./Now";
 import { BOARD_BUSY_EVERY, pollEvery } from "./poll";
-import { glyphText, StateGlyph } from "./StateGlyph";
+import { glyphText, StateGlyph, StateLabel } from "./StateGlyph";
 import { StepRow, STEPS_EVERY, useNow } from "./StepsPanel";
 import { useRereadOnChange } from "./Timeline";
 import { bars, heading } from "./spans";
@@ -55,7 +55,7 @@ export function Peek({ at, machines }: { at: Destination | undefined; machines: 
     const session = found.workspace.sessions.find((s) => s.terminal === at.terminal);
     return (
       <Shell label={`Preview of ${at.title}`}>
-        <Head glyph={found.glyph} label={found.label} name={found.name} workspace={found.workspace} machine={found.machine.name} many={machines.length > 1} />
+        <Head state={found} name={found.name} workspace={found.workspace} machine={found.machine.name} many={machines.length > 1} />
         {session ? (
           <>
             {session.title && <Said heading="Asked">“{session.title}”</Said>}
@@ -64,7 +64,7 @@ export function Peek({ at, machines }: { at: Destination | undefined; machines: 
                 <Now step={row.now} className="whitespace-normal" />
               </Part>
             )}
-            {mine ? <LastTurn session={session.id} glyph={found.glyph} label={found.label} asked={session.title} read={ready} /> : null}
+            {mine ? <LastTurn session={session.id} glyph={found.glyph} asked={session.title} read={ready} /> : null}
             {row.said && (
               <Part heading="Claude said">
                 <p className="line-clamp-8 border-l-2 border-sky-400/40 pl-2 text-xs leading-[1.125rem] whitespace-pre-line text-neutral-300">{row.said.replace(/\n{2,}/g, "\n")}</p>
@@ -99,7 +99,7 @@ export function Peek({ at, machines }: { at: Destination | undefined; machines: 
                     {r.name}
                     {r.title && <span className="text-neutral-500"> {r.title}</span>}
                   </span>
-                  <span className={glyphText[r.glyph]}>{r.label}</span>
+                  <StateLabel of={r} className={glyphText[r.glyph]} />
                 </li>
               ))}
             </ul>
@@ -154,17 +154,18 @@ function Shell({ label, children }: { label?: string; children: React.ReactNode 
   );
 }
 
-function Head({ glyph, label, name, workspace, machine, many }: { glyph?: Glyph; label?: string; name: string; workspace: WorkspaceView; machine: string; many: boolean }) {
+/** A preview's head: a terminal's `state` and its workspace, or a workspace alone. */
+function Head({ state, name, workspace, machine, many }: { state?: Pick<Located, "glyph" | "label" | "fullLabel">; name: string; workspace: WorkspaceView; machine: string; many: boolean }) {
   return (
     <header className="space-y-1">
-      {glyph && label && (
-        <p className={`flex items-center gap-2 text-xs font-medium ${glyphText[glyph]}`}>
-          <StateGlyph glyph={glyph} />
-          {label}
+      {state && (
+        <p className={`flex items-center gap-2 text-xs font-medium ${glyphText[state.glyph]}`}>
+          <StateGlyph glyph={state.glyph} />
+          <StateLabel of={state} />
         </p>
       )}
       <h3 className="text-base font-semibold text-neutral-50">
-        {glyph ? (
+        {state ? (
           <>
             <span className="text-neutral-400">{workspace.name} /</span> {name}
           </>
@@ -198,7 +199,7 @@ function Said({ heading, children }: { heading: string; children: React.ReactNod
 }
 
 /** The newest turn of a session of this machine: its prompt when it differs from the first, what it did and its newest steps. */
-function LastTurn({ session, glyph, label, asked, read }: { session: string; glyph: Glyph; label: string; asked?: string; read: boolean }) {
+function LastTurn({ session, glyph, asked, read }: { session: string; glyph: Glyph; asked?: string; read: boolean }) {
   const now = useNow();
   const { data } = useQuery({
     // The Steps column's entry, so they share what they read.
@@ -208,7 +209,7 @@ function LastTurn({ session, glyph, label, asked, read }: { session: string; gly
     retry: false,
     refetchInterval: pollEvery(STEPS_EVERY, addsSteps.includes(glyph)),
   });
-  useRereadOnChange(`${session}=${label}`);
+  useRereadOnChange(`${session}=${glyph}`);
   const busy = addsSteps.includes(glyph);
   const last = data ? bars(data, busy, now).filter((b) => !b.nudge).at(-1) : undefined;
   if (!last) return null;

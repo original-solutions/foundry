@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { AnyRecord, FactoryStatus, MachineHeld, UiMessage } from "./api";
-import { apply, branchOf, byUrgency, coordinatorOrder, emptyState, fleet, locate, machineNumbers, machineStats, rows, terminalRunning } from "./fleet";
+import { apply, branchOf, byUrgency, coordinatorOrder, emptyState, factoryRuns, fleet, locate, machineNumbers, machineStats, rows, runStage, terminalRunning, withFactory } from "./fleet";
 import type { Glyph } from "./labels";
-import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { factoryStatus, ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const full = (records: AnyRecord[]): UiMessage => ({ type: "state", protocol: 1, records, settings: settings() });
 const one = (record: AnyRecord): UiMessage => ({ type: "record", protocol: 1, record });
@@ -470,13 +470,13 @@ describe("locate", () => {
 
   it("lists a workspace's terminals as rows, sessions first, each with its session, name, label and glyph", () => {
     expect(rows(machines[0].workspaces[0])).toEqual([
-      { terminal: "t1", session: "s1", name: "sonnet", label: "Needs you", glyph: "waiting" },
-      { terminal: "sh1", name: "shell", label: "Failed · exit 2", glyph: "failed" },
+      { terminal: "t1", session: "s1", name: "sonnet", label: "Needs you", fullLabel: "Needs you", glyph: "waiting" },
+      { terminal: "sh1", name: "shell", label: "Failed · exit 2", fullLabel: "Failed · exit 2", glyph: "failed" },
     ]);
   });
 
   it("orders rows by what needs a person first: waiting, stuck, failed, working, then the rest", () => {
-    const row = (terminal: string, glyph: Glyph) => ({ terminal, name: terminal, label: "", glyph });
+    const row = (terminal: string, glyph: Glyph) => ({ terminal, name: terminal, label: "", fullLabel: "", glyph });
     const all = ["done", "ready", "working", "away", "failed", "starting", "stuck", "waiting"].map((g) => row(g, g as Glyph));
     expect(byUrgency(all).map((r) => r.glyph)).toEqual(["waiting", "stuck", "failed", "working", "starting", "ready", "done", "away"]);
   });
@@ -613,6 +613,95 @@ describe("a workspace's base, project and branch", () => {
   it("shows its branch, or the first 7 characters of its commit when its branch is empty", () => {
     const [machine] = fleet([sample(ME, 1), workspace(ME, "w2", "fix login"), commitOnly()], settings());
     expect(machine.workspaces.map(branchOf)).toEqual(["fix-login", "0123456"]);
+  });
+});
+
+describe("a factory run's stage", () => {
+  const run = "o__r__1027__2";
+  const records = (): AnyRecord[] => [
+    sample(ME, 1),
+    workspace(ME, "w1", "fac/1027-2"),
+    terminal(ME, "t1", "w1"),
+    session(ME, "s1", "w1", "t1", "finished"),
+    terminal(ME, "t2", "w1"),
+    session(ME, "s2", "w1", "t2", "working"),
+    terminal(ME, "t3", "w1"),
+    session(ME, "s3", "w1", "t3", "waiting_for_you"),
+    terminal(ME, "t4", "w1"),
+    session(ME, "s4", "w1", "t4", "idle"),
+    terminal(ME, "sh1", "w1", "exited", { exit_code: 0 }),
+    terminal(ME, "sh2", "w1", "exited", { exit_code: 2 }),
+    terminal(ME, "sh3", "w1"),
+  ];
+  const workspaceIn = (statuses: Record<string, FactoryStatus>) => withFactory(fleet(records(), settings()), statuses)[0].workspaces[0];
+  const labels = (statuses: Record<string, FactoryStatus>) => rows(workspaceIn(statuses)).map((r) => [r.terminal, r.label]);
+
+  it("says what a stuck run is stuck on, cut short, on each terminal at rest, with the whole reason beside it", () => {
+    const reason = "gate red: make check fails on main, see the gate log for the failing target";
+    const statuses = factoryStatus("p1", {}, { [run]: { kind: "stuck", workspaces: ["w1"], reason } });
+    const short = "Stuck · gate red: make check…";
+    expect(labels(statuses)).toEqual([
+      ["t1", short],
+      ["t2", "Working"],
+      ["t3", "Needs you"],
+      ["t4", short],
+      ["sh1", short],
+      ["sh2", short],
+      ["sh3", short],
+    ]);
+    expect(rows(workspaceIn(statuses))[0].fullLabel).toBe(`Stuck · ${reason}`);
+    // A failed one keeps its own state in its uncut words, for a screen reader and the tooltip.
+    expect(rows(workspaceIn(statuses))[5].fullLabel).toBe(`Failed · exit 2 — Stuck · ${reason}`);
+    expect(rows(workspaceIn(statuses))[1].fullLabel).toBe("Working");
+  });
+
+  it("gives a label that already says the whole reason as its own uncut words", () => {
+    const statuses = factoryStatus("p1", {}, { [run]: { kind: "stuck", workspaces: ["w1"], reason: "make check fails on main" } });
+    const [ended] = rows(workspaceIn(statuses));
+    expect([ended.label, ended.fullLabel]).toEqual(["Stuck · make check fails on main", "Stuck · make check fails on main"]);
+  });
+
+  it("cuts a reason with no word break in its second half at the room itself", () => {
+    const stage = runStage({ run, held: "stuck", reason: "npm ERR! /Users/ci/work/foundry/web/node_modules/vite" })!;
+    expect(stage.label).toBe("Stuck · npm ERR! /Users/ci/work…");
+    expect(stage.label).toHaveLength(32);
+    expect(stage.full).toBe("Stuck · npm ERR! /Users/ci/work/foundry/web/node_modules/vite");
+  });
+
+  it("says needs info with the reason's first line, and a run held up with no reason by its kind alone", () => {
+    const info = factoryStatus("p1", {}, { [run]: { kind: "needs_info", workspaces: ["w1"], reason: "Which API version?\nThe issue names two." } });
+    expect(runStage(factoryRuns(info)(workspaceIn(info))!)).toEqual({ label: "Needs info · Which API version?", full: "Needs info · Which API version?\nThe issue names two." });
+    expect(runStage({ run, held: "stuck", reason: " " })).toEqual({ label: "Stuck", full: "Stuck" });
+  });
+
+  it("says a live run's step in words, with the gate attempt it is on while it builds", () => {
+    expect(runStage({ run, step: "building" })?.label).toBe("Building");
+    // Two gate tries closed, failed or passed alike: it builds towards the third.
+    expect(runStage({ run, step: "building", gateTries: 2 })?.label).toBe("Building · gate attempt 3");
+    // Past building the count says nothing about the gate: a run whose gate passed first time has one.
+    expect(runStage({ run, step: "pr-open", gateTries: 1 })?.label).toBe("PR open");
+    expect(runStage({ run, step: "pr-open" })?.label).toBe("PR open");
+    expect(runStage({ run, step: "claimed" })?.label).toBe("Claimed");
+    expect(runStage({ run, step: "triage" })?.label).toBe("Triage");
+    // A step a newer daemon sends is said as it is named.
+    expect(runStage({ run, step: "merge-queue" })?.label).toBe("Merge queue");
+    expect(runStage({ run })).toBeUndefined();
+  });
+
+  it("carries a live run's step and gate tries from its status, and names its stage on its terminals that ended", () => {
+    const statuses = factoryStatus("p1", { [run]: ["w1"] });
+    statuses.p1.runs[0].gate_retries_used = 1;
+    expect(workspaceIn(statuses).factory).toMatchObject({ step: "building", gateTries: 1 });
+    const building = "Building · gate attempt 2";
+    // A ready session or an open shell keeps its own state: the factory moves it, and its turn ending is news.
+    expect(labels(statuses).map(([, label]) => label)).toEqual([building, "Working", "Needs you", "Ready", building, building, "Open"]);
+    expect(rows(workspaceIn(statuses)).map((r) => r.fullLabel)).toEqual([building, "Working", "Needs you", "Ready", building, `Failed · exit 2 — ${building}`, "Open"]);
+  });
+
+  it("leaves a workspace no run tends with its terminals' own labels", () => {
+    const own = rows(fleet(records(), settings())[0].workspaces[0]);
+    expect(own.map((r) => r.label)).toEqual(["Ended", "Working", "Needs you", "Ready", "Ended", "Failed · exit 2", "Open"]);
+    expect(own.every((r) => r.fullLabel === r.label)).toBe(true);
   });
 });
 

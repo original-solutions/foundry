@@ -4,7 +4,7 @@ import { useEffect, useRef, type ReactNode } from "react";
 import { rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { useWidth } from "./media";
 import { Named } from "./Now";
-import { glyphText, StateGlyph } from "./StateGlyph";
+import { glyphText, StateGlyph, StateLabel } from "./StateGlyph";
 import { SessionNameField, useRenaming } from "./SessionName";
 import { TerminalMenu, useTerminalActions } from "./TerminalMenu";
 
@@ -64,7 +64,7 @@ export function TabStrip({ workspace, machine, active, changed, apart = false }:
                   aria-selected={current}
                   data-changed={fresh ? "true" : undefined}
                   onDoubleClick={rename}
-                  title={`${workspace.name} / ${row.title ?? row.name}: ${row.label}`}
+                  title={`${workspace.name} / ${row.title ?? row.name}: ${row.fullLabel}`}
                   className={`flex h-7 min-w-0 max-w-[60vw] shrink-0 items-center gap-2 rounded-md px-2 text-xs md:max-w-72 ${
                     current ? "bg-neutral-800 text-neutral-100 ring-1 ring-neutral-700" : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
                   }`}
@@ -73,7 +73,7 @@ export function TabStrip({ workspace, machine, active, changed, apart = false }:
                   <span className={`flex min-w-0 ${fresh ? "font-semibold text-neutral-100" : ""}`}>
                     <Named name={row.name} title={row.title} />
                   </span>
-                  {(current || fresh) && <span className={`shrink-0 font-medium ${glyphText[row.glyph]}`}>{row.label}</span>}
+                  {(current || fresh) && <StateLabel of={row} className={`shrink-0 font-medium ${glyphText[row.glyph]}`} />}
                 </Link>
               </TerminalMenu>
             )}

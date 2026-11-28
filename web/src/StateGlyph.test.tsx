@@ -1,7 +1,7 @@
 import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { Glyph } from "./labels";
-import { glyphFill, glyphText, shapes, StateGlyph } from "./StateGlyph";
+import { glyphFill, glyphText, shapes, StateGlyph, StateLabel } from "./StateGlyph";
 
 const glyphs: Glyph[] = ["starting", "working", "waiting", "ready", "done", "failed", "stuck", "away"];
 
@@ -53,5 +53,27 @@ describe("StateGlyph", () => {
     }
     const { container } = render(<StateGlyph glyph="ready" />);
     expect(container.querySelector("svg")?.getAttribute("class")).toContain("text-neutral-");
+  });
+});
+
+describe("StateLabel", () => {
+  it("shows the label, and gives the uncut words to the tooltip and a screen reader only when they say more", () => {
+    const { container } = render(
+      <>
+        <p>
+          <StateLabel of={{ label: "Stuck · gate red: make check…", fullLabel: "Stuck · gate red: make check fails on main" }} className="text-xs" />
+        </p>
+        <p>
+          <StateLabel of={{ label: "Working", fullLabel: "Working" }} />
+        </p>
+      </>,
+    );
+    const [cut, whole] = [...container.querySelectorAll("p")].map((p) => p.firstElementChild!);
+    expect(cut.className).toBe("text-xs");
+    const shown = cut.querySelector('[aria-hidden="true"]')!;
+    expect([shown.textContent, shown.getAttribute("title")]).toEqual(["Stuck · gate red: make check…", "Stuck · gate red: make check fails on main"]);
+    expect(cut.querySelector(".sr-only")!.textContent).toBe("Stuck · gate red: make check fails on main");
+    // No tooltip or hidden copy that only says the label again.
+    expect([whole.outerHTML]).toEqual(['<span>Working</span>']);
   });
 });

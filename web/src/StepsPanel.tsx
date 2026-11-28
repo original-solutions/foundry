@@ -101,13 +101,14 @@ function Trail({ session, lens, onFile }: { session: Extract<StepsOf, { kind: "s
     refetchInterval: pollEvery(STEPS_EVERY, addsSteps.includes(session.glyph)),
     retry: false,
   });
-  // A state change means a hook arrived: read the trail again under the same entry.
-  const last = useRef(session.label);
+  // A state change means a hook arrived: read the trail again under the same entry. Its own
+  // state, not its label, which can say its factory run's stage.
+  const last = useRef(session.glyph);
   useEffect(() => {
-    if (last.current === session.label) return;
-    last.current = session.label;
+    if (last.current === session.glyph) return;
+    last.current = session.glyph;
     void client.invalidateQueries({ queryKey: ["trail", session.id], exact: true });
-  }, [session.label, session.id, client]);
+  }, [session.glyph, session.id, client]);
   const now = useNow();
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
@@ -123,7 +124,7 @@ function Trail({ session, lens, onFile }: { session: Extract<StepsOf, { kind: "s
     return <Note>{elsewhere ? "Steps are kept by the machine that runs it, and that is not this one, or its daemon restarted since it started." : error.message}</Note>;
   }
   if (isPending) return <Note>Reading steps…</Note>;
-  if (lens === "files" && data.length > 0) return <StepsFiles trail={data} workspace={session.workspace} label={session.label} onFile={onFile} />;
+  if (lens === "files" && data.length > 0) return <StepsFiles trail={data} workspace={session.workspace} glyph={session.glyph} onFile={onFile} />;
   const all = turns(data);
   if (all.length === 0) return <Note>No steps yet. Each prompt you send, tool it runs and question it asks shows here as it happens.</Note>;
   return (

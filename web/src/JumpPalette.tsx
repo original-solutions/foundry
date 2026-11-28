@@ -8,7 +8,7 @@ import { locate, type MachineView } from "./fleet";
 import { viewLook } from "./Modal";
 import { destinations, newWorkspace, search, type Command, type Destination } from "./jump";
 import { Peek, useWide } from "./Peek";
-import { StateGlyph } from "./StateGlyph";
+import { StateGlyph, StateLabel } from "./StateGlyph";
 import { actsFor, Icon, useTerminalActions, type Act } from "./TerminalMenu";
 
 /** The key that opens the palette, as this platform writes it. */
@@ -326,7 +326,9 @@ function Panel({
                       {d.kind === "terminal" && d.subtitle && <span className="block truncate text-xs text-neutral-500">{d.subtitle}</span>}
                       {d.kind === "command" && !wide && <span className="block truncate text-xs text-neutral-500">{d.command.about}</span>}
                     </span>
-                    {d.kind === "terminal" && <span className="shrink-0 text-xs text-neutral-400">{d.label}</span>}
+                    {d.kind === "terminal" && (
+                      <StateLabel of={d} className="shrink-0 text-xs text-neutral-400" />
+                    )}
                     {d.kind === "command" && d.command.hint && (
                       <span className={`shrink-0 text-xs ${d.command.hint === "Here" ? "text-neutral-200" : "text-neutral-400"}`}>{d.command.hint}</span>
                     )}
@@ -371,7 +373,7 @@ function Panel({
           <>
             <span>↵ do it</span>
             <span>esc back</span>
-            <span className="ml-auto">{target?.label}</span>
+            {target && <StateLabel of={target} className="ml-auto" />}
           </>
         ) : (
           <>

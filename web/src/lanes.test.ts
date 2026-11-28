@@ -101,11 +101,11 @@ describe("lanes of factory runs", () => {
   const board = fleet(records, settings({ machines: [] }));
   const named = (b: ReturnType<typeof lanes>) => b.map((l) => [l.lane, l.cards.map((c) => c.workspace.name)]);
 
-  it("marks a workspace a believed status names with its run and its issue", () => {
+  it("marks a workspace a believed status names with its run, its issue and its step", () => {
     const statuses = factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1"] });
     const of = factoryRuns(statuses);
     const [w1, , w3] = board[0].workspaces;
-    expect(of(w1)).toEqual({ run: "original-solutions__foundry__162__1", issue: 162, url: "https://github.com/original-solutions/foundry/issues/162" });
+    expect(of(w1)).toEqual({ run: "original-solutions__foundry__162__1", issue: 162, url: "https://github.com/original-solutions/foundry/issues/162", step: "building" });
     expect(of(w3)).toBeUndefined();
     const card = lanes(withFactory(board, statuses))
       .flatMap((l) => l.cards)
@@ -115,7 +115,7 @@ describe("lanes of factory runs", () => {
 
   it("marks the resume workspace of a run that lists its build workspace, then the resume workspace", () => {
     const of = factoryRuns(factoryStatus("p1", { "original-solutions__foundry__162__1": ["w1", "w2"] }));
-    const mark = { run: "original-solutions__foundry__162__1", issue: 162, url: "https://github.com/original-solutions/foundry/issues/162" };
+    const mark = { run: "original-solutions__foundry__162__1", issue: 162, url: "https://github.com/original-solutions/foundry/issues/162", step: "building" };
     expect(of(board[0].workspaces[0])).toEqual(mark);
     expect(of(board[0].workspaces[1])).toEqual(mark);
   });

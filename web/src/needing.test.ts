@@ -52,6 +52,13 @@ describe("needing and the factory", () => {
     const run = withFactory(fleet(records, settings()), factoryStatus("p1", { o__r__162__1: ["w1"] }, { o__r__170__1: { kind: "stuck", workspaces: ["w2"] } }));
     expect(needing(run).map((n) => [n.workspace, n.terminal])).toEqual([["fac 170", "t2"]]);
   });
+
+  it("says what the held-up run is stuck on, not that its session ended, with the whole reason beside it", () => {
+    const reason = "gate red: make check fails on main, see the gate log";
+    const run = withFactory(fleet(records, settings()), factoryStatus("p1", {}, { o__r__170__1: { kind: "stuck", workspaces: ["w2"], reason } }));
+    const held = needing(run).find((n) => n.terminal === "t2");
+    expect(held && [held.label, held.fullLabel]).toEqual(["Stuck · gate red: make check…", `Stuck · ${reason}`]);
+  });
 });
 
 describe("upNext", () => {
