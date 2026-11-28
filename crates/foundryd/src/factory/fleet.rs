@@ -22,7 +22,7 @@ use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
 use serde_json::Value;
 
 use super::messages::Message;
-use super::worker::{CreateWorkspace, Worker, WorkerError};
+use super::worker::{CreateWorkspace, Target, Worker, WorkerError, fleet_machine};
 use crate::api::{self, Api};
 use crate::secrets::redact;
 use crate::sessions::factory::{FactoryStart, SendRefused};
@@ -292,11 +292,8 @@ impl FleetWorker {
 }
 
 impl Worker for FleetWorker {
-    fn create(
-        &self,
-        machine: MachineId,
-        request: CreateWorkspace,
-    ) -> Result<WorkspaceId, WorkerError> {
+    fn create(&self, target: Target, request: CreateWorkspace) -> Result<WorkspaceId, WorkerError> {
+        let machine = fleet_machine(target)?;
         let answer = self.answered(create_request(machine, &request))?;
         created_id(&answer).map(WorkspaceId)
     }
@@ -385,6 +382,22 @@ impl Worker for FleetWorker {
                 }
             }
         })
+    }
+
+    fn advance(&self, _workspace: WorkspaceId) -> Result<(), WorkerError> {
+        Ok(())
+    }
+
+    fn rest(&self, _workspace: WorkspaceId) -> Result<(), WorkerError> {
+        Ok(())
+    }
+
+    fn wake(&self, _workspace: WorkspaceId) -> Result<(), WorkerError> {
+        Ok(())
+    }
+
+    fn keep(&self, _workspace: WorkspaceId) -> Result<(), WorkerError> {
+        Ok(())
     }
 }
 

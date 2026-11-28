@@ -34,7 +34,7 @@
 //!   [`Tracker::gh`].
 
 use foundry_proto::factory::{RunEvent, RunId};
-use foundry_proto::ids::{MachineId, SessionId, WorkspaceId};
+use foundry_proto::ids::{SessionId, WorkspaceId};
 use foundry_proto::record::{Record, Workspace};
 use foundry_proto::state::{SessionState, TerminalState};
 use serde::Deserialize;
@@ -68,7 +68,7 @@ use crate::factory::lifecycle::{
 };
 use crate::factory::messages::{self, CUT_SHORT_COMMENT, Message, ResumeFrom};
 use crate::factory::text;
-use crate::factory::worker::{CreateWorkspace, WorkerError};
+use crate::factory::worker::{CreateWorkspace, Target, WorkerError};
 use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
 use crate::workspaces::{Checkout, FactoryTag, Setup};
 
@@ -139,12 +139,8 @@ pub enum ClaimOutcome {
     },
 }
 
-/// Claims `issue`, to be built on `machine`. See the module's words for the order.
-pub fn claim(
-    ctx: &RunContext<'_>,
-    issue: u64,
-    machine: MachineId,
-) -> Result<ClaimOutcome, RunError> {
+/// Claims `issue`, to be built at `target`. See the module's words for the order.
+pub fn claim(ctx: &RunContext<'_>, issue: u64, target: Target) -> Result<ClaimOutcome, RunError> {
     let repo = ctx.repo();
     let detail = ctx.tracker.issue(repo, issue)?;
     // A closed issue is never claimed, whatever its label says: its unfinished runs are ended.
@@ -192,7 +188,7 @@ pub fn claim(
     ctx.record(
         &run,
         Event::Claimed {
-            machine: machine.to_string(),
+            machine: target.to_string(),
             github_user: ctx.project.login.clone(),
         },
         &cause,
@@ -203,7 +199,7 @@ pub fn claim(
         .held()
         .and_then(|_| {
             ctx.tracker
-                .post_claim(repo, issue, &run, &machine)
+                .post_claim(repo, issue, &run, &target)
                 .map_err(RunError::from)
         })
         .and_then(|()| ctx.set_state(issue, State::Triage))
@@ -222,7 +218,7 @@ pub fn claim(
     )?;
     ctx.upsert_status(
         issue,
-        &messages::status(State::Triage, &machine.to_string(), None, None),
+        &messages::status(State::Triage, &target.to_string(), None, None),
     )?;
     Ok(ClaimOutcome::Claimed { run })
 }
@@ -776,15 +772,14 @@ fn finish_begun_path(
         // The decision holds no setup output; the workspace is kept, so the tail is read again
         // as the first pass read it. A failed read posts the reason alone.
         if decision.code == "setup-failed"
-            && let Some(machine) = seen
+            && let Some(target) = seen
                 .machine
                 .as_deref()
-                .and_then(|machine| uuid::Uuid::parse_str(machine).ok())
-                .map(MachineId)
+                .and_then(|machine| machine.parse::<Target>().ok())
             && let Some(record) = find_workspace(
                 ctx,
                 &build_name(run),
-                machine,
+                target,
                 seen.workspace.as_deref().map(workspace_id).transpose()?,
             )
             && let Some(terminal) = record.body.setup
@@ -835,11 +830,8 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
         return skipped(format!("issue #{issue} is ready: the claim was cut short"));
     }
     let comments = ctx.tracker.issue_comments(repo, issue)?;
-    let machine = match newest_claim(&comments, &ctx.project.login) {
-        Some(Claim::Foundry {
-            run: named,
-            machine,
-        }) if named == *run => machine,
+    let target = match newest_claim(&comments, &ctx.project.login) {
+        Some(Claim::Foundry { run: named, target }) if named == *run => target,
         Some(Claim::Foundry { run: named, .. }) => {
             return skipped(format!(
                 "the issue's newest claim names run {named}, not {run}"
@@ -862,7 +854,7 @@ fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunE
     ctx.record(
         run,
         Event::Claimed {
-            machine: machine.to_string(),
+            machine: target.to_string(),
             github_user: ctx.project.login.clone(),
         },
         &Cause::new(CauseStep::Start, "claim-found"),
@@ -1245,11 +1237,11 @@ fn run_base(
 }
 
 /// The workspace record of the run's build, as the fleet shows it: `id` when the worker
-/// answered, else the one named so, on `machine` first.
+/// answered, else the one named so, at `target` first.
 fn find_workspace(
     ctx: &RunContext<'_>,
     name: &str,
-    machine: MachineId,
+    target: Target,
     id: Option<WorkspaceId>,
 ) -> Option<Record<Workspace>> {
     let named = ctx.view.workspaces_named(ctx.project.id, name);
@@ -1257,7 +1249,7 @@ fn find_workspace(
         Some(id) => named.into_iter().find(|record| record.body.id == id),
         None => named
             .iter()
-            .find(|record| record.owner == machine)
+            .find(|record| Target::Machine(record.owner) == target)
             .or(named.first())
             .copied(),
     }
@@ -1275,17 +1267,16 @@ fn build(
     at: &mut Progress,
 ) -> Result<StartStep, RunError> {
     let issue = run.issue();
-    let machine = seen
+    let target = seen
         .machine
         .as_deref()
-        .and_then(|machine| uuid::Uuid::parse_str(machine).ok())
-        .map(MachineId)
+        .and_then(|machine| machine.parse::<Target>().ok())
         .ok_or_else(|| {
             RunError::Invalid(format!("run {run} has no machine its build is asked of"))
         })?;
     let name = build_name(run);
     let wanted = seen.workspace.as_deref().map(workspace_id).transpose()?;
-    let found = find_workspace(ctx, &name, machine, wanted);
+    let found = find_workspace(ctx, &name, target, wanted);
     let cause = Cause::new(CauseStep::Start, "launch-decided");
     // What the launch is decided on, once, and recorded before the workspace is asked for.
     let (base, resumed) = if seen.workspace_requested.is_some() {
@@ -1358,7 +1349,7 @@ fn build(
             };
             // A create that fails with no answer is asked again next pass, and the worker's
             // create answers with the first by tag and name.
-            let id = ctx.create(machine, request)?;
+            let id = ctx.create(target, request)?;
             ctx.record_step(
                 run,
                 &format!("{WORKSPACE_CREATED}{id}"),
@@ -1392,7 +1383,10 @@ fn build(
                     reason: SETUP_FAILED.into(),
                 });
             }
-            _ => return Ok(StartStep::Waiting(Wait::Setup)),
+            _ => {
+                ctx.advance(workspace)?;
+                return Ok(StartStep::Waiting(Wait::Setup));
+            }
         }
     }
     // A factory session the fleet already shows in the workspace (one with a turn record: a
@@ -1951,6 +1945,12 @@ mod tests {
                     target: Target::Machine(rig.machine)
                 })
             );
+            let events = rig.events(&run);
+            assert_eq!(events[0].cause.as_ref().unwrap()["actor"], "tom");
+            assert_eq!(events[1].data["machine"], rig.machine.to_string());
+            assert_eq!(events[1].data["github_user"], LOGIN);
+        }
+
         /// A claim at a host names the host's kind in its marker and in the `claimed` line.
         #[test]
         fn a_claim_at_a_host_names_its_kind_in_the_marker_and_the_claimed_line() {
@@ -1975,12 +1975,6 @@ mod tests {
                 })
             );
             assert_eq!(rig.events(&run)[1].data["machine"], "vims");
-        }
-
-            let events = rig.events(&run);
-            assert_eq!(events[0].cause.as_ref().unwrap()["actor"], "tom");
-            assert_eq!(events[1].data["machine"], rig.machine.to_string());
-            assert_eq!(events[1].data["github_user"], LOGIN);
         }
 
         /// The runner's case "a refusal posts the comment, moves the issue to proposed and makes
@@ -3603,6 +3597,12 @@ mod tests {
                 assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Setup));
                 assert!(start_sessions(&rig).is_empty());
                 assert!(
+                    !calls(&rig)
+                        .iter()
+                        .any(|call| matches!(call, Call::Tail { .. }))
+                );
+            }
+
             #[test]
             fn still_running_is_advanced_once_a_pass_with_its_workspace() {
                 let (mut rig, run) = claimed_rig();
@@ -3643,12 +3643,6 @@ mod tests {
                     .map(|(_, c)| c)
                     .collect();
                 assert_eq!(kept, [HostCall::Keep { workspace: ws_id() }]);
-            }
-
-                    !calls(&rig)
-                        .iter()
-                        .any(|call| matches!(call, Call::Tail { .. }))
-                );
             }
 
             #[test]

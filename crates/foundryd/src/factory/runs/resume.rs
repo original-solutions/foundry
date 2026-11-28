@@ -287,7 +287,7 @@ use crate::factory::messages::{
     ResumeFrom, SESSION_GONE, prepare_output_tail, prepare_session_text,
 };
 use crate::factory::text;
-use crate::factory::worker::{CreateWorkspace, FleetView, WorkerError};
+use crate::factory::worker::{self, CreateWorkspace, FleetView, Target, WorkerError};
 use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
 use crate::workspaces::{Checkout, FactoryTag, Setup};
 
@@ -405,16 +405,12 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<ResumeStep, RunError
     pass(ctx, run, None)
 }
 
-/// [`advance`] after placement picked `machine` for what [`ResumeStep::NeedsMachine`] asked.
-/// The machine is recorded as a step before anything is asked of it, and a machine already
+/// [`advance`] after placement picked `target` for what [`ResumeStep::NeedsMachine`] asked.
+/// The target is recorded as a step before anything is asked of it, and a target already
 /// recorded for the resume stands. A call when nothing needs a machine is skipped, and a claim
 /// is never moved to the machine it is unreachable on.
-pub fn placed(
-    ctx: &RunContext<'_>,
-    run: &RunId,
-    machine: MachineId,
-) -> Result<ResumeStep, RunError> {
-    pass(ctx, run, Some(machine))
+pub fn placed(ctx: &RunContext<'_>, run: &RunId, target: Target) -> Result<ResumeStep, RunError> {
+    pass(ctx, run, Some(target))
 }
 
 /// The workspaces of `run` that it has moved on from, which `view` shows on machines that are
@@ -652,8 +648,8 @@ pub(super) struct Round {
     /// The workspace the archive is of, as written: an id or `none`.
     archiving: Option<String>,
     archive_asked: bool,
-    /// The machine recorded for the resume and not given up.
-    machine: Option<MachineId>,
+    /// The target recorded for the resume and not given up.
+    machine: Option<Target>,
     /// The machines recorded for it that were given up.
     gave_up: Vec<MachineId>,
     requested: bool,
@@ -669,6 +665,10 @@ pub(super) struct Round {
 
 fn parse_machine(text: &str) -> Option<MachineId> {
     uuid::Uuid::parse_str(text).ok().map(MachineId)
+}
+
+fn parse_target(text: &str) -> Option<Target> {
+    text.parse().ok()
 }
 
 /// The newest `session_interrupted` line that is a resume, and the steps after it.
@@ -709,7 +709,7 @@ pub(super) fn read_round(events: &[RunEvent]) -> Option<Round> {
             round.sending = false;
             round.ending_sessions = false;
         } else if let Some(rest) = numbered(step, MACHINE, k) {
-            round.machine = parse_machine(rest);
+            round.machine = parse_target(rest);
             round.requested = false;
             round.workspace = None;
             round.sending = false;
@@ -806,11 +806,7 @@ fn not_this_steps(ctx: &RunContext<'_>, run: &RunId, seen: &Seen) -> Option<Stri
 }
 
 /// One pass over `run`, with the machine placement picked when it was asked for one.
-fn pass(
-    ctx: &RunContext<'_>,
-    run: &RunId,
-    placed: Option<MachineId>,
-) -> Result<ResumeStep, RunError> {
+fn pass(ctx: &RunContext<'_>, run: &RunId, placed: Option<Target>) -> Result<ResumeStep, RunError> {
     let events = ctx.ledger.read(run)?;
     let seen = read_progress(&events);
     if let Some(reason) = not_this_steps(ctx, run, &seen) {
@@ -1543,7 +1539,7 @@ fn carry_on(
     at: &mut Progress,
     k: u32,
     branch: Option<&str>,
-    placed: Option<MachineId>,
+    placed: Option<Target>,
 ) -> Result<ResumeStep, RunError> {
     let issue = run.issue();
     let (closing, detail) = closed_issue(ctx, run, seen)?;
@@ -1587,10 +1583,13 @@ fn carry_on(
         }
         return Ok(ResumeStep::Waiting(Wait::Archive));
     }
-    let machine = match (round.machine, placed) {
-        (Some(machine), _) => machine,
-        (None, Some(machine)) => {
-            if round.gave_up.contains(&machine) && !ctx.view.online(machine) {
+    let target = match (round.machine, placed) {
+        (Some(target), _) => target,
+        (None, Some(target)) => {
+            if let Some(machine) = target.machine()
+                && round.gave_up.contains(&machine)
+                && !ctx.view.online(machine)
+            {
                 return Err(RunError::Invalid(format!(
                     "run {run} gave up on machine {machine} for resume {k}"
                 )));
@@ -1598,20 +1597,23 @@ fn carry_on(
             note(
                 ctx,
                 run,
-                &format!("{MACHINE}{k} {machine}"),
+                &format!("{MACHINE}{k} {target}"),
                 "resume-machine",
             )?;
-            machine
+            target
         }
         (None, None) => return Ok(ResumeStep::NeedsMachine(Placing::Resume { resumes: k })),
     };
     // A machine that stays away for 15 minutes before the session started is given up: nothing
     // ran, so no resume is spent, and what it made is for [`orphans`] when it is heard from.
-    if unreachable_long(ctx, machine) {
+    if target
+        .machine()
+        .is_some_and(|machine| unreachable_long(ctx, machine))
+    {
         note(
             ctx,
             run,
-            &format!("{MACHINE_GIVEN_UP}{k} {machine}"),
+            &format!("{MACHINE_GIVEN_UP}{k} {target}"),
             "resume-machine-given-up",
         )?;
         return Ok(ResumeStep::NeedsMachine(Placing::Resume { resumes: k }));
@@ -1634,10 +1636,9 @@ fn carry_on(
                 )?;
             }
             // A record the fleet shows with its setup started is the first create's answer.
-            let id = match named
-                .iter()
-                .find(|record| record.owner == machine && record.body.setup.is_some())
-            {
+            let id = match named.iter().find(|record| {
+                Target::Machine(record.owner) == target && record.body.setup.is_some()
+            }) {
                 Some(record) => record.body.id,
                 None => {
                     let checkout = match branch {
@@ -1650,7 +1651,7 @@ fn carry_on(
                         },
                     };
                     ctx.create(
-                        machine,
+                        target,
                         CreateWorkspace {
                             project: ctx.project.id,
                             name: name.clone(),
@@ -1691,7 +1692,10 @@ fn carry_on(
                 };
                 return stuck(ctx, run, at, STUCK_SETUP, stop);
             }
-            _ => return Ok(ResumeStep::Waiting(Wait::Setup)),
+            _ => {
+                ctx.advance(workspace)?;
+                return Ok(ResumeStep::Waiting(Wait::Setup));
+            }
         }
     }
     let title = detail.map(|detail| detail.title);
@@ -1699,7 +1703,7 @@ fn carry_on(
         run,
         seen,
         record: &record,
-        machine,
+        target,
         branch,
         title,
         k,
@@ -1786,7 +1790,7 @@ struct Launched<'a> {
     run: &'a RunId,
     seen: &'a Seen,
     record: &'a Record<Workspace>,
-    machine: MachineId,
+    target: Target,
     branch: Option<&'a str>,
     title: Option<String>,
     k: u32,
@@ -1839,7 +1843,7 @@ impl Launched<'_> {
             self.run.issue(),
             &messages::status(
                 State::Building,
-                &self.machine.to_string(),
+                &self.target.to_string(),
                 Some(&session.to_string()),
                 at.pr,
             ),
@@ -1904,9 +1908,11 @@ fn moved_claim(
     run: &RunId,
     events: &[RunEvent],
     seen: &Seen,
-    placed: Option<MachineId>,
+    placed: Option<Target>,
 ) -> Result<ResumeStep, RunError> {
     let issue = run.issue();
+    // Placement puts a claim on the fleet: a host is refused as the fleet worker refuses it.
+    let placed = placed.map(worker::fleet_machine).transpose()?;
     if seen.state != Some(State::Triage) {
         return skipped(run, "is not claimed and waiting for its workspace");
     }
@@ -1994,7 +2000,7 @@ fn moved_claim(
     // A create whose answer is lost is asked again: the worker answers with the first by tag
     // and name.
     let workspace = ctx.create(
-        target,
+        Target::Machine(target),
         CreateWorkspace {
             project: ctx.project.id,
             name,
@@ -3814,12 +3820,6 @@ mod tests {
             assert!(start_calls(&rig).is_empty());
         }
 
-        /// The session starts with the resume's first message on the pull request's branch, and
-        /// the launch line and the status comment name what started.
-        #[test]
-        fn the_resumed_session_is_started_recorded_and_named_in_the_status() {
-            let mut rig = Rig::new();
-            let run = run_id(1);
         /// A setup that is running is advanced each pass with its workspace; one that exited
         /// cleanly is not.
         #[test]
@@ -3844,6 +3844,12 @@ mod tests {
             assert_eq!(rig.worker.host_calls().len(), 1);
         }
 
+        /// The session starts with the resume's first message on the pull request's branch, and
+        /// the launch line and the status comment name what started.
+        #[test]
+        fn the_resumed_session_is_started_recorded_and_named_in_the_status() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
             building(&rig, &run);
             rig.view = failed();
             never_written(&rig);

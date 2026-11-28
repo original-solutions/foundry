@@ -7,10 +7,12 @@
 //! with no daemon.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
+use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use foundry_proto::factory::{MachineHeld, SessionTurn};
+use foundry_proto::factory::{HostKind, MachineHeld, SessionTurn};
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, MachineSample, Record, Session, Terminal, Workspace};
 use foundry_proto::state::{SessionState, TerminalState};
@@ -23,7 +25,7 @@ use crate::store::{Store, StoreError};
 use crate::sync::as_seen;
 use crate::workspaces::{Checkout, FactoryTag, Setup};
 
-/// What a new workspace is made from. The machine it is made on is a separate argument of
+/// What a new workspace is made from. Where it is made is a separate argument of
 /// [`Worker::create`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWorkspace {
@@ -54,15 +56,66 @@ pub enum WorkerError {
     NotWritten(String),
 }
 
+/// Where a run's workspace goes: a machine of the fleet, or a host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Target {
+    /// A machine of the fleet.
+    Machine(MachineId),
+    /// A host that makes the workspace itself.
+    Host(HostKind),
+}
+
+impl Target {
+    /// The machine this names, if it names one.
+    pub fn machine(&self) -> Option<MachineId> {
+        match self {
+            Self::Machine(machine) => Some(*machine),
+            Self::Host(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for Target {
+    /// A machine's id as [`MachineId`] shows it, and a host's kind as [`HostKind`] shows it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Machine(machine) => machine.fmt(f),
+            Self::Host(kind) => kind.fmt(f),
+        }
+    }
+}
+
+impl FromStr for Target {
+    type Err = String;
+
+    /// Parses a machine id in exactly the form Foundry writes it, else a host kind this build
+    /// knows.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if let Ok(uuid) = uuid::Uuid::parse_str(text)
+            && uuid.to_string() == text
+        {
+            return Ok(Self::Machine(MachineId(uuid)));
+        }
+        text.parse().map(Self::Host)
+    }
+}
+
+/// The machine of the fleet a call is for. A worker that runs only on the fleet refuses a host
+/// with [`WorkerError::Failed`], naming its kind.
+pub fn fleet_machine(target: Target) -> Result<MachineId, WorkerError> {
+    match target {
+        Target::Machine(machine) => Ok(machine),
+        Target::Host(kind) => Err(WorkerError::Failed(format!(
+            "the fleet worker makes no workspace on host {kind}"
+        ))),
+    }
+}
+
 /// What a run asks of the fleet. Every call is made after [`Guard::check`] passes.
 pub trait Worker: Send + Sync {
-    /// Makes a workspace on `machine`. A second create on the same machine with the same tag and
+    /// Makes a workspace at `target`. A second create at the same target with the same tag and
     /// name answers with the first workspace, while it is not archived.
-    fn create(
-        &self,
-        machine: MachineId,
-        request: CreateWorkspace,
-    ) -> Result<WorkspaceId, WorkerError>;
+    fn create(&self, target: Target, request: CreateWorkspace) -> Result<WorkspaceId, WorkerError>;
 
     /// Starts a factory session in `workspace` with `first` as its first message.
     fn start_session(
@@ -96,6 +149,23 @@ pub trait Worker: Send + Sync {
 
     /// Archives `workspace`, forced: uncommitted work is lost.
     fn archive(&self, workspace: WorkspaceId) -> Result<(), WorkerError>;
+
+    /// Takes one more step of the setup of a workspace that is still being set up. A host whose
+    /// create is a row of calls sends the next when the one under way has finished. Called each
+    /// pass, under the lease guard. The fleet does nothing.
+    fn advance(&self, workspace: WorkspaceId) -> Result<(), WorkerError>;
+
+    /// Puts a workspace whose session reported its pull request at rest, so its gate has room.
+    /// Resting one that is at rest does nothing. The fleet does nothing.
+    fn rest(&self, workspace: WorkspaceId) -> Result<(), WorkerError>;
+
+    /// Wakes a workspace that was put at rest, before a message is sent to its session. Waking
+    /// one that is awake does nothing. The fleet does nothing.
+    fn wake(&self, workspace: WorkspaceId) -> Result<(), WorkerError>;
+
+    /// Keeps the workspace of a run that went stuck, with its files, and ends what it runs. The
+    /// fleet does nothing.
+    fn keep(&self, workspace: WorkspaceId) -> Result<(), WorkerError>;
 }
 
 /// Why the factory may no longer act.
@@ -395,7 +465,7 @@ impl FleetViewBuilder {
 pub enum Call {
     /// [`Worker::create`].
     Create {
-        machine: MachineId,
+        target: Target,
         request: CreateWorkspace,
     },
     /// [`Worker::start_session`], with the four fields of its [`FactoryStart`].
@@ -423,6 +493,20 @@ pub enum Call {
     Archive { workspace: WorkspaceId },
 }
 
+/// One call to a [`FakeWorker`] of [`Worker::advance`], [`Worker::rest`], [`Worker::wake`] or
+/// [`Worker::keep`]. These are kept apart from [`Call`], which the fleet's calls fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostCall {
+    /// [`Worker::advance`].
+    Advance { workspace: WorkspaceId },
+    /// [`Worker::rest`].
+    Rest { workspace: WorkspaceId },
+    /// [`Worker::wake`].
+    Wake { workspace: WorkspaceId },
+    /// [`Worker::keep`].
+    Keep { workspace: WorkspaceId },
+}
+
 /// A worker that answers from a script and records every call, in order.
 ///
 /// Each method answers from its own queue, one answer per call in order; a method whose queue
@@ -435,6 +519,8 @@ pub struct FakeWorker {
 #[derive(Debug, Default)]
 struct FakeState {
     calls: Vec<Call>,
+    /// The host calls, each with how many of `calls` had been made before it.
+    host_calls: Vec<(usize, HostCall)>,
     create: VecDeque<Result<WorkspaceId, WorkerError>>,
     start_session: VecDeque<Result<SessionId, WorkerError>>,
     send: VecDeque<Result<u64, SendRefused>>,
@@ -443,7 +529,7 @@ struct FakeState {
     end_sessions: VecDeque<Result<(), WorkerError>>,
     archive: VecDeque<Result<(), WorkerError>>,
     /// The workspaces the default create made, by machine, tag and name.
-    made: Vec<(MachineId, FactoryTag, String, WorkspaceId)>,
+    made: Vec<(Target, FactoryTag, String, WorkspaceId)>,
     /// How many messages each session was delivered.
     delivered: BTreeMap<SessionId, u64>,
     /// The workspace each started session belongs to.
@@ -476,6 +562,13 @@ impl FakeWorker {
     /// whether it failed.
     pub fn calls(&self) -> Vec<Call> {
         self.lock().calls.clone()
+    }
+
+    /// Every call of [`Worker::advance`], [`Worker::rest`], [`Worker::wake`] and
+    /// [`Worker::keep`] so far, in order, each with the number of [`FakeWorker::calls`] made
+    /// before it. They are not in [`FakeWorker::calls`]. Each answers `Ok`.
+    pub fn host_calls(&self) -> Vec<(usize, HostCall)> {
+        self.lock().host_calls.clone()
     }
 
     /// Queues an answer for [`Worker::create`].
@@ -520,33 +613,37 @@ impl FakeWorker {
         self
     }
 
+    fn host_call(&self, call: HostCall) -> Result<(), WorkerError> {
+        let mut state = self.lock();
+        let before = state.calls.len();
+        state.host_calls.push((before, call));
+        Ok(())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, FakeState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl Worker for FakeWorker {
-    fn create(
-        &self,
-        machine: MachineId,
-        request: CreateWorkspace,
-    ) -> Result<WorkspaceId, WorkerError> {
+    fn create(&self, target: Target, request: CreateWorkspace) -> Result<WorkspaceId, WorkerError> {
         let mut state = self.lock();
         state.calls.push(Call::Create {
-            machine,
+            target,
             request: request.clone(),
         });
         if let Some(answer) = state.create.pop_front() {
             return answer;
         }
+        fleet_machine(target)?;
         let known = state.made.iter().find(|(on, tag, name, _)| {
-            *on == machine && *tag == request.tag && *name == request.name
+            *on == target && *tag == request.tag && *name == request.name
         });
         if let Some((_, _, _, made)) = known {
             return Ok(*made);
         }
         let made = WorkspaceId::random();
-        state.made.push((machine, request.tag, request.name, made));
+        state.made.push((target, request.tag, request.name, made));
         Ok(made)
     }
 
@@ -645,6 +742,22 @@ impl Worker for FakeWorker {
             state.forget_sessions(workspace);
         }
         answer
+    }
+
+    fn advance(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
+        self.host_call(HostCall::Advance { workspace })
+    }
+
+    fn rest(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
+        self.host_call(HostCall::Rest { workspace })
+    }
+
+    fn wake(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
+        self.host_call(HostCall::Wake { workspace })
+    }
+
+    fn keep(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
+        self.host_call(HostCall::Keep { workspace })
     }
 }
 
@@ -830,6 +943,90 @@ mod tests {
     }
 
     #[test]
+    fn a_target_is_written_as_its_machine_or_its_kind_and_read_back() {
+        let m = machine(1);
+        let id = m.to_string();
+        assert_eq!(Target::Machine(m).to_string(), id);
+        assert_eq!(id.parse::<Target>(), Ok(Target::Machine(m)));
+        assert_eq!(Target::Host(HostKind::Vims).to_string(), "vims");
+        assert_eq!("vims".parse::<Target>(), Ok(Target::Host(HostKind::Vims)));
+        assert_eq!(Target::Machine(m).machine(), Some(m));
+        assert_eq!(Target::Host(HostKind::Vims).machine(), None);
+    }
+
+    #[test]
+    fn a_target_is_read_only_in_the_form_foundry_writes_it() {
+        let id = machine(0xabcdef).to_string();
+        assert!("kubernetes".parse::<Target>().is_err());
+        assert!("Vims".parse::<Target>().is_err());
+        assert!("".parse::<Target>().is_err());
+        assert!(id.to_uppercase().parse::<Target>().is_err());
+        assert!(id.replace('-', "").parse::<Target>().is_err());
+        assert!(format!("{{{id}}}").parse::<Target>().is_err());
+    }
+
+    #[test]
+    fn the_fake_refuses_a_host_create_naming_the_kind_and_records_it() {
+        let fake = FakeWorker::new();
+        let host = Target::Host(HostKind::Vims);
+        let req = request("a", "r1");
+        let Err(WorkerError::Failed(said)) = fake.create(host, req.clone()) else {
+            panic!("a host create is refused");
+        };
+        assert!(said.contains("vims"), "{said}");
+        assert_eq!(
+            fake.calls(),
+            vec![Call::Create {
+                target: host,
+                request: req
+            }]
+        );
+        // A scripted answer still comes first.
+        let scripted = WorkspaceId(id(9));
+        fake.on_create(Ok(scripted));
+        assert_eq!(fake.create(host, request("a", "r1")), Ok(scripted));
+    }
+
+    #[test]
+    fn the_fleet_machine_of_a_host_is_a_refusal_naming_the_kind() {
+        let m = machine(1);
+        assert_eq!(fleet_machine(Target::Machine(m)), Ok(m));
+        let Err(WorkerError::Failed(said)) = fleet_machine(Target::Host(HostKind::Vims)) else {
+            panic!("a host is refused");
+        };
+        assert!(said.contains("vims"), "{said}");
+    }
+
+    #[test]
+    fn the_fake_records_the_four_host_calls_apart_from_its_calls() {
+        let fake = FakeWorker::new();
+        let ws = WorkspaceId(id(5));
+        let other = WorkspaceId(id(6));
+        fake.archive(ws).unwrap();
+        fake.advance(ws).unwrap();
+        fake.rest(ws).unwrap();
+        fake.archive(other).unwrap();
+        fake.wake(other).unwrap();
+        fake.keep(ws).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::Archive { workspace: ws },
+                Call::Archive { workspace: other }
+            ]
+        );
+        assert_eq!(
+            fake.host_calls(),
+            vec![
+                (1, HostCall::Advance { workspace: ws }),
+                (1, HostCall::Rest { workspace: ws }),
+                (2, HostCall::Wake { workspace: other }),
+                (2, HostCall::Keep { workspace: ws }),
+            ]
+        );
+    }
+
+    #[test]
     fn a_failed_call_is_recorded_too() {
         let fake = FakeWorker::new();
         let ws = WorkspaceId(id(5));
@@ -966,90 +1163,6 @@ mod tests {
         assert_eq!(fake.send(sess, msg("a"), Some(1)), Ok(1));
         assert_eq!(
             fake.send(sess, msg("a"), Some(1)),
-    #[test]
-    fn a_target_is_written_as_its_machine_or_its_kind_and_read_back() {
-        let m = machine(1);
-        let id = m.to_string();
-        assert_eq!(Target::Machine(m).to_string(), id);
-        assert_eq!(id.parse::<Target>(), Ok(Target::Machine(m)));
-        assert_eq!(Target::Host(HostKind::Vims).to_string(), "vims");
-        assert_eq!("vims".parse::<Target>(), Ok(Target::Host(HostKind::Vims)));
-        assert_eq!(Target::Machine(m).machine(), Some(m));
-        assert_eq!(Target::Host(HostKind::Vims).machine(), None);
-    }
-
-    #[test]
-    fn a_target_is_read_only_in_the_form_foundry_writes_it() {
-        let id = machine(0xabcdef).to_string();
-        assert!("kubernetes".parse::<Target>().is_err());
-        assert!("Vims".parse::<Target>().is_err());
-        assert!("".parse::<Target>().is_err());
-        assert!(id.to_uppercase().parse::<Target>().is_err());
-        assert!(id.replace('-', "").parse::<Target>().is_err());
-        assert!(format!("{{{id}}}").parse::<Target>().is_err());
-    }
-
-    #[test]
-    fn the_fake_refuses_a_host_create_naming_the_kind_and_records_it() {
-        let fake = FakeWorker::new();
-        let host = Target::Host(HostKind::Vims);
-        let req = request("a", "r1");
-        let Err(WorkerError::Failed(said)) = fake.create(host, req.clone()) else {
-            panic!("a host create is refused");
-        };
-        assert!(said.contains("vims"), "{said}");
-        assert_eq!(
-            fake.calls(),
-            vec![Call::Create {
-                target: host,
-                request: req
-            }]
-        );
-        // A scripted answer still comes first.
-        let scripted = WorkspaceId(id(9));
-        fake.on_create(Ok(scripted));
-        assert_eq!(fake.create(host, request("a", "r1")), Ok(scripted));
-    }
-
-    #[test]
-    fn the_fleet_machine_of_a_host_is_a_refusal_naming_the_kind() {
-        let m = machine(1);
-        assert_eq!(fleet_machine(Target::Machine(m)), Ok(m));
-        let Err(WorkerError::Failed(said)) = fleet_machine(Target::Host(HostKind::Vims)) else {
-            panic!("a host is refused");
-        };
-        assert!(said.contains("vims"), "{said}");
-    }
-
-    #[test]
-    fn the_fake_records_the_four_host_calls_apart_from_its_calls() {
-        let fake = FakeWorker::new();
-        let ws = WorkspaceId(id(5));
-        let other = WorkspaceId(id(6));
-        fake.archive(ws).unwrap();
-        fake.advance(ws).unwrap();
-        fake.rest(ws).unwrap();
-        fake.archive(other).unwrap();
-        fake.wake(other).unwrap();
-        fake.keep(ws).unwrap();
-        assert_eq!(
-            fake.calls(),
-            vec![
-                Call::Archive { workspace: ws },
-                Call::Archive { workspace: other }
-            ]
-        );
-        assert_eq!(
-            fake.host_calls(),
-            vec![
-                (1, HostCall::Advance { workspace: ws }),
-                (1, HostCall::Rest { workspace: ws }),
-                (2, HostCall::Wake { workspace: other }),
-                (2, HostCall::Keep { workspace: ws }),
-            ]
-        );
-    }
-
             Err(SendRefused::CountRose { now: 2 })
         );
         assert_eq!(fake.send(sess, msg("a"), None), Ok(2));

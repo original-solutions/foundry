@@ -1168,10 +1168,10 @@ impl<'a, 'w> Pass<'a, 'w> {
                         &world.project.login,
                         reserved,
                     ) {
-                        Ok(machine) => {
+                        Ok(target) => {
                             // Its machine is reserved now, whatever the ledger shows of it later.
                             self.counted.insert(run.clone());
-                            Ok(format!("resume: {:?}", resume::placed(&ctx, run, machine)?))
+                            Ok(format!("resume: {:?}", resume::placed(&ctx, run, target)?))
                         }
                         Err(reasons) => Ok(format!(
                             "the resume waits for a machine: {}",
@@ -1390,13 +1390,13 @@ impl<'a, 'w> Pass<'a, 'w> {
                 }
             };
             let before = reserved.clone();
-            let machine = match placing::place_run(
+            let target = match placing::place_run(
                 world.view,
                 world.shared,
                 &world.project.login,
                 reserved,
             ) {
-                Ok(machine) => machine,
+                Ok(target) => target,
                 Err(reasons) => {
                     give_back(book);
                     let reason = format!("no machine can take it now: {}", reasons.join("; "));
@@ -1406,7 +1406,7 @@ impl<'a, 'w> Pass<'a, 'w> {
                 }
             };
             let ctx = self.ctx(self.config);
-            let outcome = match start::claim(&ctx, n, machine) {
+            let outcome = match start::claim(&ctx, n, target) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     *reserved = before;
@@ -1425,14 +1425,16 @@ impl<'a, 'w> Pass<'a, 'w> {
                     self.report.claimed.push(run.clone());
                     // Its machine is reserved now, whatever the ledger shows of it later.
                     self.counted.insert(run.clone());
-                    book.place(ticket, machine);
+                    if let Some(machine) = target.machine() {
+                        book.place(ticket, machine);
+                    }
                     let ctx = self.ctx(self.config);
                     let said = match start::advance(&ctx, &run) {
                         Ok(step) => match step {
                             StartStep::Started { .. } => "claimed, session started".to_owned(),
-                            other => format!("claimed on {machine}: {other:?}"),
+                            other => format!("claimed on {target}: {other:?}"),
                         },
-                        Err(error) => format!("claimed on {machine}; {}", ending(error)?),
+                        Err(error) => format!("claimed on {target}; {}", ending(error)?),
                     };
                     self.note(&run, said);
                 }
@@ -2320,8 +2322,6 @@ mod tests {
             }
             archived
         }
-    }
-
         fn advance(&self, w: WorkspaceId) -> Result<(), WorkerError> {
             self.note("advance");
             self.inner.advance(w)
@@ -2338,6 +2338,8 @@ mod tests {
             self.note("keep");
             self.inner.keep(w)
         }
+    }
+
     // ----- the rig -----
 
     struct Rig {

@@ -189,14 +189,14 @@ impl RunContext<'_> {
         Ok(self.tracker.mark_pr_draft(self.repo(), pr)?)
     }
 
-    /// A workspace made on `machine`.
+    /// A workspace made at `target`.
     pub fn create(
         &self,
-        machine: foundry_proto::ids::MachineId,
+        target: super::worker::Target,
         request: super::worker::CreateWorkspace,
     ) -> Result<WorkspaceId, RunError> {
         self.held()?;
-        Ok(self.worker.create(machine, request)?)
+        Ok(self.worker.create(target, request)?)
     }
 
     /// A factory session started in `workspace` with `first` as its first message.
@@ -237,6 +237,30 @@ impl RunContext<'_> {
     pub fn archive(&self, workspace: WorkspaceId) -> Result<(), RunError> {
         self.held()?;
         Ok(self.worker.archive(workspace)?)
+    }
+
+    /// One more step of the setup of `workspace` taken.
+    pub fn advance(&self, workspace: WorkspaceId) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.worker.advance(workspace)?)
+    }
+
+    /// `workspace` put at rest.
+    pub fn rest(&self, workspace: WorkspaceId) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.worker.rest(workspace)?)
+    }
+
+    /// `workspace` woken from rest.
+    pub fn wake(&self, workspace: WorkspaceId) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.worker.wake(workspace)?)
+    }
+
+    /// `workspace` kept, with its files, and what it runs ended.
+    pub fn keep(&self, workspace: WorkspaceId) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.worker.keep(workspace)?)
     }
 
     /// `event` written to `run`'s ledger.
@@ -913,6 +937,9 @@ pub fn go_stuck(
         return Ok(());
     }
     stop_session(ctx, at)?;
+    if let Some(workspace) = &at.worktree {
+        ctx.keep(workspace_id(workspace)?)?;
+    }
     if let Some(after_stop) = after_stop {
         after_stop()?;
     }
@@ -3218,33 +3245,6 @@ mod tests {
         }
 
         #[test]
-        fn a_run_already_stuck_only_finishes() {
-            let rig = Rig::new();
-            let run = run_id(1);
-            building(&rig, &run);
-            rig.moved(&run, State::Building, State::Stuck);
-            let mut at = progress(&rig, &run, State::Building);
-            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
-            assert!(rig.sim.writes().is_empty());
-            assert!(rig.worker.calls().is_empty());
-            assert!(rig.finished(&run));
-        }
-
-        #[test]
-        fn a_ready_pull_request_goes_back_to_draft_before_anything_is_posted() {
-            let rig = Rig::new();
-            let run = run_id(1);
-            building(&rig, &run);
-            rig.write(
-                &run,
-                Event::PrOpened {
-                    pr: 12,
-                    url: format!("https://github.com/{REPO}/pull/12"),
-                },
-            );
-            rig.moved(&run, State::Building, State::PrOpen);
-            let mut at = progress(&rig, &run, State::Building);
-        #[test]
         fn a_run_going_stuck_keeps_its_build_workspace_once_its_session_is_stopped() {
             let rig = Rig::new();
             let run = run_id(1);
@@ -3286,6 +3286,33 @@ mod tests {
             assert!(rig.worker.host_calls().is_empty());
         }
 
+        #[test]
+        fn a_run_already_stuck_only_finishes() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.moved(&run, State::Building, State::Stuck);
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            assert!(rig.sim.writes().is_empty());
+            assert!(rig.worker.calls().is_empty());
+            assert!(rig.finished(&run));
+        }
+
+        #[test]
+        fn a_ready_pull_request_goes_back_to_draft_before_anything_is_posted() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.write(
+                &run,
+                Event::PrOpened {
+                    pr: 12,
+                    url: format!("https://github.com/{REPO}/pull/12"),
+                },
+            );
+            rig.moved(&run, State::Building, State::PrOpen);
+            let mut at = progress(&rig, &run, State::Building);
             go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
             let writes = rig.sim.writes();
             assert!(writes[0].starts_with("pr ready 12"));

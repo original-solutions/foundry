@@ -329,7 +329,7 @@ use crate::factory::messages::{
 };
 use crate::factory::placing::{self, Slots};
 use crate::factory::text::{is_commit_id, sanitize};
-use crate::factory::worker::WorkerError;
+use crate::factory::worker::{Target, WorkerError};
 use crate::sessions::factory::BODY_PATH;
 
 /// The step written once the worker has answered the create: `gate-created <k> <workspace id>`.
@@ -1604,9 +1604,9 @@ impl Gate<'_, '_> {
             .branch_tip(self.ctx.repo(), self.base(seen))?
             .to_lowercase();
         let k = log.max_k + 1;
-        let machine = match placing::place_gate(self.ctx.view, self.shared, &self.ctx.project.login)
+        let target = match placing::place_gate(self.ctx.view, self.shared, &self.ctx.project.login)
         {
-            Ok(machine) => machine,
+            Ok(target) => target,
             Err(reasons) => {
                 let reason = format!("no machine can take the gate: {}", reasons.join("; "));
                 return self.could_not_run(log, attempt, k, &reason);
@@ -1614,7 +1614,7 @@ impl Gate<'_, '_> {
         };
         slots.gates_free -= 1;
         self.step(
-            &format!("{GATE_REQUESTED}{attempt} {k} {head} {base_sha} {machine}"),
+            &format!("{GATE_REQUESTED}{attempt} {k} {head} {base_sha} {target}"),
             "gate-requested",
             Some(attempt),
         )?;
@@ -1623,7 +1623,7 @@ impl Gate<'_, '_> {
             k,
             sha: head,
             base: base_sha,
-            machine: machine.to_string(),
+            machine: target.to_string(),
             ..Req::default()
         };
         self.read_gate(req)
@@ -1675,24 +1675,29 @@ impl Gate<'_, '_> {
     /// The gate `req` placed: asked for if it was not, then its terminal read.
     fn read_gate(&self, req: Req) -> Result<GateStep, RunError> {
         let ctx = self.ctx;
-        let machine = uuid::Uuid::parse_str(&req.machine)
-            .map(MachineId)
-            .map_err(|_| RunError::Invalid(format!("the gate's machine {:?}", req.machine)))?;
+        let bad_machine = || RunError::Invalid(format!("the gate's machine {:?}", req.machine));
+        let target: Target = req.machine.parse().map_err(|_| bad_machine())?;
         let name = gate::name(self.run, req.k);
         let found = ctx
             .view
             .workspace_named(ctx.project.id, &name)
             .map(|record| (record.body.id, record.body.setup, record.owner));
-        let (setup, owner) = match found {
+        let (gate_workspace, setup, owner) = match found {
             Some((id, setup, owner)) => {
                 if req.created.is_none() {
                     self.created(&req, id)?;
                 }
-                (setup, owner)
+                (id, setup, owner)
             }
             None if req.created.is_none() => {
                 let request = gate::request(ctx.config, ctx.project.id, &req.sha, self.run, req.k);
-                return match ctx.create(machine, request) {
+                // The session reported its pull request: its workspace is put at rest, so the
+                // gate has room. A create asked again rests it again, which is safe.
+                let (seen, _) = self.fresh()?;
+                if let Some(workspace) = self.build_workspace(&seen)? {
+                    ctx.rest(workspace)?;
+                }
+                return match ctx.create(target, request) {
                     Ok(id) => {
                         self.created(&req, id)?;
                         Ok(GateStep::Running)
@@ -1717,6 +1722,7 @@ impl Gate<'_, '_> {
             }
             None => {
                 // The workspace's record has not reached the view, or is gone from it.
+                let machine = target.machine().ok_or_else(bad_machine)?;
                 let gone = gate::could_not_run(None, ctx.view.unreachable_for(machine), None);
                 return self.unseen(&req, machine, gone);
             }
@@ -1738,6 +1744,7 @@ impl Gate<'_, '_> {
             return self.unseen(&req, owner, None);
         }
         let Some((terminal, TerminalState::Exited, Some(code))) = terminal else {
+            ctx.advance(gate_workspace)?;
             return Ok(GateStep::Running);
         };
         // The output first, then the verdict: the verdict is what settles the gate, and the
@@ -2390,6 +2397,9 @@ impl Gate<'_, '_> {
                 output: message.body.clone().unwrap_or_default(),
             },
         )?;
+        if let Some(workspace) = self.build_workspace(&seen)? {
+            self.ctx.wake(workspace)?;
+        }
         apply_actions(
             self.ctx,
             self.issue,
@@ -3289,16 +3299,6 @@ mod tests {
             .collect()
     }
 
-    fn archive_of(workspace: WorkspaceId) -> Call {
-        Call::Archive { workspace }
-    }
-
-    fn end_of_build() -> Call {
-        Call::EndSessions {
-            workspace: workspace(),
-        }
-    }
-
     /// The host calls of the worker, without how many calls came before each.
     fn host_calls(rig: &Rig) -> Vec<HostCall> {
         rig.worker
@@ -3334,6 +3334,16 @@ mod tests {
             "woke after call {} but sent at {send}",
             woken[0]
         );
+    }
+
+    fn archive_of(workspace: WorkspaceId) -> Call {
+        Call::Archive { workspace }
+    }
+
+    fn end_of_build() -> Call {
+        Call::EndSessions {
+            workspace: workspace(),
+        }
     }
 
     fn no_writes(rig: &Rig) {
@@ -3449,16 +3459,6 @@ mod tests {
         }
 
         #[test]
-        fn a_gate_that_passes_marks_the_pr_ready_posts_the_results_and_moves_the_issue_to_pr_open()
-        {
-            let (mut rig, run, hub) = built();
-            assert_eq!(
-                gated(&mut rig, &run, 0, PASS_TAIL),
-                GateStep::Passed { pr: 12 }
-            );
-            let writes = rig.sim.writes();
-            assert!(
-        #[test]
         fn the_build_workspace_is_put_at_rest_before_the_gate_is_placed() {
             let (mut rig, run, _hub) = built();
             place(&mut rig, &run, 1, 1);
@@ -3519,6 +3519,16 @@ mod tests {
             );
         }
 
+        #[test]
+        fn a_gate_that_passes_marks_the_pr_ready_posts_the_results_and_moves_the_issue_to_pr_open()
+        {
+            let (mut rig, run, hub) = built();
+            assert_eq!(
+                gated(&mut rig, &run, 0, PASS_TAIL),
+                GateStep::Passed { pr: 12 }
+            );
+            let writes = rig.sim.writes();
+            assert!(
                 written_at(&writes, "pr ready 12") < written_at(&writes, "pr comment 12"),
                 "{writes:?}"
             );
@@ -4147,16 +4157,6 @@ mod tests {
         }
 
         #[test]
-        fn a_failed_attempt_is_sent_into_the_session_and_the_next_gate_waits_for_a_new_run() {
-            let (mut rig, run, hub) = built();
-            assert_eq!(
-                gated(&mut rig, &run, 101, FAIL_TAIL),
-                GateStep::SentBack { attempt: 1 }
-            );
-            assert_eq!(sends(&rig), vec![sent(1, failed_message(FAIL_OUTPUT))]);
-            assert_eq!(gate_sent_back_lines(&rig, &run), [(1, 1)]);
-            assert!(has_step(&rig, &run, "gate-sending 1 1"));
-        #[test]
         fn a_failed_attempt_wakes_the_build_workspace_before_it_is_sent_into_the_session() {
             let (mut rig, run, _hub) = built();
             assert_eq!(
@@ -4166,6 +4166,16 @@ mod tests {
             woke_before_the_send(&rig);
         }
 
+        #[test]
+        fn a_failed_attempt_is_sent_into_the_session_and_the_next_gate_waits_for_a_new_run() {
+            let (mut rig, run, hub) = built();
+            assert_eq!(
+                gated(&mut rig, &run, 101, FAIL_TAIL),
+                GateStep::SentBack { attempt: 1 }
+            );
+            assert_eq!(sends(&rig), vec![sent(1, failed_message(FAIL_OUTPUT))]);
+            assert_eq!(gate_sent_back_lines(&rig, &run), [(1, 1)]);
+            assert!(has_step(&rig, &run, "gate-sending 1 1"));
             // The gate's workspace is archived; the build session is not ended.
             assert!(calls(&rig).contains(&archive_of(gate_ws(1))));
             assert!(!calls(&rig).contains(&end_of_build()));
@@ -4752,16 +4762,6 @@ mod tests {
         }
 
         #[test]
-        fn a_building_run_is_sent_the_conflict_without_waiting_for_a_gate_slot() {
-            let (rig, run, hub) = built();
-            hub.set_mergeable("CONFLICTING");
-            assert_eq!(
-                go_without_a_slot(&rig, &run),
-                GateStep::SentBack { attempt: 1 }
-            );
-            assert_eq!(creates(&rig), 0);
-            assert_eq!(sends(&rig), vec![sent(1, conflict_message())]);
-        #[test]
         fn a_conflict_wakes_the_build_workspace_before_it_is_sent() {
             let (rig, run, hub) = built();
             hub.set_mergeable("CONFLICTING");
@@ -4772,6 +4772,16 @@ mod tests {
             woke_before_the_send(&rig);
         }
 
+        #[test]
+        fn a_building_run_is_sent_the_conflict_without_waiting_for_a_gate_slot() {
+            let (rig, run, hub) = built();
+            hub.set_mergeable("CONFLICTING");
+            assert_eq!(
+                go_without_a_slot(&rig, &run),
+                GateStep::SentBack { attempt: 1 }
+            );
+            assert_eq!(creates(&rig), 0);
+            assert_eq!(sends(&rig), vec![sent(1, conflict_message())]);
             let lines: Vec<_> = rig
                 .events(&run)
                 .into_iter()
@@ -4951,16 +4961,6 @@ mod tests {
         }
 
         #[test]
-        fn a_failed_check_goes_back_into_the_session_and_uses_a_gate_attempt() {
-            let (mut rig, run, hub) = built();
-            assert_eq!(
-                gated_with(&mut rig, &run, &hub, RED),
-                GateStep::SentBack { attempt: 1 }
-            );
-            assert_eq!(
-                sends(&rig),
-                vec![sent(
-        #[test]
         fn a_failed_check_wakes_the_build_workspace_before_it_is_sent() {
             let (mut rig, run, hub) = built();
             assert_eq!(
@@ -4970,6 +4970,16 @@ mod tests {
             woke_before_the_send(&rig);
         }
 
+        #[test]
+        fn a_failed_check_goes_back_into_the_session_and_uses_a_gate_attempt() {
+            let (mut rig, run, hub) = built();
+            assert_eq!(
+                gated_with(&mut rig, &run, &hub, RED),
+                GateStep::SentBack { attempt: 1 }
+            );
+            assert_eq!(
+                sends(&rig),
+                vec![sent(
                     1,
                     messages::check_failed(HEAD, &[red("ci")], BODY_PATH)
                 )]
