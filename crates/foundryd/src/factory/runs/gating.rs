@@ -22,8 +22,10 @@
 //!    with no pull request reported are [`GateStep::NotReady`]. A session that cannot be reached
 //!    and was at rest when last seen ([`at_rest`]) is not at work: its reported pull request is
 //!    gated, and a gate in flight on its machine is read, so a cut-off build machine's gate could
-//!    not run as any other's. One that may be at work there is waited for, and with its pull
-//!    request reported nothing interrupts it: `limits.minutes` ends the run (#367).
+//!    not run as any other's. One that may be at work there on a machine unreachable for 15
+//!    minutes is an interruption, and the run is the resume step's (`resume::takes_from_the_gate`,
+//!    #367): a gate in flight for it could not run by [`interrupted`] before the interruption is
+//!    recorded. Short of 15 minutes it is waited for.
 //!    A session the fleet does not show is stuck (`session-gone`).
 //! 3. A pull request that is gone, from a fork, off the base or off the run's branches is stuck
 //!    (`pr-not-bound`); one that was merged or closed before a pass is recorded ends the run
@@ -492,6 +494,120 @@ pub fn gate_running(events: &[RunEvent]) -> bool {
         .reqs
         .last()
         .is_some_and(|req| !req.archived && req.left.is_none() && !req.cnr)
+}
+
+/// Why a gate in flight on a machine that is not gone could not run when the interruption of
+/// its run's session stopped it: the words of its `gate-could-not-run` step.
+pub const GATE_CUT_OFF: &str = "the build session was interrupted";
+
+/// What [`interrupted`] made of the gate in flight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Interrupted {
+    /// No gate is in flight, or it could not run and its slot is free: the interruption is
+    /// recorded.
+    Clear,
+    /// Its forced archive is not done yet: answered "unreachable" and waited out, or a gate
+    /// the fleet does not show yet given its passes. The gate keeps its slot, and the
+    /// interruption waits with it.
+    Waiting,
+    /// Its failure to run was the fifth of its attempt: the run is stuck, as any gate's
+    /// fifth failure makes it, and no interruption is recorded. `reason` is the public one.
+    Stuck { reason: String },
+}
+
+/// The gate in flight when the session of a run whose pull request is reported is interrupted
+/// (#367): cut off at work on a machine unreachable for 15 minutes, or resumed and ended while
+/// a gate placed for it runs. Nothing reads a gate while the session may be at work, nor while
+/// the run is the resume step's after it, so the resume step calls this before it records the
+/// interruption, and the gate could not run by the gate's own rules:
+///
+/// - On a machine gone for `gate::MACHINE_GONE_AFTER`, it could not run in the gate's words for
+///   that, and is archived or left before another gate is placed, as any gone machine's gate.
+/// - On a machine that is not gone its commands may still run, so its workspace is archived by
+///   force first (`archive_gate` while placing gates): the gate holds its slot until it is
+///   archived or recorded left, a refusal is an error asked again next pass, and an
+///   "unreachable" answer, or a gate the fleet does not show yet (`UNSEEN_PASSES` passes), is
+///   [`Interrupted::Waiting`]. Then it could not run with [`GATE_CUT_OFF`].
+///
+/// The failure to run is counted for its attempt and waited out as the gate's are, and a fifth
+/// is the gate's stuck: a pass cut short before that stuck path began takes it again, and once
+/// it has begun the run is the gate's to finish (`resume::takes_from_the_gate`). The newest gate
+/// with neither a verdict nor a failure to run is the one in flight, archived or left included,
+/// so a pass cut short after the archive writes the failure to run in the next pass, and one
+/// cut after a failure to run that was not the fifth finds nothing here.
+pub fn interrupted(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+) -> Result<Interrupted, RunError> {
+    let log = Log::read(events);
+    // A fifth failure to run written by a pass cut short before its stuck path began.
+    let fifth = log
+        .active_cnr()
+        .filter(|cnr| gate::backoff(cnr.failures).is_none())
+        .cloned();
+    let Some(req) = log
+        .reqs
+        .last()
+        .filter(|req| fifth.is_some() || (!req.cnr && req.ended.is_none()))
+        .cloned()
+    else {
+        return Ok(Interrupted::Clear);
+    };
+    // A lost lease writes nothing: `archive_gate` records its first step before it calls.
+    ctx.held()?;
+    let seen = read_progress(events);
+    let (Some(thread), Some(last)) = (seen.thread_id, seen.last_pr) else {
+        return Ok(Interrupted::Clear);
+    };
+    // Placement, the one reader of the shared settings, is never reached from here.
+    let shared = SharedSettings::default();
+    let gate = Gate {
+        ctx,
+        run,
+        shared: &shared,
+        issue: run.issue(),
+        pr: last.pr,
+        url: last.url,
+        session: session_id(&thread)?,
+    };
+    if let Some(cnr) = fifth {
+        let GateStep::Stuck { reason } =
+            gate.stuck("gate-could-not-run", could_not_run_stop(&cnr.reason))?
+        else {
+            return Err(RunError::Invalid(
+                "the gate's stuck path did not end stuck".into(),
+            ));
+        };
+        return Ok(Interrupted::Stuck { reason });
+    }
+    let gone = uuid::Uuid::parse_str(&req.machine)
+        .ok()
+        .map(MachineId)
+        .and_then(|machine| gate::could_not_run(None, ctx.view.unreachable_for(machine), None));
+    if gone.is_none() {
+        match gate.archive_gate(&req, Mode::Place)? {
+            Archive::Done => {}
+            Archive::Waiting | Archive::Refused(_) => return Ok(Interrupted::Waiting),
+        }
+    }
+    let (_, log) = gate.fresh()?;
+    // A gate not shown yet is given its passes (`gate-unseen`) and may still be made.
+    let held = log
+        .reqs
+        .iter()
+        .find(|r| r.k == req.k)
+        .is_some_and(|r| !r.archived && r.left.is_none());
+    if gone.is_none() && held {
+        return Ok(Interrupted::Waiting);
+    }
+    let reason = gone.as_deref().unwrap_or(GATE_CUT_OFF);
+    Ok(
+        match gate.could_not_run(&log, req.attempt, req.k, reason)? {
+            GateStep::Stuck { reason } => Interrupted::Stuck { reason },
+            _ => Interrupted::Clear,
+        },
+    )
 }
 
 // ----- what the gate's own steps say -----

@@ -23,7 +23,9 @@
 //! 5. Every run is advanced through tasks 22 to 28, routed as each step's module says the pass
 //!    must ([`work_run`]): a stop asked for first, the gate's runs to the gate, the time limit,
 //!    the resume before the start and the build, the reconcile before the build, the build
-//!    and its forward, and the gate in the same pass as a pull request is reported. A run whose
+//!    and its forward, and the gate in the same pass as a pull request is reported. A run the
+//!    gate holds whose session may be at work on a machine cut off for 15 minutes is the
+//!    resume's (`resume::takes_from_the_gate`, #367), before any gate in flight. A run whose
 //!    end the reconcile is winding up is touched by no other step that pass. Runs in `pr-open`,
 //!    and runs a feedback round owns, have their feedback step after the other runs' steps and
 //!    before the claims, as the issue numbers them (the runner's `prOpenRuns` came after its
@@ -1141,7 +1143,12 @@ impl<'a, 'w> Pass<'a, 'w> {
         let state = k.info.state;
         let config = run_config(self.config, k.info.base.as_deref());
         let ctx = context(self.world, self.ledger, self.settings, &config);
-        if gating::gate_running(&k.events) {
+        let gate_holds = k.info.pr_reported || k.seen.pass.is_some();
+        // A session that may be at work on a machine cut off for 15 minutes is an interruption
+        // with its pull request reported too (#367): the resume step has the run, and a gate in
+        // flight, which is not read while the session may be at work, does not hide it.
+        let resume_has_it = gate_holds && resume::takes_from_the_gate(&ctx, &k.events);
+        if gating::gate_running(&k.events) && !resume_has_it {
             // Its slot is already counted: a gate in flight is polled, not placed.
             return self.gate(&ctx, run, false);
         }
@@ -1158,8 +1165,7 @@ impl<'a, 'w> Pass<'a, 'w> {
         {
             return Ok(format!("stuck: {reason}"));
         }
-        let gate_holds = k.info.pr_reported || k.seen.pass.is_some();
-        if !gate_holds
+        if (!gate_holds || resume_has_it)
             && matches!(
                 state,
                 None | Some(State::Triage | State::Building | State::Stuck)
@@ -3585,6 +3591,189 @@ mod tests {
                 said.iter().any(|s| s.contains("gate")),
                 "the gate step ran for the run: {report:?}"
             );
+        }
+    }
+
+    // #367: a session that may be at work on a machine cut off for 15 minutes is interrupted
+    // with its pull request reported, as one with none reported is.
+    mod a_reported_pull_request_cut_off_at_work {
+        use std::time::Duration;
+
+        use super::following_a_building_run::building_with_report;
+        use super::*;
+        use crate::factory::runs::progress::{Seen, UNREACHABLE_FOR};
+
+        /// The gate's workspace, on the builder.
+        fn gate_workspace() -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(0x6a7))
+        }
+
+        /// A building run whose session reported its pull request on the builder, gated there
+        /// in the same pass: the gate is in flight.
+        fn gated(rig: &mut Rig) -> RunId {
+            let run = building_with_report(rig);
+            rig.hub.lock().pulls.insert(12, "fac/5-1".into());
+            rig.worker.inner.on_turn(Ok(TurnText {
+                message: format!("Done.\nFACTORY-DONE: https://github.com/{REPO}/pull/12"),
+                question: None,
+            }));
+            rig.worker.inner.on_create(Ok(gate_workspace()));
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert!(seen(rig, &run).pr_reported, "{report:?}");
+            assert!(
+                gating::gate_running(&rig.ledger.read(&run).unwrap()),
+                "{report:?}"
+            );
+            run
+        }
+
+        /// The builder unreachable for `span`, the build session shown unreachable with its
+        /// newest turn 1 and `prompts` prompts: 2 is a prompt after that turn (it may be at
+        /// work), 1 is at rest. The gate's workspace shows on the builder too.
+        fn away(rig: &mut Rig, span: Duration, prompts: u64) {
+            let workspace = WorkspaceId(uuid::Uuid::from_u128(0x55));
+            let session = SessionId(uuid::Uuid::from_u128(0x56));
+            let record = |id, name: &str| Record {
+                owner: builder_machine(),
+                version: 1,
+                deleted: false,
+                body: Workspace {
+                    id,
+                    project: project_id(),
+                    name: name.into(),
+                    branch: name.into(),
+                    base: "main".into(),
+                    setup: None,
+                },
+            };
+            rig.view = FleetView::builder()
+                .online(me())
+                .workspace(record(workspace, "fac/5-1"))
+                .workspace(record(gate_workspace(), "fac/5-1-g1"))
+                .session(Record {
+                    owner: builder_machine(),
+                    version: 3,
+                    deleted: false,
+                    body: Session {
+                        id: session,
+                        workspace,
+                        terminal: TerminalId(uuid::Uuid::from_u128(0x57)),
+                        model: "opus".into(),
+                        state: SessionState::Unreachable,
+                        name: None,
+                    },
+                })
+                .turn(SessionTurn {
+                    session,
+                    workspace,
+                    project: project_id(),
+                    turn: 1,
+                    prompts,
+                    question: false,
+                })
+                .unreachable(builder_machine(), span)
+                .build();
+        }
+
+        fn seen(rig: &Rig, run: &RunId) -> Seen {
+            read_progress(&rig.ledger.read(run).unwrap())
+        }
+
+        fn interruptions(rig: &Rig, run: &RunId) -> usize {
+            rig.ledger
+                .read(run)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event == "session_interrupted")
+                .count()
+        }
+
+        fn said_of(report: &PassReport, run: &RunId) -> Vec<String> {
+            report
+                .runs
+                .iter()
+                .filter(|(r, _)| r == run)
+                .map(|(_, s)| s.clone())
+                .collect()
+        }
+
+        /// The gate in flight is marked could not run, so it does not hide the interruption.
+        #[test]
+        fn is_interrupted_at_15_minutes_with_its_gate_in_flight_marked_could_not_run() {
+            let mut rig = Rig::new();
+            let run = gated(&mut rig);
+            away(&mut rig, UNREACHABLE_FOR, 2);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            let said = said_of(&report, &run);
+            assert!(
+                said.iter().any(|s| s.starts_with("resume: Archiving")),
+                "{said:?}"
+            );
+            assert_eq!(interruptions(&rig, &run), 1);
+            let events = rig.ledger.read(&run).unwrap();
+            assert!(!gating::gate_running(&events));
+            assert!(
+                events.iter().any(|event| {
+                    event.data["step"]
+                        .as_str()
+                        .is_some_and(|step| step.starts_with(gating::GATE_COULD_NOT_RUN))
+                }),
+                "the gate in flight could not run"
+            );
+            // The resume goes on in the next pass, as a run with no pull request reported: the
+            // earlier workspace is archived, the session no longer shown, and the builder back,
+            // so nothing is cut off now and the resume owed keeps the run from the gate.
+            rig.view = fleet();
+            rig.worker
+                .inner
+                .on_create(Ok(WorkspaceId(uuid::Uuid::from_u128(0x5e8))));
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            let said = said_of(&report, &run);
+            assert!(
+                said.iter()
+                    .any(|s| s.starts_with("resume: ") && !s.contains("Archiving")),
+                "{said:?}"
+            );
+            assert!(
+                rig.creates().iter().any(|c| c.name == "fac/5-1-r1"),
+                "the resume workspace is asked for: {:?}",
+                rig.creates()
+            );
+        }
+
+        #[test]
+        fn records_nothing_and_stays_building_short_of_15_minutes() {
+            let mut rig = Rig::new();
+            let run = gated(&mut rig);
+            away(&mut rig, UNREACHABLE_FOR - Duration::from_secs(1), 2);
+            let before = rig.ledger.read(&run).unwrap().len();
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            // The gate in flight is polled, as the gate's: the resume step is not asked.
+            let said = said_of(&report, &run);
+            assert_eq!(said, vec!["gate: NotReady".to_string()], "{report:?}");
+            assert_eq!(interruptions(&rig, &run), 0);
+            assert_eq!(seen(&rig, &run).state, Some(State::Building));
+            assert!(gating::gate_running(&rig.ledger.read(&run).unwrap()));
+            assert_eq!(rig.ledger.read(&run).unwrap().len(), before, "{report:?}");
+        }
+
+        /// #294's rule: a session at rest when last seen keeps going to the gate, which reads
+        /// the gate in flight and finds its machine gone.
+        #[test]
+        fn a_session_at_rest_when_last_seen_keeps_going_to_the_gate() {
+            let mut rig = Rig::new();
+            let run = gated(&mut rig);
+            away(&mut rig, UNREACHABLE_FOR, 1);
+            let report = rig.pass();
+            assert_eq!(report.failed, None, "{report:?}");
+            assert_eq!(interruptions(&rig, &run), 0);
+            let said = said_of(&report, &run);
+            assert!(said.iter().any(|s| s.starts_with("gate: ")), "{said:?}");
+            assert!(!said.iter().any(|s| s.starts_with("resume: ")), "{said:?}");
         }
     }
 
