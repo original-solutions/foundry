@@ -682,6 +682,12 @@ fn send_once(
     let intent = |count: u64| step("send-intent", format!("{SEND_INTENT}{key} {count}"));
     let refused = || step("send-refused", format!("{SEND_REFUSED}{key}"));
     let typed = || record_send_typed(ctx, &at.run, at.step, key);
+    // A workspace put at rest is woken before anything is sent to its session. The wake checks
+    // the lease as the send does, and comes before the intent, so a wake that fails leaves no
+    // try that may have typed.
+    if let Some(workspace) = &at.worktree {
+        ctx.wake(workspace_id(workspace)?)?;
+    }
     ctx.held()?;
     intent(count)?;
     // The lease was checked just above, so no lost lease can follow the intent and leave a try

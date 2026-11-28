@@ -1199,6 +1199,15 @@ impl Gate<'_, '_> {
         self.archive_all()?;
         let (seen, _) = self.fresh()?;
         let mut at = self.at(&seen);
+        // Kept here, as `go_stuck` would: its worktree is cleared below. A gone build machine
+        // is not called, as `end_session` does not call it; a run already stuck is not kept
+        // again, as `go_stuck` returns first.
+        if at.state != State::Stuck
+            && let Some(workspace) = self.build_workspace(&seen)?
+            && !self.build_machine_gone(&seen, workspace)
+        {
+            self.ctx.keep(workspace)?;
+        }
         // Ended above: `go_stuck` has nothing to stop.
         at.worktree = None;
         let reason = recorded_reason(&stop);
@@ -2397,9 +2406,6 @@ impl Gate<'_, '_> {
                 output: message.body.clone().unwrap_or_default(),
             },
         )?;
-        if let Some(workspace) = self.build_workspace(&seen)? {
-            self.ctx.wake(workspace)?;
-        }
         apply_actions(
             self.ctx,
             self.issue,

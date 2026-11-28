@@ -632,10 +632,10 @@ impl Worker for FakeWorker {
             target,
             request: request.clone(),
         });
+        fleet_machine(target)?;
         if let Some(answer) = state.create.pop_front() {
             return answer;
         }
-        fleet_machine(target)?;
         let known = state.made.iter().find(|(on, tag, name, _)| {
             *on == target && *tag == request.tag && *name == request.name
         });
