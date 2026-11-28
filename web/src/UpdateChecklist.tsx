@@ -30,11 +30,14 @@ function runs(version: string | null | undefined, tag: string): boolean {
   return !!a && !!b && a.every((n, i) => n === b[i]);
 }
 
+/** Two versions' numbers compared: below 0 when `a` is the lower, 0 when they are one. */
+const compare = (a: number[], b: number[]) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+
 /** Whether `version` is the version `tag` names or a later one, compared as three numbers. */
 function atOrPast(version: string | null | undefined, tag: string): boolean {
   const a = version ? numbers(version) : undefined;
   const b = tagNumbers(tag);
-  return !!a && !!b && (a[0] - b[0] || a[1] - b[1] || a[2] - b[2]) >= 0;
+  return !!a && !!b && compare(a, b) >= 0;
 }
 
 /** Higher tags first; a tag that is not `v` and three numbers last. */
@@ -42,7 +45,7 @@ export function newestFirst(a: string, b: string): number {
   const x = tagNumbers(a);
   const y = tagNumbers(b);
   if (!x || !y) return x ? -1 : y ? 1 : a.localeCompare(b);
-  return y[0] - x[0] || y[1] - x[1] || y[2] - x[2];
+  return compare(y, x);
 }
 
 /** What a sent row says, from its machine's sample and its call's answer, the first match winning. */
@@ -146,9 +149,9 @@ export function useInstalls(machines: MachineView[], here: string | undefined) {
   }, [back, to]);
   const restarting = back ? undefined : to;
   const held = restarting?.sure
-    ? "This machine is restarting on the new release. Install again once it is back."
+    ? "The machine serving this page is restarting on the new release. Install again once it is back."
     : restarting
-      ? "This machine may be restarting: its install went out and no answer came. Install again once it is back, or reload the page if it never restarts."
+      ? "The machine serving this page may be restarting: its install went out and no answer came. Install again once it is back, or reload the page if it never restarts."
       : state.busy
         ? "The last install is still out. Install again once it has answered."
         : undefined;
