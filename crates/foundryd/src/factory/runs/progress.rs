@@ -3069,6 +3069,42 @@ mod tests {
         }
 
         #[test]
+        fn a_given_up_step_drops_only_the_round_of_its_own_kind_and_count() {
+            assert_eq!(
+                rounds_of(&[
+                    "resume-machine 1 A",
+                    "resume-workspace 1 W1",
+                    "feedback-machine 1 B",
+                    "feedback-workspace 1 F1",
+                    "feedback-machine-given-up 1 B",
+                ]),
+                vec![("W1".to_owned(), Some("A".to_owned()))]
+            );
+            assert_eq!(
+                rounds_of(&[
+                    "resume-machine 1 A",
+                    "resume-workspace 1 W1",
+                    "resume-machine 2 B",
+                    "resume-workspace 2 W2",
+                    "resume-machine-given-up 2 B",
+                ]),
+                vec![("W1".to_owned(), Some("A".to_owned()))]
+            );
+        }
+
+        #[test]
+        fn a_workspace_made_after_its_machine_was_given_up_names_no_machine() {
+            assert_eq!(
+                rounds_of(&[
+                    "resume-machine 1 M2",
+                    "resume-machine-given-up 1 M2",
+                    "resume-workspace 1 W3",
+                ]),
+                vec![("W3".to_owned(), None)]
+            );
+        }
+
+        #[test]
         fn does_not_read_a_round_workspace_of_a_count_that_is_not_canonical() {
             assert_eq!(rounds_of(&["resume-workspace 01 x"]), vec![]);
         }
