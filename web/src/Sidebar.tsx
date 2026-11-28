@@ -10,7 +10,7 @@ import { loadUnfolded, saveUnfolded } from "./fold";
 import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { FactoryMark } from "./FactoryMark";
 import { MachineName } from "./Machines";
-import { glyphText, StateGlyph } from "./StateGlyph";
+import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { SessionNameField, useRenaming } from "./SessionName";
@@ -236,7 +236,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                   </span>
                 </div>
               </div>
-              <div className="space-y-1">
+              <div className="space-y-3">
                 {machine.workspaces.map((workspace) => (
                   <Workspace
                     key={workspace.id}
@@ -301,81 +301,87 @@ interface WorkspaceProps {
   tab: (id: string) => { tabIndex: number; onFocus: () => void };
 }
 
+/**
+ * A workspace in two columns: its project's face, with a spine hanging from it in its most urgent
+ * terminal's fill (the board's card edge, so the two always match), and beside it everything else.
+ * The face sits in the fold button with the name, drawn over its own column, so they are one stop.
+ */
 function Workspace({ workspace, folded, readable, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
   const terminals = useTerminalActions();
   const list = rows(workspace);
   const over = ended(workspace);
+  const lead = byUrgency(list)[0];
   return (
-    <div role="group" aria-label={workspace.name} className="group/ws">
-      <div className="flex items-center gap-2 rounded-md px-1 py-1 hover:bg-neutral-800/60">
-        <button
-          type="button"
-          aria-expanded={!folded}
-          onClick={() => onFold(!folded)}
-          data-stop={workspace.id}
-          data-workspace={workspace.id}
-          data-name={workspace.name}
-          {...tab(workspace.id)}
-          title={folded ? "Unfold" : "Fold"}
-          className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
-        >
-          <svg viewBox="0 0 16 16" aria-hidden="true" className={`size-3 shrink-0 text-neutral-500 transition-transform motion-reduce:transition-none ${folded ? "" : "rotate-90"}`} fill="currentColor">
-            <path d="M6 3.5l5 4.5-5 4.5z" />
-          </svg>
-          <ProjectFace project={workspace.project} className="size-[18px] text-[9px]" />
-          <span className="truncate font-medium">{workspace.name}</span>
-        </button>
-        {workspace.factory && <FactoryMark run={workspace.factory} />}
-        {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
-      </div>
-      <StandingLine workspace={workspace} list={list} readable={readable} />
-      {!folded && (
-        <>
-          <div className="flex items-center gap-2 pl-6 pr-1">
-            <span className="min-w-0 flex-1 truncate text-xs text-neutral-500">
-              {branchOf(workspace)}
-            </span>
-            <div className="flex shrink-0 items-center gap-0.5 pointer-fine:hidden pointer-fine:group-focus-within/ws:flex pointer-fine:group-hover/ws:flex">
-              {onChanges && (
-                <Action label="Changes" title={words.changes} onClick={() => onChanges(workspace.id)}>
-                  <path d="M8 2.5v6M5 5.5h6M5 12.5h6" />
+    <div role="group" aria-label={workspace.name} className="group/ws relative grid grid-cols-[1.25rem_minmax(0,1fr)] gap-x-2">
+      <span aria-hidden="true" data-spine="" className={`mx-auto mt-7 mb-[3px] w-0.5 rounded-full ${lead ? glyphFill[lead.glyph] : "bg-neutral-800"}`} />
+      <div className="min-w-0">
+        <div className="flex items-center gap-2 rounded-md py-1 pr-1 pl-2 hover:bg-neutral-800/60">
+          <button
+            type="button"
+            aria-expanded={!folded}
+            onClick={() => onFold(!folded)}
+            data-stop={workspace.id}
+            data-workspace={workspace.id}
+            data-name={workspace.name}
+            {...tab(workspace.id)}
+            title={folded ? "Unfold" : "Fold"}
+            className="flex min-w-0 flex-1 items-center text-left"
+          >
+            <ProjectFace project={workspace.project} className="absolute top-1 left-0 size-5 text-[10px]" />
+            <span className="truncate font-medium">{workspace.name}</span>
+          </button>
+          {workspace.factory && <FactoryMark run={workspace.factory} />}
+          {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
+        </div>
+        <StandingLine workspace={workspace} list={list} readable={readable} />
+        {!folded && (
+          <>
+            <div className="flex items-center gap-2 pr-1 pl-2">
+              <span className="min-w-0 flex-1 truncate text-xs text-neutral-500">
+                {branchOf(workspace)}
+              </span>
+              <div className="flex shrink-0 items-center gap-0.5 pointer-fine:hidden pointer-fine:group-focus-within/ws:flex pointer-fine:group-hover/ws:flex">
+                {onChanges && (
+                  <Action label="Changes" title={words.changes} onClick={() => onChanges(workspace.id)}>
+                    <path d="M8 2.5v6M5 5.5h6M5 12.5h6" />
+                  </Action>
+                )}
+                {terminals && (
+                  <Action label="New session" title="Start Claude Code in this workspace" onClick={() => terminals.onNewSession(workspace.id, workspace.name)}>
+                    <path d="M8 2.5l1.3 3.2 3.2 1.3-3.2 1.3L8 11.5 6.7 8.3 3.5 7l3.2-1.3z" />
+                  </Action>
+                )}
+                <Action label="New shell" title="Open a shell in this workspace" onClick={() => shell.mutate()} disabled={shell.isPending}>
+                  <path d="M3.5 4.5l3 3-3 3M8 11.5h4.5" />
                 </Action>
-              )}
-              {terminals && (
-                <Action label="New session" title="Start Claude Code in this workspace" onClick={() => terminals.onNewSession(workspace.id, workspace.name)}>
-                  <path d="M8 2.5l1.3 3.2 3.2 1.3-3.2 1.3L8 11.5 6.7 8.3 3.5 7l3.2-1.3z" />
-                </Action>
-              )}
-              <Action label="New shell" title="Open a shell in this workspace" onClick={() => shell.mutate()} disabled={shell.isPending}>
-                <path d="M3.5 4.5l3 3-3 3M8 11.5h4.5" />
-              </Action>
-              {terminals && over.length > 0 && (
-                <Action label={`Clear ${over.length} ended`} title="Clear the terminals that ended, with their final screens" onClick={() => terminals.clear(over)}>
-                  <path d="M11.5 2l-3 6M4 8h7l1 5.5H3zM6 10.5v3M9 10.5v3" />
-                </Action>
-              )}
-              {terminals && (
-                <Action label="Archive" title={words.archive} onClick={() => terminals.archive(workspace.id)}>
-                  <path d={ARCHIVE_ICON} />
-                </Action>
-              )}
+                {terminals && over.length > 0 && (
+                  <Action label={`Clear ${over.length} ended`} title="Clear the terminals that ended, with their final screens" onClick={() => terminals.clear(over)}>
+                    <path d="M11.5 2l-3 6M4 8h7l1 5.5H3zM6 10.5v3M9 10.5v3" />
+                  </Action>
+                )}
+                {terminals && (
+                  <Action label="Archive" title={words.archive} onClick={() => terminals.archive(workspace.id)}>
+                    <path d={ARCHIVE_ICON} />
+                  </Action>
+                )}
+              </div>
             </div>
-          </div>
-          {shell.error && (
-            <p role="alert" className="pl-6 text-xs text-red-400">
-              {couldNot("start a shell", shell.error)}
-            </p>
-          )}
-          {list.length > 0 && (
-            <ul className="ml-[11px] mt-0.5 border-l border-neutral-800 pl-1.5">
-              {list.map((row) => (
-                <Item key={row.terminal} row={row} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />
-              ))}
-            </ul>
-          )}
-        </>
-      )}
+            {shell.error && (
+              <p role="alert" className="pl-2 text-xs text-red-400">
+                {couldNot("start a shell", shell.error)}
+              </p>
+            )}
+            {list.length > 0 && (
+              <ul className="mt-0.5">
+                {list.map((row) => (
+                  <Item key={row.terminal} row={row} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -407,7 +413,7 @@ function StandingLine({ workspace, list, readable }: { workspace: WorkspaceView;
   const working = list.some((r) => r.glyph === "starting" || r.glyph === "working");
   const stands = readable && data && !isError ? standing(data, working) : undefined;
   return (
-    <p ref={ref} title={stands ? `${workspace.project} · ${stands.text}` : workspace.project} className="truncate pl-6 pr-1 text-xs text-neutral-500">
+    <p ref={ref} title={stands ? `${workspace.project} · ${stands.text}` : workspace.project} className="truncate pr-1 pl-2 text-xs text-neutral-500">
       <span>{workspace.project}</span>
       {stands && (
         <>

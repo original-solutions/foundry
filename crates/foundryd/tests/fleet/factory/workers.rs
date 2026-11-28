@@ -22,6 +22,7 @@ use foundry_proto::record::{AnyRecord, Record, Session, Workspace};
 use foundryd::factory::SCAN;
 use foundryd::factory::gate::COMMAND_LIMIT;
 use foundryd::factory::messages::TIME_LIMIT;
+use foundryd::factory::runs::gating::GATE_COULD_NOT_RUN;
 use foundryd::factory::runs::progress::LAUNCH_RESENDING;
 use foundryd::factory::runs::resume::CLAIM_MOVED;
 use foundryd::factory::runs::start::LAUNCH_TAKEN;
@@ -640,70 +641,107 @@ fn a_gate_whose_machine_goes_offline_is_run_again_on_another() {
     isolated(
         module_path!(),
         "a_gate_whose_machine_goes_offline_is_run_again_on_another",
-        || async {
-            // The first gate hangs; any gate after it passes.
-            let h = Harness::start(Options {
-                config: config(
-                    &[],
-                    &[
-                        "mkdir {marks}/gate-hangs 2>/dev/null && sleep 100000 || true",
-                        "test -f feature.txt",
-                    ],
-                    2,
-                ),
-                ..Options::default()
-            })
-            .await;
-            h.github.pull(PR, "fac/12-1", 12);
-            h.script(
-                12,
-                &format!(
-                    "{COMMITS}agent '- hook: {{event: SessionStart}}\n- wait_prompt\n{DONE}'\n"
-                ),
-            );
-            h.ready(12, "Make the widgets faster");
-            // The builder shows a session, so the gate goes to the other machine. A gate on a
-            // cut-off build machine is never marked "could not run" (#294): until that is fixed,
-            // this test cuts off a machine that runs the gate alone.
-            let build = h.made("fac/12-1").await;
-            h.fleet.daemons[index(&h, build.owner)].write(sample(1));
-
-            let first = h.made("fac/12-1-g1").await;
-            assert_ne!(first.owner, build.owner, "the gate runs beside the build");
-            until(WAIT, "the first gate runs, and the coordinator knows it", || {
-                h.marks.join("gate-hangs").exists()
-                    && steps(&h, 12).iter().any(|s| s.starts_with("gate-created 1 "))
-                    && h.fleet.daemons[0]
-                        .held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.id == first.body.id))
-                        .is_some()
-            })
-            .await;
-            let gone = index(&h, first.owner);
-            h.fleet.cut(gone);
-
-            // Five minutes unreachable: the gate could not run and is tried elsewhere.
-            hurry(&h, Duration::from_secs(5 * 60 + 30)).await;
-            let second = h.made("fac/12-1-g2").await;
-            assert_ne!(
-                second.owner, first.owner,
-                "the gate runs again on another machine"
-            );
-            assert_eq!(second.owner, build.owner);
-            h.reaches(12, "factory:pr-open").await;
-            assert!(
-                named(&h, 12, "gate_sent_back").is_empty(),
-                "a gate that could not run is no gate failure"
-            );
-            assert!(
-                !h.sent()
-                    .iter()
-                    .any(|m| m.line.starts_with("The factory gate failed")),
-                "{:?}",
-                h.sent()
-            );
-            h.no_unknown_calls();
-        },
+        || gate_machine_cut_off(false),
     );
+}
+
+#[test]
+fn a_gate_on_the_build_machine_cut_off_is_run_again_on_another() {
+    isolated(
+        module_path!(),
+        "a_gate_on_the_build_machine_cut_off_is_run_again_on_another",
+        || gate_machine_cut_off(true),
+    );
+}
+
+/// A gate that hangs, placed on the build machine (`on_build`) or on the other builder, whose
+/// machine is cut off mid-gate: within the five minutes the factory waits for a machine, the
+/// gate could not run and runs again on the machine that answers.
+async fn gate_machine_cut_off(on_build: bool) {
+    // The first gate hangs; any gate after it passes.
+    let h = Harness::start(Options {
+        config: config(
+            &[],
+            &[
+                "mkdir {marks}/gate-hangs 2>/dev/null && sleep 100000 || true",
+                "test -f feature.txt",
+            ],
+            2,
+        ),
+        ..Options::default()
+    })
+    .await;
+    h.github.pull(PR, "fac/12-1", 12);
+    h.script(
+        12,
+        &format!("{COMMITS}agent '- hook: {{event: SessionStart}}\n- wait_prompt\n{DONE}'\n"),
+    );
+    h.ready(12, "Make the widgets faster");
+    // The machine that is not to take the gate shows a session, so the gate goes to the other.
+    let build = h.made("fac/12-1").await;
+    let built_on = index(&h, build.owner);
+    let busier = if on_build {
+        other([1, 2], built_on)
+    } else {
+        built_on
+    };
+    h.fleet.daemons[busier].write(sample(1));
+
+    let first = h.made("fac/12-1-g1").await;
+    assert_eq!(
+        first.owner == build.owner,
+        on_build,
+        "the gate runs on the machine it was sent to"
+    );
+    until(
+        WAIT,
+        "the first gate runs, and the coordinator knows it",
+        || {
+            h.marks.join("gate-hangs").exists()
+                && steps(&h, 12)
+                    .iter()
+                    .any(|s| s.starts_with("gate-created 1 "))
+                && h.fleet.daemons[0]
+                    .held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.id == first.body.id))
+                    .is_some()
+        },
+    )
+    .await;
+    let gone = index(&h, first.owner);
+    h.fleet.cut(gone);
+
+    // Five minutes unreachable: the gate could not run and is tried elsewhere.
+    hurry(&h, Duration::from_secs(5 * 60 + 30)).await;
+    let second = h.made("fac/12-1-g2").await;
+    assert_ne!(
+        second.owner, first.owner,
+        "the gate runs again on another machine"
+    );
+    assert_eq!(second.owner, h.fleet.daemons[other([1, 2], gone)].id);
+    assert!(
+        steps(&h, 12)
+            .iter()
+            .any(|s| s.starts_with(GATE_COULD_NOT_RUN) && s.contains("unreachable")),
+        "the gate is marked could not run: {:?}",
+        steps(&h, 12)
+    );
+    if on_build {
+        // The build session is ended at the pass: its machine is gone after fifteen minutes.
+        hurry(&h, Duration::from_secs(10 * 60)).await;
+    }
+    h.reaches(12, "factory:pr-open").await;
+    assert!(
+        named(&h, 12, "gate_sent_back").is_empty(),
+        "a gate that could not run is no gate failure"
+    );
+    assert!(
+        !h.sent()
+            .iter()
+            .any(|m| m.line.starts_with("The factory gate failed")),
+        "{:?}",
+        h.sent()
+    );
+    h.no_unknown_calls();
 }
 
 #[test]
