@@ -239,6 +239,15 @@ describe("StepsPanel reading again", () => {
     expect(client.getQueryCache().findAll({ queryKey: ["trail"] })).toHaveLength(1);
   });
 
+  it("does not read an ended session again when only its label moves, as a factory run's step does", async () => {
+    answer = () => json(200, { steps: trail });
+    const building: StepsOf = { ...session, glyph: "done", label: "Building" };
+    await watch(building, { ...building, label: "PR open" });
+    fireEvent.click(screen.getByRole("button", { name: "change state" }));
+    await wait(60_000);
+    expect(reads).toBe(1);
+  });
+
   it("keeps reading a working session after a failed read, at the back-off", async () => {
     answer = () => json(500, { error: "daemon hiccup" });
     await watch(working);

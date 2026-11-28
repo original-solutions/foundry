@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { fleet, withFactory } from "./fleet";
 import { TabStrip } from "./TabStrip";
@@ -19,5 +19,15 @@ describe("TabStrip and the factory", () => {
     // The open tab and the changed one say the label, cut to fit.
     expect(screen.getAllByText("Stuck · gate red: make check…")).toHaveLength(2);
     expect(screen.queryByText("Ended")).toBeNull();
+  });
+
+  it("tells a screen reader that the open tab's shell failed, though its label says the run's stage", async () => {
+    const [machine] = withFactory(
+      fleet([sample(ME, 1), workspace(ME, "w1", "fac/214-1"), terminal(ME, "t1", "w1", "exited", { exit_code: 2 })], settings()),
+      factoryStatus("p1", { o__r__214__1: ["w1"] }),
+    );
+    await renderApp(<TabStrip workspace={machine.workspaces[0]} machine={machine} active="t1" changed={new Set()} />);
+    const tab = screen.getByRole("tab", { name: /^shell.*Failed · exit 2 — Building$/ });
+    expect(within(tab).getByText("Building").getAttribute("title")).toBe("Failed · exit 2 — Building");
   });
 });
