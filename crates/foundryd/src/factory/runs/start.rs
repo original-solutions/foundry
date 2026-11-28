@@ -2184,6 +2184,31 @@ mod tests {
             assert!(rig.ledger.issue_runs(REPO, ISSUE).unwrap().is_empty());
         }
 
+        /// `postponed` is judged after a closed issue and a label that is not `factory:ready`,
+        /// so each of those keeps its own reason when the issue is postponed too.
+        #[test]
+        fn a_postponed_issue_that_is_closed_or_not_ready_keeps_that_reason() {
+            let rig = Rig::new();
+            rig.sim.set_labels(&["factory:ready", "postponed"]);
+            rig.sim.set_closed(true);
+            assert_eq!(
+                claim_it(&rig).unwrap(),
+                ClaimOutcome::Skipped {
+                    reason: "issue #8 is closed".into()
+                }
+            );
+            let rig = Rig::new();
+            rig.sim.set_labels(&["factory:proposed", "postponed"]);
+            assert_eq!(
+                claim_it(&rig).unwrap(),
+                ClaimOutcome::Skipped {
+                    reason: "issue #8 is not factory:ready".into()
+                }
+            );
+            assert!(rig.sim.writes().is_empty());
+            assert!(rig.ledger.issue_runs(REPO, ISSUE).unwrap().is_empty());
+        }
+
         /// The runner's case "a claim that finds an assignee is skipped and makes no run": the
         /// issue is read for its assignees before anything is written.
         #[test]
