@@ -1,14 +1,15 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named } from "./Now";
 import { startShell } from "./api";
+import { archiveOf } from "./Archive";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
 import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
-import { FactoryMark } from "./FactoryMark";
+import { FactoryIcon, FactoryMark } from "./FactoryMark";
 import { MachineName } from "./Machines";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
@@ -51,6 +52,8 @@ interface Props {
   onKeys?: () => void;
   /** Collapses the list to the rail, on a wide screen. */
   onRail?: () => void;
+  /** Whether the fleet shown is not the daemon's live word (remembered, or the link is lost): a machine's sweep waits for it. */
+  stale?: boolean;
 }
 
 /** The terminals a folded workspace (or the rail) shows: the most urgent first, and the open one always. */
@@ -70,11 +73,12 @@ const TYPEAHEAD_MS = 600;
  * unfolds or goes in), Home and End go to the ends, and typing a name's first letters goes to the
  * next one it starts. A workspace's actions show while the keyboard is in it, the Tab after it.
  */
-export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys, onRail }: Props) {
+export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys, onRail, stale }: Props) {
   // A workspace is one line of its states unless it is unfolded: the board already shows every
   // terminal, so the list stays an index. The workspace you are in unfolds, and folds again when
   // you leave it; one you unfold yourself stays open.
   const [unfolded, setUnfolded] = useState(() => new Set(loadUnfolded()));
+  const terminals = useTerminalActions();
   const present = new Set(machines.flatMap((m) => m.workspaces.map((w) => w.id)));
   // Keep only workspaces still listed, so archived ones do not pile up in storage.
   const keep = (next: Set<string>) => saveUnfolded([...next].filter((id) => present.has(id)));
@@ -153,11 +157,20 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
           </Link>
         </h1>
         <div className="flex shrink-0 items-center gap-0.5">
+          <Link
+            to="/factory"
+            onClick={onNavigate}
+            aria-label="The factory"
+            title="The factory"
+            className="rounded p-1 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+          >
+            <FactoryIcon className="size-4" />
+          </Link>
           {onRail && (
             <button
               type="button"
               aria-label="Collapse sidebar"
-              title={`Collapse to a rail of states, for a wider terminal (${railKey})`}
+              title={`Collapse to a rail, for a wider terminal (${railKey})`}
               onClick={onRail}
               className="hidden rounded p-1 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 md:block"
             >
@@ -189,6 +202,8 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
         {machines.map((machine) => {
           const ids = machine.workspaces.map((w) => w.id);
           const allFolded = ids.length > 0 && ids.every((id) => !unfolded.has(id));
+          // Each workspace's own Clear N ended for the whole machine, so failed shells count too, though the Sessions list files them under Needs you.
+          const over = machine.workspaces.flatMap(ended);
           return (
             <section key={machine.id} aria-label={machine.name} className="space-y-2">
               <div className="px-1">
@@ -237,6 +252,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                     {machineStats(machine.sample)}
                   </span>
                 </div>
+                {terminals && <Tidy over={over} empty={sweepable(machine)} clear={terminals.clear} stale={stale} />}
               </div>
               <div className="space-y-3">
                 {machine.workspaces.map((workspace) => (
@@ -269,6 +285,74 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
         )}
       </div>
     </nav>
+  );
+}
+
+/**
+ * The workspaces of `machine` its sweep archives: those with no terminals left that no factory run
+ * holds. A run's workspace can be empty between its sessions, and the factory still builds in it;
+ * while its project's status is not known yet (`statusUnknown`), whether a run holds it is not known either.
+ */
+function sweepable(machine: MachineView): string[] {
+  return machine.workspaces.filter((w) => rows(w).length === 0 && !w.factory && !w.statusUnknown).map((w) => w.id);
+}
+
+/**
+ * A machine's sweep, under its numbers: clear every terminal that ended (`over`), and archive every
+ * workspace left with no terminals (`empty`). Archiving is not forced, so the daemon keeps any
+ * workspace with work it would lose, and the line says how many it kept. Each archive is the same
+ * mutation a single one is (`archiveOf`), so every view sees it under way; one that fails leaves
+ * the others to finish, and the line says how many could not be archived and why. While the fleet
+ * shown is not the daemon's live word (`stale`), both wait: what it lists as ended or empty may not be.
+ */
+function Tidy({ over, empty, clear, stale = false }: { over: string[]; empty: string[]; clear: (ids: string[]) => void; stale?: boolean }) {
+  const client = useQueryClient();
+  const archive = useMutation({
+    mutationFn: async (ids: string[]) => {
+      const results = await Promise.allSettled(ids.map((id) => client.getMutationCache().build(client, archiveOf(id)).execute(false)));
+      const failed = results.flatMap((r) => (r.status === "rejected" ? [r.reason as unknown] : []));
+      return { of: ids.length, kept: results.filter((r) => r.status === "fulfilled" && r.value !== null).length, failed: failed.length, why: failed[0] };
+    },
+  });
+  if (over.length === 0 && empty.length === 0) return null;
+  const action = "rounded px-1 text-[11px] text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-50";
+  // What was kept or could not be archived is still empty, so the line stays until those go too.
+  const { kept = 0, failed = 0, of = 0, why = undefined } = archive.data ?? {};
+  const said = [
+    kept > 0 && `${kept} kept: ${kept === 1 ? "it has" : "they have"} work archiving would lose. Archive ${kept === 1 ? "it from its row" : "them from their rows"}.`,
+    failed > 0 && couldNot(`archive ${failed} of the ${of} empty workspaces`, why),
+  ].filter((line) => line !== false);
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-x-1">
+      {over.length > 0 && (
+        <button
+          type="button"
+          onClick={() => clear(over)}
+          disabled={stale}
+          title="Clear the terminals that ended in every workspace on this machine, with their final screens"
+          className={action}
+        >
+          Clear {over.length} ended
+        </button>
+      )}
+      {empty.length > 0 && (
+        // One click and no confirm: the archive is never forced, so the daemon keeps any workspace with work to lose, and branches stay.
+        <button
+          type="button"
+          onClick={() => archive.mutate(empty)}
+          disabled={stale || archive.isPending}
+          title="Archive every workspace on this machine with no terminals left. Their branches stay; one with work archiving would lose is kept."
+          className={action}
+        >
+          {archive.isPending ? `Archiving ${archive.variables.length}…` : `Archive ${empty.length} empty`}
+        </button>
+      )}
+      {empty.length > 0 && said.length > 0 && (
+        <p role="status" className="basis-full px-1 text-xs text-amber-400">
+          {said.join(" ")}
+        </p>
+      )}
+    </div>
   );
 }
 

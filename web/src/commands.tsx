@@ -6,7 +6,7 @@ import { setHome, useHome } from "./home";
 import type { Command } from "./jump";
 import type { Needing } from "./needing";
 import { nextKey } from "./NextUp";
-import { FactoryIcon } from "./Rail";
+import { FactoryIcon } from "./FactoryMark";
 import { categories } from "./settingsNav";
 import { settingsKey } from "./shortcut";
 import { PanelIcon } from "./Sidebar";
@@ -124,7 +124,7 @@ export function useCommands({ screen, next, onNext, onCreate, onKeys, sidebar }:
             key: "sidebar",
             title: sidebar.rail ? "Expand sidebar" : "Collapse sidebar",
             group: "Do" as const,
-            about: sidebar.rail ? "Show every workspace and terminal by name." : "Fold the workspaces list to a rail of states.",
+            about: sidebar.rail ? "Show every workspace and terminal by name." : "Fold the workspaces list to a rail.",
             also: "sidebar rail workspaces list",
             keys: railKey,
             icon: <PanelIcon className="size-3.5" />,
