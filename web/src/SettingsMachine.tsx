@@ -149,7 +149,8 @@ const without = <T extends object>(from: T, keys: readonly (keyof T)[]): T => {
  */
 function Shared({ machine }: { machine: MachineView }) {
   const id = useId();
-  const [draft, setDraft] = useState<{ edits: Partial<Texts>; from: Partial<Texts> }>({ edits: {}, from: {} });
+  // `out`: the fields a save sent and has not heard back on.
+  const [draft, setDraft] = useState<{ edits: Partial<Texts>; from: Partial<Texts>; out?: Key[] }>({ edits: {}, from: {} });
   // What a save sent, by field, with the saved value then: shown until the saved value moves.
   const [sentOut, setSentOut] = useState<Partial<Record<Key, { value: string; was: string }>>>({});
   const [refusals, setRefusals] = useState<Refusal[]>([]);
@@ -181,8 +182,9 @@ function Shared({ machine }: { machine: MachineView }) {
       let edits = { ...d.edits };
       let from = { ...d.from };
       for (const key of keys) {
-        // Typed back to exactly what the settings hold, it is untouched again and follows them.
-        if (patch[key] === now[key]) {
+        // Typed back to exactly what the settings hold, it is untouched again and follows them. A
+        // field whose save is out is kept even then: what the save makes the settings decides.
+        if (patch[key] === now[key] && !d.out?.includes(key)) {
           edits = without(edits, [key]);
           from = without(from, [key]);
         } else {
@@ -223,6 +225,8 @@ function Shared({ machine }: { machine: MachineView }) {
         : { fields: { max_sessions: asNumber(values.max_sessions), max_load_per_core: asNumber(values.max_load_per_core), min_free_disk_gb: asNumber(values.min_free_disk_gb) } };
       sends.push(answer(limitKeys, limitKey, sendLimits({ id: machine.id, action })));
     }
+    const out: Key[] = [...(renaming ? (["name"] as const) : []), ...(limiting && !wrong ? limitKeys : [])];
+    setDraft((d) => ({ ...d, out }));
     const results = await Promise.all(sends);
     const done = results.filter((r) => !r.error).flatMap((r) => r.keys);
     const sentValues: Texts = { ...values, name };
@@ -230,7 +234,9 @@ function Shared({ machine }: { machine: MachineView }) {
     // Typing since the send is kept.
     setDraft((d) => {
       const kept = done.filter((key) => d.edits[key] !== sending[key]);
-      const gone = done.filter((key) => !kept.includes(key));
+      // A refused field typed back to what the settings held then is untouched again.
+      const back = out.filter((key) => !done.includes(key) && d.edits[key] === d.from[key]);
+      const gone = [...done.filter((key) => !kept.includes(key)), ...back];
       const from = without(d.from, gone);
       // What this page just sent is the baseline for what was typed since.
       for (const key of kept) from[key] = sentValues[key];

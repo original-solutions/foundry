@@ -419,6 +419,45 @@ describe("SettingsMachine", () => {
     expect(screen.getByRole("button", { name: "Save 1 change" })).toBeDefined();
   });
 
+  it("keeps a name typed back to the saved one while its save is out, as a change from what was sent", async () => {
+    const out = held();
+    await show(OTHER);
+    type("Name", "desk");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(out).toHaveLength(1));
+    type("Name", "laptop");
+    await act(async () => out[0].answer(new Response(null, { status: 204 })));
+    expect(field("Name").value).toBe("laptop");
+    expect(bar()?.textContent).toContain("Name desk → laptop");
+  });
+
+  it("keeps a limit typed back to the saved one while its save is out, as a change from what was sent", async () => {
+    const out = held();
+    await show(OTHER);
+    type("Max sessions", "5");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(out).toHaveLength(1));
+    type("Max sessions", "4");
+    await act(async () => out[0].answer(new Response(null, { status: 204 })));
+    expect(field("Max sessions").value).toBe("4");
+    expect(bar()?.textContent).toContain("Max sessions 5 → 4");
+  });
+
+  it("drops a name typed back to the saved one when its save is refused, so the field follows the settings again", async () => {
+    const out = held();
+    const change = await live();
+    type("Name", "desk");
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 change" }));
+    await waitFor(() => expect(out).toHaveLength(1));
+    type("Name", "laptop");
+    await act(async () => out[0].answer(json(409, { error: "a machine is already named desk" })));
+    expect(field("Name").value).toBe("laptop");
+    expect(bar()).toBeNull();
+    change(renamed("den"));
+    expect(field("Name").value).toBe("den");
+    expect(bar()).toBeNull();
+  });
+
   describe("the update", () => {
     const ready = (id: string) => [at(ME, 1, id === ME ? { version: "0.9.0", update_ready: "v0.9.1" } : {}), at(OTHER, 1, id === OTHER ? { version: "0.9.0", update_ready: "v0.9.1" } : {})];
 
