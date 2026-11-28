@@ -79,6 +79,8 @@ use serde::Serialize;
 use crate::api::edit_status;
 use crate::clock::Clock;
 use crate::coordinator::{self, Coordinator};
+use crate::factory::messages::TIME_LIMIT;
+use crate::factory::runs::building::SESSION_WAITING;
 use crate::factory::status::{Freshness, believed};
 use crate::machine::{Over, over_limits};
 use crate::secrets::redact;
@@ -622,8 +624,7 @@ fn factory_items(
                 HeldUpKind::Stuck => (
                     Kind::RunStuck,
                     format!("The factory's run of {} is stuck", issue(&held.run)),
-                    "Read the factory's last comment on the issue, fix the cause, then move the \
-                     issue out of factory:stuck",
+                    run_stuck_todo(&held.reason),
                 ),
                 HeldUpKind::NeedsInfo => (
                     Kind::RunNeedsInfo,
@@ -698,6 +699,22 @@ fn issue_url(run: &RunId) -> String {
 /// `owner/name#N` of `run`'s issue.
 fn issue(run: &RunId) -> String {
     format!("{}#{}", run.repo(), run.issue())
+}
+
+/// What to do about a run that stopped for `reason`, read before [`redact`]: a time limit leaves
+/// a branch the next attempt continues from while the issue text is unedited, and a session that
+/// waits for a person can be answered where it waits. Issue #398 gives each text word for word.
+fn run_stuck_todo(reason: &str) -> &'static str {
+    if reason.starts_with(TIME_LIMIT) {
+        "Check how far the run's branch got. To continue from it, move the issue to \
+         factory:ready without editing the issue text"
+    } else if reason.starts_with(SESSION_WAITING) {
+        "Open the session to see what it is waiting for. Answer it there to finish by hand, or \
+         fix the cause and move the issue out of factory:stuck"
+    } else {
+        "Read the factory's last comment on the issue, fix the cause, then move the issue out of \
+         factory:stuck"
+    }
 }
 
 /// The "factory idle" item of `project`, when it stands: for a reason the believed status
@@ -1827,6 +1844,59 @@ mod tests {
         );
         assert!(!item.todo.is_empty());
         assert!(world.of(Kind::RunNeedsInfo).is_empty());
+    }
+
+    /// The todo of the run-stuck item a run of issue 12 stuck for `reason` raises.
+    fn stuck_todo(reason: &str) -> String {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.held_up.push(held_up(12, HeldUpKind::Stuck, reason));
+        world.status(world.peer, status);
+        let items = world.of(Kind::RunStuck);
+        assert_eq!(items.len(), 1, "{items:?}");
+        items[0].todo.clone()
+    }
+
+    #[test]
+    fn a_run_stuck_at_its_time_limit_says_to_continue_from_its_branch() {
+        let todo = "Check how far the run's branch got. To continue from it, move the issue to \
+                    factory:ready without editing the issue text";
+        assert_eq!(stuck_todo(crate::factory::messages::TIME_LIMIT), todo);
+        assert_eq!(
+            stuck_todo(
+                "the run passed its time limit (180 min worked; last session activity 2 min \
+                 before the stop)"
+            ),
+            todo
+        );
+    }
+
+    #[test]
+    fn a_run_stuck_on_a_waiting_session_says_to_open_the_session() {
+        use crate::factory::runs::{Stop, building::SESSION_WAITING, recorded_reason};
+        let todo = "Open the session to see what it is waiting for. Answer it there to finish by \
+                    hand, or fix the cause and move the issue out of factory:stuck";
+        assert_eq!(stuck_todo(SESSION_WAITING), todo);
+        // The reason as the waiting path records it, with the session's question after it.
+        let asked = recorded_reason(&Stop {
+            reason: SESSION_WAITING.into(),
+            session_text: Some("Which login should I use?".into()),
+            ..Stop::default()
+        });
+        assert_eq!(stuck_todo(&asked), todo);
+    }
+
+    #[test]
+    fn a_run_stuck_for_any_other_reason_says_to_read_the_last_comment() {
+        let todo = "Read the factory's last comment on the issue, fix the cause, then move the \
+                    issue out of factory:stuck";
+        assert_eq!(stuck_todo("the gate failed 3 times"), todo);
+        // Only a reason that starts with one names it.
+        assert_eq!(
+            stuck_todo("the gate failed: the run passed its time limit"),
+            todo
+        );
     }
 
     #[test]

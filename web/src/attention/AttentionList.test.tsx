@@ -287,7 +287,7 @@ describe("AttentionList", () => {
     expect(within(card).getAllByRole("link", { name: "Pull request" }).map((link) => link.getAttribute("href"))).toEqual([pull(10)]);
   });
 
-  it("collapses items of one kind into one card that counts them and says their shared todo once", async () => {
+  it("collapses items of one kind and todo into one card that counts them and says their todo once", async () => {
     const items = [stuck(1), stuck(2), stuck(3)];
     lists = [[offline, ...items]];
     await renderApp(<AttentionList />);
@@ -315,18 +315,48 @@ describe("AttentionList", () => {
     expect(screen.queryByText(/ReportingEdgeTest > totals 1/)).toBeNull();
   });
 
-  it("says each grouped item's own todo and machine when they differ", async () => {
+  it("says each grouped item's own machine when they differ, and their shared todo once", async () => {
     const one = { ...stuck(1), id: "foreign_claim:p__1", kind: "foreign_claim", what: "Issue #1 is claimed", todo: "Move it out of factory:ready" };
-    const two = { ...one, id: "foreign_claim:p__2", what: "Issue #2 is claimed", todo: "Move it out of factory:building", machine: "m3", machine_name: "build-box" };
+    const two = { ...one, id: "foreign_claim:p__2", what: "Issue #2 is claimed", machine: "m3", machine_name: "build-box" };
     lists = [[one, two]];
     await renderApp(<AttentionList />);
     const card = await screen.findByRole("listitem", { name: "2 foreign claims" });
     expect(within(card).getByText("trilogy-mac")).toBeTruthy();
     expect(within(card).getByText("build-box")).toBeTruthy();
-    expect(within(card).queryByText(one.todo)).toBeNull();
+    expect(within(card).getAllByText(one.todo)).toHaveLength(1);
     fireEvent.click(within(card).getByRole("button", { name: two.what }));
-    expect(within(card).getByText(two.todo)).toBeTruthy();
-    expect(within(card).queryByText(one.todo)).toBeNull();
+    expect(within(card).getAllByText(one.todo)).toHaveLength(1);
+  });
+
+  const timeLimitTodo = "Check how far the run's branch got. To continue from it, move the issue to factory:ready without editing the issue text";
+
+  const atTimeLimit = (issue: number): AttentionItem => ({
+    ...stuck(issue),
+    what: `The factory's run of tc/people-hub#${issue} is stuck: the run passed its time limit (180 min worked; last session activity 2 min before the stop)`,
+    todo: timeLimitTodo,
+  });
+
+  it("puts stuck runs on a card per reason they stopped for, each saying its todo once", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const other = stuck(2);
+    lists = [[atTimeLimit(1), other, atTimeLimit(3)]];
+    await renderApp(<AttentionList />);
+    const list = await screen.findByRole("region", { name: "Needs attention" });
+    expect(within(list).getByRole("button", { name: /3 need attention/ })).toBeTruthy();
+    const cards = within(list).getAllByRole("listitem").filter((li) => li.parentElement?.parentElement === list);
+    expect(cards).toHaveLength(2);
+    const timed = within(list).getByRole("listitem", { name: "2 runs stuck" });
+    expect(cards[0]).toBe(timed);
+    expect(within(timed).getAllByText(timeLimitTodo)).toHaveLength(1);
+    expect(within(timed).queryByText(other.todo)).toBeNull();
+    for (const issue of [1, 3]) expect(within(timed).getByRole("button", { name: atTimeLimit(issue).what })).toBeTruthy();
+    expect(within(cards[1]).getByText("Run stuck")).toBeTruthy();
+    expect(within(cards[1]).getByText(/tc\/people-hub#2 is stuck: make check fails on main/)).toBeTruthy();
+    expect(within(cards[1]).queryByText(timeLimitTodo)).toBeNull();
+    expect(within(list).getAllByText(timeLimitTodo)).toHaveLength(1);
+    expect(within(list).getAllByText(other.todo)).toHaveLength(1);
+    expect(errors).not.toHaveBeenCalled();
+    errors.mockRestore();
   });
 
   it("keeps each grouped item's terminal and close button", async () => {
