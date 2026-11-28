@@ -1982,6 +1982,8 @@ async fn a_holders_status_received_at_9_minutes_keeps_factory_idle_away_at_10() 
         kind: HeldUpKind::Stuck,
         reason: "the gate failed".into(),
         workspaces: vec![],
+        pr_url: None,
+        sessions: vec![],
     });
     send(
         &conn,
