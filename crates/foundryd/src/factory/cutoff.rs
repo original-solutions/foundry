@@ -420,6 +420,27 @@ exec "$agent" "$@""#;
                 .join(format!("{terminal}.sock"))
         }
 
+        /// The pid of the holder of session `id`'s terminal: the one process that names its
+        /// socket.
+        fn holder_pid(&self, id: SessionId) -> nix::unistd::Pid {
+            let socket = self.socket(id);
+            let out = std::process::Command::new("pgrep")
+                .args(["-f", &socket.to_string_lossy()])
+                .output()
+                .unwrap();
+            let pids: Vec<i32> = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+            assert_eq!(
+                pids.len(),
+                1,
+                "one holder serves {}: {pids:?}",
+                socket.display()
+            );
+            nix::unistd::Pid::from_raw(pids[0])
+        }
+
         /// A second connection to the store's database, to break and mend it under the store.
         fn database(&self) -> rusqlite::Connection {
             rusqlite::Connection::open(self.data.path().join("foundry.db")).unwrap()
@@ -463,6 +484,19 @@ exec "$agent" "$@""#;
                 });
             }
         })
+    }
+
+    #[tokio::test]
+    async fn dropping_the_fixture_closes_the_terminals_it_started() {
+        let f = Fx::new().await;
+        let session = f.start_p1(WorkspaceId::random()).await;
+        let holder = f.holder_pid(session);
+
+        drop(f);
+        until("the holder to exit", || {
+            nix::sys::signal::kill(holder, None).is_err()
+        })
+        .await;
     }
 
     #[test]
