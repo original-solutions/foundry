@@ -78,7 +78,7 @@ let placements: unknown[] = [];
 const quiet: Shipping = { branch: "b", pushed: false, unpushed: 0, pr: null, unreachable: false };
 let shipping: Shipping = quiet;
 
-function mockActions(...answers: Response[]): Call[] {
+function mockActions(...answers: (Response | Promise<Response>)[]): Call[] {
   const calls: Call[] = [];
   vi.stubGlobal(
     "fetch",
@@ -499,14 +499,16 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Workspaces" }).getAttribute("aria-expanded")).toBe("false");
   });
 
-  it("collapses the sidebar to a rail of states with its button or Cmd+B, keeps the choice, and expands the same ways", async () => {
+  it("collapses the sidebar to a rail with its button or Cmd+B, keeps the choice, and expands the same ways", async () => {
     await open("/terminals/t1", live);
     expect(screen.getByRole("link", { name: /^sonnet/ })).toBeDefined();
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
     const rail = screen.getByRole("navigation", { name: "Workspaces" });
     expect(rail.id).not.toBe("sidebar");
-    expect(within(rail).getByRole("link", { name: "fix login / sonnet: Working" }).getAttribute("aria-current")).toBe("page");
+    fireEvent.click(within(rail).getByRole("button", { name: /^Sessions/ }));
+    const list = screen.getByRole("region", { name: "Sessions" });
+    expect(within(list).getByRole("link", { name: "fix login / sonnet: Working" }).getAttribute("aria-current")).toBe("page");
     expect(localStorage.getItem("foundry.rail")).toBe("1");
 
     fireEvent.keyDown(window, { key: "b", metaKey: true });
@@ -1410,6 +1412,56 @@ describe("App", () => {
     fireEvent.click(within(sidebar).getByRole("button", { name: "Clear 2 ended" }));
 
     await waitFor(() => expect(calls.map((c) => c.url).sort()).toEqual(["/api/terminals/t3/close", "/api/terminals/t4/close"]));
+  });
+
+  it("clears every ended terminal of every workspace on a machine at once from its heading", async () => {
+    const calls = mockActions(...Array.from({ length: 3 }, () => new Response(null, { status: 204 })));
+    await open("/terminals/t1", {
+      ...ended,
+      records: [...ended.records, workspace(ME, "w2", "fix logout"), terminal(ME, "t5", "w2", "exited", { exit_code: 0 })],
+    });
+    const sidebar = screen.getByRole("navigation");
+
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Clear 3 ended" }));
+
+    await waitFor(() => expect(calls.map((c) => c.url).sort()).toEqual(["/api/terminals/t3/close", "/api/terminals/t4/close", "/api/terminals/t5/close"]));
+  });
+
+  it("clears the ended terminals from the rail's sessions list", async () => {
+    const calls = mockActions(new Response(null, { status: 204 }));
+    await open("/terminals/t1", ended);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+
+    // The shell that failed needs you, as on the board; only the clean exit has ended.
+    const list = screen.getByRole("region", { name: "Sessions" });
+    expect(within(within(list).getByRole("group", { name: "Needs you" })).getByRole("link").getAttribute("aria-label")).toMatch(/Failed · exit 2$/);
+    fireEvent.click(within(within(list).getByRole("group", { name: "Ended" })).getByRole("button", { name: "Clear 1" }));
+
+    await waitFor(() => expect(calls.map((c) => c.url)).toEqual(["/api/terminals/t3/close"]));
+  });
+
+  it("archives every workspace on a machine with no terminals left, keeping those with work to lose", async () => {
+    let answer = () => {};
+    const held = new Promise<Response>((resolve) => (answer = () => resolve(new Response(null, { status: 204 }))));
+    const calls = mockActions(held, json(409, { uncommitted: ["a.txt"], unpushed: [], submodules: [], detached: false }));
+    await open("/terminals/t1", {
+      ...live,
+      records: [...live.records, workspace(ME, "w2", "fix logout"), workspace(ME, "w3", "fix signup")],
+    });
+    const sidebar = screen.getByRole("navigation");
+
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Archive 2 empty" }));
+    expect((await within(sidebar).findByRole("button", { name: "Archiving 2…" })).hasAttribute("disabled")).toBe(true);
+    answer();
+
+    await waitFor(() =>
+      expect(calls.sort((a, b) => a.url.localeCompare(b.url))).toEqual([
+        { url: "/api/workspaces/w2/archive", method: "POST", body: { force: false } },
+        { url: "/api/workspaces/w3/archive", method: "POST", body: { force: false } },
+      ]),
+    );
+    expect((await within(sidebar).findByRole("status")).textContent).toBe("1 kept: it has work archiving would lose. Archive it from its row.");
   });
 
   it("ends a running session from the header's menu only after asking, then moves to the next tab once it is gone", async () => {

@@ -6,7 +6,7 @@ import { setHome, useHome } from "./home";
 import type { Command } from "./jump";
 import type { Needing } from "./needing";
 import { nextKey } from "./NextUp";
-import { FactoryIcon } from "./Rail";
+import { FactoryIcon } from "./FactoryMark";
 import { PanelIcon } from "./Sidebar";
 import { StateGlyph } from "./StateGlyph";
 

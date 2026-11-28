@@ -461,6 +461,11 @@ describe("Sidebar", () => {
     expect(strip[5].getAttribute("aria-current")).toBe("true");
   });
 
+  it("links to the factory beside the board, as the rail does", async () => {
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    expect(screen.getByRole("link", { name: "The factory" }).getAttribute("href")).toBe("/factory");
+  });
+
   it("unfolds and folds every workspace of a machine at once", async () => {
     await renderApp(<Sidebar machines={machines()} {...props} />);
     const studio = screen.getByRole("region", { name: "studio" });

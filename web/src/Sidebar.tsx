@@ -4,11 +4,11 @@ import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named } from "./Now";
-import { startShell } from "./api";
+import { archiveWorkspace, startShell } from "./api";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
 import { branchOf, byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
-import { FactoryMark } from "./FactoryMark";
+import { FactoryIcon, FactoryMark } from "./FactoryMark";
 import { MachineName } from "./Machines";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
@@ -74,6 +74,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
   // terminal, so the list stays an index. The workspace you are in unfolds, and folds again when
   // you leave it; one you unfold yourself stays open.
   const [unfolded, setUnfolded] = useState(() => new Set(loadUnfolded()));
+  const terminals = useTerminalActions();
   const present = new Set(machines.flatMap((m) => m.workspaces.map((w) => w.id)));
   // Keep only workspaces still listed, so archived ones do not pile up in storage.
   const keep = (next: Set<string>) => saveUnfolded([...next].filter((id) => present.has(id)));
@@ -152,6 +153,15 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
           </Link>
         </h1>
         <div className="flex shrink-0 items-center gap-0.5">
+          <Link
+            to="/factory"
+            onClick={onNavigate}
+            aria-label="The factory"
+            title="The factory"
+            className="rounded p-1 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+          >
+            <FactoryIcon className="size-4" />
+          </Link>
           {onRail && (
             <button
               type="button"
@@ -187,6 +197,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
         {machines.map((machine) => {
           const ids = machine.workspaces.map((w) => w.id);
           const allFolded = ids.length > 0 && ids.every((id) => !unfolded.has(id));
+          const over = machine.workspaces.flatMap(ended);
           return (
             <section key={machine.id} aria-label={machine.name} className="space-y-2">
               <div className="px-1">
@@ -235,6 +246,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                     {machineStats(machine.sample)}
                   </span>
                 </div>
+                {terminals && <Tidy over={over} empty={machine.workspaces.filter((w) => rows(w).length === 0).map((w) => w.id)} clear={terminals.clear} />}
               </div>
               <div className="space-y-3">
                 {machine.workspaces.map((workspace) => (
@@ -267,6 +279,45 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
         )}
       </div>
     </nav>
+  );
+}
+
+/**
+ * A machine's sweep, under its numbers: clear every terminal that ended (`over`), and archive every
+ * workspace left with no terminals (`empty`). Archiving is not forced, so the daemon keeps any
+ * workspace with work it would lose, and the line says how many it kept.
+ */
+function Tidy({ over, empty, clear }: { over: string[]; empty: string[]; clear: (ids: string[]) => void }) {
+  const archive = useMutation({
+    mutationFn: async (ids: string[]) => (await Promise.all(ids.map((id) => archiveWorkspace(id, false)))).filter((held) => held !== null).length,
+  });
+  const kept = archive.data ?? 0;
+  if (over.length === 0 && empty.length === 0 && !archive.error) return null;
+  const action = "rounded px-1 text-[11px] text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-50";
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-x-1">
+      {over.length > 0 && (
+        <button type="button" onClick={() => clear(over)} title="Clear the terminals that ended in every workspace on this machine, with their final screens" className={action}>
+          Clear {over.length} ended
+        </button>
+      )}
+      {empty.length > 0 && (
+        <button
+          type="button"
+          onClick={() => archive.mutate(empty)}
+          disabled={archive.isPending}
+          title="Archive every workspace on this machine with no terminals left. Their branches stay; one with work archiving would lose is kept."
+          className={action}
+        >
+          {archive.isPending ? `Archiving ${archive.variables.length}…` : `Archive ${empty.length} empty`}
+        </button>
+      )}
+      {((kept > 0 && empty.length > 0) || archive.error) && (
+        <p role="status" className="basis-full px-1 text-xs text-amber-400">
+          {archive.error ? couldNot("archive the empty workspaces", archive.error) : `${kept} kept: ${kept === 1 ? "it has" : "they have"} work archiving would lose. Archive ${kept === 1 ? "it from its row" : "them from their rows"}.`}
+        </p>
+      )}
+    </div>
   );
 }
 

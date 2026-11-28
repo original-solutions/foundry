@@ -22,3 +22,12 @@ export function FactoryMark({ run, compact = false }: { run: FactoryRun; compact
     </a>
   );
 }
+
+/** A factory's roofline: the factory view. */
+export function FactoryIcon({ className }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" className={className}>
+      <path d="M2 14V7l4 2.5V7l4 2.5V3h4v11z" />
+    </svg>
+  );
+}
